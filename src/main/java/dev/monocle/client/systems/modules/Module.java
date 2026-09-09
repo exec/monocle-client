@@ -88,6 +88,7 @@ public abstract class Module implements ISerializable<Module>, Comparable<Module
     }
 
     public void toggle() {
+        activationRevision++;
         if (!active) {
             active = true;
             Modules.get().addActive(this);
@@ -112,6 +113,11 @@ public abstract class Module implements ISerializable<Module>, Comparable<Module
     public void enable() {
         if (!isActive()) toggle();
     }
+
+    private long activationRevision;
+
+    /** Changes on every toggle, including an off/on cycle ending in the same state. */
+    public long activationRevision() { return activationRevision; }
 
     public void disable() {
         if (isActive()) toggle();

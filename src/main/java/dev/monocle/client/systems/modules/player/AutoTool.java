@@ -14,6 +14,9 @@ import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.render.Xray;
 import dev.monocle.client.systems.modules.world.InfinityMiner;
+import dev.monocle.client.systems.modules.world.HighwayBuilder;
+import dev.monocle.client.systems.modules.combat.KillAura;
+import dev.monocle.client.utils.entity.DamageUtils;
 import dev.monocle.client.utils.Utils;
 import dev.monocle.client.utils.misc.ListMode;
 import dev.monocle.client.utils.player.InvUtils;
@@ -26,6 +29,7 @@ import net.minecraft.tags.ItemTags;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.ShearsItem;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
@@ -36,6 +40,12 @@ import java.util.function.Predicate;
 public class AutoTool extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgWhitelist = settings.createGroup("Whitelist");
+    private final Setting<Boolean> combatSword = sgGeneral.add(new BoolSetting.Builder()
+        .name("kill-aura-sword").description("Offer Kill Aura a permitted sword before attacking, including during Highway Builder work.")
+        .defaultValue(true).build());
+    private final Setting<Boolean> inventorySword = sgGeneral.add(new BoolSetting.Builder()
+        .name("inventory-swords").description("Bring a sword from inventory into an empty hotbar slot, or swap with slot nine (eight if nine is selected). Nothing is dropped.")
+        .defaultValue(true).visible(combatSword::get).build());
 
     // General
 
@@ -104,7 +114,7 @@ public class AutoTool extends Module {
         .name("whitelist")
         .description("The tools you want to use.")
         .visible(() -> listMode.get() == ListMode.Whitelist)
-        .filter(AutoTool::isTool)
+        .filter(item -> isTool(item) || item.getDefaultInstance().is(ItemTags.SWORDS))
         .build()
     );
 
@@ -112,7 +122,7 @@ public class AutoTool extends Module {
         .name("blacklist")
         .description("The tools you don't want to use.")
         .visible(() -> listMode.get() == ListMode.Blacklist)
-        .filter(AutoTool::isTool)
+        .filter(item -> isTool(item) || item.getDefaultInstance().is(ItemTags.SWORDS))
         .build()
     );
 
@@ -127,7 +137,7 @@ public class AutoTool extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Post event) {
-        if (Modules.get().isActive(InfinityMiner.class)) return;
+        if (miningOwnedElsewhere()) { shouldSwitch = wasPressed = false; return; }
 
         if (switchBack.get() && !mc.options.keyAttack.isDown() && wasPressed && InvUtils.previousSlot != -1) {
             InvUtils.swapBack();
@@ -147,7 +157,7 @@ public class AutoTool extends Module {
 
     @EventHandler(priority = EventPriority.HIGH)
     private void onStartBreakingBlock(StartBreakingBlockEvent event) {
-        if (Modules.get().isActive(InfinityMiner.class)) return;
+        if (miningOwnedElsewhere()) { shouldSwitch = wasPressed = false; return; }
         if (mc.player.isCreative()) return;
 
         // Get blockState
@@ -193,6 +203,41 @@ public class AutoTool extends Module {
 
     private boolean shouldStopUsing(ItemStack itemStack) {
         return antiBreak.get() && (itemStack.getMaxDamage() - itemStack.getDamageValue()) < (itemStack.getMaxDamage() * breakDurability.get() / 100);
+    }
+
+    private boolean miningOwnedElsewhere() {
+        return Modules.get().isActive(InfinityMiner.class) || Modules.get().isActive(HighwayBuilder.class)
+            || Modules.get().get(KillAura.class).attacking;
+    }
+
+    /** Called before Aura's cooldown test; Aura owns selection and restoration for the encounter. */
+    public int combatSwordSlot(Entity target, Predicate<ItemStack> permitted) {
+        if (!isActive() || !combatSword.get() || mc.player == null || mc.gui.screen() != null
+            || mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.containerMenu.getCarried().isEmpty()
+            || mc.player.isUsingItem()) return -1;
+        int best = -1;
+        double damage = -1;
+        int selected = mc.player.getInventory().getSelectedSlot();
+        for (int i = 0; i < (inventorySword.get() ? 36 : 9); i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            boolean listed = (listMode.get() == ListMode.Whitelist ? whitelist.get() : blacklist.get()).contains(stack.getItem());
+            if (!stack.is(ItemTags.SWORDS) || shouldStopUsing(stack) || !listMode.get().allows(listed) || !permitted.test(stack)) continue;
+            // Keep a usable sword: damage estimates vary with attack charge, so reranking it can reset cooldown forever.
+            if (i == selected) return selected;
+            double score = DamageUtils.getAttackDamage(mc.player, target, stack);
+            if (score > damage) { best = i; damage = score; }
+        }
+        if (best < 9) return best;
+        int destination = swordHotbarSlot(selected);
+        for (int i = 0; i < 9; i++) if (mc.player.getInventory().getItem(i).isEmpty()) { destination = i; break; }
+        ItemStack sword = mc.player.getInventory().getItem(best).copy();
+        InvUtils.quickSwap().fromId(destination).to(best);
+        return ItemStack.isSameItemSameComponents(sword, mc.player.getInventory().getItem(destination)) ? destination : -1;
+    }
+
+    static int swordHotbarSlot(int selected) {
+        if (selected < 0 || selected > 8) throw new IllegalArgumentException("Invalid hotbar slot");
+        return selected == 8 ? 7 : 8;
     }
 
     public static double getScore(ItemStack itemStack, BlockState state, boolean silkTouchEnderChest, boolean fortuneOre, EnchantPreference enchantPreference, Predicate<ItemStack> good) {

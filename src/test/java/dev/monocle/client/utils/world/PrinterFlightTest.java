@@ -148,7 +148,9 @@ public final class PrinterFlightTest {
         assert invokes(ElytraFlightMode.class, "onTick", "hasAutopilotRequest") : "Restocking lease must suppress inventory interference";
         assert invokes(ElytraFly.class, "onPlayerMove", "hasAutopilotRequest");
         assert invokes(ElytraFly.class, "onPlayerMove", "segmentClear") : "Check actual movement immediately, not just the cached route";
-        assert invokes(Class.forName(ElytraFly.class.getName() + "$StaticGroundListener"), "chestSwapGroundListener", "hasAutopilotRequest");
+        assert invokes(ElytraFly.class, "onTick", "hasAutopilotRequest");
+        assert invokes(Class.forName("dev.monocle.client.systems.modules.player.ChestSwap$SwapListener"), "onTick", "hasAutopilotRequest")
+            : "Shared landing swap must still yield to Printer steering";
         assert invokes(Class.forName(ElytraFly.class.getName() + "$StaticInstaDropListener"), "onInstadropTick", "hasAutopilotRequest");
         for (String method : List.of("onDeactivate", "onModeChanged", "onPacketReceive")) assert invokes(ElytraFly.class, method, "clearAutopilot");
         for (String method : List.of("requestAutopilot", "clearAutopilot")) {

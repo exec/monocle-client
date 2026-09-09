@@ -5,7 +5,6 @@
 
 package dev.monocle.client.systems.modules.player;
 
-import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
 import dev.monocle.client.events.entity.player.ItemUseCrosshairTargetEvent;
 import dev.monocle.client.events.world.TickEvent;
 import dev.monocle.client.pathing.PathManagers;
@@ -138,7 +137,10 @@ public class AutoGap extends Module {
     private int slot, prevSlot;
     private boolean wasUsePressed;
 
-    private final List<Class<? extends Module>> wasAura = new ReferenceArrayList<>();
+    private final Map<Module, Long> wasAura = new java.util.HashMap<>();
+    private Object eatingWorld;
+    private ItemStack eatingStack = ItemStack.EMPTY;
+    private int handoffTicks;
     private boolean wasBaritone;
 
     public AutoGap() {
@@ -154,6 +156,17 @@ public class AutoGap extends Module {
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null) {
             if (eating) stopEating();
+            return;
+        }
+        if (handoffTicks > 0) { handoffTicks--; return; }
+        if (mc.gui.screen() != null || mc.player.containerMenu != mc.player.inventoryMenu
+            || !mc.player.containerMenu.getCarried().isEmpty()) {
+            if (eating) stopEating();
+            return;
+        }
+        if (eating && slot != SlotUtils.OFFHAND && mc.player.getInventory().getSelectedSlot() != slot) {
+            stopEating();
+            handoffTicks = 20;
             return;
         }
 
@@ -197,6 +210,7 @@ public class AutoGap extends Module {
         if (!changeSlot(slot)) return false;
 
         eating = true;
+        eatingWorld = mc.level;
 
         wasAura.clear();
         if (pauseAuras.get()) {
@@ -204,8 +218,8 @@ public class AutoGap extends Module {
                 Module module = Modules.get().get(klass);
 
                 if (module.isActive()) {
-                    wasAura.add(klass);
                     module.toggle();
+                    wasAura.put(module, module.activationRevision());
                 }
             }
         }
@@ -226,16 +240,22 @@ public class AutoGap extends Module {
     private void stopEating() {
         if (!eating && wasAura.isEmpty() && !wasBaritone) return;
 
-        if (mc.player != null && SlotUtils.isHotbar(prevSlot)) InvUtils.swap(prevSlot, false);
+        if (mc.player != null && mc.level == eatingWorld
+            && ItemStack.isSameItemSameComponents(stackIn(slot), eatingStack)
+            && (slot == SlotUtils.OFFHAND || mc.player.getInventory().getSelectedSlot() == slot)) {
+            if (mc.player.isUsingItem() && mc.player.getUsedItemHand() == (slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND)
+                && isSuitable(mc.player.getUseItem())) mc.gameMode.releaseUsingItem(mc.player);
+            if (slot != SlotUtils.OFFHAND && SlotUtils.isHotbar(prevSlot)) InvUtils.swap(prevSlot, false);
+        }
         setPressed(wasUsePressed);
 
         eating = false;
         slot = -1;
         prevSlot = -1;
 
-        for (Class<? extends Module> klass : wasAura) {
-            Modules.get().get(klass).enable();
-        }
+        wasAura.forEach((module, revision) -> {
+            if (mc.level == eatingWorld && !module.isActive() && module.activationRevision() == revision) module.enable();
+        });
         wasAura.clear();
 
         if (wasBaritone) PathManagers.get().resume();
@@ -249,6 +269,7 @@ public class AutoGap extends Module {
     private boolean changeSlot(int slot) {
         if (slot != SlotUtils.OFFHAND && !InvUtils.swap(slot, false)) return false;
         this.slot = slot;
+        eatingStack = stackIn(slot).copy();
         return true;
     }
 

@@ -26,6 +26,8 @@ import dev.monocle.client.mixininterface.IClientboundExplodePacket;
 import dev.monocle.client.pathing.BaritoneUtils;
 import dev.monocle.client.systems.config.Config;
 import dev.monocle.client.systems.modules.Modules;
+import dev.monocle.client.systems.modules.combat.Surround;
+import dev.monocle.client.systems.modules.movement.Scaffold;
 import dev.monocle.client.systems.modules.movement.Velocity;
 import dev.monocle.client.systems.modules.player.NoRotate;
 import dev.monocle.client.systems.modules.render.NoRender;
@@ -113,12 +115,16 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
         // Vanilla has resolved block predictions on the client thread before this callback.
         Modules.get().get(HighwayBuilder.class).onServerBlockAck(packet.sequence());
         Modules.get().get(PrinterHelper.class).onServerBlockAck(packet.sequence());
+        Modules.get().get(Surround.class).onServerBlockAck(packet.sequence());
+        Modules.get().get(Scaffold.class).onServerBlockAck(packet.sequence());
     }
 
     @Inject(method = "handleBlockUpdate", at = @At("TAIL"))
     private void onHandleBlockUpdate(ClientboundBlockUpdatePacket packet, CallbackInfo ci) {
         Modules.get().get(HighwayBuilder.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(PrinterHelper.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
+        Modules.get().get(Surround.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
+        Modules.get().get(Scaffold.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
     }
 
     @Inject(method = "handleChunkBlocksUpdate", at = @At("TAIL"))
@@ -126,6 +132,8 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
         packet.runUpdates((pos, state) -> {
             Modules.get().get(HighwayBuilder.class).onServerBlockUpdate(pos, state);
             Modules.get().get(PrinterHelper.class).onServerBlockUpdate(pos, state);
+            Modules.get().get(Surround.class).onServerBlockUpdate(pos, state);
+            Modules.get().get(Scaffold.class).onServerBlockUpdate(pos, state);
         });
     }
 

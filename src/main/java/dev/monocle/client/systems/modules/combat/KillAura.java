@@ -13,6 +13,9 @@ import dev.monocle.client.systems.friends.Friends;
 import dev.monocle.client.systems.modules.Categories;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
+import dev.monocle.client.systems.modules.player.AutoTool;
+import dev.monocle.client.systems.modules.player.AutoEat;
+import dev.monocle.client.systems.modules.player.AutoGap;
 import dev.monocle.client.utils.entity.EntityAgeTest;
 import dev.monocle.client.utils.entity.EntityUtils;
 import dev.monocle.client.utils.entity.SortPriority;
@@ -25,6 +28,7 @@ import dev.monocle.client.utils.player.PlayerUtils;
 import dev.monocle.client.utils.player.Rotations;
 import dev.monocle.client.utils.world.TickRate;
 import meteordevelopment.orbit.EventHandler;
+import meteordevelopment.orbit.EventPriority;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.util.Mth;
@@ -267,6 +271,9 @@ public class KillAura extends Module {
     private int switchTimer, hitTimer;
     private int previousSlot = -1;
     private boolean wasPathing, swapped;
+    private boolean toolSwapped;
+    private int equippedSlot = -1;
+    private ItemStack equippedStack = ItemStack.EMPTY;
     public boolean attacking;
 
     public KillAura() {
@@ -282,6 +289,9 @@ public class KillAura extends Module {
         attacking = false;
         wasPathing = false;
         swapped = false;
+        toolSwapped = false;
+        equippedSlot = -1;
+        equippedStack = ItemStack.EMPTY;
     }
 
     @Override
@@ -290,7 +300,7 @@ public class KillAura extends Module {
         stopAttacking();
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGH)
     private void onTick(TickEvent.Pre event) {
         if (shouldPause()) {
             stopAttacking();
@@ -323,11 +333,17 @@ public class KillAura extends Module {
         }
 
         List<Entity> batch = List.copyOf(targets);
+        long revision = activationRevision();
+        var attackWorld = mc.level;
         if (rotation.get() == RotationMode.None) attack(batch);
-        else Rotations.rotate(Rotations.getYaw(primary), Rotations.getPitch(primary, Target.Body), () -> attack(batch));
+        else Rotations.rotate(Rotations.getYaw(primary), Rotations.getPitch(primary, Target.Body), () -> {
+            if (activationRevision() == revision && mc.level == attackWorld) attack(batch);
+        });
     }
 
     private boolean shouldPause() {
+        if (mc.player == null || mc.level == null) return true;
+        if (Modules.get().get(AutoEat.class).eating || Modules.get().get(AutoGap.class).isEating()) return true;
         if (!mc.player.isAlive() || PlayerUtils.getGameMode() == GameType.SPECTATOR) return true;
         if (pauseOnUse.get() && (mc.gameMode.isDestroying() || mc.player.isUsingItem())) return true;
         if (onlyOnClick.get() && !mc.options.keyAttack.isDown()) return true;
@@ -349,9 +365,10 @@ public class KillAura extends Module {
     }
 
     private boolean equipWeapon(boolean shieldBreak) {
-        if (!autoSwitch.get()) return true;
+        int sword = shieldBreak ? -1 : Modules.get().get(AutoTool.class).combatSwordSlot(targets.getFirst(), stack -> acceptableWeapon(stack, false));
+        if (sword < 0 && !autoSwitch.get()) return true;
 
-        FindItemResult weapon = shieldBreak
+        FindItemResult weapon = sword >= 0 ? new FindItemResult(sword, 1) : shieldBreak
             ? InvUtils.find(stack -> stack.getItem() instanceof AxeItem, 0, 8)
             : attackWhenHolding.get() == AttackItems.All
                 ? new FindItemResult(mc.player.getInventory().getSelectedSlot(), 1)
@@ -364,6 +381,10 @@ public class KillAura extends Module {
         if (!InvUtils.swap(weapon.slot(), false)) return false;
 
         swapped = true;
+        toolSwapped |= sword >= 0;
+        equippedSlot = weapon.slot();
+        equippedStack = mc.player.getMainHandItem().copy();
+        if (sword >= 0) mc.player.resetAttackStrengthTicker();
         return true;
     }
 
@@ -380,10 +401,22 @@ public class KillAura extends Module {
             PathManagers.get().resume();
             wasPathing = false;
         }
-        if (swapBack.get() && swapped && previousSlot >= 0) InvUtils.swap(previousSlot, false);
+        if ((swapBack.get() || toolSwapped) && swapped && previousSlot >= 0 && mc.player != null
+            && !mc.player.isUsingItem() && mc.player.getInventory().getSelectedSlot() == equippedSlot
+            && sameWeapon(mc.player.getMainHandItem(), equippedStack)) InvUtils.swap(previousSlot, false);
 
         previousSlot = -1;
         swapped = false;
+        toolSwapped = false;
+        equippedSlot = -1;
+        equippedStack = ItemStack.EMPTY;
+    }
+
+    private static boolean sameWeapon(ItemStack current, ItemStack expected) {
+        if (current.isEmpty() || expected.isEmpty()) return false;
+        ItemStack copy = current.copy();
+        copy.setDamageValue(expected.getDamageValue());
+        return ItemStack.matches(copy, expected);
     }
 
     private boolean shouldShieldBreak() {
@@ -461,6 +494,7 @@ public class KillAura extends Module {
     }
 
     private void attack(List<Entity> batch) {
+        if (!isActive() || !attacking || shouldPause() || !acceptableWeapon(mc.player.getMainHandItem(), shouldShieldBreak())) return;
         boolean attacked = false;
         for (Entity target : batch) {
             if (!entityCheck(target)) continue;

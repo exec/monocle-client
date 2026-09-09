@@ -5,7 +5,6 @@
 
 package dev.monocle.client.systems.modules.player;
 
-import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
 import dev.monocle.client.events.entity.player.ItemUseCrosshairTargetEvent;
 import dev.monocle.client.events.world.TickEvent;
 import dev.monocle.client.pathing.PathManagers;
@@ -28,6 +27,7 @@ import net.minecraft.world.food.FoodProperties;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.Container;
 
 import java.util.List;
 
@@ -76,13 +76,23 @@ public class AutoEat extends Module {
     private final Setting<Boolean> searchInventory = sgGeneral.add(new BoolSetting.Builder()
         .name("search-inventory")
         .description("Search the full inventory for food, not only the hotbar.")
-        .defaultValue(false)
+        .defaultValue(true)
         .build()
+    );
+
+    private final Setting<Integer> foodSlot = sgGeneral.add(new IntSetting.Builder()
+        .name("food-hotbar-slot").description("Use an empty hotbar slot first; otherwise swap food into this slot. The displaced stack moves into the food's old inventory slot and stays there. Nothing is dropped.")
+        .defaultValue(9).range(1, 9).sliderRange(1, 9).visible(searchInventory::get).build()
+    );
+
+    private final Setting<Boolean> protectNamed = sgGeneral.add(new BoolSetting.Builder()
+        .name("protect-named-food").description("Do not automatically eat food with a custom name, in addition to the blacklist.")
+        .defaultValue(true).build()
     );
 
     private final Setting<Priority> prioritise = sgGeneral.add(new EnumSetting.Builder<Priority>()
         .name("food-priority")
-        .description("Which aspect of the food to prioritise selecting for.")
+        .description("Choose nutrition, saturation or LeastWaste. LeastWaste favors food that fits the missing hunger; low health favors saturation instead.")
         .defaultValue(Priority.Saturation)
         .build()
     );
@@ -117,19 +127,26 @@ public class AutoEat extends Module {
 
     // Module state
     public boolean eating;
-    private int slot, prevSlot;
+    private int slot = -1, prevSlot = -1, retryTicks, eatingTicks, lastFoodCount, lastHunger;
     private boolean wasUsePressed;
+    private String status = "Idle";
 
-    private final List<Class<? extends Module>> wasAura = new ReferenceArrayList<>();
+    private final java.util.Map<Module, Long> wasAura = new java.util.HashMap<>();
+    private Object eatingWorld;
+    private ItemStack eatingStack = ItemStack.EMPTY;
     private boolean wasBaritone = false;
 
     public AutoEat() {
-        super(Categories.Player, "auto-eat", "Automatically eats food.");
+        super(Categories.Player, "auto-eat", "Food management for travel and building: full-inventory supplies, protected food and hunger-aware selection.");
     }
+
+    @Override public void onActivate() { retryTicks = eatingTicks = 0; status = "Ready"; }
 
     @Override
     public void onDeactivate() {
         stopEating();
+        retryTicks = 0;
+        status = "Inactive";
     }
 
     /**
@@ -141,8 +158,22 @@ public class AutoEat extends Module {
             if (eating) stopEating();
             return;
         }
+        if (retryTicks > 0) { retryTicks--; return; }
         if (Modules.get().get(AutoGap.class).isEating() || !thresholdReached()) {
             if (eating) stopEating();
+            status = Modules.get().get(AutoGap.class).isEating() ? "Yielding to Auto Gap" : "Ready";
+            return;
+        }
+
+        if (mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.containerMenu.getCarried().isEmpty() || mc.gui.screen() != null) {
+            if (eating) stopEating();
+            status = "Waiting for inventory / screen";
+            return;
+        }
+        if (eating && slot != SlotUtils.OFFHAND && mc.player.getInventory().getSelectedSlot() != slot) {
+            stopEating();
+            retryTicks = 20;
+            status = "Yielding to slot change";
             return;
         }
 
@@ -152,10 +183,24 @@ public class AutoEat extends Module {
             int nextSlot = findSlot();
             if (nextSlot == -1 || (eating ? !changeSlot(nextSlot) : !startEating(nextSlot))) {
                 if (eating) stopEating();
+                status = "No usable food available";
                 return;
             }
+            eatingTicks = 0;
         }
 
+        int foodCount = stackIn(slot).getCount(), hunger = mc.player.getFoodData().getFoodLevel();
+        if (foodCount != lastFoodCount || hunger != lastHunger) eatingTicks = 0;
+        lastFoodCount = foodCount;
+        lastHunger = hunger;
+        if (++eatingTicks >= 100) {
+            stopEating();
+            retryTicks = 40;
+            status = "Eating stalled; retrying shortly";
+            return;
+        }
+
+        status = "Eating " + stackIn(slot).getHoverName().getString();
         eat();
     }
 
@@ -170,6 +215,10 @@ public class AutoEat extends Module {
         if (!changeSlot(slot)) return false;
 
         eating = true;
+        eatingWorld = mc.level;
+        eatingTicks = 0;
+        lastFoodCount = stackIn(this.slot).getCount();
+        lastHunger = mc.player.getFoodData().getFoodLevel();
 
         wasAura.clear();
         if (pauseAuras.get()) {
@@ -177,8 +226,8 @@ public class AutoEat extends Module {
                 Module module = Modules.get().get(klass);
 
                 if (module.isActive()) {
-                    wasAura.add(klass);
                     module.toggle();
+                    wasAura.put(module, module.activationRevision());
                 }
             }
         }
@@ -201,16 +250,21 @@ public class AutoEat extends Module {
     void stopEating() {
         if (!eating && wasAura.isEmpty() && !wasBaritone) return;
 
-        if (mc.player != null && SlotUtils.isHotbar(prevSlot)) InvUtils.swap(prevSlot, false);
+        if (mc.player != null && mc.level == eatingWorld && ItemStack.isSameItemSameComponents(stackIn(slot), eatingStack)
+            && (slot == SlotUtils.OFFHAND || mc.player.getInventory().getSelectedSlot() == slot)) {
+            if (mc.player.isUsingItem() && mc.player.getUsedItemHand() == (slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND)
+                && mc.player.getUseItem().get(DataComponents.FOOD) != null) mc.gameMode.releaseUsingItem(mc.player);
+            if (slot != SlotUtils.OFFHAND && SlotUtils.isHotbar(prevSlot)) InvUtils.swap(prevSlot, false);
+        }
         setPressed(wasUsePressed);
 
         eating = false;
         slot = -1;
         prevSlot = -1;
 
-        for (Class<? extends Module> klass : wasAura) {
-            Modules.get().get(klass).enable();
-        }
+        wasAura.forEach((module, revision) -> {
+            if (mc.level == eatingWorld && !module.isActive() && module.activationRevision() == revision) module.enable();
+        });
         wasAura.clear();
 
         if (wasBaritone) PathManagers.get().resume();
@@ -223,12 +277,13 @@ public class AutoEat extends Module {
 
     /**
      * Prepares a slot for eating. Uses offhand or hotbar directly.
-     * Moves a main-inventory item to an empty hotbar slot; returns false if none.
+     * Uses a cursor-free native hotbar swap for inventory food. Displaced stacks stay in inventory.
      */
     private boolean changeSlot(int slot) {
         // offhand: use directly
         if (slot == SlotUtils.OFFHAND) {
             this.slot = SlotUtils.OFFHAND;
+            eatingStack = stackIn(slot).copy();
             return true;
         }
 
@@ -236,21 +291,26 @@ public class AutoEat extends Module {
         if (SlotUtils.isHotbar(slot)) {
             InvUtils.swap(slot, false);
             this.slot = slot;
+            eatingStack = stackIn(slot).copy();
             return true;
         }
 
-        // main inventory: move to empty hotbar, abort if none
-        int emptySlot = InvUtils.find(ItemStack::isEmpty, SlotUtils.HOTBAR_START, SlotUtils.HOTBAR_END).slot();
-        if (emptySlot == -1) return false;
-
-        InvUtils.move().from(slot).toHotbar(emptySlot);
-        InvUtils.swap(emptySlot, false);
-        this.slot = emptySlot;
+        if (mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.containerMenu.getCarried().isEmpty()) return false;
+        int target = foodHotbarSlot(mc.player.getInventory(), foodSlot.get() - 1);
+        ItemStack food = mc.player.getInventory().getItem(slot).copy();
+        // quickSwap's source is the hotbar button (0–8), not a container slot ID.
+        InvUtils.quickSwap().fromId(target).to(slot);
+        if (!ItemStack.isSameItemSameComponents(food, mc.player.getInventory().getItem(target))) return false;
+        InvUtils.swap(target, false);
+        this.slot = target;
+        eatingStack = stackIn(target).copy();
         return true;
     }
 
     public boolean shouldEat() {
-        return mc.player != null && thresholdReached() && findSlot() != -1;
+        return mc.player != null && retryTicks == 0 && mc.gui.screen() == null
+            && mc.player.containerMenu == mc.player.inventoryMenu && mc.player.containerMenu.getCarried().isEmpty()
+            && thresholdReached() && findSlot() != -1;
     }
 
     private boolean thresholdReached() {
@@ -266,19 +326,17 @@ public class AutoEat extends Module {
         ItemStack offhand = mc.player.getOffhandItem();
         if (canEat(offhand)) {
             best = SlotUtils.OFFHAND;
-            bestValue = prioritise.get().value(offhand.get(DataComponents.FOOD));
+            bestValue = score(offhand.get(DataComponents.FOOD));
         }
 
-        boolean canUseInventory = searchInventory.get()
-            && InvUtils.find(ItemStack::isEmpty, SlotUtils.HOTBAR_START, SlotUtils.HOTBAR_END).found();
-        int end = canUseInventory ? SlotUtils.MAIN_END : SlotUtils.HOTBAR_END;
+        int end = searchInventory.get() ? SlotUtils.MAIN_END : SlotUtils.HOTBAR_END;
 
         for (int i = SlotUtils.HOTBAR_START; i <= end; i++) {
             ItemStack stack = mc.player.getInventory().getItem(i);
             if (!canEat(stack)) continue;
 
-            float value = prioritise.get().value(stack.get(DataComponents.FOOD));
-            if (value > bestValue) {
+            float value = score(stack.get(DataComponents.FOOD));
+            if (best < 0 || value > bestValue) {
                 bestValue = value;
                 best = i;
             }
@@ -291,13 +349,34 @@ public class AutoEat extends Module {
         FoodProperties food = stack.get(DataComponents.FOOD);
         return food != null
             && Utils.isFood(stack)
-            && !blacklist.get().contains(stack.getItem())
+            && foodAllowed(stack, blacklist.get(), protectNamed.get())
             && (mc.player.getFoodData().needsFood() || food.canAlwaysEat());
     }
 
     private ItemStack stackIn(int slot) {
         return slot == SlotUtils.OFFHAND ? mc.player.getOffhandItem() : mc.player.getInventory().getItem(slot);
     }
+
+    private float score(FoodProperties food) {
+        return foodScore(food, prioritise.get(), 20 - mc.player.getFoodData().getFoodLevel(), mc.player.getHealth() <= healthThreshold.get());
+    }
+
+    static int foodHotbarSlot(Container inventory, int preferred) {
+        if (preferred < 0 || preferred > 8) throw new IllegalArgumentException("Invalid food hotbar slot");
+        for (int i = 0; i < 9; i++) if (inventory.getItem(i).isEmpty()) return i;
+        return preferred;
+    }
+
+    static boolean foodAllowed(ItemStack stack, List<Item> blacklist, boolean protectNamed) {
+        return !blacklist.contains(stack.getItem()) && (!protectNamed || !stack.has(DataComponents.CUSTOM_NAME));
+    }
+
+    static float foodScore(FoodProperties food, Priority priority, int missingHunger, boolean lowHealth) {
+        if (priority != Priority.LeastWaste) return priority.value(food);
+        return lowHealth ? food.saturation() : food.saturation() - Math.max(0, food.nutrition() - missingHunger) * 100;
+    }
+
+    @Override public String getInfoString() { return status; }
 
     public enum ThresholdMode {
         Health,
@@ -318,13 +397,15 @@ public class AutoEat extends Module {
     public enum Priority {
         Combined,
         Hunger,
-        Saturation;
+        Saturation,
+        LeastWaste;
 
         public float value(FoodProperties food) {
             return switch (this) {
                 case Combined -> food.nutrition() + food.saturation();
                 case Hunger -> food.nutrition();
                 case Saturation -> food.saturation();
+                case LeastWaste -> food.saturation();
             };
         }
     }

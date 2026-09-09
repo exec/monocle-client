@@ -210,6 +210,16 @@ tasks {
     }
 
     val moduleChecks = mapOf(
+        "chestSwapCheck" to "dev.monocle.client.systems.modules.player.ChestSwapTest",
+        "elytraSettingsCheck" to "dev.monocle.client.systems.modules.movement.ElytraSettingsTest",
+        "scaffoldCheck" to "dev.monocle.client.systems.modules.movement.ScaffoldTest",
+        "moduleHandoffCheck" to "dev.monocle.client.systems.modules.ModuleHandoffTest",
+        "surroundCheck" to "dev.monocle.client.systems.modules.combat.SurroundTest",
+        "autoToolCheck" to "dev.monocle.client.systems.modules.player.AutoToolTest",
+        "autoArmorCheck" to "dev.monocle.client.systems.modules.combat.AutoArmorTest",
+        "autoMendCheck" to "dev.monocle.client.systems.modules.player.AutoMendTest",
+        "autoEatCheck" to "dev.monocle.client.systems.modules.player.AutoEatTest",
+        "autoLogCheck" to "dev.monocle.client.systems.modules.combat.AutoLogTest",
         "stashFinderCheck" to "dev.monocle.client.systems.modules.world.StashFinderTest",
         "inventoryLoadoutCheck" to "dev.monocle.client.utils.player.InventoryLoadoutTest",
         "inventoryTransferCheck" to "dev.monocle.client.utils.player.InventoryTransferTest",
@@ -235,6 +245,16 @@ tasks {
     }
 
     test {
+        exclude("**/ChestSwapTest*.class")
+        exclude("**/ElytraSettingsTest*.class")
+        exclude("**/ScaffoldTest*.class")
+        exclude("**/ModuleHandoffTest*.class")
+        exclude("**/SurroundTest*.class")
+        exclude("**/AutoToolTest*.class")
+        exclude("**/AutoArmorTest*.class")
+        exclude("**/AutoMendTest*.class")
+        exclude("**/AutoEatTest*.class")
+        exclude("**/AutoLogTest*.class")
         exclude("**/StashFinderTest*.class")
         // These assertion-based mains run through their JavaExec tasks, not a test framework.
         exclude("**/HighwayPlanTest*.class", "**/HighwaySupplyTest*.class", "**/HighwayFarmingTest*.class", "**/MonocleStyleTest*.class", "**/MonocleFontTest*.class")

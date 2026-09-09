@@ -28,6 +28,9 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
@@ -43,22 +46,26 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 public class ElytraFly extends Module {
-    private final SettingGroup sgGeneral = settings.getDefaultGroup();
-    private final SettingGroup sgInventory = settings.createGroup("Inventory");
-    private final SettingGroup sgAutopilot = settings.createGroup("Autopilot");
+    private final SettingGroup sgFlight = settings.createGroup("Flight");
+    private final SettingGroup sgAcceleration = settings.createGroup("Acceleration");
+    private final SettingGroup sgTakeoff = settings.createGroup("Takeoff & Landing");
+    private final SettingGroup sgSafety = settings.createGroup("Safety");
+    private final SettingGroup sgAutopilot = settings.createGroup("Autopilot", false);
+    private final SettingGroup sgInventory = settings.createGroup("Inventory", false);
+    private final SettingGroup sgAdvanced = settings.createGroup("Advanced", false);
 
     // General
 
-    public final Setting<ElytraFlightModes> flightMode = sgGeneral.add(new EnumSetting.Builder<ElytraFlightModes>()
+    public final Setting<ElytraFlightModes> flightMode = sgFlight.add(new EnumSetting.Builder<ElytraFlightModes>()
         .name("mode")
-        .description("The mode of flying.")
+        .description("Vanilla: direct steering. Packet: packet-based flight. Pitch40: altitude cycling. Bounce: repeated gliding. Printer Helper requires Vanilla.")
         .defaultValue(ElytraFlightModes.Vanilla)
         .onModuleActivated(flightModesSetting -> onModeChanged(flightModesSetting.get()))
         .onChanged(this::onModeChanged)
         .build()
     );
 
-    public final Setting<Boolean> autoTakeOff = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> autoTakeOff = sgTakeoff.add(new BoolSetting.Builder()
         .name("auto-take-off")
         .description("Automatically takes off when you hold jump without needing to double jump.")
         .defaultValue(false)
@@ -66,42 +73,44 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Double> fallMultiplier = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> fallMultiplier = sgFlight.add(new DoubleSetting.Builder()
         .name("fall-multiplier")
-        .description("Controls how fast will you go down naturally.")
+        .description("Multiplies natural downward velocity. Zero removes natural descent; this does not change the sneak descent control.")
         .defaultValue(0.01)
         .min(0)
         .visible(() -> flightMode.get() != ElytraFlightModes.Pitch40 && flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Double> horizontalSpeed = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> horizontalSpeed = sgFlight.add(new DoubleSetting.Builder()
         .name("horizontal-speed")
-        .description("How fast you go forward and backward.")
+        .description("Cruising speed and acceleration target. Vanilla uses blocks per tick (1 = 20 blocks/sec at 20 TPS); server acceptance may reduce actual speed.")
         .defaultValue(1)
         .min(0)
         .visible(() -> flightMode.get() != ElytraFlightModes.Pitch40 && flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Double> verticalSpeed = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> verticalSpeed = sgFlight.add(new DoubleSetting.Builder()
         .name("vertical-speed")
-        .description("How fast you go up and down.")
+        .description("Jump / sneak vertical speed multiplier. Vanilla adds 0.5 blocks per tick per unit, in addition to natural descent.")
         .defaultValue(1)
         .min(0)
         .visible(() -> flightMode.get() != ElytraFlightModes.Pitch40 && flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Boolean> acceleration = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> acceleration = sgAcceleration.add(new BoolSetting.Builder()
         .name("acceleration")
+        .description("Ramps toward Horizontal Speed instead of applying it immediately. Server corrections and unloaded-chunk stops reset the ramp.")
         .defaultValue(false)
         .visible(() -> flightMode.get() != ElytraFlightModes.Pitch40 && flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Double> accelerationStep = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> accelerationStep = sgAcceleration.add(new DoubleSetting.Builder()
         .name("acceleration-step")
+        .description("Ramp increment: each movement update adds Acceleration Start + (this value x 0.1), capped at Horizontal Speed.")
         .min(0.1)
         .max(5)
         .defaultValue(1)
@@ -109,15 +118,16 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Double> accelerationMin = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> accelerationMin = sgAcceleration.add(new DoubleSetting.Builder()
         .name("acceleration-start")
+        .description("Legacy ramp offset: added on EVERY acceleration update, not just at takeoff. Kept unchanged so existing flight tuning behaves identically.")
         .min(0.1)
         .defaultValue(0)
         .visible(() -> flightMode.get() != ElytraFlightModes.Pitch40 && acceleration.get() && flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Boolean> stopInWater = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> stopInWater = sgSafety.add(new BoolSetting.Builder()
         .name("stop-in-water")
         .description("Stops flying in water.")
         .defaultValue(true)
@@ -125,32 +135,32 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Boolean> dontGoIntoUnloadedChunks = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> dontGoIntoUnloadedChunks = sgSafety.add(new BoolSetting.Builder()
         .name("no-unloaded-chunks")
         .description("Stops you from going into unloaded chunks.")
         .defaultValue(true)
         .build()
     );
 
-    public final Setting<Boolean> autoHover = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> autoHover = sgTakeoff.add(new BoolSetting.Builder()
         .name("auto-hover")
-        .description("Automatically hover .3 blocks off ground when holding shift.")
+        .description("Attempts to hover near the ground while holding sneak. May adjust pitch; not an automatic landing.")
         .defaultValue(false)
         .visible(() -> flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Boolean> noCrash = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> noCrash = sgSafety.add(new BoolSetting.Builder()
         .name("no-crash")
-        .description("Stops you from going into walls.")
+        .description("Stops horizontal movement when the forward collision probe finds a wall. Not full pathfinding or a guarantee against crashes.")
         .defaultValue(false)
         .visible(() -> flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Integer> crashLookAhead = sgGeneral.add(new IntSetting.Builder()
+    public final Setting<Integer> crashLookAhead = sgSafety.add(new IntSetting.Builder()
         .name("crash-look-ahead")
-        .description("Distance to look ahead when flying.")
+        .description("Wall-probe distance in blocks. Increase for faster flight; this is a forward ray, not a full-body clearance check.")
         .defaultValue(5)
         .range(1, 15)
         .sliderMin(1)
@@ -158,15 +168,15 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    private final Setting<Boolean> instaDrop = sgGeneral.add(new BoolSetting.Builder()
+    private final Setting<Boolean> instaDrop = sgTakeoff.add(new BoolSetting.Builder()
         .name("insta-drop")
-        .description("Makes you drop out of flight instantly.")
+        .description("Stops gliding when you disable ElytraFly. You will fall: disable only where landing is safe.")
         .defaultValue(false)
         .visible(() -> flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Double> pitch40lowerBounds = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> pitch40lowerBounds = sgAdvanced.add(new DoubleSetting.Builder()
         .name("pitch40-lower-bounds")
         .description(
             "The bottom height boundary for pitch40. You must be at least 40 blocks above this boundary when starting the module.\n" +
@@ -179,7 +189,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Double> pitch40upperBounds = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> pitch40upperBounds = sgAdvanced.add(new DoubleSetting.Builder()
         .name("pitch40-upper-bounds")
         .description(
             "The upper height boundary for pitch40. You must be above this boundary when starting the module.\n" +
@@ -192,7 +202,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Double> pitch40rotationSpeedUp = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> pitch40rotationSpeedUp = sgAdvanced.add(new DoubleSetting.Builder()
         .name("pitch40-rotate-speed-up")
         .description("The speed for pitch rotation upwards (degrees per tick).")
         .defaultValue(5.45)
@@ -202,7 +212,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Double> pitch40rotationSpeedDown = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> pitch40rotationSpeedDown = sgAdvanced.add(new DoubleSetting.Builder()
         .name("pitch40-rotate-speed-down")
         .description("The speed for pitch rotation downwards (degrees per tick).")
         .defaultValue(0.90)
@@ -212,7 +222,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Boolean> autoJump = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> autoJump = sgTakeoff.add(new BoolSetting.Builder()
         .name("auto-jump")
         .description("Automatically jumps for you.")
         .defaultValue(true)
@@ -220,7 +230,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Rotation.LockMode> yawLockMode = sgGeneral.add(new EnumSetting.Builder<Rotation.LockMode>()
+    public final Setting<Rotation.LockMode> yawLockMode = sgAdvanced.add(new EnumSetting.Builder<Rotation.LockMode>()
         .name("yaw-lock")
         .description("Whether to enable yaw lock or not")
         .defaultValue(Rotation.LockMode.Smart)
@@ -228,7 +238,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Double> yaw = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> yaw = sgAdvanced.add(new DoubleSetting.Builder()
         .name("yaw")
         .description("The yaw angle to look at when using simple rotation lock in bounce mode.")
         .defaultValue(0)
@@ -238,7 +248,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Boolean> lockPitch = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> lockPitch = sgAdvanced.add(new BoolSetting.Builder()
         .name("pitch-lock")
         .description("Whether to lock your pitch angle.")
         .defaultValue(true)
@@ -246,7 +256,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Double> pitch = sgGeneral.add(new DoubleSetting.Builder()
+    public final Setting<Double> pitch = sgAdvanced.add(new DoubleSetting.Builder()
         .name("pitch")
         .description("The pitch angle to look at when using the bounce mode.")
         .defaultValue(85)
@@ -256,15 +266,15 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Boolean> restart = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> restart = sgSafety.add(new BoolSetting.Builder()
         .name("restart")
-        .description("Restarts flying with the elytra when rubberbanding.")
+        .description("Bounce only: restarts gliding after a server correction. Other modes already reset acceleration on correction.")
         .defaultValue(true)
         .visible(() -> flightMode.get() == ElytraFlightModes.Bounce)
         .build()
     );
 
-    public final Setting<Integer> restartDelay = sgGeneral.add(new IntSetting.Builder()
+    public final Setting<Integer> restartDelay = sgSafety.add(new IntSetting.Builder()
         .name("restart-delay")
         .description("How many ticks to wait before restarting the elytra again after rubberbanding.")
         .defaultValue(7)
@@ -274,7 +284,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Boolean> sprint = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> sprint = sgAdvanced.add(new BoolSetting.Builder()
         .name("sprint-constantly")
         .description("Sprints all the time. If turned off, it will only sprint when the player is touching the ground.")
         .defaultValue(true)
@@ -282,7 +292,7 @@ public class ElytraFly extends Module {
         .build()
     );
 
-    public final Setting<Boolean> manualTakeoff = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> manualTakeoff = sgTakeoff.add(new BoolSetting.Builder()
         .name("manual-takeoff")
         .description("Does not automatically take off.")
         .defaultValue(false)
@@ -292,25 +302,25 @@ public class ElytraFly extends Module {
 
     // Inventory
 
-    public final Setting<Boolean> replace = sgInventory.add(new BoolSetting.Builder()
+    public final Setting<Boolean> replace = sgSafety.add(new BoolSetting.Builder()
         .name("elytra-replace")
-        .description("Replaces broken elytra with a new elytra.")
+        .description("Attempts to equip a spare elytra from inventory at the durability threshold. Requires a healthier spare; does not repair it.")
         .defaultValue(false)
         .build()
     );
 
-    public final Setting<Integer> replaceDurability = sgInventory.add(new IntSetting.Builder()
+    public final Setting<Integer> replaceDurability = sgSafety.add(new IntSetting.Builder()
         .name("replace-durability")
-        .description("The durability threshold your elytra will be replaced at.")
+        .description("Remaining durability points (not percent) at which to attempt a spare-elytra swap.")
         .defaultValue(2)
         .sliderRange(1, 500)
         .visible(replace::get)
         .build()
     );
 
-    public final Setting<ChestSwapMode> chestSwap = sgInventory.add(new EnumSetting.Builder<ChestSwapMode>()
+    public final Setting<ChestSwapMode> chestSwap = sgTakeoff.add(new EnumSetting.Builder<ChestSwapMode>()
         .name("chest-swap")
-        .description("Enables ChestSwap when toggling this module.")
+        .description("Always: swap on enable and disable. WaitForGround: equip on enable, restore armor after a flight lands even while ElytraFly stays enabled. Never: leave equipment alone.")
         .defaultValue(ChestSwapMode.Never)
         .build()
     );
@@ -324,7 +334,7 @@ public class ElytraFly extends Module {
 
     public final Setting<Integer> replenishSlot = sgInventory.add(new IntSetting.Builder()
         .name("replenish-slot")
-        .description("The slot auto move moves fireworks to.")
+        .description("Hotbar destination for rockets (1–9). The existing inventory move can exchange the item already in this slot.")
         .defaultValue(9)
         .range(1, 9)
         .sliderRange(1, 9)
@@ -336,7 +346,7 @@ public class ElytraFly extends Module {
 
     public final Setting<Boolean> autoPilot = sgAutopilot.add(new BoolSetting.Builder()
         .name("auto-pilot")
-        .description("Moves forward while elytra flying.")
+        .description("Holds forward above Minimum Height. This is straight flight, not route planning; Printer Helper temporarily owns steering.")
         .defaultValue(false)
         .visible(() -> flightMode.get() != ElytraFlightModes.Pitch40 && flightMode.get() != ElytraFlightModes.Bounce)
         .build()
@@ -344,9 +354,9 @@ public class ElytraFly extends Module {
 
     public final Setting<Boolean> useFireworks = sgAutopilot.add(new BoolSetting.Builder()
         .name("use-fireworks")
-        .description("Uses firework rockets every second of your choice.")
+        .description("Automatically uses available hotbar/offhand rockets at the configured interval, even if Auto Pilot is off.")
         .defaultValue(false)
-        .visible(() -> autoPilot.get() && flightMode.get() != ElytraFlightModes.Pitch40 && flightMode.get() != ElytraFlightModes.Bounce)
+        .visible(() -> flightMode.get() != ElytraFlightModes.Pitch40 && flightMode.get() != ElytraFlightModes.Bounce)
         .build()
     );
 
@@ -362,7 +372,7 @@ public class ElytraFly extends Module {
 
     public final Setting<Double> autoPilotMinimumHeight = sgAutopilot.add(new DoubleSetting.Builder()
         .name("minimum-height")
-        .description("The minimum height for autopilot.")
+        .description("World Y above which Auto Pilot holds forward. Does not climb to this height automatically.")
         .defaultValue(120)
         .min(-128)
         .sliderMax(260)
@@ -371,6 +381,10 @@ public class ElytraFly extends Module {
     );
 
     private ElytraFlightMode currentMode = new Vanilla();
+    private LocalPlayer landingPlayer;
+    private ClientLevel landingWorld;
+    private int landingTicks;
+    private boolean flew;
     private Vec3 autopilotVelocity;
     private ClientLevel autopilotWorld;
     private LocalPlayer autopilotPlayer;
@@ -378,6 +392,43 @@ public class ElytraFly extends Module {
 
     public ElytraFly() {
         super(Categories.Movement, "elytra-fly", "Gives you more control over your elytra.");
+    }
+
+    @Override
+    public Module fromTag(CompoundTag tag) {
+        CompoundTag migrated = tag.copy();
+        if (tag.get("settings") instanceof CompoundTag saved) {
+            CompoundTag settingsTag = saved.copy();
+            ListTag groups = new ListTag();
+            for (SettingGroup group : settings) {
+                groups.add(regroupSettings(saved, group.name, group.sectionExpanded, name -> group.get(name) != null));
+            }
+            settingsTag.put("groups", groups);
+            migrated.put("settings", settingsTag);
+        }
+        return super.fromTag(migrated);
+    }
+
+    /** Route old group entries by their unchanged setting keys; do not mutate saved profiles. */
+    public static CompoundTag regroupSettings(CompoundTag saved, String destination, boolean expanded,
+                                              java.util.function.Predicate<String> contains) {
+        CompoundTag group = new CompoundTag();
+        group.putString("name", destination);
+        group.putBoolean("sectionExpanded", expanded);
+        ListTag values = new ListTag();
+        for (Tag entry : saved.getListOrEmpty("groups")) {
+            if (!(entry instanceof CompoundTag source)) continue;
+            if (source.getStringOr("name", "").equals(destination)) {
+                group.putBoolean("sectionExpanded", source.getBooleanOr("sectionExpanded", expanded));
+            }
+            for (Tag value : source.getListOrEmpty("settings")) {
+                if (value instanceof CompoundTag setting && contains.test(setting.getStringOr("name", ""))) {
+                    values.add(setting.copy());
+                }
+            }
+        }
+        group.put("settings", values);
+        return group;
     }
 
     /** A short-lived world-space request; zero also owns grounded restocking without taking off. */
@@ -433,10 +484,15 @@ public class ElytraFly extends Module {
     @Override
     public void onActivate() {
         clearAutopilot();
+        Modules.get().get(ChestSwap.class).cancelRequest();
+        landingPlayer = mc.player;
+        landingWorld = mc.level;
+        flew = false;
+        landingTicks = 0;
         currentMode.onActivate();
         if ((chestSwap.get() == ChestSwapMode.Always || chestSwap.get() == ChestSwapMode.WaitForGround)
             && mc.player.getItemBySlot(EquipmentSlot.CHEST).getItem() != Items.ELYTRA && isActive()) {
-            Modules.get().get(ChestSwap.class).swap();
+            Modules.get().get(ChestSwap.class).requestEquip(true, false);
         }
     }
 
@@ -445,11 +501,11 @@ public class ElytraFly extends Module {
         clearAutopilot();
         if (autoPilot.get()) mc.options.keyUp.setDown(false);
 
-        if (chestSwap.get() == ChestSwapMode.Always && mc.player.getItemBySlot(EquipmentSlot.CHEST).getItem() == Items.ELYTRA) {
-            Modules.get().get(ChestSwap.class).swap();
-        } else if (chestSwap.get() == ChestSwapMode.WaitForGround) {
-            enableGroundListener();
+        if (mc.player != null && mc.player.isAlive() && mc.level == landingWorld
+            && mc.player == landingPlayer && chestSwap.get() != ChestSwapMode.Never) {
+            Modules.get().get(ChestSwap.class).requestEquip(false, chestSwap.get() == ChestSwapMode.WaitForGround);
         }
+        flew = false;
 
         if (mc.player.isFallFlying() && instaDrop.get()) {
             enableInstaDropListener();
@@ -564,6 +620,23 @@ public class ElytraFly extends Module {
     @EventHandler
     private void onTick(TickEvent.Post event) {
         currentMode.onTick();
+        if (mc.player != landingPlayer || mc.level != landingWorld || mc.player == null || !mc.player.isAlive()) {
+            flew = false;
+            landingTicks = 0;
+            return;
+        }
+        if (chestSwap.get() != ChestSwapMode.WaitForGround || hasAutopilotRequest()) {
+            flew = false;
+            landingTicks = 0;
+            return;
+        }
+        if (mc.player.isFallFlying()) flew = true;
+        landingTicks = flew && mc.player.onGround() && !mc.player.isFallFlying() ? landingTicks + 1 : 0;
+        if (landingTicks >= 2) {
+            Modules.get().get(ChestSwap.class).requestEquip(false, true);
+            flew = false;
+            landingTicks = 0;
+        }
     }
 
     @EventHandler
@@ -597,30 +670,6 @@ public class ElytraFly extends Module {
             }
             case Bounce -> currentMode = new Bounce();
         }
-    }
-
-    //Ground
-    private class StaticGroundListener {
-        @EventHandler
-        private void chestSwapGroundListener(PlayerMoveEvent event) {
-            if (hasAutopilotRequest()) return;
-            if (mc.player != null && mc.player.onGround()) {
-                if (mc.player.getItemBySlot(EquipmentSlot.CHEST).getItem() == Items.ELYTRA) {
-                    Modules.get().get(ChestSwap.class).swap();
-                    disableGroundListener();
-                }
-            }
-        }
-    }
-
-    private final StaticGroundListener staticGroundListener = new StaticGroundListener();
-
-    protected void enableGroundListener() {
-        MonocleClient.EVENT_BUS.subscribe(staticGroundListener);
-    }
-
-    protected void disableGroundListener() {
-        MonocleClient.EVENT_BUS.unsubscribe(staticGroundListener);
     }
 
     //Drop

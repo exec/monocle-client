@@ -13,6 +13,8 @@ import dev.monocle.client.systems.modules.Categories;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.player.ChestSwap;
+import dev.monocle.client.systems.modules.player.AutoMend;
+import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFly;
 import dev.monocle.client.utils.Utils;
 import dev.monocle.client.utils.player.InvUtils;
 import meteordevelopment.orbit.EventHandler;
@@ -31,6 +33,7 @@ import net.minecraft.world.item.enchantment.Enchantments;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Set;
+import java.util.EnumMap;
 
 public class AutoArmor extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -67,10 +70,22 @@ public class AutoArmor extends Module {
 
     private final Setting<Boolean> antiBreak = sgGeneral.add(new BoolSetting.Builder()
         .name("anti-break")
-        .description("Takes off armor if it is about to break.")
-        .defaultValue(false)
+        .description("Replaces worn armor with a usable spare before it breaks.")
+        .defaultValue(true)
         .build()
     );
+
+    private final Setting<Integer> durabilityThreshold = sgGeneral.add(new IntSetting.Builder()
+        .name("replace-below-durability").description("Replace armor at or below this remaining durability percentage.")
+        .defaultValue(10).range(1, 99).sliderRange(1, 99).visible(antiBreak::get).build());
+    private final Setting<Boolean> removeWithoutSpare = sgGeneral.add(new BoolSetting.Builder()
+        .name("remove-without-spare").description("Allow worn armor to be removed without a replacement. Leaves you less protected.")
+        .defaultValue(false).visible(antiBreak::get).build());
+    private final Setting<Integer> durabilityUpgrade = sgGeneral.add(new IntSetting.Builder()
+        .name("durability-upgrade-gap").description("Minimum percentage-point gain to swap equally rated armor. 100 disables these swaps.")
+        .defaultValue(20).range(1, 100).sliderRange(1, 100).build());
+    private final EnumMap<EquipmentSlot, Setting<Boolean>> pinned = new EnumMap<>(EquipmentSlot.class);
+    private String status = "Healthy";
 
     private final Setting<Boolean> ignoreElytra = sgGeneral.add(new BoolSetting.Builder()
         .name("ignore-elytra")
@@ -88,17 +103,22 @@ public class AutoArmor extends Module {
     private int timer;
 
     public AutoArmor() {
-        super(Categories.Combat, "auto-armor", "Automatically equips armor.");
+        super(Categories.Combat, "auto-armor", "Equips preferred armor and usable spares while respecting pinned slots and flight.");
 
         armorPieces[0] = helmet;
         armorPieces[1] = chestplate;
         armorPieces[2] = leggings;
         armorPieces[3] = boots;
+        SettingGroup pins = settings.createGroup("Pinned Slots");
+        for (ArmorPiece piece : armorPieces) pinned.put(piece.slot, pins.add(new BoolSetting.Builder()
+            .name("pin-" + piece.slot.getName()).description("Leave this equipment slot untouched, even when empty or nearly broken.")
+            .defaultValue(false).build()));
     }
 
     @Override
     public void onActivate() {
         timer = 0;
+        status = "Healthy";
     }
 
     @EventHandler
@@ -107,24 +127,26 @@ public class AutoArmor extends Module {
             || mc.gui.screen() != null
             || !(mc.player.containerMenu instanceof InventoryMenu)
             || !mc.player.containerMenu.getCarried().isEmpty()
-            || mc.player.isUsingItem()) return;
+            || mc.player.isUsingItem()) { status = "Waiting for inventory / item use"; return; }
 
         // Wait for timer (delay)
         if (timer > 0) {
             timer--;
             return;
         }
+        status = "Healthy";
 
         // Reset armor pieces
         for (ArmorPiece armorPiece : armorPieces) armorPiece.reset();
 
         // Loop through items in inventory
         for (int i = 0; i < mc.player.getInventory().getNonEquipmentItems().size(); i++) {
+            if (Modules.get().get(AutoMend.class).reservesSlot(i)) continue;
             ItemStack itemStack = mc.player.getInventory().getItem(i);
             if (itemStack.isEmpty() || !isArmor(itemStack)) continue;
 
             // Check for durability if anti break is enabled
-            if (antiBreak.get() && itemStack.isDamageableItem() && itemStack.getMaxDamage() - itemStack.getDamageValue() <= 10) {
+            if (antiBreak.get() && worn(itemStack, durabilityThreshold.get())) {
                 continue;
             }
 
@@ -231,8 +253,25 @@ public class AutoArmor extends Module {
     }
 
     private boolean isArmor(ItemStack itemStack) {
-        return itemStack.is(ItemTags.FOOT_ARMOR) || itemStack.is(ItemTags.LEG_ARMOR) || itemStack.is(ItemTags.CHEST_ARMOR) || itemStack.is(ItemTags.HEAD_ARMOR);
+        return itemStack.has(DataComponents.EQUIPPABLE) && (itemStack.is(ItemTags.FOOT_ARMOR) || itemStack.is(ItemTags.LEG_ARMOR) || itemStack.is(ItemTags.CHEST_ARMOR) || itemStack.is(ItemTags.HEAD_ARMOR));
     }
+
+    static double durabilityPercent(ItemStack stack) {
+        return !stack.isDamageableItem() ? 100 : 100.0 * (stack.getMaxDamage() - stack.getDamageValue()) / stack.getMaxDamage();
+    }
+
+    static boolean worn(ItemStack stack, int threshold) {
+        return !stack.isEmpty() && stack.isDamageableItem() && durabilityPercent(stack) <= threshold;
+    }
+
+    static boolean shouldReplace(int currentScore, int spareScore, double currentDurability, double spareDurability,
+                                 boolean needsSpare, int gap) {
+        return spareScore >= 0 && (needsSpare && spareDurability > currentDurability || spareScore > currentScore
+            || spareScore == currentScore && gap < 100 && spareDurability - currentDurability >= gap);
+    }
+
+    @Override
+    public String getInfoString() { return status; }
 
     public enum Protection {
         Protection(Enchantments.PROTECTION),
@@ -252,10 +291,11 @@ public class AutoArmor extends Module {
 
         private int bestSlot;
         private int bestScore;
-        private int bestDurability;
+        private double bestDurability;
 
         private int score;
-        private int durability;
+        private double durability;
+        private boolean needsSpare;
 
         public ArmorPiece(EquipmentSlot slot) {
             this.slot = slot;
@@ -267,12 +307,13 @@ public class AutoArmor extends Module {
             bestDurability = -1;
             score = -1;
             durability = Integer.MAX_VALUE;
+            needsSpare = false;
         }
 
         public void add(ItemStack itemStack, int slot) {
             // Calculate armor piece score and check if its higher than the last one
             int score = getScore(itemStack);
-            int durability = itemStack.isDamageableItem() ? itemStack.getMaxDamage() - itemStack.getDamageValue() : Integer.MAX_VALUE;
+            double durability = durabilityPercent(itemStack);
 
             if (score > bestScore || (score == bestScore && durability > bestDurability)) {
                 bestScore = score;
@@ -286,9 +327,23 @@ public class AutoArmor extends Module {
 
             ItemStack itemStack = mc.player.getItemBySlot(slot);
 
+            if (pinned.get(slot).get()) {
+                score = Integer.MAX_VALUE;
+                if (status.equals("Healthy")) status = "Keeping pinned " + slot.getName();
+                return;
+            }
+
+            if (slot == EquipmentSlot.CHEST && Modules.get().get(ChestSwap.class).controlsChest()) {
+                score = Integer.MAX_VALUE;
+                if (status.equals("Healthy")) status = "Yielding chest to Chest Swap";
+                return;
+            }
+
             // Check if the item is an elytra
-            if ((ignoreElytra.get() || Modules.get().isActive(ChestSwap.class)) && itemStack.has(DataComponents.GLIDER)) {
+            if ((ignoreElytra.get() || mc.player.isFallFlying() || !mc.player.onGround()
+                || Modules.get().isActive(ElytraFly.class)) && itemStack.has(DataComponents.GLIDER)) {
                 score = Integer.MAX_VALUE; // Setting score to Integer.MAX_VALUE so its now swapped later
+                if (status.equals("Healthy")) status = "Keeping elytra for flight";
                 return;
             }
 
@@ -297,23 +352,24 @@ public class AutoArmor extends Module {
             // Return if current armor piece has Curse of Binding
             if (enchantments.keySet().stream().anyMatch(e -> e.is(Enchantments.BINDING_CURSE))) {
                 score = Integer.MAX_VALUE; // Setting score to Integer.MAX_VALUE so its now swapped later
+                if (status.equals("Healthy")) status = "Bound " + slot.getName();
                 return;
             }
 
             // Calculate current score
-            score = getScore(itemStack);
+            score = itemStack.isEmpty() ? -1 : getScore(itemStack);
             score = decreaseScoreByAvoidedEnchantments(score);
-            score = applyAntiBreakScore(score, itemStack);
+            needsSpare = antiBreak.get() && worn(itemStack, durabilityThreshold.get());
 
             // Calculate durability
             if (!itemStack.isEmpty()) {
-                durability = itemStack.getMaxDamage() - itemStack.getDamageValue();
+                durability = durabilityPercent(itemStack);
             }
         }
 
         public int getSortScore() {
-            if (antiBreak.get() && durability <= 10) return Integer.MIN_VALUE;
             if (score == Integer.MAX_VALUE) return Integer.MAX_VALUE;
+            if (needsSpare) return Integer.MIN_VALUE;
             return score - bestScore;
         }
 
@@ -322,14 +378,21 @@ public class AutoArmor extends Module {
             if (cannotSwap() || score == Integer.MAX_VALUE) return false;
 
             // Check if new score is better and swap if it is
-            if (bestScore > score) {
+            if (bestSlot >= 0 && shouldReplace(score, bestScore, durability, bestDurability, needsSpare, durabilityUpgrade.get())) {
                 swap(bestSlot, slot.getIndex());
+                status = (needsSpare ? "Replacing worn " : "Upgrading ") + slot.getName();
                 return true;
             }
-            else if (antiBreak.get() && durability <= 10) {
+            else if (needsSpare) {
                 // If no better piece has been found but current piece is broken find an empty slot and move it there
-                return moveToEmpty(slot.getIndex());
+                status = "No usable spare for " + slot.getName() + " — keeping protection";
+                if (removeWithoutSpare.get()) {
+                    boolean moved = moveToEmpty(slot.getIndex());
+                    status = moved ? "Storing worn " + slot.getName() : "No inventory space to store " + slot.getName();
+                    return moved;
+                }
             }
+            else if (mc.player.getItemBySlot(slot).isEmpty() && status.equals("Healthy")) status = "No spare for " + slot.getName();
 
             return false;
         }
@@ -342,12 +405,5 @@ public class AutoArmor extends Module {
             return score;
         }
 
-        private int applyAntiBreakScore(int score, ItemStack itemStack) {
-            if (antiBreak.get() && itemStack.isDamageableItem() && itemStack.getMaxDamage() - itemStack.getDamageValue() <= 10) {
-                return -1;
-            }
-
-            return score;
-        }
     }
 }

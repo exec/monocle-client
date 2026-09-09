@@ -28,6 +28,9 @@ import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ClientboundPlayerCombatKillPacket;
 import net.minecraft.network.protocol.game.ServerboundAttackPacket;
 import net.minecraft.network.protocol.game.ServerboundSwingPacket;
+import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.server.level.BlockDestructionProgress;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
@@ -41,6 +44,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Predicate;
 import java.util.SortedSet;
+import java.util.HashMap;
 
 public class Surround extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -239,7 +243,16 @@ public class Surround extends Module {
     );
 
     public ArrayList<Module> toActivate = new ArrayList<>();
+    private final HashMap<Module, Long> disabledRevisions = new HashMap<>();
     private int timer;
+    private final Setting<Boolean> searchInventory = sgGeneral.add(new BoolSetting.Builder()
+        .name("search-inventory").description("Promote permitted surround blocks from inventory; displaced hotbar items stay in inventory.")
+        .defaultValue(true).build());
+    private final HashMap<BlockPos, Integer> pending = new HashMap<>(), attempted = new HashMap<>();
+    private BlockPos anchor, placingTarget;
+    private Object world;
+    private int epoch, probeTick = -100;
+    private String status = "Incomplete";
 
     public Surround() {
         super(Categories.Combat, "surround", "Surrounds you in blocks to prevent massive crystal damage.");
@@ -277,6 +290,14 @@ public class Surround extends Module {
 
     @Override
     public void onActivate() {
+        pending.clear();
+        attempted.clear();
+        anchor = null;
+        world = mc.level;
+        epoch++;
+        probeTick = -100;
+        toActivate.clear();
+        disabledRevisions.clear();
         // Center on activate
         if (center.get() == Center.OnActivate) PlayerUtils.centerPlayer();
 
@@ -285,9 +306,10 @@ public class Surround extends Module {
 
         if (toggleModules.get() && !modules.get().isEmpty() && mc.level != null && mc.player != null) {
             for (Module module : modules.get()) {
-                if (module.isActive()) {
+                if (module != this && module.isActive()) {
                     module.toggle();
                     toActivate.add(module);
+                    disabledRevisions.put(module, module.activationRevision());
                 }
             }
         }
@@ -295,18 +317,22 @@ public class Surround extends Module {
 
     @Override
     public void onDeactivate() {
+        epoch++;
+        pending.clear();
+        attempted.clear();
         if (toggleBack.get() && !toActivate.isEmpty() && mc.level != null && mc.player != null) {
             for (Module module : toActivate) {
-                module.enable();
+                if (!module.isActive() && disabledRevisions.getOrDefault(module, -1L) == module.activationRevision()) module.enable();
             }
         }
+        toActivate.clear();
+        disabledRevisions.clear();
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        // Delay
-        if (timer++ < delay.get()) return;
-
+        if (mc.player == null || mc.level == null) return;
+        if (world != mc.level) { toggle(); return; }
         // Toggle if Y level changed
         if (toggleOnYChange.get() && mc.player.yo != mc.player.getY()) {
             toggle();
@@ -314,61 +340,114 @@ public class Surround extends Module {
         }
 
         // Wait till player is on ground
-        if (onlyOnGround.get() && !mc.player.onGround()) return;
-
-        // Wait until the player has a block available to place
-        FindItemResult block = InvUtils.findInHotbar(itemStack -> blocks.get().contains(Block.byItem(itemStack.getItem())));
-        if (!block.found()) return;
+        if (onlyOnGround.get() && !mc.player.onGround()) { status = "Waiting for ground"; return; }
 
         // Centering player
         if (center.get() == Center.Always) PlayerUtils.centerPlayer();
 
-        int placedCount = 0;
-        boolean complete = true;
-
         BlockPos playerPos = mc.player.blockPosition();
-
-        // Placing feet blocks
-        for (Direction direction : DirectionAccessor.monocle$getHorizontal()) {
-            BlockPos placePos = playerPos.relative(direction);
-
-            // Place support blocks if air place is disabled
-            if (!airPlace.get() && isAirPlace(placePos) && mc.level.getBlockState(placePos).canBeReplaced()) {
-                if (place(placePos.below(), block) && ++placedCount >= blocksPerTick.get()) break;
-
-                if (mc.level.getBlockState(placePos.below()).canBeReplaced()) complete = false;
-            }
-
-            if (place(placePos, block) && ++placedCount >= blocksPerTick.get()) break;
-
-            if (mc.level.getBlockState(placePos).canBeReplaced()) complete = false;
+        if (!playerPos.equals(anchor)) {
+            anchor = playerPos.immutable();
+            pending.clear();
+            attempted.clear();
+            epoch++;
         }
-
-        // Placing head blocks
-        if (doubleHeight.get() && complete) {
-            for (Direction direction : DirectionAccessor.monocle$getHorizontal()) {
-                BlockPos placePos = playerPos.relative(direction).above();
-                if (place(placePos, block) && ++placedCount >= blocksPerTick.get()) break;
-
-                if (mc.level.getBlockState(placePos).canBeReplaced()) complete = false;
+        List<BlockPos> ring = positions(anchor, doubleHeight.get());
+        int verified = 0;
+        for (BlockPos pos : ring) if (resolved(pos)) verified++;
+        status = verified == ring.size() ? "Protected" : "Incomplete " + verified + "/" + ring.size();
+        if (verified == ring.size()) {
+            if (toggleOnComplete.get()) toggle();
+            else if (protect.get() && inventoryReady()) {
+                FindItemResult block = InvUtils.findInHotbar(stack -> blocks.get().contains(Block.byItem(stack.getItem())));
+                if (block.found()) for (BlockPos pos : ring) place(pos, block);
             }
-        }
-
-        timer = 0;
-
-        // Disable if all the surround blocks are placed
-        if (complete && toggleOnComplete.get()) {
-            toggle();
             return;
         }
+        if (!inventoryReady()) { status += " — inventory / item use busy"; return; }
+        if (center.get() == Center.Incomplete) PlayerUtils.centerPlayer();
+        int tick = mc.player.tickCount;
+        if (!pending.isEmpty() && tick - probeTick >= 40 && !mc.gameMode.isDestroying()
+            && attempted.values().stream().anyMatch(t -> tick - t >= 20)) {
+            probeTick = tick;
+            mc.gameMode.startPrediction(mc.level, sequence -> {
+                pending.replaceAll((pos, sent) -> sent == Integer.MAX_VALUE && tick - attempted.getOrDefault(pos, tick) >= 20 ? sequence : sent);
+                return new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK, anchor.below(), Direction.DOWN, sequence);
+            });
+        }
+        if (timer++ < delay.get()) return;
+        timer = 0;
+        FindItemResult block = materials();
+        if (!block.found()) { status += " — out of permitted blocks"; return; }
+        int placed = 0;
+        for (BlockPos pos : ring) {
+            if (resolved(pos)) { if (protect.get()) place(pos, block); continue; }
+            if (pending.containsKey(pos)) continue;
+            if (!airPlace.get() && isAirPlace(pos) && mc.level.getBlockState(pos).canBeReplaced()) {
+                if (place(pos.below(), block) && ++placed >= blocksPerTick.get()) break;
+            }
+            if (place(pos, block) && ++placed >= blocksPerTick.get()) break;
+        }
+        status += !pending.isEmpty() ? " — awaiting server" : placed == 0 ? " — blocked / no placement support" : " — placing";
+    }
 
-        // Keep the player centered until all the blocks are placed to avoid collision
-        if (!complete && center.get() == Center.Incomplete) PlayerUtils.centerPlayer();
+    static List<BlockPos> positions(BlockPos anchor, boolean doubled) {
+        List<BlockPos> result = new ArrayList<>(8);
+        for (Direction direction : Direction.Plane.HORIZONTAL) result.add(anchor.relative(direction));
+        if (doubled) for (Direction direction : Direction.Plane.HORIZONTAL) result.add(anchor.relative(direction).above());
+        return result;
+    }
+
+    static boolean protective(BlockState state) {
+        return !state.canBeReplaced() && (state.getBlock().defaultDestroyTime() < 0 || state.getBlock().getExplosionResistance() >= 600);
+    }
+
+    private boolean resolved(BlockPos pos) {
+        return mc.level.hasChunkAt(pos) && !pending.containsKey(pos) && protective(mc.level.getBlockState(pos));
+    }
+
+    private boolean inventoryReady() {
+        return mc.gui.screen() == null && mc.player.containerMenu == mc.player.inventoryMenu
+            && mc.player.containerMenu.getCarried().isEmpty() && !mc.player.isUsingItem();
+    }
+
+    private FindItemResult materials() {
+        Predicate<ItemStack> allowed = stack -> blocks.get().contains(Block.byItem(stack.getItem()));
+        FindItemResult found = InvUtils.findInHotbar(allowed);
+        if (found.found() || !searchInventory.get()) return found;
+        found = InvUtils.find(allowed, 9, 35);
+        if (!found.found()) return found;
+        int destination = mc.player.getInventory().getSelectedSlot() == 8 ? 7 : 8;
+        for (int i = 0; i < 9; i++) if (mc.player.getInventory().getItem(i).isEmpty()) { destination = i; break; }
+        InvUtils.quickSwap().fromId(destination).to(found.slot());
+        return InvUtils.findInHotbar(allowed);
     }
 
     private boolean place(BlockPos placePos, FindItemResult block) {
         // Attempt to place
-        boolean placed = BlockUtils.place(placePos, block, rotate.get(), 100, swing.get(), true);
+        boolean placed = false;
+        if (!pending.containsKey(placePos) && mc.player.tickCount - attempted.getOrDefault(placePos, -100) >= 5
+            && mc.level.hasChunkAt(placePos) && (airPlace.get() || !isAirPlace(placePos)) && BlockUtils.canPlace(placePos, true)) {
+            int currentEpoch = epoch;
+            ItemStack expected = (block.isOffhand() ? mc.player.getOffhandItem() : mc.player.getInventory().getItem(block.slot())).copy();
+            pending.put(placePos.immutable(), Integer.MAX_VALUE);
+            attempted.put(placePos.immutable(), mc.player.tickCount);
+            Runnable action = () -> {
+                if (!isActive() || epoch != currentEpoch || mc.level != world || !inventoryReady()
+                    || !mc.player.blockPosition().equals(anchor)
+                    || !ItemStack.isSameItemSameComponents(expected, block.isOffhand() ? mc.player.getOffhandItem() : mc.player.getInventory().getItem(block.slot()))) {
+                    if (epoch == currentEpoch) pending.remove(placePos);
+                    return;
+                }
+                placingTarget = placePos;
+                try {
+                    if (!BlockUtils.place(placePos, block, false, 100, swing.get(), true)) pending.remove(placePos);
+                } finally { placingTarget = null; }
+            };
+            if (rotate.get()) Rotations.rotate(Rotations.getYaw(net.minecraft.world.phys.Vec3.atCenterOf(placePos)), Rotations.getPitch(net.minecraft.world.phys.Vec3.atCenterOf(placePos)), 100, action);
+            else action.run();
+            placed = true;
+        }
 
         // Check if the block is being mined
         boolean beingMined = false;
@@ -394,8 +473,11 @@ public class Surround extends Module {
 
             for (Entity crystal : mc.level.getEntities((Entity) null, box, entityPredicate)) {
                 if (rotate.get()) {
-                    Rotations.rotate(Rotations.getPitch(crystal), Rotations.getYaw(crystal), () -> {
-                        mc.player.connection.send(new ServerboundAttackPacket(crystal.getId()));
+                    int currentEpoch = epoch;
+                    Rotations.rotate(Rotations.getYaw(crystal), Rotations.getPitch(crystal), () -> {
+                        if (isActive() && epoch == currentEpoch && mc.level == world && crystal.isAlive()
+                            && DamageUtils.crystalDamage(mc.player, crystal.position()) < PlayerUtils.getTotalHealth())
+                            mc.player.connection.send(new ServerboundAttackPacket(crystal.getId()));
                     });
                 } else {
                     mc.player.connection.send(new ServerboundAttackPacket(crystal.getId()));
@@ -409,17 +491,41 @@ public class Surround extends Module {
     }
 
     @EventHandler
+    private void onPacketSent(PacketEvent.Sent event) {
+        if (placingTarget != null && event.packet instanceof ServerboundUseItemOnPacket packet)
+            pending.put(placingTarget.immutable(), packet.getSequence());
+    }
+
+    public void onServerBlockAck(int sequence) {
+        if (!isActive() || mc.level != world || mc.player == null) return;
+        pending.entrySet().removeIf(entry -> acknowledged(entry.getValue(), sequence));
+    }
+
+    static boolean acknowledged(int sent, int ack) { return sent != Integer.MAX_VALUE && sent <= ack; }
+
+    public void onServerBlockUpdate(BlockPos pos, BlockState state) {
+        if (isActive() && mc.level == world && protective(state)) pending.remove(pos);
+    }
+
+    @Override
+    public String getInfoString() { return status; }
+
+    @EventHandler
     private void onPacketReceive(PacketEvent.Receive event) {
         if (event.packet instanceof ClientboundPlayerCombatKillPacket packet) {
-            Entity entity = mc.level.getEntity(packet.playerId());
-            if (entity == mc.player && toggleOnDeath.get()) {
-                toggle();
-                info("Toggled off because you died.");
-            }
+            int currentEpoch = epoch;
+            mc.execute(() -> {
+                if (isActive() && epoch == currentEpoch && mc.level == world && mc.player != null
+                    && packet.playerId() == mc.player.getId() && toggleOnDeath.get()) {
+                    toggle();
+                    info("Toggled off because you died.");
+                }
+            });
         }
     }
 
     private BlockType getBlockType(BlockPos pos) {
+        if (pending.containsKey(pos)) return BlockType.Pending;
         BlockState blockState = mc.level.getBlockState(pos);
 
         // Unbreakable eg. bedrock
@@ -435,6 +541,7 @@ public class Surround extends Module {
             case Safe -> safeSideColor.get();
             case Normal -> normalSideColor.get();
             case Unsafe -> unsafeSideColor.get();
+            case Pending -> new Color(230, 180, 60, 30);
         };
     }
 
@@ -443,6 +550,7 @@ public class Surround extends Module {
             case Safe -> safeLineColor.get();
             case Normal -> normalLineColor.get();
             case Unsafe -> unsafeLineColor.get();
+            case Pending -> new Color(230, 180, 60, 180);
         };
     }
 
@@ -467,6 +575,7 @@ public class Surround extends Module {
     public enum BlockType {
         Safe,
         Normal,
+        Pending,
         Unsafe
     }
 }

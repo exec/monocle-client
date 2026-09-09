@@ -8,13 +8,35 @@ Monocle is a fork of [Meteor Client](https://github.com/MeteorDevelopment/meteor
 
 ## Build
 
-Monocle **0.2.14** targets Java 25 and Minecraft 26.2. Client releases use their own version in `gradle.properties` (`mod_version`), independently of Minecraft's version.
+Monocle **0.3.0** targets Java 25 and Minecraft 26.2. Client releases use their own version in `gradle.properties` (`mod_version`), independently of Minecraft's version.
 
 ```sh
 ./gradlew build
 ```
 
-The installable JAR is `build/libs/monocle-v0.2.14-26.2.jar`. Replace the previous Monocle JAR in your Fabric instance's `mods` folder; do not install both versions together.
+The installable JAR is `build/libs/monocle-v0.3.0-26.2.jar`. Replace the previous Monocle JAR in your Fabric instance's `mods` folder; do not install both versions together.
+
+0.3.0 bundles the Auto Log, Auto Eat, Auto Mend, Auto Armor, Auto Tool/Kill Aura, Surround, Scaffold and ElytraFly settings updates, plus shared Chest Swap landing recovery. The 0.2.15–0.2.23 changes were user-tested; the newest landing recovery still needs live-server testing. GitHub Actions checks tag/version agreement, runs the build and all 26 checks, verifies the installable JAR and publishes it with a SHA-256 checksum on version tags.
+
+0.2.24 moves ElytraFly landing swaps onto Chest Swap's shared directional requests. WaitForGround now restores a chestplate after landing while ElytraFly remains enabled, as well as after disabling in flight. Requests defer during inventory/item use and Printer steering, retry every 10 ticks for up to 200 eligible ticks, and retain a 20-tick local observation window for inventory corrections (not a server acknowledgment guarantee). World/player changes and disconnects cancel requests; re-enabling ElytraFly cancels stale landing work. Broken gliders and Auto Mend-reserved inventory slots are skipped, and an optional Any chestplate preference accepts lower-tier armor. Live 6b6t landing and rejected inventory swaps need testing.
+
+The user reports the 0.2.15–0.2.23 module changes tested and working as intended.
+
+0.2.23 reorganizes ElytraFly into Flight, Acceleration, Takeoff & Landing, Safety, Autopilot, Inventory and Advanced sections. Existing setting keys, defaults and flight mechanics are unchanged; old profile groups migrate automatically. Tooltips explain speed units, the legacy per-update acceleration offset, landing risks and mode-specific recovery. Fireworks remain controllable independently of forward autopilot, matching their existing behavior. No ExperimentalGrim mode or server-specific preset is added. In-game layout and loading your live flight profile still need testing.
+
+The 0.2.22 Java 25 build and all twenty-four checks passed. JAR integrity and embedded version were verified. Scaffold bridging, rejected placements, inventory promotion and tower behavior still need live-server testing.
+
+The 0.2.21 Java 25 build and all twenty-three checks passed. JAR integrity and embedded version were verified. Combined eating/combat/mending handoffs and manual toggles still need live-server testing.
+
+The 0.2.20 Java 25 build and all twenty-two checks passed. JAR integrity and embedded version were verified. Surround placement rejection, obstructing entities, low placement budgets and full-inventory promotion still need live-server testing.
+
+The 0.2.19 Java 25 build and all twenty-one checks passed. JAR integrity and embedded version were verified. Kill Aura/Highway Builder sword handoffs and inventory promotion still need live-server testing.
+
+The 0.2.18 Java 25 build and all twenty checks passed. JAR integrity and embedded version were verified. Full-inventory armor exchanges, flight protection and Chest Swap handoffs still need live testing.
+
+The 0.2.17 Java 25 build and all nineteen checks passed on 2026-09-09. JAR integrity and embedded version were verified. Repair sessions, safety handoffs, full-hotbar eating and server-rejected inventory swaps still need live testing.
+
+The 0.2.15 Java 25 build and all seventeen checks passed on 2026-09-09. JAR integrity and embedded version were verified. Auto Log's survival-guard additions still require live alert-only testing, including inventory swaps, reconnect behavior and server-specific logout consequences.
 
 The 0.2.14 Java 25 build and all sixteen checks passed on 2026-09-08. JAR integrity and embedded version were verified. This release overhauls Stash Finder into a survey notebook using existing Monocle widgets; live notebook layout and chunk/dimension transitions still need testing.
 
@@ -26,7 +48,7 @@ Walking destinations, alignment and supply placement now share the road-height t
 
 The 0.2.12 Java 25 build and all fifteen checks passed on 2026-09-08, including mining completion timeouts, task-handoff guards and short return routes with fractional road-height errors. JAR integrity and embedded version were verified. Live 6b6t restocking, sealing and walking recovery still need testing.
 
-`./gradlew check` runs sixteen assertion-based checks: Stash Finder detection, notebook persistence and filtering; Highway Builder geometry, supply recovery and piglin-obstruction handling (`highwayMobCheck`); UI styling and native fonts; Inventory Manager loadout planning/persistence, bounded transfers/item conservation, cleanup protections/cancellation and container-toolbar layout; schematic export format/file safety plus selector input/render isolation; and Printer Helper geometry, optional integration, flight and supplies. Live GUI interaction and target-server inventory, supply, combat and maximum-rate building behavior still need testing.
+`./gradlew check` runs twenty-six assertion-based checks: Chest Swap equipment eligibility and landing/retry guards; ElytraFly profile migration; Scaffold footing sweeps and placement guards; module handoff guards; Surround full-ring geometry and confirmation guards; Auto Tool sword handoff and cooldown-order guards; Auto Armor replacement policy and equipment guards; Auto Mend durability targets and ownership guards; Auto Eat food selection and slot guards; Auto Log survival-guard policy; Stash Finder detection, notebook persistence and filtering; Highway Builder geometry, supply recovery and piglin-obstruction handling (`highwayMobCheck`); UI styling and native fonts; Inventory Manager loadout planning/persistence, bounded transfers/item conservation, cleanup protections/cancellation and container-toolbar layout; schematic export format/file safety plus selector input/render isolation; and Printer Helper geometry, optional integration, flight and supplies. Live GUI interaction and target-server inventory, supply, combat and maximum-rate building behavior still need testing.
 
 The 0.2.10 Java 25 build and all fifteen checks passed on 2026-09-08, including HUD throughput, idle health, pause-time accounting, resets and bounded long-session storage. In-game HUD appearance still needs visual testing. Paving behavior is unchanged from 0.2.9.
 
@@ -90,6 +112,80 @@ Exports contain one rectangular region, including air, block properties and avai
 The first version is limited to **2,000,000 blocks**, **64 MiB of block-entity data** and currently loaded chunks. Unloaded chunks fail explicitly instead of becoming air. Capture runs in bounded client-thread batches, so keep the build still while it is being read. Changing worlds/dimensions or disabling the module cancels an unfinished capture. Compression and writing happen only after the snapshot is complete; that final save can finish even if the module is subsequently disabled. Completed files are published atomically without overwrites; filesystems without hard-link support report an error instead of exposing a partial final file.
 
 The writer follows the [Litematica 26.2 serializer](https://github.com/sakura-ryoko/litematica/blob/26.2/src/main/java/fi/dy/masa/litematica/schematic/LitematicaSchematic.java) and [dense block-state packing](https://github.com/sakura-ryoko/litematica/blob/26.2/src/main/java/fi/dy/masa/litematica/schematic/container/LitematicaBitArray.java), using Minecraft's native NBT support without a new runtime dependency. Loading an export in Litematica and reviewing the pink selection in-game remain required live tests.
+
+## Scaffold — confirmed footing (0.2.22)
+
+**Movement → Scaffold** tracks its own placement predictions until a full-block server update or vanilla's post-reconciliation ACK. Rejected placements become eligible for retry after a five-tick per-position interval. Stalled predictions request a sequenced verification probe at most every 40 ticks; timeout alone never confirms a block. Tracking stops new placements at 128 pending positions until the server resolves them. Placement highlights now render after confirmation, not when an action is merely queued.
+
+**Verified Edge Guard** defaults on: while grounded, it sweeps the player's center over loaded full-block footing and clips horizontal movement before unsupported or Scaffold-pending positions. Ordinary placement looks slightly ahead in the movement direction so the guard can wait for a new block without preventing its placement. Fast Tower waits for pending predictions. This conservative guard does not model slabs/slopes, airborne rescue, vehicle/fluid movement or predictions made by other modules; it is not a guarantee against falls, knockback or server corrections. Disable it if you need legacy movement behavior.
+
+**Search Inventory** defaults on with Auto Switch: promote permitted unnamed full building blocks into an empty hotbar slot, otherwise slot nine (eight if nine is selected). Displaced items remain in inventory. Inventory promotion excludes block entities and Auto Mend's reserved source slot; falling blocks are excluded from Scaffold entirely. No drops, supply-container opening or automatic reconstruction of the old hotbar layout.
+
+Placement defers for screens/cursor items, item use, Auto Eat/Auto Gap, Kill Aura combat, active Highway Builder control and Printer Helper inventory control. Deferred rotations recheck activation, inventory access and material identity. The edge guard remains available during food/combat waits but yields movement to Highway Builder and Printer Helper. Closest-block search is capped at eight blocks and uses the world's actual maximum Y.
+
+## Module cooperation — first pass (0.2.21)
+
+Auto Armor excludes Auto Mend's reserved inventory slot from spare selection. Auto Gap now waits for safe inventory access and yields for 20 ticks after an external selected-slot change. Both food modules check food stack identity, selected slot and world before restoring selection. If a stack was consumed completely, conservative cleanup may leave the current slot selected rather than guessing ownership.
+
+Each module now has a runtime toggle revision. Auto Eat, Auto Gap and Surround restore modules they disabled only if no intervening toggle changed that revision. Kill Aura explicitly yields while either food module is eating; delayed rotations retain the activation revision/world and recheck active state, attack state, pause conditions and weapon eligibility before attacking. Existing high-priority totem handling and Highway Builder's combat/eating waits are retained.
+
+This is targeted cooperation, not a universal inventory lock. External Baritone/Voyager pause/resume ownership still uses the legacy path-manager API and remains a separate integration gap. Other combat modules' delayed callbacks and cross-module placement ownership are not claimed covered by this pass. Combined live-server testing remains required.
+
+## Surround — verified ring (0.2.20)
+
+**Combat → Surround** checks all four positions (eight with Double Height) before reporting **Protected** or honoring Toggle On Complete, independently of the placement budget and material availability. Attempted placements remain pending until an explicit protective server block update or vanilla's post-reconciliation sequence acknowledgment. Pending placements render gold. Existing loaded blast-resistant/unbreakable blocks count toward the ring; ordinary solid blocks such as netherrack do not. This is a ring-completeness status, not a guarantee against combat damage.
+
+Placement remains feet-first but skips entity-blocked, pending and currently unplaceable positions to work on other openings, including the upper ring. Rejected placements retry with a five-tick per-position minimum interval; missing acknowledgments trigger a sequenced verification probe at most every 40 ticks, without starting a mine. Unresolved predictions are never declared successful just because a timer expired. Air Place, support placement, centering and the shared per-tick budget remain available. Weak solid obstructions are reported, not automatically mined.
+
+**Search Inventory** defaults on and promotes permitted blocks into an empty hotbar slot, otherwise slot nine (eight if nine is selected), using the existing native swap. The displaced stack stays in the material's former inventory slot; no dropping, shulker opening or automatic hotbar-layout restoration. Screens, cursor items and item use defer placement. Status distinguishes incomplete counts, server waits, missing materials, blocked/support failures and inventory waits. Deferred placement/crystal rotations check the current activation/world before acting; crystal yaw/pitch ordering and module-restore list cleanup are also corrected.
+
+## Auto Tool — Kill Aura handoff (0.2.19)
+
+Enable **Auto Tool** alongside **Kill Aura**. Auto Tool's **Kill Aura Sword** defaults on and offers a sword before Aura's weapon/cooldown checks, even with Aura's Auto Switch off. **Inventory Swords** defaults on: search carried inventory as well as hotbar; use an empty hotbar slot first, otherwise exchange with slot nine (eight if nine is selected). Displaced items stay in the sword's former inventory slot; this does not rebuild the original hotbar layout afterward.
+
+Auto Tool respects its tool list/durability settings and Aura's accepted weapon types; leave swords permitted. It keeps a usable selected sword instead of repeatedly reranking and resetting cooldown. Otherwise it selects using the existing target-damage estimate. Aura's explicit shield-breaking axe behavior takes priority. Without a permitted sword, Aura retains its existing weapon behavior. No module is automatically enabled, no target filters/reach are changed, and Highway Builder's separate opt-in pickaxe-based piglin clearing is unchanged.
+
+Aura now runs before the builder's tick so its existing combat wait releases building controls before tool selection can compete. Auto Tool cancels pending mining switches while Highway Builder, Infinity Miner or Aura combat owns tools. Sword selection resets attack charge before Aura evaluates its configured timing. Combat restores the preceding selected slot only while Aura still owns the selected weapon and no item is being used. Inventory-screen/cursor/use guards protect sword promotion. Live testing with building, mobs, inventory promotion and server lag remains required; native swaps are client-predicted.
+
+## Auto Armor — replacement-first equipment (0.2.18)
+
+**Combat → Auto Armor** retains preferred protection, blast-protection leggings and avoided enchantments. **Anti Break** defaults on for new profiles; existing saved choices remain unchanged. **Replace Below Durability** defaults to 10% remaining (inclusive). At that threshold it selects the best-rated permitted spare above the threshold, even if that means less protection than the worn piece. Without a spare it keeps the armor equipped. **Remove Without Spare** is explicitly opt-in and requires an empty inventory slot; it never drops armor to make space.
+
+Equally rated armor now upgrades when the spare has at least **Durability Upgrade Gap** more percentage points remaining (default 20; 100 disables these durability-only upgrades). Smaller differences do not trigger swaps. **Pinned Slots** leave the chosen slots completely alone, including when empty or nearly broken. Pinned slots and worn Curse of Binding pieces take precedence over anti-break.
+
+An equipped elytra stays on while airborne, gliding or ElytraFly is enabled, even with Ignore Elytra off. Ignore Elytra still defaults on. Auto Armor yields the chest slot while Chest Swap is enabled and for 40 client ticks after a Chest Swap action, including calls from ElytraFly. After that window, normal preferences apply; pin the chest slot to retain your choice indefinitely. This does not change explicit Chest Swap actions themselves.
+
+Status distinguishes upgrades, worn replacements, unavailable spares, pinned/bound pieces, flight protection and busy inventory access. Existing inventory/cursor/item-use guards and swap delay remain. Exchanges reuse the existing inventory helper, returning displaced armor to the spare's source slot; swaps remain client-predicted, not server-confirmed.
+
+## Auto Mend — carried gear repair (0.2.17)
+
+**Player → Auto Mend** selects carried Mending gear by lowest remaining durability percentage. **Target Durability** defaults to 95%; set 100 for full repairs. An eligible item already in the offhand finishes first, and each selected item stays there until it reaches the target. The blacklist applies to both inventory and offhand gear. Status shows the current item/percentage, queued inventory items, and observed durability repaired; five seconds without a damage decrease shows “Waiting for repair XP.” This measures local damage changes, not server-confirmed XP consumption.
+
+Native cursor-free swaps preserve the original offhand in the selected item's source slot, including with a full inventory. Auto Mend restores it between items and when disabled only if that exact pair still matches (allowing repair damage changes). A changed pair stops the session without touching either item; busy/unsafe disable leaves restoration to the user with a warning. **Force** remains off by default for non-Mending offhand items. Auto Totem/Offhand safety locks, food, combat, screens and cursor items take priority.
+
+Auto Mend waits while Highway Builder is enabled, Printer Helper controls inventory, or the player is gliding. Stop the building job and land before repairing; it does not automatically pause/resume travel, remove equipped armor/elytra, or throw XP bottles. Equipped gear can still receive normal vanilla Mending XP.
+
+## Auto Eat — travel food management (0.2.16)
+
+**Player → Auto Eat** now searches inventory by default; existing profiles that saved Search Inventory off keep that choice. It uses an empty hotbar slot first. If full, a native hotbar swap brings food into **Food Hotbar Slot** (default nine), moving the displaced stack into the food's former inventory slot. Nothing is dropped and the offhand is never used as a swap destination. The displaced stack stays in inventory; the original hotbar layout is not automatically reconstructed.
+
+**Protect Named Food** defaults on alongside the existing blacklist, which still excludes golden apples, enchanted golden apples, chorus fruit and risky foods by default. **LeastWaste** is a new optional food priority: favor meals that fit missing hunger, with saturation preferred when health is low. The original Saturation default and other priority modes remain available.
+
+Auto Eat waits while a screen/container or cursor item is active, yields to Auto Gap and manual/other-module slot changes, and restores the previous selection only when it still owns the selected food slot. A five-second attempt without a food-count or hunger change releases eating and retries after two seconds. This timeout targets normal food durations; unusual server-defined long-use foods still need testing. Status messages distinguish eating, missing permitted food, blocked inventory access and retries. Existing aura/Baritone pause options and the `eating` signal used by Highway Builder remain in place.
+
+Native inventory prediction is still subject to server acceptance. Test full-hotbar swaps and eating alongside your other inventory modules before relying on unattended use. This does not search shulkers or ender chests, automatically unblacklist food, or change Auto Gap/Highway Builder implementations.
+
+## Auto Log — survival guard (0.2.15)
+
+Open **Combat → Auto Log**. The existing name, Meteor attribution and saved settings are retained. **Action** defaults to Disconnect; choose **AlertOnly** to test thresholds without disconnecting, toggling Auto Reconnect or disabling Auto Log. Warnings are rate-limited to once per ten client seconds. The module panel shows a snapshot of guard status, pop count and the last trigger; reopen it to refresh. The module's info string updates while running.
+
+**Supply / Gear Guard** adds two opt-in checks, both disabled at zero: **Minimum Totems** counts inventory plus offhand, excluding shulker contents; a value of one triggers when none remain. **Gear Durability Percent** checks equipped armor and elytra, ignoring empty slots and nondamageable items. A one-second confirmation window defaults on for these checks to tolerate inventory swaps. This does not equip, restock or repair anything.
+
+With **Only Trusted** enabled, **Untrusted Player Range** limits detection distance; zero preserves all-loaded-player detection. **Untrusted Confirmation Seconds** defaults to zero (immediate), or can require continuous stranger presence to avoid brief sightings. Friends, dead players and spectators do not count as strangers. Existing low-health, predicted-damage and lethal-melee checks remain immediate, independent of those confirmation windows. Health is measured in points (two per heart) and includes absorption for logout thresholds.
+
+Totem-pop callbacks run on the client thread and reject stale world/activation callbacks. Pop counts and confirmation timers reset on activation or world change. After a real safety logout, disabling Auto Reconnect remains enabled by default; existing Toggle Off and Smart Toggle behavior is retained. AlertOnly does not take those actions.
+
+**This is not a survival guarantee:** damage predictions and inventory state are client-side estimates, servers may punish combat logging or keep a player vulnerable after disconnect, and warnings do not stop Highway Builder or other automation. Test in AlertOnly first and understand the server's logout behavior before relying on disconnects. Highway Builder, Printer Helper, Auto Totem and Auto Reconnect implementations are unchanged.
 
 ## Stash Finder — survey notebook (0.2.14)
 
