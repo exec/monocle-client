@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "package": "dev.monocle.client.mixin.printer",
+  "compatibilityLevel": "JAVA_25",
+  "plugin": "dev.monocle.client.modintegration.PrinterMixinPlugin",
+  "client": ["PrinterMixin", "ActionHandlerMixin", "ActionHandlerAccessor", "GuideAccessor"],
+  "injectors": { "defaultRequire": 1 }
+}

@@ -1,51 +1,39 @@
 {
   "schemaVersion": 1,
-  "name": "Meteor Client",
-  "id": "meteor-client",
+  "name": "Monocle Client",
+  "id": "monocle-client",
   "version": "${version}",
-  "description": "Based utility mod.",
+  "description": "A focused Minecraft utility client for anarchy servers.",
   "authors": [
-    "MineGame159",
-    "squidoodly",
-    "seasnail"
+    "Monocle contributors"
   ],
-  "contact": {
-    "homepage": "https://meteorclient.com",
-    "issues": "https://github.com/MeteorDevelopment/meteor-client/issues",
-    "sources": "https://github.com/MeteorDevelopment/meteor-client",
-    "discord": "https://meteorclient.com/discord"
-  },
   "license": "GPL-3.0",
-  "icon": "assets/meteor-client/icon.png",
+  "icon": "assets/monocle-client/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [
-      "meteordevelopment.meteorclient.MeteorClient"
+      "dev.monocle.client.MonocleClient"
     ],
     "modmenu": [
-      "meteordevelopment.meteorclient.modintegration.ModMenuIntegration"
+      "dev.monocle.client.modintegration.ModMenuIntegration"
     ]
   },
   "mixins": [
-    "meteor-client.mixins.json",
-    "meteor-client-baritone.mixins.json",
-    "meteor-client-indigo.mixins.json",
-    "meteor-client-sodium.mixins.json",
-    "meteor-client-lithium.mixins.json",
-    "meteor-client-viafabricplus.mixins.json"
+    "monocle-client.mixins.json",
+    "monocle-client-baritone.mixins.json",
+    "monocle-client-indigo.mixins.json",
+    "monocle-client-sodium.mixins.json",
+    "monocle-client-lithium.mixins.json",
+    "monocle-client-viafabricplus.mixins.json",
+    "monocle-client-printer.mixins.json"
   ],
-  "accessWidener": "meteor-client.classtweaker",
+  "accessWidener": "monocle-client.classtweaker",
   "custom": {
-    "meteor-client:build_number": "${build_number}",
-    "meteor-client:color": "145,61,226",
-    "meteor-client:commit": "${commit}",
-    "modmenu": {
-      "links": {
-        "modmenu.discord": "https://meteorclient.com/discord"
-      }
-    },
+    "monocle-client:build_number": "${build_number}",
+    "monocle-client:color": "35,205,190",
+    "monocle-client:commit": "${commit}",
     "badoptimizations:cache_hooks": {
-      "lightmap": "meteordevelopment.meteorclient.modintegration.BadOptimizationsHook"
+      "lightmap": "dev.monocle.client.modintegration.BadOptimizationsHook"
     }
   },
   "depends": {

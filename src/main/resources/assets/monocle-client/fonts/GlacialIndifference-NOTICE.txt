@@ -1,0 +1,24 @@
+Glacial Indifference
+===================
+
+GlacialIndifference-Regular.otf and GlacialIndifference-Bold.otf are bundled
+unmodified. They remain licensed under the SIL Open Font License, Version 1.1;
+see GlacialIndifference-OFL.txt alongside this notice. Monocle's software
+license does not replace the font license.
+
+The following notices are reproduced verbatim from the fonts' embedded
+metadata, including the spelling used in the Regular copyright field.
+
+GlacialIndifference-Regular.otf — copyright field:
+Copyright (c) 2015 by Alfredo Marco Padil. All rights reserved.
+
+GlacialIndifference-Regular.otf — license field copyright notice:
+Copyright (c) 2015, Alfredo Marco Pradil (ammpradil@gmail.com),
+with Reserved Font Name Glacial Indifference.
+
+GlacialIndifference-Bold.otf — copyright field:
+Glacial Indifference is a trademark of Alfredo Marco Pradil
+
+GlacialIndifference-Bold.otf — license field copyright notice:
+Copyright (c) 2015, Alfredo Marco Pradil - ammpradil@gmail.com,
+with Reserved Font Name Glacial Indifference.

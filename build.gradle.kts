@@ -1,21 +1,14 @@
-import net.ltgt.gradle.errorprone.errorprone
-
 plugins {
     alias(libs.plugins.fabric.loom)
-    id("maven-publish")
-    alias(libs.plugins.errorprone)
 }
 
 val archivesBaseName = providers.gradleProperty("archives_base_name").get()
 val mavenGroup = providers.gradleProperty("maven_group").get()
-val runErrorProne = providers.gradleProperty("errorprone").isPresent
 
 base {
     archivesName = archivesBaseName
     group = mavenGroup
-
-    val suffix = providers.gradleProperty("build_number").getOrElse("local")
-    version = "${libs.versions.minecraft.get()}-$suffix"
+    version = providers.gradleProperty("mod_version").get()
 }
 
 repositories {
@@ -90,6 +83,14 @@ dependencies {
     compileOnly(libs.baritone)
     compileOnly(libs.modmenu)
 
+    // Optional Printer Helper integration: users install these mods separately.
+    for (optionalMod in listOf("litematica:CuniXtbo", "malilib:KvjmGjAV", "litematica-printer:7l7ihnI0")) {
+        compileOnly("maven.modrinth:$optionalMod") { isTransitive = false }
+        // Reproducible optional-mod startup check; still never included in the release JAR.
+        if (providers.gradleProperty("printerSmoke").isPresent)
+            runtimeOnly("maven.modrinth:$optionalMod") { isTransitive = false }
+    }
+
     // Libraries (JAR-in-JAR)
     jij(libs.orbit)
     jij(libs.starscript)
@@ -98,14 +99,7 @@ dependencies {
     jij(libs.netty.handler.proxy) { isTransitive = false }
     jij(libs.netty.codec.socks) { isTransitive = false }
     jij(libs.waybackauthlib)
-    jij(libs.minecraft.auth) {
-        exclude("com.google.code.gson")
-        exclude("com.google.errorprone")
-    }
-
-    // Error Prone
-    errorprone(libs.errorprone.core)
-    errorprone(libs.nullaway)
+    jij(libs.minecraft.auth)
 }
 
 java {
@@ -142,7 +136,7 @@ listOf("api", "implementation", "include").forEach { configName ->
 }
 
 loom {
-    accessWidenerPath = file("src/main/resources/meteor-client.classtweaker")
+    accessWidenerPath = file("src/main/resources/monocle-client.classtweaker")
 }
 
 fun toMinecraftCompat(version: String): String {
@@ -171,6 +165,90 @@ fun toMinecraftCompat(version: String): String {
 }
 
 tasks {
+    withType<AbstractArchiveTask>().configureEach {
+        archiveVersion.set("v${project.version}-${libs.versions.minecraft.get()}")
+    }
+
+    val highwayBuilderCheck = register<JavaExec>("highwayBuilderCheck") {
+        group = "verification"
+        description = "Checks Highway Builder planning and recovery rules without starting Minecraft."
+        dependsOn(testClasses)
+        classpath = sourceSets["test"].runtimeClasspath
+        mainClass.set("dev.monocle.client.systems.modules.world.HighwayPlanTest")
+        javaLauncher.set(project.extensions.getByType<JavaToolchainService>().launcherFor(java.toolchain))
+        enableAssertions = true
+    }
+
+    val highwaySupplyCheck = register<JavaExec>("highwaySupplyCheck") {
+        group = "verification"
+        description = "Checks supply container recovery identity using Minecraft item components."
+        dependsOn(testClasses)
+        classpath = sourceSets["test"].runtimeClasspath
+        mainClass.set("dev.monocle.client.systems.modules.world.HighwaySupplyTest")
+        javaLauncher.set(project.extensions.getByType<JavaToolchainService>().launcherFor(java.toolchain))
+        enableAssertions = true
+    }
+
+    val monocleStyleCheck = register<JavaExec>("monocleStyleCheck") {
+        group = "verification"
+        description = "Checks Monocle theme color and animation helpers without starting Minecraft."
+        dependsOn(testClasses)
+        classpath = sourceSets["test"].runtimeClasspath
+        mainClass.set("dev.monocle.client.gui.themes.monocle.MonocleStyleTest")
+        javaLauncher.set(project.extensions.getByType<JavaToolchainService>().launcherFor(java.toolchain))
+        enableAssertions = true
+    }
+
+    val monocleFontCheck = register<JavaExec>("monocleFontCheck") {
+        group = "verification"
+        description = "Checks bundled fonts, native OpenType rasterization, and font licensing resources without a GPU."
+        dependsOn(testClasses)
+        classpath = sourceSets["test"].runtimeClasspath
+        mainClass.set("dev.monocle.client.renderer.MonocleFontTest")
+        javaLauncher.set(project.extensions.getByType<JavaToolchainService>().launcherFor(java.toolchain))
+        enableAssertions = true
+    }
+
+    val moduleChecks = mapOf(
+        "stashFinderCheck" to "dev.monocle.client.systems.modules.world.StashFinderTest",
+        "inventoryLoadoutCheck" to "dev.monocle.client.utils.player.InventoryLoadoutTest",
+        "inventoryTransferCheck" to "dev.monocle.client.utils.player.InventoryTransferTest",
+        "inventoryManagerCheck" to "dev.monocle.client.systems.modules.misc.InventoryManagerTest",
+        "inventoryManagerUiCheck" to "dev.monocle.client.gui.screens.InventoryManagerUiTest",
+        "litematicExporterCheck" to "dev.monocle.client.utils.world.LitematicExporterTest",
+        "schematicSelectorCheck" to "dev.monocle.client.systems.modules.world.SchematicSelectorTest",
+        "highwayMobCheck" to "dev.monocle.client.systems.modules.world.HighwayMobTest",
+        "printerHelperCheck" to "dev.monocle.client.systems.modules.world.PrinterHelperTest",
+        "printerFlightCheck" to "dev.monocle.client.utils.world.PrinterFlightTest",
+        "printerIntegrationCheck" to "dev.monocle.client.modintegration.PrinterIntegrationTest",
+        "printerRestockCheck" to "dev.monocle.client.systems.modules.world.PrinterRestockTest"
+    ).map { (taskName, main) ->
+        register<JavaExec>(taskName) {
+            group = "verification"
+            description = "Checks Monocle module behavior without starting Minecraft."
+            dependsOn(testClasses)
+            classpath = sourceSets["test"].runtimeClasspath
+            mainClass.set(main)
+            javaLauncher.set(project.extensions.getByType<JavaToolchainService>().launcherFor(java.toolchain))
+            enableAssertions = true
+        }
+    }
+
+    test {
+        exclude("**/StashFinderTest*.class")
+        // These assertion-based mains run through their JavaExec tasks, not a test framework.
+        exclude("**/HighwayPlanTest*.class", "**/HighwaySupplyTest*.class", "**/HighwayFarmingTest*.class", "**/MonocleStyleTest*.class", "**/MonocleFontTest*.class")
+        exclude("**/InventoryLoadoutTest*.class", "**/InventoryTransferTest*.class", "**/InventoryManagerTest*.class", "**/InventoryManagerUiTest*.class")
+        exclude("**/LitematicExporterTest*.class", "**/SchematicSelectorTest*.class")
+        exclude("**/HighwayMobTest*.class")
+        exclude("**/Printer*Test*.class")
+    }
+
+    check {
+        dependsOn(highwayBuilderCheck, highwaySupplyCheck, monocleStyleCheck, monocleFontCheck)
+        dependsOn(moduleChecks)
+    }
+
     processResources {
         val buildNumber = providers.gradleProperty("build_number").getOrElse("")
         val commit = providers.gradleProperty("commit").getOrElse("")
@@ -208,7 +286,7 @@ tasks {
         from(launcher.output)
 
         manifest {
-            attributes["Main-Class"] = "meteordevelopment.meteorclient.Main"
+            attributes["Main-Class"] = "dev.monocle.client.Main"
         }
     }
 
@@ -219,18 +297,6 @@ tasks {
                 "-Xlint:unchecked"
             )
         )
-
-        options.errorprone.enabled.set(runErrorProne)
-
-        if (runErrorProne) {
-            options.errorprone {
-                check("NullAway", net.ltgt.gradle.errorprone.CheckSeverity.ERROR)
-                option("NullAway:AnnotatedPackages", "meteordevelopment.meteorclient")
-                option("NullAway:JSpecifyMode", "true")
-                // Event handlers are discovered reflectively by Orbit.
-                option("UnusedMethod:ExcludedAnnotations", "meteordevelopment.orbit.EventHandler")
-            }
-        }
     }
 
     javadoc {
@@ -244,32 +310,6 @@ tasks {
     build {
         if (System.getenv("CI")?.toBoolean() == true) {
             dependsOn("javadocJar")
-        }
-    }
-}
-
-publishing {
-    publications {
-        create<MavenPublication>("mavenJava") {
-            from(components["java"])
-            artifactId = "meteor-client"
-
-            version = "${libs.versions.minecraft.get()}-SNAPSHOT"
-        }
-    }
-
-    repositories {
-        maven("https://maven.meteordev.org/snapshots") {
-            name = "meteor-maven"
-
-            credentials {
-                username = System.getenv("MAVEN_METEOR_ALIAS")
-                password = System.getenv("MAVEN_METEOR_TOKEN")
-            }
-
-            authentication {
-                create<BasicAuthentication>("basic")
-            }
         }
     }
 }

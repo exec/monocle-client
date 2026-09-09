@@ -1,0 +1,12 @@
+{
+  "required": false,
+  "package": "dev.monocle.client.mixin.indigo",
+  "compatibilityLevel": "JAVA_21",
+  "plugin": "dev.monocle.client.MixinPlugin",
+  "client": [
+    "AltModelBlockRendererImplMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
