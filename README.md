@@ -1,6 +1,8 @@
-# Monocle
+<p align="center">
+  <img src="src/main/resources/assets/monocle-client/icon.png" alt="Monocle Client" width="128" height="128">
+</p>
 
-Monocle: A Clear Advantage.
+<p align="center"><strong>Monocle: A Clear Advantage.</strong></p>
 
 Monocle is a Minecraft Fabric utility client intended for anarchy servers where client mods are permitted.
 
