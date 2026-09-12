@@ -22,6 +22,7 @@ import dev.monocle.client.systems.modules.combat.KillAura;
 import dev.monocle.client.utils.player.InvUtils;
 import dev.monocle.client.utils.player.SlotUtils;
 import meteordevelopment.orbit.EventHandler;
+import meteordevelopment.orbit.EventPriority;
 import net.minecraft.core.Holder;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.effect.MobEffect;
@@ -139,8 +140,9 @@ public class AutoGap extends Module {
 
     private final Map<Module, Long> wasAura = new java.util.HashMap<>();
     private Object eatingWorld;
+    private Object eatingPlayer;
     private ItemStack eatingStack = ItemStack.EMPTY;
-    private int handoffTicks;
+    private int handoffTicks, eatingTicks, lastFoodCount;
     private boolean wasBaritone;
 
     public AutoGap() {
@@ -152,14 +154,15 @@ public class AutoGap extends Module {
         stopEating();
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGH + 1)
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null) {
+        if (eating && (mc.player != eatingPlayer || mc.level != eatingWorld)) stopEating();
+        if (mc.player == null || !mc.player.isAlive()) {
             if (eating) stopEating();
             return;
         }
         if (handoffTicks > 0) { handoffTicks--; return; }
-        if (mc.gui.screen() != null || mc.player.containerMenu != mc.player.inventoryMenu
+        if (mc.player.containerMenu != mc.player.inventoryMenu
             || !mc.player.containerMenu.getCarried().isEmpty()) {
             if (eating) stopEating();
             return;
@@ -196,7 +199,32 @@ public class AutoGap extends Module {
             }
         }
 
-        eat();
+        if (stackIn(slot).getCount() < lastFoodCount) eatingTicks = 0;
+        lastFoodCount = stackIn(slot).getCount();
+        if (++eatingTicks >= 100) {
+            // Restart only our own stalled use; keep the food slot and builder/aura pause.
+            if (ownsItemUse()) mc.gameMode.releaseUsingItem(mc.player);
+            eatingTicks = 0;
+        }
+        setPressed(true);
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST - 200)
+    private void onPostTick(TickEvent.Post event) {
+        if (ownsFoodSlot()) eat();
+    }
+
+    private boolean ownsFoodSlot() {
+        return isActive() && eating && mc.player != null && mc.player == eatingPlayer && mc.level == eatingWorld
+            && mc.player.isAlive() && mc.player.containerMenu == mc.player.inventoryMenu && mc.player.containerMenu.getCarried().isEmpty()
+            && (slot == SlotUtils.OFFHAND || mc.player.getInventory().getSelectedSlot() == slot)
+            && AutoEat.sameFoodUse(eatingStack, stackIn(slot), stackIn(slot));
+    }
+
+    public boolean ownsItemUse() {
+        return ownsFoodSlot() && mc.player.isUsingItem()
+            && mc.player.getUsedItemHand() == (slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND)
+            && AutoEat.sameFoodUse(eatingStack, stackIn(slot), mc.player.getUseItem());
     }
 
     @EventHandler
@@ -211,6 +239,9 @@ public class AutoGap extends Module {
 
         eating = true;
         eatingWorld = mc.level;
+        eatingPlayer = mc.player;
+        eatingTicks = 0;
+        lastFoodCount = stackIn(this.slot).getCount();
 
         wasAura.clear();
         if (pauseAuras.get()) {
@@ -233,6 +264,7 @@ public class AutoGap extends Module {
     private void eat() {
         setPressed(true);
         if (!mc.player.isUsingItem()) {
+            if (mc.gameMode.isDestroying()) mc.gameMode.stopDestroyBlock();
             mc.gameMode.useItem(mc.player, slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND);
         }
     }
@@ -240,7 +272,7 @@ public class AutoGap extends Module {
     private void stopEating() {
         if (!eating && wasAura.isEmpty() && !wasBaritone) return;
 
-        if (mc.player != null && mc.level == eatingWorld
+        if (mc.player != null && mc.player == eatingPlayer && mc.level == eatingWorld
             && ItemStack.isSameItemSameComponents(stackIn(slot), eatingStack)
             && (slot == SlotUtils.OFFHAND || mc.player.getInventory().getSelectedSlot() == slot)) {
             if (mc.player.isUsingItem() && mc.player.getUsedItemHand() == (slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND)

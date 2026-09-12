@@ -26,7 +26,6 @@ import dev.monocle.client.systems.Systems;
 import dev.monocle.client.systems.config.Config;
 import dev.monocle.client.systems.modules.combat.*;
 import dev.monocle.client.systems.modules.misc.*;
-import dev.monocle.client.systems.modules.misc.swarm.Swarm;
 import dev.monocle.client.systems.modules.movement.*;
 import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFly;
 import dev.monocle.client.systems.modules.movement.speed.Speed;
@@ -342,6 +341,7 @@ public class Modules extends System<Modules> {
         ListTag modulesTag = new ListTag();
         for (Module module : getAll()) {
             CompoundTag moduleTag = module.toTag();
+            if (moduleTag != null) moduleTag = dev.monocle.client.systems.bots.BotProfiles.persistentTag(module.name, moduleTag);
             if (moduleTag != null) modulesTag.add(moduleTag);
         }
         tag.put("modules", modulesTag);
@@ -351,6 +351,10 @@ public class Modules extends System<Modules> {
 
     @Override
     public Modules fromTag(CompoundTag tag) {
+        if (dev.monocle.client.systems.bots.BotProfiles.leased()) {
+            MonocleClient.LOG.warn("Module profile reload deferred: a bot workflow owns temporary settings. Pause it and finish its safe handoff first.");
+            return this;
+        }
         disableAll();
 
         ListTag modulesTag = tag.getListOrEmpty("modules");
@@ -575,6 +579,7 @@ public class Modules extends System<Modules> {
         add(new BookBot());
         add(new DiscordPresence());
         add(new InventoryTweaks());
+        add(new CommunityChat());
         add(new MessageAura());
         add(new Notebot());
         add(new Notifier());
@@ -583,6 +588,5 @@ public class Modules extends System<Modules> {
         add(new ServerSpoof());
         add(new SoundBlocker());
         add(new Spam());
-        add(new Swarm());
     }
 }

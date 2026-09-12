@@ -12,12 +12,14 @@ import dev.monocle.client.gui.widgets.WWidget;
 import dev.monocle.client.gui.widgets.pressable.WButton;
 import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
 import dev.monocle.client.events.game.GameLeftEvent;
+import dev.monocle.client.events.entity.player.PlayerMoveEvent;
 import dev.monocle.client.events.packets.PacketEvent;
 import dev.monocle.client.events.render.Render2DEvent;
 import dev.monocle.client.events.render.Render3DEvent;
 import dev.monocle.client.events.world.TickEvent;
 import dev.monocle.client.mixin.MinecraftMixin;
 import dev.monocle.client.mixin.ShulkerBoxMenuAccessor;
+import dev.monocle.client.mixin.MultiPlayerGameModeAccessor;
 import dev.monocle.client.mixininterface.IVec3;
 import dev.monocle.client.renderer.ShapeMode;
 import dev.monocle.client.renderer.text.TextRenderer;
@@ -25,8 +27,18 @@ import dev.monocle.client.settings.*;
 import dev.monocle.client.systems.modules.Categories;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
+import dev.monocle.client.systems.bots.Bots;
+import dev.monocle.client.systems.bots.BotWorkflows.Action;
+import dev.monocle.client.systems.modules.misc.swarm.SwarmCrew;
+import com.google.gson.JsonObject;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
 import dev.monocle.client.systems.modules.combat.KillAura;
 import dev.monocle.client.systems.modules.movement.Velocity;
+import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFly;
+import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFlightModes;
 import dev.monocle.client.systems.modules.movement.speed.Speed;
 import dev.monocle.client.systems.modules.player.*;
 import dev.monocle.client.utils.Utils;
@@ -43,7 +55,9 @@ import dev.monocle.client.utils.render.color.SettingColor;
 import dev.monocle.client.utils.world.BlockUtils;
 import dev.monocle.client.utils.world.Dir;
 import dev.monocle.client.utils.world.TickRate;
+import dev.monocle.client.utils.world.PrinterFlight;
 import meteordevelopment.orbit.EventHandler;
+import meteordevelopment.orbit.EventPriority;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.inventory.ContainerScreen;
@@ -57,6 +71,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.Container;
@@ -64,7 +79,9 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EntityTypes;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
@@ -92,6 +109,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.function.Predicate;
+import dev.monocle.client.systems.modules.misc.swarm.CrewInventory;
+import net.minecraft.core.component.DataComponents;
 
 @SuppressWarnings("ConstantConditions")
 public class HighwayBuilder extends Module {
@@ -148,6 +167,7 @@ public class HighwayBuilder extends Module {
     private final SettingGroup sgDigging = settings.createGroup("Digging", false);
     private final SettingGroup sgPaving = settings.createGroup("Paving", false);
     private final SettingGroup sgInventory = settings.createGroup("Inventory", false);
+    private final SettingGroup sgCrewInventory = settings.createGroup("Bots · Crew Inventory", false);
     private final SettingGroup sgMobs = settings.createGroup("Mob Handling", false);
     private final SettingGroup sgRenderDigging = settings.createGroup("Render Digging", false);
     private final SettingGroup sgRenderPaving = settings.createGroup("Render Paving", false);
@@ -331,6 +351,15 @@ public class HighwayBuilder extends Module {
 
     // Digging
 
+    private final Setting<Integer> blocksAheadToBreak = sgDigging.add(new IntSetting.Builder()
+        .name("blocks-ahead-to-break")
+        .description("Rows to excavate ahead. Extra rows experimentally use Place Range (or your mining reach, if greater), without walking ahead or waiting for distant breaks. Server-dependent; required excavation retains normal mining reach and liquid sealing.")
+        .defaultValue(5)
+        .range(1, 5)
+        .sliderRange(1, 5)
+        .build()
+    );
+
     private final Setting<Boolean> doubleMine = sgDigging.add(new BoolSetting.Builder()
         .name("double-mine")
         .description("Whether to double mine blocks when applicable (normal mine and packet mine simultaneously).")
@@ -411,7 +440,7 @@ public class HighwayBuilder extends Module {
     private final Setting<Integer> blocksAheadToPave = sgPaving.add(new IntSetting.Builder()
         .name("blocks-ahead-to-pave")
         .description("Rows to pave ahead. Values above 2 are experimental; extra rows use spare placement budget within Place Range, without extra movement. Underfoot verification is unchanged.")
-        .defaultValue(2)
+        .defaultValue(5)
         .range(1, 5)
         .sliderRange(1, 5)
         .build()
@@ -434,6 +463,15 @@ public class HighwayBuilder extends Module {
     );
 
     // Inventory
+
+    private final Setting<Boolean> crewPooling = sgCrewInventory.add(new BoolSetting.Builder().name("crew-resource-pool")
+        .description("Bot jobs only: shared loadout, local supplies first, then detached resource exchange with a crewmate. Captured when creating the job.").defaultValue(true).build());
+    private final Setting<Boolean> crewTrash = sgCrewInventory.add(new BoolSetting.Builder().name("crew-auto-trash")
+        .description("Bot jobs only: discard non-highway items. Protect equipment, food, containers, named items, totems, pearls and rockets. Throw away from other lanes.").defaultValue(true).build());
+    private final Setting<Integer> crewPavingTarget = sgCrewInventory.add(new IntSetting.Builder().name("crew-paving-target").description("Loose paving blocks to refill to, subject to inventory space.").defaultValue(512).range(64, 1536).sliderRange(64, 1536).build());
+    private final Setting<Integer> crewPickTarget = sgCrewInventory.add(new IntSetting.Builder().name("crew-pickaxe-target").description("Usable pickaxes to carry; your protected pickaxe reserve is also respected.").defaultValue(3).range(2, 9).build());
+    private final Setting<Integer> crewFoodTarget = sgCrewInventory.add(new IntSetting.Builder().name("crew-food-target").description("Usable food items to refill to.").defaultValue(64).range(16, 256).build());
+    private final Setting<Integer> crewFillerTarget = sgCrewInventory.add(new IntSetting.Builder().name("crew-filler-target").description("Keep this many expendable filler blocks; reclaim excess for supply space. Zero keeps none.").defaultValue(64).range(0, 256).build());
 
     private final Setting<List<Block>> fillerBlocks = sgInventory.add(new BlockListSetting.Builder()
         .name("filler-blocks")
@@ -641,8 +679,12 @@ public class HighwayBuilder extends Module {
     private final MBlockPos lastBreakingPos = new MBlockPos();
     private boolean displayInfo, warned;
     private boolean suspended = true, inventory = true;
-    private int placeTimer, breakTimer, count, containerId, queuedHotbarSlots;
+    private int placeTimer, breakTimer, count, breakCount, containerId, queuedHotbarSlots;
     private final RestockTask restockTask = new RestockTask(this);
+    private HighwaySupplyForecast supplyForecast = new HighwaySupplyForecast();
+    private String forecastJob = "";
+    private double forecastSampleAt, forecastRestockAt, forecastRetryAt;
+    private int forecastBlocks, forecastTools, forecastCarriedBlocks, forecastCarriedTools;
     private final Set<EndCrystal> ignoreCrystals = new ReferenceOpenHashSet<>();
     public boolean drawingBow;
     public DoubleMineBlock normalMining, packetMining;
@@ -651,8 +693,771 @@ public class HighwayBuilder extends Module {
     private final MBlockPos posRender3 = new MBlockPos();
 
     private boolean job, paused, preview, listening;
+    private boolean crewAssigned, crewStarting, crewReturning;
+    private BlockPos crewSupplyOrigin, crewTravelTarget;
+    private BlockPos crewSupplySite;
+    private final Set<BlockPos> crewTriedSupplySites = new HashSet<>();
+    private boolean crewTravelToSupply, crewTravelEnabledFly, endingJob, crewToggledOff;
+    private int crewLaunchTick = -1, crewTravelTick = -1;
+    private int crewRunUntil = -1;
+    private Vec3 crewRunTarget;
+    private Vec3 crewTravelProgress;
+    private int crewTravelProgressTick, crewRetryAt = -1, crewRetries;
+    private Integer crewSupplyProgress;
+    private int crewSupplyProgressTick, crewSupplyRetries;
+    private final Map<Setting<?>, CompoundTag> crewSettings = new java.util.LinkedHashMap<>();
+    private ItemStack crewReturnedStack = ItemStack.EMPTY;
+
+    private SwarmCrew crew() { return Bots.get().crew; }
+    public boolean crewAssigned() { return crewAssigned; }
+    public boolean crewInventoryEnabled() { return crewAssigned && crew().localAssigned() && crew().inventoryPolicy().enabled(); }
+    private boolean crewPrepared;
+    private int crewPrepareResource, crewPendingResource = -1;
+    private int crewTrashSlot = -1, crewInventoryTick;
+    private ItemStack crewTrashStack = ItemStack.EMPTY;
+    private JsonObject crewLedger = new JsonObject();
+    private int crewLedgerTick = -100;
+    public CrewInventory.Policy configuredCrewInventory() {
+        return new CrewInventory.Policy(crewPooling.get(), crewTrash.get(), crewPavingTarget.get(), crewPickTarget.get(), crewFoodTarget.get(), crewFillerTarget.get());
+    }
+    public boolean crewAcceptsResource(int resource, ItemStack stack) {
+        return switch (resource) {
+            case CrewInventory.MATERIALS -> forecastPavingCount(stack) > 0;
+            case CrewInventory.PICKS -> usablePickaxe(stack);
+            case CrewInventory.FOOD -> Utils.isFood(stack) && !Modules.get().get(AutoEat.class).blacklist.get().contains(stack.getItem());
+            case CrewInventory.FILLERS -> !stack.has(DataComponents.CUSTOM_NAME) && isExpendableFiller(stack, fillerBlocks.get(), blocksToPlace.get());
+            case CrewInventory.ECHESTS -> stack.is(Items.ENDER_CHEST);
+            default -> false;
+        };
+    }
+    public int crewResourceCount(int resource) { return CrewInventory.count(mc.player.getInventory(), s -> crewAcceptsResource(resource, s)); }
+    public int crewResourceReserve(int resource) { return Math.max(crew().inventoryPolicy().reserve(resource), resource == CrewInventory.PICKS ? savePickaxes.get() + 1 : resource == CrewInventory.ECHESTS ? saveEchests.get() : 0); }
+    public int crewResourceTarget(int resource) { return Math.max(crew().inventoryPolicy().target(resource), crewResourceReserve(resource)); }
+    public JsonObject crewInventoryReport() {
+        if (!crewInventoryEnabled() || !Utils.canUpdate()) return new JsonObject();
+        if (mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.inventoryMenu.getCarried().isEmpty()) {
+            JsonObject busy = crewLedger.deepCopy(); busy.addProperty("busy", true); return busy;
+        }
+        if (mc.player.tickCount - crewLedgerTick >= 20) {
+            crewLedgerTick = mc.player.tickCount;
+            List<Predicate<ItemStack>> accepts = new ArrayList<>();
+            for (int r = 0; r < CrewInventory.RESOURCES; r++) { int resource = r; accepts.add(s -> crewAcceptsResource(resource, s)); }
+            List<ItemStack> inventory = new ArrayList<>();
+            for (int i = 0; i < 36; i++) inventory.add(mc.player.getInventory().getItem(i));
+            int[] loose = CrewInventory.totals(inventory, accepts, false);
+            int[] nested = CrewInventory.totals(inventory, accepts, searchInventoryShulkers());
+            for (int i = 0; i < CrewInventory.RESOURCES; i++) nested[i] -= loose[i];
+            int slots = enderChestSearchSlots();
+            boolean accessible = searchChestContents() && inventory.stream().anyMatch(s -> s.is(Items.ENDER_CHEST));
+            boolean known = accessible && EChestMemory.isKnown(slots);
+            List<ItemStack> chest = accessible && EChestMemory.isKnown() ? EChestMemory.ITEMS.subList(0, Math.min(slots, EChestMemory.ITEMS.size())) : List.of();
+            crewLedger = new JsonObject(); crewLedger.addProperty("version", 1);
+            crewLedger.add("loose", CrewInventory.array(loose)); crewLedger.add("shulkers", CrewInventory.array(nested));
+            crewLedger.add("echest", CrewInventory.array(CrewInventory.totals(chest, accepts, searchInventoryShulkers())));
+            crewLedger.addProperty("echestKnown", known); crewLedger.addProperty("echestSlots", known ? slots : chest.size());
+            crewLedger.add("reserve", CrewInventory.array(java.util.stream.IntStream.range(0, CrewInventory.RESOURCES).map(this::crewResourceReserve).toArray()));
+            crewLedger.add("target", CrewInventory.array(java.util.stream.IntStream.range(0, CrewInventory.RESOURCES).map(this::crewResourceTarget).toArray()));
+            crewLedger.add("inventory", CrewInventory.manifest(inventory)); crewLedger.add("storage", CrewInventory.manifest(chest));
+        }
+        JsonObject report = crewLedger.deepCopy(); report.addProperty("busy", false); report.addProperty("idle", crewRestockIdle()); return report;
+    }
+    public boolean crewInventorySettled() {
+        return crewAssigned && controlsPlayer() && State.Restock.reconfigureReady(this) && recoverCursor()
+            && mc.player.containerMenu == mc.player.inventoryMenu && crewQuiesce();
+    }
+    public void crewFetchResource(int resource, int target) {
+        if (!crewInventoryEnabled() || !restockTask.tasksInactive() || !crewInventorySettled()) return;
+        restockTask.setTask(resource);
+        restockTask.minimumSupply = Math.max(target, crewResourceTarget(resource));
+    }
+    public boolean crewHasStoredResource(int resource) { return hasStoredSupply(s -> crewAcceptsResource(resource, s)); }
+    public void crewFinishResourceWait() {
+        if (!crewAssigned || !State.Restock.reconfigureReady(this)) return;
+        restockTask.complete(); State.Restock.resetSupplyJob(this); setState(State.Forward);
+        crewLedgerTick = -100;
+    }
+    public void crewInventoryStatus(String text) { waiting = ""; status = text; idleTicks = 0; }
+    public boolean crewRestockIdle() { return restockTask.tasksInactive() && State.Restock.reconfigureReady(this); }
+    public float crewTrashYaw() { return crewInventoryEnabled() ? crew().trashYaw(dir.yaw) : dir.opposite().yaw; }
+    public boolean crewMakeTransferRoom(ItemStack incoming, int amount) {
+        if (!crewInventoryEnabled() || !crewInventorySettled()) return true;
+        if (CrewInventory.capacity(mc.player.getInventory(), incoming, 1) >= amount) return true;
+        if (mc.player.tickCount < crewInventoryTick) return true;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty() || stack.has(DataComponents.CUSTOM_NAME) || !(isExpendableFiller(stack, fillerBlocks.get(), blocksToPlace.get())
+                || crew().inventoryPolicy().trash() && !CrewInventory.keep(stack, blocksToPlace.get(), fillerBlocks.get(), List.of()))) continue;
+            mc.player.setYRot(crewTrashYaw()); mc.player.setXRot(-25);
+            if (crewTrashSlot == i && ItemStack.matches(crewTrashStack, stack)) {
+                InvUtils.drop().slot(i); crewTrashSlot = -1; crewInventoryTick = mc.player.tickCount + 3;
+            } else { crewTrashSlot = i; crewTrashStack = stack.copy(); }
+            return true;
+        }
+        return false;
+    }
+
+    /** One cursor-free, identity-checked cleanup/swap at a time, only while native work is quiescent. */
+    private boolean prepareCrewInventory() {
+        if (!crewInventoryEnabled() || !restockTask.tasksInactive() || state != State.Forward || !State.Restock.reconfigureReady(this)) return false;
+        if (mc.player.tickCount < crewInventoryTick) return true;
+        if (!crewQuiesce() || !recoverCursor()) return true;
+        int retained = 0, discard = -1;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            boolean filler = !stack.has(DataComponents.CUSTOM_NAME) && isExpendableFiller(stack, fillerBlocks.get(), blocksToPlace.get());
+            boolean excess = filler && retained >= crew().inventoryPolicy().filler();
+            if (filler) retained += stack.getCount();
+            if (crew().inventoryPolicy().trash() && !stack.isEmpty() && (excess || !CrewInventory.keep(stack, blocksToPlace.get(), fillerBlocks.get(), List.of()))) { discard = i; break; }
+        }
+        if (discard >= 0) {
+            ItemStack stack = mc.player.getInventory().getItem(discard);
+            mc.player.setYRot(crewTrashYaw()); mc.player.setXRot(-25);
+            if (crewTrashSlot == discard && ItemStack.matches(crewTrashStack, stack)) {
+                InvUtils.drop().slot(discard); crewTrashSlot = -1; crewInventoryTick = mc.player.tickCount + 3;
+            } else { crewTrashSlot = discard; crewTrashStack = stack.copy(); }
+            status = "Preparing crew inventory: discarding trash";
+            return true;
+        }
+        crewTrashSlot = -1;
+        // Fixed role slots, not exact stack copies: tool durability/names stay intact.
+        for (int resource = 0; resource < 3; resource++) {
+            int target = resource == 0 ? 7 : resource == 1 ? 0 : 8;
+            if (crewAcceptsResource(resource, mc.player.getInventory().getItem(target))) continue;
+            for (int i = 0; i < 36; i++) if (crewAcceptsResource(resource, mc.player.getInventory().getItem(i))) {
+                InvUtils.quickSwap().fromId(target).to(i); crewInventoryTick = mc.player.tickCount + 3;
+                status = "Preparing crew inventory: arranging hotbar"; return true;
+            }
+        }
+        while (crewPrepareResource < CrewInventory.RESOURCES) {
+            int resource = crewPrepareResource++;
+            if (resource == 0 && !doesPave() || resource == 1 && !doesDig()) continue;
+            if (crewResourceCount(resource) < crewResourceTarget(resource) && crewHasStoredResource(resource)) {
+                crewFetchResource(resource, crewResourceTarget(resource)); return true;
+            }
+        }
+        crewPrepared = true; return false;
+    }
+    public List<BlockPos> crewMiningTargets() {
+        if (!crewAssigned || !controlsPlayer()) return List.of();
+        Set<BlockPos> targets = new java.util.LinkedHashSet<>();
+        if (normalMining != null) targets.add(normalMining.blockPos);
+        if (packetMining != null) targets.add(packetMining.blockPos);
+        if (mc.gameMode.isDestroying()) targets.add(((MultiPlayerGameModeAccessor) mc.gameMode).monocle$getCurrentBreakingBlockPos());
+        return targets.stream().filter(java.util.Objects::nonNull).map(BlockPos::immutable).toList();
+    }
+    private List<Setting<?>> crewSettingsList() {
+        return List.of(operation, heading, width, height, length, floor, railings, cornerBlock, mineAboveRailings, blocksToPlace, fillerBlocks, keepShulkers);
+    }
+    public JsonObject crewLayout() {
+        JsonObject m = new JsonObject();
+        HorizontalDirection d = selectedHeading();
+        m.addProperty("dx", d.offsetX); m.addProperty("dz", d.offsetZ);
+        m.addProperty("operation", operation.get().name()); m.addProperty("heading", d.name());
+        m.addProperty("width", width.get()); m.addProperty("height", height.get());
+        m.addProperty("floor", floor.get().name()); m.addProperty("railings", railings.get());
+        m.addProperty("supports", cornerBlock.get()); m.addProperty("above", mineAboveRailings.get());
+        m.addProperty("blocks", String.join(",", blocksToPlace.get().stream().map(b -> BuiltInRegistries.BLOCK.getKey(b).toString()).toList()));
+        m.add("inventory", configuredCrewInventory().json());
+        return m;
+    }
+    public void validateCrewLayout(JsonObject m) {
+        CrewInventory.Policy.read(m);
+        SwarmCrew.workSharing(m);
+        HorizontalDirection d = HorizontalDirection.valueOf(m.get("heading").getAsString());
+        if (d.diagonal || d.offsetX != m.get("dx").getAsInt() || d.offsetZ != m.get("dz").getAsInt()
+            || m.get("width").getAsInt() < 1 || m.get("width").getAsInt() > 5 || m.get("height").getAsInt() < 1 || m.get("height").getAsInt() > 7)
+            throw new IllegalArgumentException("Unsupported crew geometry");
+        Operation.valueOf(m.get("operation").getAsString()); Floor.valueOf(m.get("floor").getAsString());
+        String blocks = m.get("blocks").getAsString();
+        if (blocks.length() > 2048 || blocks.isBlank()) throw new IllegalArgumentException("Choose crew building materials");
+        for (String id : blocks.split(",")) {
+            Block b = BuiltInRegistries.BLOCK.getValue(Identifier.parse(id));
+            var filter = ((BlockListSetting) blocksToPlace).filter;
+            if (b == null || b.defaultBlockState().isAir() || filter != null && !filter.test(b)) throw new IllegalArgumentException("Invalid crew building material");
+        }
+    }
+    public void beginCrew(JsonObject m, BlockPos origin, int distance) {
+        beginCrew(m, origin, distance, false);
+    }
+    public boolean beginCrewReturn(JsonObject m, BlockPos origin, int distance) {
+        if (!Utils.canUpdate() || !mc.player.onGround() || mc.player.isFallFlying() || !crew().detachedSupply() || mc.player.getBlockY() != origin.getY()) return false;
+        beginCrew(m, origin, distance, true);
+        if (!job) { endCrew(); return false; }
+        crewSupplyOrigin = origin.immutable(); workOrigin = mc.player.blockPosition();
+        return true;
+    }
+    private void beginCrew(JsonObject m, BlockPos origin, int distance, boolean returning) {
+        validateCrewLayout(m);
+        if (job || crewAssigned || !returning && mc.player.position().distanceToSqr(Vec3.atBottomCenterOf(crew().lanePosition(origin))) > .09) throw new IllegalStateException("Worker moved away from its lane start");
+        dev.monocle.client.pathing.PathManagers.get().stop();
+        if (Bots.get().worker != null) Bots.get().worker.target = null;
+        for (Setting<?> s : crewSettingsList()) crewSettings.put(s, s.toTag().copy());
+        operation.set(Operation.valueOf(m.get("operation").getAsString())); heading.set(Heading.valueOf(m.get("heading").getAsString()));
+        width.set(m.get("width").getAsInt()); height.set(m.get("height").getAsInt()); length.set(distance);
+        floor.set(Floor.valueOf(m.get("floor").getAsString())); railings.set(m.get("railings").getAsBoolean());
+        cornerBlock.set(m.get("supports").getAsBoolean()); mineAboveRailings.set(m.get("above").getAsBoolean()); blocksToPlace.parse(m.get("blocks").getAsString());
+        crewAssigned = crewStarting = true;
+        crewPrepared = false; crewPrepareResource = 0; crewPendingResource = -1; crewInventoryTick = 0; crewTrashSlot = -1; crewLedgerTick = -100;
+        if (CrewInventory.Policy.read(m).enabled()) {
+            var fillers = new ArrayList<>(fillerBlocks.get());
+            for (var block : CrewInventory.FILLER) if (!fillers.contains(block)) fillers.add(block);
+            fillerBlocks.set(fillers); keepShulkers.set(true);
+        }
+        try { startJob(); } finally { crewStarting = false; }
+    }
+    public void endCrew() {
+        crewRunUntil = -1;
+        if (job && crewAssigned) stopJob();
+        stopCrewFlight();
+        crewSupplyOrigin = crewTravelTarget = null;
+        crewSupplySite = null; crewTriedSupplySites.clear();
+        crewTravelProgress = null; crewRetryAt = -1; crewRetries = 0;
+        crewSupplyProgress = null; crewSupplyRetries = 0;
+        crewYieldGoal = null; crewYieldSearchTick = -10;
+        crewSettings.forEach(Setting::fromTag); crewSettings.clear();
+        crewAssigned = crewReturning = false; crewReturnedStack = ItemStack.EMPTY;
+        crewToggledOff = false;
+    }
+    @Override public CompoundTag toTag() {
+        CompoundTag tag = super.toTag();
+        if (crewSettings.isEmpty()) return tag;
+        // Profiles must retain personal settings, never a temporary host layout or an active crew job.
+        ListTag groups = new ListTag();
+        for (SettingGroup group : settings) {
+            CompoundTag g = group.toTag(); ListTag values = new ListTag();
+            for (Setting<?> s : group) values.add(crewSettings.containsKey(s) ? crewSettings.get(s).copy() : s.toTag());
+            g.put("settings", values); groups.add(g);
+        }
+        CompoundTag saved = new CompoundTag(); saved.put("groups", groups); tag.put("settings", saved); tag.putBoolean("active", false);
+        return tag;
+    }
+    public boolean crewQuiesce() {
+        if (!crewAssigned || !job) return true;
+        if (input != null) input.stop();
+        if (!Utils.canUpdate() || mc.level != jobWorld || waitingForWorld) return false;
+        actionEpoch++;
+        stopWorkMining();
+        pendingPlaces.keySet().removeIf(pos -> !placeSequences.containsKey(pos));
+        idleTicks = 0;
+        waiting = "Waiting for crew synchronization";
+        if (!pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()) { predictionFlushRequested = true; tickPredictionFlush(); }
+        return pendingPlaces.isEmpty() && pendingBreaks.isEmpty();
+    }
+    /** A membership change must never discard an outstanding container/drop/cursor recovery. */
+    public boolean crewReconfigureReady() {
+        if (!crewAssigned || !job) return true;
+        if (!Utils.canUpdate() || mc.level != jobWorld || crewNeedsCleanup()) return false;
+        return crewQuiesce();
+    }
+    /** Cancellation retains the verified checkpoint, but need not finish speculative road work. */
+    public boolean crewReleaseReady() {
+        if (!crewAssigned || !job) return true;
+        if (!Utils.canUpdate() || mc.level != jobWorld || crewNeedsCleanup() || !mc.player.onGround() || mc.player.isFallFlying()) return false;
+        crewQuiesce();
+        return true;
+    }
+
+    public boolean crewNeedsCleanup() {
+        return crewAssigned && job && Utils.canUpdate() && (crewTravelTarget != null || crewReturning || !temporarySteps.isEmpty() || !State.Restock.reconfigureReady(this)
+            || mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.containerMenu.getCarried().isEmpty()
+            || cursorSyncPending || cursorRecoveryRequired || drawingBow);
+    }
+
+    public boolean crewDetachedSupply() { return crewSupplyOrigin != null; }
+    public boolean crewIsTraveling() { return crewTravelTarget != null; }
+    private boolean crewAwaitingRejoin() { return crewDetachedSupply() && crew().returningSupply() && crewTravelTarget == null; }
+    public boolean crewCanReconnect() { return !job || crewAssigned && worldReady() && mc.level == jobWorld; }
+    public boolean wasPausedBeforeWorldChange() { return waitingForWorld ? pausedBeforeWorldChange : paused; }
+    public void pauseForCrewConnection() { waitForWorld(); }
+    public boolean crewToggledOff() { return crewAssigned && job && crewToggledOff; }
+    public boolean crewUnavailable() { return crewAssigned && job && (crewToggledOff || paused && crewRetries >= 3); }
+    public void crewNudge() {
+        if (!crewAssigned || !job || !Utils.canUpdate() || mc.level != jobWorld) return;
+        if (paused) { if (crewRetryAt >= 0) crewRetryAt = mc.player.tickCount; return; }
+        if (walkTicks >= 20) walkGoal = null;
+        // A slow block is work, not a stalled prediction. Ordinary ACK recovery is background work.
+        if (idleTicks >= 20 && !miningInProgress() && (!pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()))
+            pendingPredictionSince = mc.player.tickCount - 12;
+    }
+    public String crewDiagnostics() {
+        String detail = getStatus();
+        return detail.substring(0, Math.min(detail.length(), 384)) + " [" + state + "; place ACKs=" + pendingPlaces.size() + ", break ACKs=" + pendingBreaks.size()
+            + (crewTravelTarget == null ? "" : "; travel=" + crewTravelTarget.toShortString()) + "]"
+            + " [gate=" + diagnosticGate + "; tickAgeMs=" + diagnosticTickAge() + "; active=" + isActive()
+            + "; paused=" + paused + "; suspended=" + suspended + "; controls=" + controlsPlayer()
+            + (mc.player == null ? "" : "; playerTick=" + mc.player.tickCount + "; inventoryWait=" + ((long) crewInventoryTick - mc.player.tickCount)) + "]";
+    }
+
+    private long diagnosticTickAt, diagnosticSnapshotAt;
+    private String diagnosticGate = "not ticked";
+    private JsonObject diagnosticSnapshot = new JsonObject();
+
+    private long diagnosticTickAge() { return diagnosticTickAt == 0 ? -1 : Math.max(0, (System.nanoTime() - diagnosticTickAt) / 1_000_000); }
+
+    /** Read-only, bounded, one snapshot per second. Never drives verification or resource ownership. */
+    public JsonObject diagnosticSnapshot() {
+        long now = System.nanoTime();
+        if (diagnosticSnapshotAt != 0 && now - diagnosticSnapshotAt < 1_000_000_000L) return diagnosticSnapshot.deepCopy();
+        diagnosticSnapshotAt = now;
+        JsonObject d = new JsonObject();
+        d.addProperty("version", 1); d.addProperty("capturedAt", System.currentTimeMillis());
+        d.addProperty("gate", diagnosticGate); d.addProperty("tickAgeMs", diagnosticTickAge());
+        d.addProperty("active", isActive()); d.addProperty("job", job); d.addProperty("listening", listening);
+        d.addProperty("paused", paused); d.addProperty("suspended", suspended); d.addProperty("waitingForWorld", waitingForWorld);
+        d.addProperty("sameWorld", Utils.canUpdate() && mc.level == jobWorld); d.addProperty("controlsPlayer", controlsPlayer());
+        String detail = getStatus();
+        d.addProperty("state", String.valueOf(state)); d.addProperty("status", detail.substring(0, Math.min(detail.length(), 512)));
+        d.addProperty("idleTicks", idleTicks); d.addProperty("advancing", advancing); d.addProperty("crewPrepared", crewPrepared);
+        d.addProperty("restockTask", restockTask.item()); d.addProperty("restockInactive", restockTask.tasksInactive());
+        d.addProperty("restockResource", restockTask.resource);
+        d.addProperty("crewInventoryTick", crewInventoryTick); d.addProperty("crewLedgerTick", crewLedgerTick);
+        d.addProperty("cursorPending", cursorSyncPending); d.addProperty("cursorRecovery", cursorRecoveryRequired);
+        d.addProperty("predictionFlush", predictionFlushRequested); d.addProperty("probeSequence", predictionProbeSequence);
+        d.addProperty("workOrigin", workOrigin == null ? "" : workOrigin.toShortString());
+        d.addProperty("travelTarget", crewTravelTarget == null ? "" : crewTravelTarget.toShortString());
+        d.addProperty("walkGoal", String.valueOf(walkGoal)); d.addProperty("walkTicks", walkTicks);
+        d.addProperty("autoEat", Modules.get().get(AutoEat.class).eating); d.addProperty("autoGap", Modules.get().get(AutoGap.class).isEating());
+        d.addProperty("killAuraAttacking", Modules.get().get(KillAura.class).attacking);
+        d.addProperty("focused", mc.isWindowActive()); d.addProperty("gamePaused", mc.isPaused());
+        d.addProperty("screen", mc.gui.screen() == null ? "none" : mc.gui.screen().getClass().getSimpleName());
+        if (Utils.canUpdate()) {
+            d.addProperty("playerTick", mc.player.tickCount); d.addProperty("position", mc.player.position().toString());
+            d.addProperty("velocity", mc.player.getDeltaMovement().toString()); d.addProperty("onGround", mc.player.onGround());
+            d.addProperty("gliding", mc.player.isFallFlying()); d.addProperty("health", mc.player.getHealth());
+            d.addProperty("hunger", mc.player.getFoodData().getFoodLevel()); d.addProperty("usingItem", mc.player.isUsingItem());
+            d.addProperty("useTicks", mc.player.getTicksUsingItem()); d.addProperty("slot", mc.player.getInventory().getSelectedSlot());
+            d.addProperty("held", BuiltInRegistries.ITEM.getKey(mc.player.getMainHandItem().getItem()).toString());
+            d.addProperty("inputOwner", mc.player.input.getClass().getSimpleName()); d.addProperty("ownsInput", mc.player.input == input);
+            d.addProperty("input", mc.player.input.keyPresses.toString());
+            d.addProperty("containerMenu", mc.player.containerMenu.containerId); d.addProperty("cursorCount", mc.player.containerMenu.getCarried().getCount());
+            d.addProperty("normalMine", normalMining == null ? "" : normalMining.blockPos.toShortString());
+            d.addProperty("packetMine", packetMining == null ? "" : packetMining.blockPos.toShortString());
+            d.addProperty("vanillaMining", mc.gameMode != null && mc.gameMode.isDestroying());
+            d.addProperty("serverTickAgeSeconds", TickRate.INSTANCE.getTimeSinceLastTick());
+            d.addProperty("crewHold", crewAssigned && crew().hold());
+            d.addProperty("crewWindow", crewAssigned ? crew().windowStatus() : "");
+            com.google.gson.JsonArray pending = new com.google.gson.JsonArray();
+            java.util.stream.Stream.concat(pendingPlaces.keySet().stream(), pendingBreaks.keySet().stream()).distinct().limit(8).forEach(pos -> {
+                JsonObject p = new JsonObject(); p.addProperty("pos", pos.toShortString());
+                p.addProperty("placing", pendingPlaces.containsKey(pos)); p.addProperty("breaking", pendingBreaks.containsKey(pos));
+                p.addProperty("loaded", mc.level.hasChunkAt(pos));
+                if (mc.level.hasChunkAt(pos)) p.addProperty("block", BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(pos).getBlock()).toString());
+                p.addProperty("predicted", mc.level.getBlockStatePredictionHandler().serverVerifiedStates.containsKey(pos.asLong()));
+                pending.add(p);
+            });
+            d.add("pendingBlocks", pending);
+            State.Restock.diagnose(d);
+        }
+        diagnosticSnapshot = d;
+        return d.deepCopy();
+    }
+
+    /** A moving crew can collect a grounded returner nearby, without making it chase the front forever. */
+    public boolean crewPrepareRejoin() {
+        if (!crewDetachedSupply() || !controlsPlayer() || !mc.player.onGround() || mc.player.isFallFlying()
+            || !State.Restock.reconfigureReady(this) || !recoverCursor()) return false;
+        input.stop();
+        stopCrewFlight();
+        brakeCrewFlight();
+        BlockPos travel = crewTravelTarget;
+        crewTravelTarget = null;
+        if (crewNeedsCleanup()) { crewTravelTarget = travel; return false; }
+        return crewReconfigureReady();
+    }
+
+    /** Resume this supplier in place; never restart the other builders or discard their ACKs. */
+    public boolean crewFinishRejoin(int remaining) {
+        if (remaining <= 0 || !crewPrepareRejoin()) return false;
+        length.set(remaining); // Another supplier's detachment may have advanced the assignment's start row.
+        BlockPos origin = crew().origin(), begin = crew().startPosition();
+        int first = (begin.getX() - origin.getX()) * dir.offsetX + (begin.getZ() - origin.getZ()) * dir.offsetZ;
+        int row = crewRejoinRow(origin, dir.offsetX, dir.offsetZ, first, remaining, mc.player.position());
+        workOrigin = origin.offset(dir.offsetX * row, 0, dir.offsetZ * row);
+        crewSupplyOrigin = crewSupplySite = crewTravelTarget = null;
+        crewTravelProgress = null; crewTriedSupplySites.clear();
+        crewSupplyProgress = null; crewSupplyRetries = 0;
+        advancing = false; advancingPaving = List.of(); pavingChecks.clear();
+        completedDistance = row - first;
+        start = Vec3.atBottomCenterOf(begin);
+        jobLayout = layout();
+        walkGoal = null; walkPath = List.of(); idleTicks = 0;
+        State.Restock.resetSupplyJob(this);
+        setState(State.Forward);
+        crewPrepared = false; // Reapply the shared hotbar/cleanup policy after a supply trip.
+        return true;
+    }
+
+    static int crewRejoinRow(BlockPos origin, int dx, int dz, int first, int remaining, Vec3 feet) {
+        return Math.clamp((int) Math.floor((feet.x - origin.getX() - .5) * dx + (feet.z - origin.getZ() - .5) * dz), first, first + remaining - 1);
+    }
+
+    /** Called before opening/placing any supply container; existing recovery state is never reset. */
+    public boolean crewTravelSupply(BlockPos site) {
+        if (crewSupplySite != null) site = crewSupplySite;
+        if (!crewAssigned || !controlsPlayer() || site.getY() != workOrigin.getY()) return false;
+        if (crewSupplyOrigin == null) {
+            if (!crewReconfigureReady()) return false;
+            crewSupplyOrigin = workOrigin.immutable();
+        }
+        // Once at the service site, native restocking owns nearby movement (paired chests, drops).
+        // Requiring its exact center on every supplyReady call would continually restart travel.
+        if (crewTravelTarget == null && workOrigin.equals(site)) return true;
+        crewTravelToSupply = true;
+        crewTravelTarget = site.immutable();
+        return tickCrewTravel();
+    }
+
+    private void relocateCrewSupplySite() {
+        if (!crewDetachedSupply()) return;
+        BlockPos reserved = crew().supplyPosition();
+        if (reserved == null) return;
+        crewTriedSupplySites.add(workOrigin.immutable());
+        var layout = HighwayPlan.supplyLayout(dir.offsetX, dir.offsetZ, width.get(), doubleEnderChests.get());
+        for (int offset : new int[] {-2, 2, -4, 4, -6, 6}) {
+            if (crew().compactSupply() && offset > 0) continue;
+            BlockPos candidate = reserved.offset(dir.offsetX * offset, 0, dir.offsetZ * offset);
+            if (crewTriedSupplySites.contains(candidate) || !standable(cell(candidate)) || crewPositionWaypoint(candidate) == null) continue;
+            boolean clear = layout.positions().stream().allMatch(c -> BlockUtils.canPlaceBlock(candidate.offset(c.x(), c.y(), c.z()), true, Blocks.ENDER_CHEST));
+            if (!clear) continue;
+            crewSupplySite = candidate;
+            crewTravelTarget = null;
+            info("Supply placement blocked; retrying from nearby clear footing at %s.", candidate.toShortString());
+            return;
+        }
+    }
+
+    /** Reuse the flight sweep for optional overshoot, including landing/head clearance. */
+    public boolean crewReturnCorridorClear(BlockPos from, BlockPos to) {
+        return crewDetachedSupply() && controlsPlayer() && from.getY() == workOrigin.getY() && to.getY() == workOrigin.getY()
+            && PrinterFlight.segmentClear(Vec3.atBottomCenterOf(from), Vec3.atBottomCenterOf(to),
+                mc.player.getBbWidth() + .12, 2.3, this::crewTravelClear);
+    }
+
+    /** A returning worker follows the moving crew's collision-checked rendezvous. */
+    public boolean crewTravelRejoin(BlockPos rendezvous) {
+        if (!crewDetachedSupply() || !controlsPlayer() || rendezvous.getY() != workOrigin.getY()
+            || !State.Restock.reconfigureReady(this) || !mc.player.containerMenu.getCarried().isEmpty()) return false;
+        crewTravelToSupply = false;
+        crewTravelTarget = rendezvous.immutable();
+        return tickCrewTravel();
+    }
+
+    private void stopCrewFlight() {
+        crewRunTarget = null;
+        ElytraFly fly = Modules.get().get(ElytraFly.class);
+        if (fly != null && (crewTravelTarget != null || crewTravelEnabledFly || crewSupplyOrigin != null)) {
+            fly.clearAutopilot();
+            // Never disable flight in midair on pause/disconnect; hand steering back to the user safely.
+            if (crewTravelEnabledFly && fly.isActive() && Utils.canUpdate() && mc.player.onGround()) fly.disable();
+        }
+        crewTravelEnabledFly = false;
+        crewLaunchTick = -1;
+    }
+
+    private void brakeCrewFlight() {
+        ElytraFly fly = Modules.get().get(ElytraFly.class);
+        if (crewDetachedSupply() && controlsPlayer() && fly.isActive() && fly.flightMode.get() == ElytraFlightModes.Vanilla)
+            fly.requestAutopilot(Vec3.ZERO); // Suppress automatic takeoff without changing its setting or grounded running.
+    }
+
+    private boolean crewTravelClear(AABB box) {
+        int roadY = workOrigin.getY();
+        if (box.minY < roadY - .05 || box.maxY > mc.level.getMaxY() + 1
+            || crew().supplyTravelBlocked(box)
+            || !PrinterFlight.loaded(box, mc.level.getChunkSource()::hasChunk) || !mc.level.noCollision(mc.player, box)
+            || !mc.level.getEntities(mc.player, box, entity -> entity instanceof LivingEntity && !(entity instanceof Player)).isEmpty()) return false;
+        for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY, box.minZ),
+            BlockPos.containing(Math.nextDown(box.maxX), Math.nextDown(box.maxY), Math.nextDown(box.maxZ)))) {
+            BlockState block = crewVerifiedState(pos);
+            if (!mc.level.getWorldBorder().isWithinBounds(pos) || block == null || !crewClearanceResolved(block, mc.level, pos)) return false;
+        }
+        for (int x = (int) Math.floor(box.minX); x <= (int) Math.floor(Math.nextDown(box.maxX)); x++) for (int z = (int) Math.floor(box.minZ); z <= (int) Math.floor(Math.nextDown(box.maxZ)); z++) {
+            BlockPos floor = new BlockPos(x, roadY - 1, z);
+            BlockState block = crewVerifiedState(floor);
+            if (block == null || !block.getFluidState().isEmpty() || block.is(Blocks.MAGMA_BLOCK) || block.is(Blocks.CAMPFIRE) || block.is(Blocks.SOUL_CAMPFIRE)
+                || !Block.isShapeFullBlock(block.getCollisionShape(mc.level, floor))) return false;
+        }
+        return true;
+    }
+
+    private boolean tickCrewTravel() {
+        waiting = ""; // A prior quiesce must not hide flight/route/equipment diagnostics.
+        if (crewTravelTarget == null || !controlsPlayer()) return false;
+        timingPhase(HighwayHud.Phase.Travel);
+        if (crewTravelTick == mc.player.tickCount) return false;
+        crewTravelTick = mc.player.tickCount;
+        crewRunTarget = null; // Renew only after all travel, inventory and route gates pass.
+        input.stop();
+        if (!crew().canResume()) { stopCrewFlight(); return false; }
+        if (mc.player.input != input) { pauseJob("Another feature took movement control during supply travel."); return false; }
+        idleTicks = 0;
+        if (Modules.get().get(AutoEat.class).eating || Modules.get().get(AutoGap.class).isEating() || Modules.get().get(KillAura.class).attacking
+            || mc.player.isUsingItem() || pauseOnLag.get() && TickRate.INSTANCE.getTimeSinceLastTick() >= 1.5f || !recoverCursor()) {
+            brakeCrewFlight();
+            status = "Waiting safely during supply travel";
+            return false;
+        }
+        if (mc.player.isPassenger() || mc.player.isInWater() || mc.player.isInLava()) { pauseJob("Supply travel interrupted by riding or fluid. Get onto the completed road, then Resume."); return false; }
+        Vec3 from = mc.player.position(), destination = Vec3.atBottomCenterOf(crewTravelTarget);
+        if (crewTravelProgress == null || from.distanceToSqr(crewTravelProgress) >= .25) {
+            crewTravelProgress = from; crewTravelProgressTick = mc.player.tickCount;
+        } else if (mc.player.tickCount - crewTravelProgressTick >= 20) {
+            crewTravelProgressTick = mc.player.tickCount;
+            if (crewLaunchTick >= 0) crewRunUntil = mc.player.tickCount + 100;
+            crewLaunchTick = -1;
+            State.Forward.resetReturnPath(this);
+            if (mc.player.onGround()) stopCrewFlight();
+            MonocleClient.LOG.info("Crew travel stalled; resetting the route (running fallback available): feet={}, target={}, status={}", from, crewTravelTarget, status);
+        }
+        double distance = from.distanceTo(destination);
+        ElytraFly fly = Modules.get().get(ElytraFly.class);
+        String trip = crewTravelToSupply ? "safe supply area" : "crew rendezvous";
+        if (distance < .15 && mc.player.onGround() && !mc.player.isFallFlying()) {
+            input.stop();
+            mc.player.setDeltaMovement(0, mc.player.getDeltaMovement().y, 0);
+            stopCrewFlight();
+            brakeCrewFlight();
+            if (crewTravelToSupply) workOrigin = crewTravelTarget;
+            crewTravelTarget = null;
+            crewTravelProgress = null;
+            status = "Arrived at " + trip;
+            return true;
+        }
+        ItemStack glider = mc.player.getItemBySlot(EquipmentSlot.CHEST);
+        boolean equipped = usableCrewGlider(glider);
+        if (glider.has(net.minecraft.core.component.DataComponents.GLIDER) && fly.isActive() && fly.flightMode.get() != ElytraFlightModes.Vanilla) {
+            status = "Select ElytraFly Vanilla mode, or disable ElytraFly for running supply travel";
+            return false; // Other flight modes cannot accept the navigation/braking lease.
+        }
+        Vec3 waypoint = Vec3.atBottomCenterOf(block(HighwayPlan.travelWaypoint(cell(BlockPos.containing(from.x, workOrigin.getY(), from.z)), cell(crewTravelTarget), 8)));
+        boolean flightLeg = crewFlightLeg(distance, crewTravelToSupply);
+        boolean preferFlight = flightLeg && fly.flightMode.get() == ElytraFlightModes.Vanilla
+            && (mc.player.isFallFlying() || mc.player.tickCount >= crewRunUntil);
+        if (preferFlight && !equipped) {
+            fly.clearAutopilot(); // ChestSwap cannot equip while an autopilot lease pins the chest slot.
+            if (mc.player.onGround() && mc.player.tickCount % 40 == 0
+                && mc.player.getInventory().getNonEquipmentItems().stream().anyMatch(HighwayBuilder::usableCrewGlider))
+                Modules.get().get(ChestSwap.class).requestEquip(true, true);
+        }
+        Vec3 flightWaypoint = equipped && preferFlight ? crewFlightWaypoint(from, waypoint) : null;
+        boolean flyCorridor = flightWaypoint != null;
+        if (mc.player.isFallFlying()) {
+            if (!fly.isActive()) { pauseJob("ElytraFly was disabled during supply travel. Land safely, then Resume."); return false; }
+            Vec3 goal = flyCorridor ? flightWaypoint.add(0, .5, 0) : new Vec3(from.x, workOrigin.getY(), from.z);
+            if (!flyCorridor && PrinterFlight.segmentClear(from, goal, mc.player.getBbWidth() + .12, 1.8, this::crewTravelClear)) {
+                fly.requestAutopilot(Vec3.ZERO);
+                mc.player.stopFallFlying();
+                mc.player.setDeltaMovement(0, -.08, 0);
+                status = "Landing on the completed road";
+                return false;
+            }
+            Vec3 velocity = PrinterFlight.safeVelocity(from, goal, crewFlightSpeed(fly.horizontalSpeed.get()), mc.player.getBbWidth() + .12, Math.max(.7, mc.player.getBbHeight()), this::crewTravelClear);
+            fly.requestAutopilot(velocity);
+            status = velocity.lengthSqr() == 0 ? "Waiting for a clear, supported flight corridor" : "Flying along the highway to " + trip;
+            return false;
+        }
+        if (flyCorridor) {
+            if (!fly.isActive()) { fly.enable(); crewTravelEnabledFly = true; }
+            fly.requestAutopilot(Vec3.ZERO);
+            if (crewLaunchTick < 0 && mc.player.onGround()) {
+                if (!PrinterFlight.segmentClear(from, from.add(0, 1.15, 0), mc.player.getBbWidth() + .12, 1.8, this::crewTravelClear)) {
+                    crewRunUntil = mc.player.tickCount + 100;
+                } else { mc.player.jumpFromGround(); crewLaunchTick = mc.player.tickCount; }
+            }
+            if (crewLaunchTick >= 0) {
+                int elapsed = mc.player.tickCount - crewLaunchTick;
+                if (!mc.player.onGround() && elapsed >= 3 && elapsed % 4 == 3)
+                    mc.getConnection().send(new ServerboundPlayerCommandPacket(mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+                if (elapsed > 20) {
+                    crewLaunchTick = -1;
+                    crewRunUntil = mc.player.tickCount + 100;
+                } else {
+                    status = "Taking off for supply travel";
+                    return false;
+                }
+            }
+        }
+        if (!mc.player.onGround()) { if (fly.isActive()) fly.requestAutopilot(Vec3.ZERO); status = "Landing before running to " + trip; return false; }
+        stopCrewFlight();
+        // Brake even a worn-out equipped glider so auto-takeoff cannot interrupt running.
+        // Without a glider there is no automatic takeoff; leave ChestSwap free to equip one.
+        if (glider.has(net.minecraft.core.component.DataComponents.GLIDER)) brakeCrewFlight();
+        Vec3 step = waypoint;
+        if (!PrinterFlight.segmentClear(from, waypoint, mc.player.getBbWidth() + .12, 1.8, this::crewTravelClear)) {
+            var path = HighwayPlan.route(cell(BlockPos.containing(from.x, workOrigin.getY(), from.z)), cell(BlockPos.containing(waypoint)),
+                c -> c.y() == workOrigin.getY() && crewTravelClear(PrinterFlight.body(Vec3.atBottomCenterOf(block(c)), mc.player.getBbWidth() + .12, 1.8)), this::safeStep);
+            if (path.isEmpty()) { status = "Waiting for a clear, supported highway route to " + trip; return false; }
+            step = Vec3.atBottomCenterOf(block(path.get(Math.min(1, path.size() - 1))));
+        }
+        if (!PrinterFlight.segmentClear(from, step, mc.player.getBbWidth() + .12, 1.8, this::crewTravelClear)) { status = "Waiting for the supply travel route to clear"; return false; }
+        mc.player.setYRot((float) Rotations.getYaw(step));
+        mc.player.setSprinting(distance > 2 && mc.player.getFoodData().getFoodLevel() > 6);
+        input.forward(true);
+        crewRunTarget = step;
+        status = "Running along the highway to " + trip + " (up to 7 blocks/sec)";
+        return false;
+    }
+
+    static boolean usableCrewGlider(ItemStack stack) {
+        return ChestSwap.matchesTarget(stack, true)
+            && (!stack.isDamageableItem() || stack.getMaxDamage() - stack.getDamageValue() > 10);
+    }
+
+    static Vec3 crewRunVelocity(Vec3 from, Vec3 target, double width, Predicate<AABB> clear) {
+        // Vanilla Speed uses blocks/sec; keep its settings untouched and shorten the last step to avoid overshoot.
+        return PrinterFlight.safeVelocity(from, new Vec3(target.x, from.y, target.z), 7.0 / 20, width, 1.8, clear);
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    private void onCrewTravelMove(PlayerMoveEvent event) {
+        if (event.type != MoverType.SELF || !controlsPlayer() || !crewDetachedSupply() || crewTravelTarget == null
+            || mc.player.input != input || !mc.player.onGround() || mc.player.isFallFlying() || mc.player.isPassenger()
+            || mc.player.isInWater() || mc.player.isInLava() || crewLaunchTick >= 0) return;
+        // A stale or withheld request brakes instead of inheriting Speed or residual walking input.
+        boolean fresh = mc.player.tickCount >= crewTravelTick && mc.player.tickCount - crewTravelTick <= 1;
+        Vec3 velocity = fresh && crewRunTarget != null && crew().canResume() && !mc.player.isUsingItem()
+            && !Modules.get().get(AutoEat.class).eating && !Modules.get().get(AutoGap.class).isEating()
+            && !Modules.get().get(KillAura.class).attacking
+            ? crewRunVelocity(mc.player.position(), crewRunTarget, mc.player.getBbWidth() + .12, this::crewTravelClear) : Vec3.ZERO;
+        ((IVec3) event.movement).monocle$set(velocity.x, event.movement.y, velocity.z);
+    }
+
+    static boolean crewFlightLeg(double distance) { return distance > 2; }
+    static boolean crewFlightLeg(double distance, boolean toSupply) { return toSupply ? crewFlightLeg(distance) : distance > .75; }
+
+    private Vec3 crewFlightWaypoint(Vec3 from, Vec3 preferred) {
+        Vec3 flightFrom = new Vec3(from.x, workOrigin.getY() + .5, from.z);
+        java.util.function.Predicate<Vec3> clear = target -> PrinterFlight.segmentClear(flightFrom, target.add(0, .5, 0),
+            mc.player.getBbWidth() + .12, 1.8, this::crewTravelClear);
+        if (clear.test(preferred)) return preferred;
+        // Same verified road, neighboring columns: pass a stopped supplier instead of
+        // requiring the center line to be completely empty. No flying over unknown ground.
+        BlockPos origin = crew().origin();
+        int row = (BlockPos.containing(preferred).getX() - origin.getX()) * dir.offsetX
+            + (BlockPos.containing(preferred).getZ() - origin.getZ()) * dir.offsetZ;
+        int currentRow = (mc.player.getBlockX() - origin.getX()) * dir.offsetX + (mc.player.getBlockZ() - origin.getZ()) * dir.offsetZ;
+        List<Vec3> candidates = new ArrayList<>();
+        for (int column = 0; column < width.get(); column++) {
+            int side = width.get() / 2 - column;
+            Vec3 lane = Vec3.atBottomCenterOf(origin.offset(dir.offsetX * row + dir.offsetZ * side, 0, dir.offsetZ * row - dir.offsetX * side));
+            if (clear.test(lane)) candidates.add(lane);
+            Vec3 sideways = lane.add(dir.offsetX * (currentRow - row), 0, dir.offsetZ * (currentRow - row));
+            if (sideways.distanceToSqr(from) > .25 && clear.test(sideways)
+                && PrinterFlight.segmentClear(sideways.add(0, .5, 0), lane.add(0, .5, 0), mc.player.getBbWidth() + .12, 1.8, this::crewTravelClear)) candidates.add(sideways);
+        }
+        return candidates.stream().min(Comparator.comparingDouble(target -> from.distanceTo(target) + target.distanceTo(preferred))).orElse(null);
+    }
+    // Keep the existing collision-checked autopilot contract (one block/tick); no printer-wide changes.
+    static double crewFlightSpeed(double configured) { return Double.isFinite(configured) ? Math.clamp(configured, .1, 1) : 1; }
+
+    /** Absolute, physically reached progress, never a permission or a client-predicted block count. */
+    public int crewCurrentRow() {
+        if (!crewAssigned || workOrigin == null || !Utils.canUpdate() || mc.level != jobWorld || !mc.isSameThread()) return 0;
+        BlockPos origin = crew().origin(), begin = crew().startPosition();
+        int workRow = (workOrigin.getX() - origin.getX()) * dir.offsetX + (workOrigin.getZ() - origin.getZ()) * dir.offsetZ;
+        int lastRow = (begin.getX() - origin.getX()) * dir.offsetX + (begin.getZ() - origin.getZ()) * dir.offsetZ + length.get();
+        double physicalRow = (mc.player.getX() - origin.getX() - .5) * dir.offsetX + (mc.player.getZ() - origin.getZ() - .5) * dir.offsetZ;
+        return HighwayPlan.reachedRow(workRow, physicalRow, lastRow);
+    }
+
+    /** Exact row feet center; intentionally checks the entire row, not only our currently owned cells. */
+    public boolean crewRowResolved(BlockPos rowCenter) {
+        if (!crewAssigned || !Utils.canUpdate() || mc.level != jobWorld || !mc.isSameThread() || dir.diagonal || rowCenter.getY() != workOrigin.getY()) return false;
+        BlockPos origin = rowCenter.offset(-dir.offsetX, 0, -dir.offsetZ);
+        var clearance = new ArrayList<>(HighwayPlan.front(dir.offsetX, dir.offsetZ, width.get(), height.get()));
+        if (operation.get() == Operation.Build && mineAboveRailings.get())
+            clearance.addAll(HighwayPlan.railings(dir.offsetX, dir.offsetZ, width.get(), height.get(), 1));
+        for (HighwayPlan.Cell cell : clearance) {
+            BlockPos pos = origin.offset(cell.x(), cell.y(), cell.z());
+            BlockState state = crewVerifiedState(pos);
+            if (state == null || !crewClearanceResolved(state, mc.level, pos)) return false;
+        }
+        for (HighwayPlan.PavingCell target : HighwayPlan.paving(dir.offsetX, dir.offsetZ, width.get(), operation.get() != Operation.ClearTunnel, hasPreviewRailings(), hasPreviewSupports())) {
+            HighwayPlan.Cell cell = target.position();
+            BlockPos pos = origin.offset(cell.x(), cell.y(), cell.z());
+            boolean replace = operation.get() == Operation.Build && !target.filler() && (cell.y() == 0 || floor.get() == Floor.Replace);
+            BlockState state = crewVerifiedState(pos);
+            if (state == null || !crewPavingResolved(state, replace, blocksToPlace.get())) return false;
+        }
+        return true;
+    }
+
+    private BlockState crewVerifiedState(BlockPos pos) {
+        if (!mc.level.hasChunkAt(pos) || pendingPlaces.containsKey(pos) || pendingBreaks.containsKey(pos)
+            || mc.level.getBlockStatePredictionHandler().serverVerifiedStates.containsKey(pos.asLong())) return null;
+        return mc.level.getBlockState(pos);
+    }
+
+    static boolean crewClearanceResolved(BlockState state, net.minecraft.world.level.BlockGetter world, BlockPos pos) {
+        return state.getFluidState().isEmpty() && !state.is(Blocks.FIRE) && !state.is(Blocks.SOUL_FIRE) && !state.is(Blocks.POWDER_SNOW)
+            && state.getCollisionShape(world, pos).isEmpty();
+    }
+
+    static boolean crewPavingResolved(BlockState state, boolean replace, List<Block> materials) {
+        return !state.canBeReplaced() && state.getFluidState().isEmpty() && !pavingNeedsMining(state, replace, materials);
+    }
+    /** Nearby, same-level crew setup only; no job input, digging, jumping or speculative footing. */
+    public Vec3 crewPositionWaypoint(BlockPos target) {
+        BlockPos feet = BlockPos.containing(mc.player.getX(), target.getY(), mc.player.getZ());
+        var route = HighwayPlan.route(cell(feet), cell(target), c -> c.y() == target.getY() && standable(c), this::safeStep, 24);
+        if (route.isEmpty()) return null;
+        Vec3 point = Vec3.atBottomCenterOf(block(route.get(Math.min(1, route.size() - 1))));
+        Vec3 delta = point.subtract(mc.player.position());
+        // Check actual off-center body travel, not just the block-center route nodes.
+        for (int i = 0; i <= 8; i++) {
+            Vec3 sample = mc.player.position().add(delta.scale(i / 8.0));
+            if (!standable(cell(BlockPos.containing(sample.x, target.getY(), sample.z))) || !mc.level.noCollision(mc.player,
+                mc.player.getBoundingBox().move(sample.subtract(mc.player.position())))) return null;
+        }
+        return point;
+    }
+    public boolean crewBackstep() {
+        BlockPos target = BlockPos.containing(jobWorkPosition()).offset(-dir.offsetX, 0, -dir.offsetZ);
+        if (!standable(cell(target))) { status = "Waiting for safe crew restock footing behind the section"; return false; }
+        status = "Backing up for crew restocking";
+        return walkToWorkPosition(Vec3.atBottomCenterOf(target));
+    }
+    public boolean crewOwnsDrop(ItemEntity item) { return crewAssigned && State.Restock.crewOwnsDrop(this, item); }
+    public void crewAwaitReturn(ItemStack stack) { crewReturning = true; crewReturnedStack = stack.copy(); }
+    public boolean crewCanReceive() { return Utils.canUpdate() && emptySlots() > 0 && mc.player.containerMenu.getCarried().isEmpty(); }
+    private Vec3 crewYieldGoal;
+    private int crewYieldSearchTick = -10;
+    public boolean crewYielding() { return crewYieldGoal != null; }
+    public Vec3 crewSupplyYieldWaypoint(BlockPos center) {
+        double clearDistance = crew().supplyYieldDistance() + .5;
+        Vec3 waypoint = crewYieldGoal == null ? null : crewPositionWaypoint(BlockPos.containing(crewYieldGoal));
+        if (waypoint != null && crewYieldGoal.distanceToSqr(Vec3.atCenterOf(center)) >= clearDistance * clearDistance) return waypoint;
+        crewYieldGoal = null;
+        if (mc.player.tickCount - crewYieldSearchTick < 10) return null;
+        crewYieldSearchTick = mc.player.tickCount;
+        List<BlockPos> candidates = new ArrayList<>();
+        BlockPos origin = BlockPos.containing(jobWorkPosition());
+        for (int x = -8; x <= 8; x++) for (int z = -8; z <= 8; z++) {
+            BlockPos target = origin.offset(x, 0, z);
+            if (target.distSqr(origin) <= 121 && Vec3.atBottomCenterOf(target).distanceToSqr(Vec3.atCenterOf(center)) >= clearDistance * clearDistance
+                && standable(cell(target))) candidates.add(target);
+        }
+        candidates.sort(Comparator.comparingDouble(pos -> pos.distToCenterSqr(mc.player.position())));
+        // Reuse safe routing: escaping can require first moving sideways or toward the supplier.
+        for (BlockPos target : candidates) {
+            waypoint = crewPositionWaypoint(target);
+            if (waypoint != null) { crewYieldGoal = Vec3.atBottomCenterOf(target); return waypoint; }
+        }
+        return null;
+    }
+    public boolean crewYield(BlockPos center) {
+        double clearDistance = crew().supplyYieldDistance();
+        if (mc.player.position().distanceToSqr(Vec3.atCenterOf(center)) >= clearDistance * clearDistance) { crewYieldGoal = null; return true; }
+        if (!job || paused || !controlsPlayer()) return false;
+        Vec3 waypoint = crewSupplyYieldWaypoint(center);
+        status = waypoint == null ? "Waiting for a supported route out of crew pickup space" : "Yielding safe space for crew restocking";
+        if (waypoint != null) walkToWorkPosition(waypoint);
+        return false;
+    }
     private String status = "Ready to configure", waiting = "";
     private ClientLevel jobWorld;
+    private String jobScope = "";
+    private boolean waitingForWorld, pausedBeforeWorldChange;
     private BlockPos workOrigin;
     private Vec3 walkGoal;
     private List<HighwayPlan.Cell> walkPath = List.of();
@@ -670,6 +1475,7 @@ public class HighwayBuilder extends Module {
     private final Map<BlockPos, Boolean> liquidPlacements = new HashMap<>();
     private BlockPos pavingRepairTarget;
     private final HashMap<BlockPos, BlockState> pendingBreaks = new HashMap<>();
+    private final Set<BlockPos> speculativeBreaks = new HashSet<>();
     private final HashMap<BlockPos, Block> pendingPlaces = new HashMap<>();
     private final HashMap<BlockPos, Integer> placeSequences = new HashMap<>(), breakSequences = new HashMap<>();
     private BlockPos placingTarget;
@@ -695,6 +1501,8 @@ public class HighwayBuilder extends Module {
         for (Setting<?> setting : List.of(operation, heading, width, height, length, floor, railings, cornerBlock, mineAboveRailings, blocksToPlace)) build.add(setting);
         SettingGroup supplies = view.createGroup("Supplies", false);
         for (Setting<?> setting : List.of(searchShulkers, searchEnderChest, maxShulkersPerRestock, doubleEnderChests, keepShulkers, mineEnderChests, dontBreakTools, breakDurability, savePickaxes, saveEchests, minEmpty, fillerBlocks, trashItems)) supplies.add(setting);
+        SettingGroup crewInventory = view.createGroup("Bots · Crew Inventory", false);
+        for (Setting<?> setting : List.of(crewPooling, crewTrash, crewPavingTarget, crewPickTarget, crewFoodTarget, crewFillerTarget)) crewInventory.add(setting);
         SettingGroup mobs = view.createGroup("Mob Handling", false);
         for (Setting<?> setting : List.of(clearPiglins, mobTypes, mobWeapons, mobAge, mobIgnoreNamed, mobPursuit,
             mobWaitTicks, mobTimeout, mobRotate, mobMinHealth, mobChaseRange)) mobs.add(setting);
@@ -711,15 +1519,15 @@ public class HighwayBuilder extends Module {
     public boolean hasJob() { return job; }
     public boolean isJobPaused() { return job && paused; }
     public boolean controlsPlayer() { return isActive() && job && !paused && !suspended && Utils.canUpdate() && mc.level == jobWorld; }
-    public boolean doesDig() { return operation.get() == Operation.Build || operation.get() == Operation.ClearTunnel; }
-    public boolean doesPave() { return operation.get() != Operation.ClearTunnel; }
+    public boolean doesDig() { return (operation.get() == Operation.Build || operation.get() == Operation.ClearTunnel) && (!crewAssigned || crew().doesExcavate()); }
+    public boolean doesPave() { return operation.get() != Operation.ClearTunnel && (!crewAssigned || crew().doesPave()); }
     public int getPreviewWidth() { return width.get(); }
     public int getPreviewHeight() { return height.get(); }
-    public boolean hasPreviewFloor() { return doesPave(); }
-    public boolean hasPreviewRailings() { return doesPave() && operation.get() != Operation.Pave && railings.get(); }
+    public boolean hasPreviewFloor() { return operation.get() != Operation.ClearTunnel; }
+    public boolean hasPreviewRailings() { return hasPreviewFloor() && (crewAssigned || operation.get() != Operation.Pave) && railings.get(); }
     public boolean hasPreviewSupports() { return hasPreviewRailings() && cornerBlock.get(); }
     public boolean isPreviewEnabled() { return preview; }
-    public Vec3 jobWorkPosition() { return workOrigin == null ? mc.player.position() : Vec3.atBottomCenterOf(workOrigin); }
+    public Vec3 jobWorkPosition() { return workOrigin == null ? mc.player.position() : Vec3.atBottomCenterOf(crewAssigned && !crewDetachedSupply() ? crew().lanePosition(workOrigin) : workOrigin); }
 
     private HorizontalDirection selectedHeading() {
         return heading.get() == Heading.Facing ? HorizontalDirection.get(mc.player.getYRot()) : HorizontalDirection.valueOf(heading.get().name());
@@ -738,10 +1546,24 @@ public class HighwayBuilder extends Module {
     public boolean isHudHealthy() { return job && !paused && !suspended && !hud.jammed(); }
     public String getHudStatus() { return isHudHealthy() ? "Healthy" : getStatus(); }
     public String getPavingRate() { return String.format(java.util.Locale.ROOT, "%.1f blocks/sec paved", hud.rate(averageWindow.get().seconds)); }
+    public String getTimingSummary() { return hud.timingSummary(); }
+    private void timingPhase(HighwayHud.Phase phase) { hud.timingPhase(System.nanoTime() / 1e9, phase); }
+    private HighwayHud.Phase stateTimingPhase() {
+        if (state == null) return HighwayHud.Phase.Other;
+        return switch (state) {
+            case MineFront, MineFloor, MineRailings, MineAboveRailings -> HighwayHud.Phase.Mining;
+            case Forward, PlaceCornerBlock, PlaceRailings, PlaceFloor -> HighwayHud.Phase.Paving;
+            case Restock, ThrowOutTrash, MineEnderChests, PlaceEChestBlockade, MineEChestBlockade,
+                PlaceShulkerBlockade, MineShulkerBlockade -> HighwayHud.Phase.Supply;
+            case FillLiquids, MinePaving, ReLevel -> HighwayHud.Phase.Recovery;
+            case DefuseCrystalTraps -> HighwayHud.Phase.Entities;
+            case Center -> HighwayHud.Phase.Other;
+        };
+    }
 
     private void updateHud() {
         double progress = completedDistance + pavingChecks.size() * (dir.diagonal ? Math.sqrt(2) : 1);
-        if (controlsPlayer() && state == State.Forward && advancing) {
+        if (controlsPlayer() && state == State.Forward && advancing && !crewDetachedSupply()) {
             Vec3 offset = mc.player.position().subtract(jobWorkPosition());
             double step = dir.diagonal ? Math.sqrt(2) : 1;
             progress += Math.clamp((offset.x * dir.offsetX + offset.z * dir.offsetZ) / step, 0, step);
@@ -778,17 +1600,18 @@ public class HighwayBuilder extends Module {
         HorizontalDirection direction = job ? dir : selectedHeading();
         if (direction != null && direction.diagonal && width.get() < 3) return "Diagonal highways need a width of at least 3.";
         if (doesPave() && blocksToPlace.get().isEmpty()) return "Choose at least one building material.";
+        if (crewInventoryEnabled()) return null; // A resource-poor bot can receive its starting kit from the crew.
         if (!mc.player.isCreative() && doesDig() && State.Forward.countItem(this, this::usablePickaxe) <= savePickaxes.get() && !hasStoredSupply(this::usablePickaxe))
             return "Add a usable pickaxe above the " + savePickaxes.get() + " reserved, or lower the reserve.";
-        if (doesPave() && !State.Forward.hasItem(this, s -> s.getItem() instanceof BlockItem bi && blocksToPlace.get().contains(bi.getBlock())) && !hasStoredSupply(s -> s.getItem() instanceof BlockItem bi && (blocksToPlace.get().contains(bi.getBlock()) || mineEnderChests.get() && blocksToPlace.get().contains(Blocks.OBSIDIAN) && s.is(Items.ENDER_CHEST)))
-            && !(mineEnderChests.get() && blocksToPlace.get().contains(Blocks.OBSIDIAN) && State.Forward.countItem(this, s -> s.is(Items.ENDER_CHEST)) > saveEchests.get()))
+        if (doesPave() && !State.Forward.hasItem(this, s -> s.getItem() instanceof BlockItem bi && blocksToPlace.get().contains(bi.getBlock())) && !hasStoredSupply(s -> s.getItem() instanceof BlockItem bi && (blocksToPlace.get().contains(bi.getBlock()) || farmEnderChests() && blocksToPlace.get().contains(Blocks.OBSIDIAN) && s.is(Items.ENDER_CHEST)))
+            && !canFarmEnderChests())
             return "Add building blocks or enable a supply source you are carrying.";
         return null;
     }
 
     private boolean hasStoredSupply(Predicate<ItemStack> wanted) {
         ItemStack[] contents = new ItemStack[27];
-        if (searchShulkers.get()) {
+        if (searchInventoryShulkers()) {
             for (int i = 0; i < 36; i++) {
                 ItemStack stack = mc.player.getInventory().getItem(i);
                 if (!Utils.isShulker(stack.getItem())) continue;
@@ -796,12 +1619,12 @@ public class HighwayBuilder extends Module {
                 for (ItemStack item : contents) if (wanted.test(item)) return true;
             }
         }
-        if (searchEnderChest.get() && State.Forward.hasItem(this, s -> s.is(Items.ENDER_CHEST))) {
+        if (searchChestContents() && State.Forward.hasItem(this, s -> s.is(Items.ENDER_CHEST))) {
             int slots = enderChestSearchSlots();
             if (!EChestMemory.isKnown(slots)) return true; // A single-chest observation cannot rule out the second half.
             for (ItemStack stack : EChestMemory.ITEMS.subList(0, Math.min(slots, EChestMemory.ITEMS.size()))) {
                 if (wanted.test(stack)) return true;
-                if (searchShulkers.get() && Utils.isShulker(stack.getItem())) {
+                if (searchInventoryShulkers() && Utils.isShulker(stack.getItem())) {
                     Utils.getItemsInContainerItem(stack, contents);
                     for (ItemStack item : contents) if (wanted.test(item)) return true;
                 }
@@ -816,8 +1639,34 @@ public class HighwayBuilder extends Module {
     }
 
     private boolean hasSupplyContainer() {
-        return searchShulkers.get() && State.Forward.hasItem(this, s -> Utils.isShulker(s.getItem()))
-            || searchEnderChest.get() && State.Forward.hasItem(this, s -> s.is(Items.ENDER_CHEST));
+        return searchInventoryShulkers() && State.Forward.hasItem(this, s -> Utils.isShulker(s.getItem()))
+            || searchChestContents() && State.Forward.hasItem(this, s -> s.is(Items.ENDER_CHEST));
+    }
+
+    /** Expanded workflow order is the execution order; solo jobs retain their existing source toggles. */
+    static List<Action> supplySources(JsonObject workflow, boolean shulkers, boolean contents, boolean farm) {
+        if (workflow != null) {
+            List<Action> sources = new ArrayList<>();
+            for (var entry : workflow.getAsJsonArray("actions")) {
+                Action action = Action.valueOf(entry.getAsString());
+                if (action == Action.InventoryShulkers || action == Action.EnderChestContents || action == Action.EnderChestFarm) sources.add(action);
+            }
+            return List.copyOf(sources);
+        }
+        List<Action> sources = new ArrayList<>();
+        if (shulkers) sources.add(Action.InventoryShulkers);
+        if (contents) sources.add(Action.EnderChestContents);
+        if (farm) sources.add(Action.EnderChestFarm);
+        return List.copyOf(sources);
+    }
+
+    private List<Action> supplySources() { return supplySources(crewAssigned ? crew().workflow() : null, searchShulkers.get(), searchEnderChest.get(), mineEnderChests.get()); }
+    private boolean searchInventoryShulkers() { return supplySources().contains(Action.InventoryShulkers); }
+    private boolean searchChestContents() { return supplySources().contains(Action.EnderChestContents); }
+    private boolean farmEnderChests() { return supplySources().contains(Action.EnderChestFarm); }
+    private boolean canFarmEnderChests() {
+        return farmEnderChests() && blocksToPlace.get().contains(Blocks.OBSIDIAN)
+            && State.Forward.countItem(this, s -> s.is(Items.ENDER_CHEST)) > saveEchests.get();
     }
 
     private boolean needsFoodRestock() {
@@ -829,6 +1678,119 @@ public class HighwayBuilder extends Module {
         return stack.is(ItemTags.PICKAXES) && (!dontBreakTools.get() || HighwayPlan.usableTool(stack.getMaxDamage() - stack.getDamageValue(), stack.getMaxDamage(), breakDurability.get()));
     }
 
+    private boolean forecastWorking() {
+        return job && isActive() && !paused && !suspended && mc.level == jobWorld && restockTask.tasksInactive()
+            && !crewNeedsCleanup() && crewTravelTarget == null && (!crewAssigned || !crew().away() && !crew().detachedSupply())
+            && switch (state) {
+                case Forward, MineFront, MineFloor, MineRailings, MineAboveRailings, PlaceFloor, PlaceRailings, FillLiquids -> true;
+                default -> false;
+            };
+    }
+
+    private void sampleSupplyForecast() {
+        double now = System.nanoTime() / 1e9;
+        boolean working = forecastWorking();
+        if (!working) supplyForecast.sample(now, false, 0, 0, 0);
+        if (now < forecastSampleAt) return;
+        forecastSampleAt = now + 1;
+        List<Integer> tools = new ArrayList<>(), carriedTools = new ArrayList<>();
+        int blocks = 0, carriedBlocks = 0;
+        boolean includeShulkers = searchInventoryShulkers();
+        ItemStack[] contents = new ItemStack[27];
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            blocks += forecastPavingCount(stack);
+            if (stack.is(ItemTags.PICKAXES)) tools.add(forecastDurability(stack));
+            if (includeShulkers && Utils.isShulker(stack.getItem())) {
+                Utils.getItemsInContainerItem(stack, contents);
+                for (ItemStack stored : contents) {
+                    carriedBlocks += forecastPavingCount(stored);
+                    if (stored.is(ItemTags.PICKAXES)) carriedTools.add(forecastDurability(stored));
+                }
+            }
+        }
+        int rawTools = tools.stream().mapToInt(Integer::intValue).sum();
+        carriedTools.addAll(tools);
+        forecastBlocks = blocks;
+        forecastTools = forecastToolCapacity(tools, savePickaxes.get());
+        forecastCarriedBlocks = blocks + carriedBlocks;
+        forecastCarriedTools = forecastToolCapacity(carriedTools, savePickaxes.get());
+        supplyForecast.sample(now, working, blocks, rawTools, tools.size());
+        if (working && forecastRestockAt > 0) {
+            supplyForecast.supplied(now - forecastRestockAt);
+            forecastRestockAt = 0;
+        }
+    }
+
+    private int forecastPavingCount(ItemStack stack) {
+        return stack.getItem() instanceof BlockItem block && blocksToPlace.get().contains(block.getBlock()) ? stack.getCount() : 0;
+    }
+
+    private int forecastDurability(ItemStack stack) {
+        int reserve = dontBreakTools.get() ? (int) Math.ceil(stack.getMaxDamage() * breakDurability.get() / 100.0) : 0;
+        return Math.max(0, stack.getMaxDamage() - stack.getDamageValue() - reserve);
+    }
+
+    static int forecastToolCapacity(List<Integer> tools, int reserve) {
+        // Keep the healthiest reserved picks out of the spendable pool: a conservative ETA.
+        return tools.stream().sorted(java.util.Comparator.reverseOrder()).skip(Math.max(0, reserve)).mapToInt(Integer::intValue).sum();
+    }
+
+    public double crewSupplyEta() {
+        if (!forecastWorking() || System.nanoTime() / 1e9 < forecastRetryAt || !hasSupplyContainer() && !canFarmEnderChests()) return -1;
+        if (emptySlots() == 0 && expendableFillerSlot(mc.player.getInventory(), fillerBlocks.get(), blocksToPlace.get()) < 0) return -1;
+        double blocks = doesPave() ? supplyForecast.pavingSeconds(forecastBlocks) : -1;
+        double picks = doesDig() ? supplyForecast.pickaxeSeconds(forecastTools) : -1;
+        double lead = supplyForecast.leadSeconds();
+        return HighwaySupplyForecast.due(blocks, lead) && HighwaySupplyForecast.due(picks, lead) ? Math.min(blocks, picks)
+            : HighwaySupplyForecast.due(blocks, lead) ? blocks : HighwaySupplyForecast.due(picks, lead) ? picks : -1;
+    }
+
+    public void crewAnticipateSupply() {
+        // Host hints cannot override live state, required ACKs, the supply lock, or the normal low-stock fallback.
+        if (!crewAssigned || crew().hold() || crew().isReleasing() || state != State.Forward
+            || !pendingPlaces.isEmpty() || !pendingBreaks.isEmpty() || crewSupplyEta() < 0) return;
+        forecastSampleAt = 0;
+        sampleSupplyForecast();
+        if (crewSupplyEta() < 0) return;
+        double blocks = doesPave() ? supplyForecast.pavingSeconds(forecastBlocks) : -1;
+        double picks = doesDig() ? supplyForecast.pickaxeSeconds(forecastTools) : -1;
+        int need = anticipatedSupply(doesPave(), forecastBlocks, doesDig(), State.Forward.countItem(this, this::usablePickaxe), savePickaxes.get(), blocks, picks, supplyForecast.leadSeconds());
+        if (need < 0) return;
+        boolean materials = need == 0;
+        if (materials ? !canFarmEnderChests() && !hasStoredSupply(s -> forecastPavingCount(s) > 0) : !hasStoredSupply(this::usablePickaxe)) return;
+        forecastRetryAt = System.nanoTime() / 1e9 + 45;
+        restockTask.setTask(need, true);
+    }
+
+    static int anticipatedSupply(boolean paving, int blocks, boolean digging, int picks, int reserve, double blockEta, double pickEta, double lead) {
+        // Live shortages outrank estimates, including a stale 'no net depletion' estimate at zero blocks.
+        if (digging && picks <= reserve) return 1;
+        if (paving && blocks == 0) return 0;
+        boolean materials = paving && HighwaySupplyForecast.due(blockEta, lead);
+        boolean tools = digging && HighwaySupplyForecast.due(pickEta, lead);
+        return materials && (!tools || blockEta <= pickEta) ? 0 : tools ? 1 : -1;
+    }
+
+    static int restockMinimum(int kind, int carried, int reserve, boolean anticipated) {
+        return kind == 1 ? Math.max(reserve + 1, carried + (anticipated ? 1 : 0)) : kind == 0 ? carried + 1 : 1;
+    }
+
+    static boolean usableSupplyBox(ItemStack box, ItemStack[] contents, Predicate<ItemStack> wanted, List<ItemStack> rejected) {
+        if (!(box.getItem() instanceof BlockItem block && block.getBlock() instanceof ShulkerBoxBlock)
+            || rejected.stream().anyMatch(item -> ItemStack.isSameItemSameComponents(item, box))) return false;
+        for (ItemStack stack : contents) if (wanted.test(stack)) return true;
+        return false;
+    }
+
+    public String crewSupplyForecast() {
+        if (!job) return "";
+        return (doesPave() ? " · Paving " + HighwaySupplyForecast.describe(supplyForecast.pavingSeconds(forecastBlocks))
+            + " (carried " + HighwaySupplyForecast.describe(supplyForecast.pavingSeconds(forecastCarriedBlocks)) + ")" : "")
+            + (doesDig() ? " · Picks " + HighwaySupplyForecast.describe(supplyForecast.pickaxeSeconds(forecastTools))
+            + " (carried " + HighwaySupplyForecast.describe(supplyForecast.pickaxeSeconds(forecastCarriedTools)) + ")" : "");
+    }
+
     private int emptySlots() {
         int free = 0;
         for (int i = 0; i < 36; i++) if (mc.player.getInventory().getItem(i).isEmpty()) free++;
@@ -837,26 +1799,136 @@ public class HighwayBuilder extends Module {
 
     public void startJob() { if (!job) enable(); }
     public void startTestRun() { if (!job) { testLength = 20; startJob(); } }
-    public void stopJob() { if (isActive()) disable(); }
+    public void stopJob() {
+        endingJob = true;
+        try { if (isActive()) disable(); else if (job) onDeactivate(); }
+        finally { endingJob = false; }
+    }
     public void pauseJob() { pauseJob("Manually paused"); }
 
     public void pauseJob(String reason) {
+        crewRetryAt = -1; // Manual pauses and hazards must never inherit an automatic retry.
         if (!job) { status = reason; return; }
         boolean changed = !paused || !status.equals(reason);
         paused = true;
+        timingPhase(HighwayHud.Phase.Paused);
         status = reason;
         waiting = "";
         releaseControls();
-        if (changed && Utils.canUpdate()) warning("Paused: %s", reason);
+        if (waitingForWorld) pausedBeforeWorldChange = true; // Explicit user/host pauses survive reconnect.
+        if (changed && !waitingForWorld && Utils.canUpdate()) warning("Paused: %s", reason);
+    }
+
+    private String worldScope() {
+        return (mc.getCurrentServer() == null ? "local:" + Utils.getWorldName() : mc.getCurrentServer().ip)
+            + "\n" + mc.level.dimension().identifier() + "\n" + mc.player.getUUID();
+    }
+
+    static boolean worldResumeAllowed(String saved, String current, boolean loaded) {
+        return loaded && !saved.isEmpty() && saved.equals(current);
+    }
+
+    private boolean worldReady() {
+        return Utils.canUpdate() && worldResumeAllowed(jobScope, worldScope(), mc.getConnection() != null && mc.gameMode != null
+            && mc.level.hasChunkAt(mc.player.blockPosition()) && mc.level.hasChunkAt(BlockPos.containing(jobWorkPosition())));
+    }
+
+    private void waitForWorld() {
+        if (!job || waitingForWorld) return;
+        waitingForWorld = true;
+        pausedBeforeWorldChange = paused;
+        paused = suspended = true;
+        crewRetryAt = -1;
+        waiting = "";
+        status = "Waiting for the original world and loaded highway chunks";
+        timingPhase(HighwayHud.Phase.Paused);
+        releaseControls();
+    }
+
+    private boolean refreshJobWorld() {
+        if (!worldReady()) return false;
+        if (mc.level != jobWorld) {
+            // Sequence numbers, menus and entity IDs belong to a connection, not the saved job.
+            // Keep paving checks and all supply ownership/UUIDs; fresh chunks must verify the work.
+            jobWorld = mc.level;
+            resetPredictionTracking();
+            pendingPlaces.clear(); pendingBreaks.clear(); speculativeBreaks.clear();
+            placeSequences.clear(); breakSequences.clear();
+            advancing = false;
+            advancingPaving = List.of();
+            resetCursorRecovery();
+            containerId = -1;
+            prevInput = null;
+            blockingMob = combatMob = null;
+            mobReturn = null;
+            mobPreviousSlot = mobToolSlot = -1;
+            idleTicks = mobTicks = walkTicks = 0;
+            crewSupplyProgress = null;
+            State.Restock.worldChanged();
+        }
+        return true;
+    }
+
+    private void pauseRecoverably(String reason) {
+        if (paused) return;
+        pauseJob(reason);
+        if (crewAssigned && crewRetries < 3 && Utils.canUpdate()) crewRetryAt = mc.player.tickCount + 20;
+    }
+
+    static boolean crewRetryAllowed(int attempts, boolean sameWorld, boolean grounded, boolean hostPaused) {
+        return attempts < 3 && sameWorld && grounded && !hostPaused;
+    }
+
+    static boolean restartableSupply(boolean containerOrDrop, boolean protection, boolean returning, boolean inventoryBusy, boolean pendingBlocks) {
+        return !containerOrDrop && !protection && !returning && !inventoryBusy && !pendingBlocks;
+    }
+
+    static boolean supplyRetryDue(int elapsed, int attempts) { return elapsed >= 20 && attempts < 3; }
+
+    private void tickCrewSupplyRecovery() {
+        // Clearance/travel has its own coordinator. Retrying here used to revoke the
+        // reservation every second while teammates were still walking out of its way.
+        if (!crewAssigned || state != State.Restock || !state.supplyStarted()) { crewSupplyProgress = null; crewSupplyRetries = 0; return; }
+        int now = mc.player.tickCount;
+        if (now % 20 != 0) return;
+        int progress = state.supplyProgress(this);
+        if (crewSupplyProgress == null || crewSupplyProgress != progress) {
+            crewSupplyProgress = progress; crewSupplyProgressTick = now; crewSupplyRetries = 0;
+            return;
+        }
+        if (!supplyRetryDue(now - crewSupplyProgressTick, crewSupplyRetries) || !mc.player.onGround()) return;
+        if (normalMining != null || packetMining != null || mc.gameMode.isDestroying()) return; // Slow obsidian mining is work, not a stalled placement.
+        crewSupplyRetries++;
+        State.Forward.resetReturnPath(this);
+        if (!pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()) predictionFlushRequested = true;
+        state.retrySupply(this);
+        crewSupplyProgress = state.supplyProgress(this); // Our own reset is not proof of progress.
+        crewSupplyProgressTick = now;
+        info("Retrying stalled supply step (%d/3); keeping container ownership and pending confirmations.", crewSupplyRetries);
+    }
+
+    private void retryCrewPause() {
+        if (!paused || crewRetryAt < 0 || mc.player.tickCount < crewRetryAt || !crew().canResume()
+            || !crewRetryAllowed(crewRetries, mc.level == jobWorld, mc.player.onGround() && !mc.player.isFallFlying(), crew().isPausedByHost())) return;
+        crewRetryAt = -1;
+        crewRetries++;
+        resumeJob();
+        if (paused) { if (crewRetries < 3) crewRetryAt = mc.player.tickCount + 100; }
+        else {
+            State.Forward.resetReturnPath(this);
+            state.retrySupply(this);
+            info("Retrying stalled crew work (%d/3); supply recovery and block confirmations are preserved.", crewRetries);
+        }
     }
 
     public void resumeJob() {
         if (!job || !paused) return;
-        if (!Utils.canUpdate()) { status = "Join the original world before resuming."; return; }
-        if (mc.level != jobWorld) { status = "World changed. Stop this job and start at the new position."; return; }
-        if (mc.player.position().distanceToSqr(jobWorkPosition()) > 144) { status = "Return within 12 blocks of the build position to resume."; return; }
+        if (!isActive()) { enable(); return; }
+        if (crewAssigned && !crew().canResume()) { status = "Wait for the crew connection or explicitly leave the crew."; return; }
+        if (!refreshJobWorld()) { waitForWorld(); return; }
+        if (crewTravelTarget == null && !crewAwaitingRejoin() && mc.player.position().distanceToSqr(jobWorkPosition()) > 144) { status = "Return within 12 blocks of the build position to resume."; return; }
         if (heading.get() != Heading.Facing && selectedHeading() != dir) { status = "Stop the current job before changing its direction."; return; }
-        String problem = state == State.Restock ? null : readinessProblem();
+        String problem = state == State.Restock || crewAssigned && crewNeedsCleanup() ? null : readinessProblem();
         if (problem != null) { status = problem; return; }
         boolean changed = !layout().equals(jobLayout);
         if (changed && (!pavingChecks.isEmpty() || !temporarySteps.isEmpty() || switch (state) {
@@ -866,7 +1938,7 @@ public class HighwayBuilder extends Module {
             status = "Finish paving/supply/step recovery before changing the layout, or Stop and start a new job.";
             return;
         }
-        paused = suspended = false;
+        paused = suspended = waitingForWorld = pausedBeforeWorldChange = false;
         waiting = "";
         idleTicks = 0;
         mobTicks = 0;
@@ -877,6 +1949,7 @@ public class HighwayBuilder extends Module {
             advancing = false;
             advancingPaving = List.of();
             pendingBreaks.clear();
+            speculativeBreaks.clear();
             pendingPlaces.clear();
             liquidPlacements.clear();
             setState(State.Forward);
@@ -915,14 +1988,17 @@ public class HighwayBuilder extends Module {
     }
 
     private void releaseControls() {
+        stopCrewFlight();
         actionEpoch++;
         pendingPlaces.keySet().removeIf(pos -> !placeSequences.containsKey(pos));
         if (input != null) input.stop();
         if (Utils.canUpdate()) {
             if (mc.player.input == input && prevInput != null) mc.player.input = prevInput;
-            if (drawingBow) mc.gameMode.releaseUsingItem(mc.player);
-            stopWorkMining();
-            restoreMobSlot();
+            if (mc.level == jobWorld && mc.getConnection() != null && mc.gameMode != null) {
+                if (drawingBow) mc.gameMode.releaseUsingItem(mc.player);
+                stopWorkMining();
+                restoreMobSlot();
+            }
         }
         drawingBow = false;
         normalMining = packetMining = null;
@@ -932,14 +2008,27 @@ public class HighwayBuilder extends Module {
     }
 
     private void stopWorkMining() {
-        if (normalMining != null) mc.getConnection().send(new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK, normalMining.blockPos, normalMining.direction));
-        if (packetMining != null) mc.getConnection().send(new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK, packetMining.blockPos, packetMining.direction));
-        mc.gameMode.stopDestroyBlock();
+        if (mc.getConnection() != null) {
+            if (normalMining != null) mc.getConnection().send(new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK, normalMining.blockPos, normalMining.direction));
+            if (packetMining != null) mc.getConnection().send(new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK, packetMining.blockPos, packetMining.direction));
+            if (mc.gameMode != null) mc.gameMode.stopDestroyBlock();
+        }
         normalMining = packetMining = null;
     }
 
     @Override
     public void onActivate() {
+        if (crewAssigned && job) {
+            crewToggledOff = false;
+            if (crew().away()) { status = "Waiting for the host to restore this worker's lane"; return; }
+            if (crew().isPausedByHost() && !crew().isReleasing()) { status = "Crew is paused by the host; resume it from Bots."; return; }
+            resumeJob();
+            return;
+        }
+        if ((crewAssigned || crew().localAssigned()) && !crewStarting) {
+            status = "Bots owns this job. Manage it in the Bots tab; End job before starting a standalone highway.";
+            warning("%s", status); disable(); return;
+        }
         String problem = readinessProblem();
         if (problem != null) {
             status = problem;
@@ -950,10 +2039,22 @@ public class HighwayBuilder extends Module {
         dir = selectedHeading();
         leftDir = dir.rotateLeftSkipOne();
         rightDir = leftDir.opposite();
-        workOrigin = mc.player.blockPosition();
+        workOrigin = crewAssigned ? crew().startPosition() : mc.player.blockPosition();
         start = Vec3.atBottomCenterOf(workOrigin);
         jobLayout = layout();
         jobWorld = mc.level;
+        jobScope = worldScope();
+        waitingForWorld = pausedBeforeWorldChange = false;
+        String session = crewAssigned ? crew().jobId() : "";
+        if (!crewAssigned || !session.equals(forecastJob)) {
+            supplyForecast = new HighwaySupplyForecast();
+            forecastRestockAt = forecastRetryAt = 0;
+            hud.resetTiming(System.nanoTime() / 1e9);
+        }
+        hud.resumeTiming(System.nanoTime() / 1e9);
+        forecastJob = session;
+        forecastSampleAt = 0;
+        supplyForecast.sample(System.nanoTime() / 1e9, false, 0, 0, 0);
         job = true;
         paused = suspended = false;
         advancing = false;
@@ -968,6 +2069,7 @@ public class HighwayBuilder extends Module {
         hud.reset(System.nanoTime() / 1e9);
         resetPredictionTracking();
         pendingBreaks.clear();
+        speculativeBreaks.clear();
         pendingPlaces.clear();
         liquidPlacements.clear();
         breakSequences.clear();
@@ -992,8 +2094,16 @@ public class HighwayBuilder extends Module {
 
     @Override
     public void onDeactivate() {
+        if (retainCrewOnToggle(crewAssigned, job, endingJob)) {
+            crewToggledOff = true;
+            if (state == State.Restock && Utils.canUpdate() && mc.level == jobWorld && !waitingForWorld)
+                state.retrySupply(this); // Release only a provably unused reservation; owned containers stay tracked.
+            pauseJob("Highway Builder toggled off; toggle it on or use host Resume to rejoin this job.");
+            return; // Keep the exact lane, supply FSM, drop identities and pending confirmations.
+        }
         boolean hadJob = job;
         if (job) updateHud();
+        if (job) hud.stopTiming(System.nanoTime() / 1e9);
         releaseControls();
         if (job && Utils.canUpdate()) {
             info("Completed road: (highlight)%.1f(default) blocks. Broken: (highlight)%d(default). Placed: (highlight)%d(default).",
@@ -1001,11 +2111,13 @@ public class HighwayBuilder extends Module {
             if (!temporarySteps.isEmpty()) info("Stopped with %d temporary work step(s) left nearby.", temporarySteps.size());
         }
         job = false;
+        waitingForWorld = pausedBeforeWorldChange = false;
         paused = false;
         suspended = true;
         testLength = 0;
         resetPredictionTracking();
         pendingBreaks.clear();
+        speculativeBreaks.clear();
         pendingPlaces.clear();
         liquidPlacements.clear();
         breakSequences.clear();
@@ -1021,6 +2133,8 @@ public class HighwayBuilder extends Module {
         listen(preview);
     }
 
+    static boolean retainCrewOnToggle(boolean crew, boolean job, boolean ending) { return crew && job && !ending; }
+
     @Override
     public void error(String message, Object... args) {
         String reason = String.format(message, args);
@@ -1034,11 +2148,58 @@ public class HighwayBuilder extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        diagnosticTickAt = System.nanoTime();
+        diagnosticGate = "world";
         if (!job) { updatePreview(); return; }
         updateHud();
-        if (!Utils.canUpdate()) return;
-        if (mc.level != jobWorld) { pauseJob("World changed. Stop this job before starting here."); return; }
-        if (paused || suspended) return;
+        if (!Utils.canUpdate() || mc.getConnection() == null || mc.gameMode == null || mc.level != jobWorld) waitForWorld();
+        if (waitingForWorld) {
+            if (refreshJobWorld() && !crewAssigned && !pausedBeforeWorldChange && isActive()) resumeJob();
+            if (waitingForWorld) { timingPhase(HighwayHud.Phase.Paused); return; }
+        }
+        sampleSupplyForecast();
+        if (crewAssigned) retryCrewPause();
+        diagnosticGate = "paused/suspended";
+        if (paused || suspended) { timingPhase(HighwayHud.Phase.Paused); return; }
+        timingPhase(stateTimingPhase());
+        if (crewAssigned && crew().isReleasing() && !crewNeedsCleanup()) {
+            crewQuiesce();
+            crew().releaseSupply();
+            status = "Work stopped; waiting for cancellation acknowledgments";
+            timingPhase(HighwayHud.Phase.Crew);
+            return;
+        }
+        // Honor cancellation first; eating then owns any crew hold/travel or native work.
+        diagnosticGate = "eating";
+        if (Modules.get().get(AutoEat.class).eating || Modules.get().get(AutoGap.class).isEating()) {
+            pauseForEating();
+            return;
+        }
+        if (crewInventoryEnabled() && crewPendingResource >= 0 && state == State.Forward && !crewNeedsCleanup()
+            && pendingPlaces.isEmpty() && pendingBreaks.isEmpty()) {
+            int resource = crewPendingResource;
+            crewPendingResource = -1;
+            crew().requestCrewResource(resource);
+        }
+        diagnosticGate = "inventory-exchange";
+        if (crewInventoryEnabled() && crew().tickInventoryExchange(this)) return;
+        if (crewDetachedSupply() && mc.player.onGround()) brakeCrewFlight();
+        diagnosticGate = "travel/rejoin";
+        if (crewTravelTarget != null) { timingPhase(HighwayHud.Phase.Travel); tickCrewTravel(); return; }
+        if (crewAwaitingRejoin() && !crewNeedsCleanup()) {
+            // The host has not handed us a new lane yet. The old work origin is the distant
+            // supply site: entering Forward here can pause or start a second supply trip.
+            crewQuiesce();
+            if (!paused) status = "Supply recovery complete; waiting for the host's lane handoff";
+            timingPhase(HighwayHud.Phase.Crew);
+            return;
+        }
+        diagnosticGate = "crew-hold";
+        if (crewAssigned && crew().hold()) {
+            timingPhase(HighwayHud.Phase.Crew);
+            crew().holdStep(this);
+            return;
+        }
         if (idleTicks >= 40 && mc.player.tickCount % 100 == 0) {
             MonocleClient.LOG.info("Highway stalled: state={}, status={}, feet={}, held={}, pendingPlaces={}, pendingBreaks={}, normalMine={}, packetMine={}, vanillaMining={}, flush={}, probe={}",
                 state, status, mc.player.position(), mc.player.getMainHandItem(), pendingPlaces, pendingBreaks,
@@ -1048,10 +2209,11 @@ public class HighwayBuilder extends Module {
         if (!layout().equals(jobLayout)) { pauseJob("Setup changed. Review the plan, then Resume to apply it."); return; }
         if (width.get() < 3 && dir.diagonal) { pauseJob("Diagonal highways require width 3 or greater."); return; }
 
-        String reason = Modules.get().get(AutoEat.class).eating || Modules.get().get(AutoGap.class).isEating() ? "Paused for eating"
-            : Modules.get().get(KillAura.class).attacking ? "Paused for combat"
+        diagnosticGate = "combat/server-lag";
+        String reason = Modules.get().get(KillAura.class).attacking ? "Paused for combat"
             : pauseOnLag.get() && TickRate.INSTANCE.getTimeSinceLastTick() >= 1.5f ? "Waiting for server" : "";
         if (!reason.isEmpty()) {
+            timingPhase(reason.equals("Waiting for server") ? HighwayHud.Phase.Verification : HighwayHud.Phase.Entities);
             waiting = reason;
             input.stop();
             actionEpoch++;
@@ -1060,15 +2222,30 @@ public class HighwayBuilder extends Module {
             return;
         }
         waiting = "";
+        diagnosticGate = "input/supply-reservation";
         if (mc.player.input != input) { pauseJob("Another feature took movement control."); return; }
+        tickCrewSupplyRecovery();
+        if (crewAssigned && switch (state) { case MineEnderChests, PlaceEChestBlockade, MineEChestBlockade -> true; default -> false; }) {
+            if (!crew().supplyReady(this)) { timingPhase(HighwayHud.Phase.Crew); idleTicks = 0; status = "Waiting for crew supply reservation"; return; }
+        }
+        if (crewAssigned && state == State.Forward && pendingPlaces.isEmpty() && pendingBreaks.isEmpty() && !crewNeedsCleanup()) {
+            crew().releaseSupply();
+            if (crewDetachedSupply()) { input.stop(); idleTicks = 0; status = "Ready to return from the supply area"; return; }
+        }
         if (mc.player.position().distanceToSqr(jobWorkPosition()) > 144) { pauseJob("Moved too far from the build position."); return; }
-        if (!recoverCursor()) return;
-        if (state.recoverSealing(this)) return;
-        if (tickPredictionFlush()) return;
+        diagnosticGate = "cursor";
+        if (!recoverCursor()) { timingPhase(HighwayHud.Phase.Supply); return; }
+        diagnosticGate = "inventory-preparation";
+        if (!crewPrepared && prepareCrewInventory()) return;
+        diagnosticGate = "sealing-recovery";
+        if (state.recoverSealing(this)) { timingPhase(HighwayHud.Phase.Recovery); return; }
+        diagnosticGate = "prediction-flush";
+        if (tickPredictionFlush()) { timingPhase(HighwayHud.Phase.Verification); return; }
 
-        if (tickMobCombat()) return;
+        diagnosticGate = "mob-combat";
+        if (tickMobCombat()) { timingPhase(HighwayHud.Phase.Entities); return; }
 
-        count = queuedHotbarSlots = 0;
+        count = breakCount = queuedHotbarSlots = 0;
         waitingForMob = false;
         if (mc.player.getY() < workOrigin.getY() - 0.5 && state != State.ReLevel) setState(State.ReLevel);
         if ((state == State.MineFront || state == State.MineFloor || state == State.MineRailings || state == State.MineAboveRailings) && needsBarrierSealing()) {
@@ -1078,13 +2255,27 @@ public class HighwayBuilder extends Module {
             setState(State.FillLiquids);
         }
         tickDoubleMine();
+        diagnosticGate = "state:" + state;
         if (!paused) state.tick(this);
-        if (waitingForMob) paveWhileWaiting();
+        if (waitingForMob) { timingPhase(HighwayHud.Phase.Entities); paveWhileWaiting(); }
+        breakAhead();
 
         if (breakTimer > 0) breakTimer--;
         if (placeTimer > 0) placeTimer--;
-        if (++idleTicks > 400 && !paused && !state.retryReturn(this)) pauseJob("No progress for 20 seconds while " + status.toLowerCase()
+        if (++idleTicks > 400 && !paused && !state.retryReturn(this)) pauseRecoverably("No progress for 20 seconds while " + status.toLowerCase()
             + " (" + pendingPlaces.size() + " placements, " + pendingBreaks.size() + " breaks awaiting confirmation). Check the server response, then Resume.");
+    }
+
+    private void pauseForEating() {
+        timingPhase(HighwayHud.Phase.Entities);
+        waiting = "Paused for eating";
+        input.stop();
+        if (crewDetachedSupply()) brakeCrewFlight();
+        actionEpoch++;
+        pendingPlaces.keySet().removeIf(pos -> !placeSequences.containsKey(pos));
+        if (miningInProgress()) stopWorkMining();
+        // The food slot has already replaced any bow; do not release Auto Eat's new use.
+        drawingBow = false;
     }
 
     private int pendingPredictionSince = -1, predictionProbeTick = -1, predictionProbeSequence = -1, predictionProbeAttempts;
@@ -1111,16 +2302,30 @@ public class HighwayBuilder extends Module {
         return pendingSince >= 0 && tick - pendingSince >= 12 && (previousProbe < 0 || tick - previousProbe >= 40);
     }
 
-    static boolean sealingRetryDue(int stalledTicks) { return stalledTicks >= 40; }
+    static boolean sealingRetryDue(long stalledNanos, int pingMillis) {
+        return stalledNanos >= Math.max(0L, pingMillis) * 2_000_000L;
+    }
+
+    static int sealingProbeTicks(int pingMillis) {
+        return (int) Math.max(1, Math.ceilDiv(Math.max(0L, pingMillis) * 2, 50));
+    }
+
+    static boolean sealingRecoveryBlock(BlockState state, boolean plug, boolean pendingPlacement, boolean container, boolean playerFooting) {
+        return !plug && !pendingPlacement && !container && !playerFooting && !state.canBeReplaced() && state.getFluidState().isEmpty();
+    }
 
     static boolean serverConfirmedBreak(BlockState before, BlockState serverState) {
         return before != null && !before.equals(serverState);
     }
 
+    private boolean miningInProgress() {
+        return normalMining != null || packetMining != null || mc.gameMode.isDestroying();
+    }
+
     private boolean tickPredictionFlush() {
         // Explicit reconciliation must not wait on a mining task that it is meant to recover.
         if (predictionFlushRequested) stopWorkMining();
-        boolean pending = predictionFlushRequested || !pendingBreaks.isEmpty()
+        boolean pending = predictionFlushRequested || hasPendingExcavation()
             || pendingPlaces.keySet().stream().anyMatch(pos -> !isBackgroundPaving(pos));
         if (!pending && predictionProbeSequence < 0) {
             pendingPredictionSince = -1;
@@ -1128,23 +2333,27 @@ public class HighwayBuilder extends Module {
             return false;
         }
         int tick = mc.player.tickCount;
+        boolean fastRecovery = state.fastSealingRecovery();
         if (pendingPredictionSince < 0) pendingPredictionSince = tick;
         if (predictionProbeSequence >= 0) {
-            input.stop();
-            status = "Waiting for server to resolve block predictions";
-            if (tick - predictionProbeTick < 40) return true;
-            if (predictionProbeAttempts >= 3 || tick - predictionProbeTick >= 120) {
+            if (predictionFlushRequested) {
+                input.stop();
+                status = "Waiting for server to resolve canceled block predictions";
+            }
+            if (tick - predictionProbeTick < (fastRecovery ? sealingProbeTicks(PlayerUtils.getPing()) : 40)) return predictionFlushRequested;
+            if (predictionFlushRequested && ((!fastRecovery && predictionProbeAttempts >= 3) || tick - predictionProbeTick >= 120)) {
                 predictionProbeSequence = -1;
                 predictionProbeAttempts = 0;
                 predictionFlushRequested = true;
-                pauseJob("The server has not acknowledged block verification. No new blocks were placed; Resume to retry.");
+                pauseRecoverably("The server has not acknowledged block verification. No new blocks were placed; Resume to retry.");
                 return true;
             }
+            // Fast retries must not turn a late ACK into a false failure or an unbounded packet burst.
+            if (fastRecovery && predictionProbeAttempts >= 3) return predictionFlushRequested;
         }
-        if (normalMining != null || packetMining != null || mc.gameMode.isDestroying()
-            || !predictionFlushRequested && state.name().startsWith("Mine"))
-            return predictionProbeSequence >= 0;
-        if (predictionProbeSequence < 0 && !predictionProbeDue(tick, pendingPredictionSince, predictionProbeTick)) {
+        // An ABORT probe itself interrupts server-side mining, even when aimed into air.
+        if (miningInProgress()) return predictionFlushRequested;
+        if (predictionProbeSequence < 0 && !fastRecovery && !predictionProbeDue(tick, pendingPredictionSince, predictionProbeTick)) {
             if (predictionFlushRequested) {
                 input.stop();
                 status = "Waiting to verify canceled placement";
@@ -1154,19 +2363,21 @@ public class HighwayBuilder extends Module {
         }
         BlockPos probe = BlockPos.containing(mc.player.getEyePosition());
         if (!mc.level.getBlockState(probe).isAir()) {
-            if (predictionProbeSequence >= 0) return true;
+            if (predictionProbeSequence >= 0) return predictionFlushRequested;
             if (predictionFlushRequested) {
                 pauseJob("Move into clear space before verifying the canceled placement, then Resume.");
                 return true;
             }
             return false;
         }
-        input.stop();
-        status = "Verifying stalled block predictions";
-        actionEpoch++;
-        pendingPlaces.keySet().removeIf(pos -> !placeSequences.containsKey(pos));
+        if (predictionFlushRequested) {
+            input.stop();
+            status = "Verifying canceled block predictions";
+            actionEpoch++;
+            pendingPlaces.keySet().removeIf(pos -> !placeSequences.containsKey(pos));
+        }
         predictionProbeTick = tick;
-        predictionProbeAttempts++;
+        predictionProbeAttempts = Math.min(3, predictionProbeAttempts + 1);
         sendingPredictionProbe = true;
         try {
             // A sequenced ABORT acknowledges prior predictions without starting a mine or placing a block.
@@ -1177,11 +2388,12 @@ public class HighwayBuilder extends Module {
         } finally {
             sendingPredictionProbe = false;
         }
-        return true;
+        return predictionFlushRequested;
     }
 
     public void onServerBlockUpdate(BlockPos position, BlockState serverState) {
         if (!job || !Utils.canUpdate() || mc.level != jobWorld) return;
+        if (crewAssigned && position.distSqr(workOrigin) <= 144) crew().workChanged();
         int pendingBefore = pendingPlaces.size() + pendingBreaks.size();
         Block expected = pendingPlaces.get(position);
         if (expected != null && serverState.is(expected)) {
@@ -1192,6 +2404,7 @@ public class HighwayBuilder extends Module {
         }
         if (serverConfirmedBreak(pendingBreaks.get(position), serverState)) {
             pendingBreaks.remove(position);
+            speculativeBreaks.remove(position);
             breakSequences.remove(position);
             blocksBroken++;
             idleTicks = 0;
@@ -1202,6 +2415,7 @@ public class HighwayBuilder extends Module {
 
     public void onServerBlockAck(int sequence) {
         if (!job || !Utils.canUpdate() || mc.level != jobWorld) return;
+        if (crewAssigned) crew().workChanged();
         int pendingBefore = pendingPlaces.size() + pendingBreaks.size();
         boolean probeAcknowledged = predictionProbeSequence >= 0 && sequence >= predictionProbeSequence;
         if (probeAcknowledged) {
@@ -1214,6 +2428,7 @@ public class HighwayBuilder extends Module {
             if (sent != null && sent <= sequence) {
                 if (mc.level.getBlockState(entry.getKey()).is(entry.getValue())) {
                     blocksPlaced++;
+                    crewRetries = 0;
                     idleTicks = 0;
                 }
                 placeSequences.remove(entry.getKey());
@@ -1227,6 +2442,7 @@ public class HighwayBuilder extends Module {
             if (sent > sequence) return false;
             if (serverConfirmedBreak(entry.getValue(), mc.level.getBlockState(entry.getKey()))) {
                 blocksBroken++;
+                crewRetries = 0;
                 idleTicks = 0;
             } else if ((!probeAcknowledged && state != State.Forward) || normalMining != null || packetMining != null || mc.gameMode.isDestroying()) {
                 return false; // A START acknowledgment is not the end of an ongoing mine.
@@ -1234,6 +2450,7 @@ public class HighwayBuilder extends Module {
             breakSequences.remove(entry.getKey());
             return true;
         });
+        speculativeBreaks.retainAll(pendingBreaks.keySet());
         if (!predictionFlushRequested && pendingPlaces.size() + pendingBreaks.size() < pendingBefore)
             pendingPredictionSince = mc.player.tickCount;
     }
@@ -1249,6 +2466,7 @@ public class HighwayBuilder extends Module {
                 breakSequences.put(packet.getPos().immutable(), packet.getSequence());
             if (packet.getAction() == ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK && !sendingPredictionProbe) {
                 pendingBreaks.remove(packet.getPos());
+                speculativeBreaks.remove(packet.getPos());
                 breakSequences.remove(packet.getPos());
             }
         }
@@ -1261,7 +2479,7 @@ public class HighwayBuilder extends Module {
 
     @EventHandler
     private void onGameLeave(GameLeftEvent event) {
-        if (job) pauseJob("Disconnected. Stop and restart after checking the new world and position.");
+        waitForWorld();
         suspended = true;
         inventory = false;
     }
@@ -1352,8 +2570,13 @@ public class HighwayBuilder extends Module {
     }
 
     private boolean waitForMob(AABB area) {
+        return waitForMob(area, false);
+    }
+
+    private boolean waitForMob(AABB area, boolean walking) {
         LivingEntity blocker = mc.level.getEntitiesOfClass(LivingEntity.class, area,
             entity -> entity != mc.player && entity.isAlive() && !entity.isSpectator() && entity.blocksBuilding
+                && !(walking && crewAssigned && entity instanceof Player && crew().activeCoworker(entity.getUUID()))
                 && !entity.isPassengerOfSameVehicle(mc.player)).stream()
             .min(Comparator.<LivingEntity>comparingInt(entity -> mobTargetAllowed(entity) ? 0 : 1)
                 .thenComparingDouble(entity -> entity.distanceToSqr(mc.player))).orElse(null);
@@ -1551,7 +2774,7 @@ public class HighwayBuilder extends Module {
                     MonocleClient.LOG.info("Highway route rejected: from={}, to={}, reason={}, floor={}, body={}, above={}, pendingPlaces={}",
                         walkingFeet(), goal, reason, mc.level.getBlockState(goal.below()), mc.level.getBlockState(goal), mc.level.getBlockState(goal.above()), pendingPlaces);
                 }
-                if (walkFailures >= 40) pauseJob("No safe walking route to " + goal.toShortString() + ": " + reason + ". Check the route, then Resume.");
+                if (walkFailures >= 40) pauseRecoverably("No safe walking route to " + goal.toShortString() + ": " + reason + ". Check the route, then Resume.");
                 else if (!pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()) requestPredictionFlush();
                 return false;
             }
@@ -1581,11 +2804,17 @@ public class HighwayBuilder extends Module {
             walkTicks = 0;
             idleTicks = 0;
             lastWalkDistance = distance;
-        } else if (++walkTicks > 100) {
-            if (!state.retryReturn(this)) pauseJob("Movement blocked while " + status.toLowerCase() + ". Clear the path, then Resume.");
+        } else if (crewAssigned && ++walkTicks >= 20) {
+            walkGoal = null;
+            input.stop();
+            if (!pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()) requestPredictionFlush();
+            status = "Replanning stalled crew movement";
+            return false;
+        } else if (!crewAssigned && ++walkTicks > 100) {
+            if (!state.retryReturn(this)) pauseRecoverably("Movement blocked while " + status.toLowerCase() + ". Clear the path, then Resume.");
             return false;
         }
-        if (mobReturn == null && waitForMob(mc.player.getBoundingBox().expandTowards(point.subtract(current).normalize().scale(0.5)))) return false;
+        if (mobReturn == null && waitForMob(mc.player.getBoundingBox().expandTowards(point.subtract(current).normalize().scale(0.5)), true)) return false;
         input.stop();
         mc.player.setYRot((float) Rotations.getYaw(point));
         input.forward(true);
@@ -1595,7 +2824,16 @@ public class HighwayBuilder extends Module {
     }
 
     static Vec3 backstepTarget(Vec3 position, float yaw) {
-        return position.subtract(Vec3.directionFromRotation(0, yaw).normalize());
+        return backstepTarget(position, yaw, 1);
+    }
+
+    static Vec3 backstepTarget(Vec3 position, float yaw, double distance) {
+        return position.subtract(Vec3.directionFromRotation(0, yaw).normalize().scale(distance));
+    }
+
+    static boolean sealingBackstepReached(Vec3 start, Vec3 current, Vec3 target) {
+        Vec3 delta = target.subtract(start);
+        return current.subtract(start).dot(delta.normalize()) >= delta.length() - .02;
     }
 
     static Vec3 walkingTarget(Vec3 position, int roadY) {
@@ -1603,9 +2841,29 @@ public class HighwayBuilder extends Module {
         return Math.abs(position.y - roadY) <= 0.25 ? new Vec3(position.x, roadY, position.z) : position;
     }
 
+    static Vec3 crewReturnTarget(int dx, int dz, Vec3 player, Vec3 work, boolean sharedLane) {
+        Vec3 offset = player.subtract(work);
+        double forward = offset.x * dx + offset.z * dz;
+        double sideways = offset.x * dz - offset.z * dx;
+        if (forward >= -.1 && (!sharedLane || Math.abs(sideways) < .3)) return null;
+        // Walking accepts .15 from its target, but row reporting requires at least center-.1.
+        // Aim .1 into the current row so those tolerances cannot leave us permanently one row behind.
+        // If already ahead, correct sideways without steering backward to an old center.
+        return work.add(dx * Math.max(.1, forward), 0, dz * Math.max(.1, forward));
+    }
+
+    private boolean returnToCrewWorkRow() {
+        if (!crewAssigned || crewDetachedSupply()) return false;
+        Vec3 target = crewReturnTarget(dir.offsetX, dir.offsetZ, mc.player.position(), jobWorkPosition(), crew().breakOrder());
+        if (target == null) return false;
+        status = "Returning to crew work row";
+        walkToWorkPosition(target); // Existing collision, footing, prediction, combat and pause guards still apply.
+        return true;
+    }
+
     private boolean advanceRoad() {
         if (predictionFlushRequested) { input.stop(); return false; }
-        Vec3 next = Vec3.atBottomCenterOf(workOrigin.offset(dir.offsetX, 0, dir.offsetZ));
+        Vec3 next = jobWorkPosition().add(dir.offsetX, 0, dir.offsetZ);
         Vec3 current = mc.player.position();
         if (reachedNextSection()) {
             walkGoal = null;
@@ -1623,7 +2881,7 @@ public class HighwayBuilder extends Module {
         int samples = Math.max(1, (int) Math.ceil(current.distanceTo(next) * 4));
         for (int i = 0; i <= samples; i++) {
             Vec3 point = current.lerp(next, (double) i / samples);
-            if (waitForMob(mc.player.getBoundingBox().move(point.subtract(current)))) return false;
+            if (waitForMob(mc.player.getBoundingBox().move(point.subtract(current)), true)) return false;
             int feetY = HighwayPlan.roadFeetY(point.y, workOrigin.getY());
             for (double x : new double[] {-0.29, 0.29}) for (double z : new double[] {-0.29, 0.29}) {
                 if (!standable(cell(BlockPos.containing(point.x + x, feetY, point.z + z)))) {
@@ -1640,7 +2898,7 @@ public class HighwayBuilder extends Module {
     }
 
     private boolean reachedNextSection() {
-        Vec3 next = Vec3.atBottomCenterOf(workOrigin.offset(dir.offsetX, 0, dir.offsetZ));
+        Vec3 next = jobWorkPosition().add(dir.offsetX, 0, dir.offsetZ);
         return HighwayPlan.passedSection(dir.offsetX, dir.offsetZ, mc.player.getX() - next.x, mc.player.getZ() - next.z)
             && Math.abs(mc.player.getY() - next.y) < 0.25 && mc.player.onGround();
     }
@@ -1650,8 +2908,14 @@ public class HighwayBuilder extends Module {
     }
 
     private List<PavingTarget> pavingTargets(int sectionOffset) {
+        if (!doesPave()) return List.of();
+        return plannedPavingTargets(sectionOffset).stream()
+            .filter(p -> !crewAssigned || crew().ownsPaving(p.position())).toList();
+    }
+
+    private List<PavingTarget> plannedPavingTargets(int sectionOffset) {
         BlockPos origin = workOrigin.offset(dir.offsetX * sectionOffset, 0, dir.offsetZ * sectionOffset);
-        return HighwayPlan.paving(dir.offsetX, dir.offsetZ, width.get(), doesPave(), hasPreviewRailings(), hasPreviewSupports()).stream()
+        return HighwayPlan.paving(dir.offsetX, dir.offsetZ, width.get(), hasPreviewFloor(), hasPreviewRailings(), hasPreviewSupports()).stream()
             .map(p -> new PavingTarget(origin.offset(p.position().x(), p.position().y(), p.position().z()), p.filler(),
                 operation.get() == Operation.Build && !p.filler() && (p.position().y() == 0 || floor.get() == Floor.Replace))).toList();
     }
@@ -1665,6 +2929,86 @@ public class HighwayBuilder extends Module {
         for (int offset = 1; offset < blocksAheadToPave.get(); offset++) {
             if (pavingWithinLength(offset)) paveAvailable(pavingTargets(offset), false);
         }
+    }
+
+    private boolean isBackgroundExcavation(BlockPos pos) {
+        return speculativeBreaks.contains(pos) && HighwayPlan.backgroundRow(dir.offsetX, dir.offsetZ,
+            pos.getX() - workOrigin.getX(), pos.getZ() - workOrigin.getZ());
+    }
+
+    private boolean hasPendingExcavation() {
+        return pendingBreaks.keySet().stream().anyMatch(pos -> !isBackgroundExcavation(pos));
+    }
+
+    static boolean excavationNeighborsSafe(BlockPos target, Predicate<BlockPos> safe) {
+        if (!safe.test(target)) return false;
+        for (Direction face : Direction.values()) if (!safe.test(target.relative(face))) return false;
+        return true;
+    }
+
+    private boolean canBreakAhead(BlockPos target) {
+        if (!crewMayMine(target) || target.distToCenterSqr(mc.player.getEyePosition()) > Math.pow(speculativeMiningRange(), 2)
+            || mc.level.getBlockEntity(target) != null || liquidPlacements.containsKey(target)) return false;
+        // Never remove a plug or expose a visible lava/water inlet before the normal sealing pass gets there.
+        if (!excavationNeighborsSafe(target, pos -> mc.level.hasChunkAt(pos) && mc.level.getBlockState(pos).getFluidState().isEmpty()
+            && !pendingPlaces.containsKey(pos))) return false;
+        AABB footing = new AABB(target).move(0, 1, 0);
+        return mc.level.players().stream().noneMatch(player -> footing.intersects(player.getBoundingBox()));
+    }
+
+    private double speculativeMiningRange() { return Math.max(mc.player.blockInteractionRange(), placeRange.get()); }
+
+    private boolean immediateExcavation() {
+        return hasObstruction(this, blockPosProvider.getFront())
+            || operation.get() == Operation.Build && (
+                floor.get() == Floor.Replace && needsToMine(this, blockPosProvider.getFloor(), false)
+                || railings.get() && needsToMine(this, blockPosProvider.getRailings(0), false)
+                || mineAboveRailings.get() && hasObstruction(this, blockPosProvider.getRailings(1)));
+    }
+
+    private static boolean hasObstruction(HighwayBuilder b, MBPIterator it) {
+        for (MBlockPos pos : it) {
+            if (b.crewAssigned && b.doesDig() && !b.crewMayMine(pos.getBlockPos())) continue;
+            BlockState state = pos.getState();
+            if (!state.getCollisionShape(b.mc.level, pos.getBlockPos()).isEmpty()) return true;
+        }
+        return false;
+    }
+
+    private static boolean needsToMine(HighwayBuilder b, MBPIterator it, boolean mineBlocksToPlace) {
+        for (MBlockPos pos : it) {
+            if (!b.crewMayMine(pos.getBlockPos())) continue;
+            if (!pos.getState().isAir() && !pos.getState().canBeReplaced() && (mineBlocksToPlace || !b.blocksToPlace.get().contains(pos.getState().getBlock()))) return true;
+        }
+        return false;
+    }
+
+    static List<BlockPos> miningOrder(List<BlockPos> targets, BlockPos active, java.util.function.ToIntFunction<BlockPos> row) {
+        // Stable within each row; retain a slow mine unless a nearer row needs the tool.
+        return targets.stream().sorted(Comparator.comparingInt(row).thenComparingInt(pos -> pos.equals(active) ? 0 : 1)).toList();
+    }
+
+    private void breakAhead() {
+        if (!controlsPlayer() || state != State.Forward || !doesDig() || blocksAheadToBreak.get() <= 1 || mobReturn != null
+            || predictionFlushRequested || immediateExcavation() || breakCount >= blocksPerTick.get() || breakTimer > 0 || !mc.player.containerMenu.getCarried().isEmpty()) return;
+        var keep = new HashSet<BlockPos>();
+        for (int offset = 1; offset < blocksAheadToBreak.get(); offset++) for (PavingTarget target : plannedPavingTargets(offset)) keep.add(target.position());
+        List<BlockPos> targets = HighwayPlan.excavationAhead(dir.offsetX, dir.offsetZ, width.get(), height.get(), blocksAheadToBreak.get(),
+                operation.get() == Operation.Build && floor.get() == Floor.Replace,
+                operation.get() == Operation.Build && railings.get(), operation.get() == Operation.Build && mineAboveRailings.get()).stream()
+            .map(p -> workOrigin.offset(p.x(), p.y(), p.z()))
+            .filter(p -> HighwayPlan.withinLength(dir.diagonal, completedDistance, pavingChecks.size()
+                + excavationRow(p), testLength > 0 ? testLength : length.get()))
+            .filter(p -> !crewAssigned || crew().ownsExcavation(p))
+            .filter(p -> !keep.contains(p) || !blocksToPlace.get().contains(mc.level.getBlockState(p).getBlock()))
+            .filter(this::canBreakAhead).toList();
+        State.Forward.mine(this, new PositionIterator(targets, false), true, State.Forward, State.Forward, true);
+    }
+
+    private int excavationRow(BlockPos pos) {
+        int projection = (pos.getX() - workOrigin.getX()) * dir.offsetX + (pos.getZ() - workOrigin.getZ()) * dir.offsetZ;
+        int stride = dir.offsetX * dir.offsetX + dir.offsetZ * dir.offsetZ;
+        return Math.ceilDiv(projection, stride);
     }
 
     private boolean isTrailingPaving(BlockPos pos) {
@@ -1682,7 +3026,7 @@ public class HighwayBuilder extends Module {
             if (pavingTargets(offset).stream().anyMatch(target -> target.position().equals(pos))) return true;
         }
         if (pavingTargets().stream().noneMatch(target -> target.position().equals(pos))) return false;
-        Vec3 next = Vec3.atBottomCenterOf(workOrigin.offset(dir.offsetX, 0, dir.offsetZ));
+        Vec3 next = jobWorkPosition().add(dir.offsetX, 0, dir.offsetZ);
         // Approaching edge blocks are speculative, but the next step's actual footing must resolve.
         return !mc.player.getBoundingBox().expandTowards(next.subtract(mc.player.position())).move(0, -0.05, 0)
             .intersects(new AABB(pos));
@@ -1729,7 +3073,7 @@ public class HighwayBuilder extends Module {
 
     private void paveAvailable(List<PavingTarget> targets, boolean opportunistic) {
         // Preplace only from here, using carried supplies. No extra walking, excavation or restock for speculative rows.
-        if (!controlsPlayer() || state != State.Forward || mobReturn != null || predictionFlushRequested || !pendingBreaks.isEmpty()) return;
+        if (!controlsPlayer() || state != State.Forward || mobReturn != null || predictionFlushRequested) return;
         for (PavingTarget target : targets) {
             if (count >= placementsPerTick.get() || placeTimer > 0) return;
             BlockPos pos = target.position();
@@ -1761,16 +3105,24 @@ public class HighwayBuilder extends Module {
     private boolean paveSection(List<PavingTarget> targets, boolean verifying) {
         input.stop();
         boolean complete = true;
+        boolean awaitingConfirmation = false;
+        int placedBefore = count;
         for (PavingTarget target : targets) {
             BlockPos pos = target.position();
             if (!mc.level.hasChunkAt(pos)) { complete = false; continue; }
             if (pendingPlaces.containsKey(pos)) {
-                if (verifying) complete = false;
+                if (verifying) { complete = false; awaitingConfirmation = true; }
                 continue;
             }
             BlockState existing = mc.level.getBlockState(pos);
             if (!existing.canBeReplaced()) {
                 if (verifying && pavingNeedsMining(existing, target.replace(), blocksToPlace.get())) {
+                    if (crewAssigned && (!doesDig() || !crew().ownsExcavation(pos))) {
+                        idleTicks = 0;
+                        status = "Waiting for the excavation workflow to clear paving";
+                        complete = false;
+                        continue;
+                    }
                     pavingRepairTarget = pos;
                     setState(State.MinePaving);
                     return false;
@@ -1793,6 +3145,8 @@ public class HighwayBuilder extends Module {
             else complete = false;
             if (verifying) complete = false;
         }
+        if (verifying && awaitingConfirmation && count == placedBefore && state == State.Forward)
+            timingPhase(HighwayHud.Phase.Verification);
         return complete;
     }
 
@@ -1849,6 +3203,11 @@ public class HighwayBuilder extends Module {
 
     private boolean placeWorkBlock(BlockPos position, int slot, Direction facing) {
         if (!controlsPlayer()) return false;
+        if (crewAssigned && !crew().allowsPlacement(position)) {
+            // Sealing has deterministic per-plug ownership, not a crew-wide supply lock.
+            idleTicks = 0;
+            return placementBlocked(position, "outside crew section or protected supply area");
+        }
         if (mobReturn != null) return placementBlocked(position, "returning from combat");
         if (predictionFlushRequested) return placementBlocked(position, "waiting for server verification");
         if (placeTimer > 0) return placementBlocked(position, "waiting for placement delay");
@@ -1866,6 +3225,7 @@ public class HighwayBuilder extends Module {
         if (facing != null || rotation.get().place) queuedHotbarSlots |= 1 << slot;
         Runnable place = () -> {
             if (actionEpoch != epoch) return;
+            if (crewAssigned && !crew().allowsPlacement(target)) { pendingPlaces.remove(target); return; }
             if (!controlsPlayer() || !pendingPlaces.containsKey(target) || !waiting.isEmpty() || !ItemStack.isSameItemSameComponents(mc.player.getInventory().getItem(slot), stack)
                 || target.distToCenterSqr(mc.player.getEyePosition()) > placeRange.get() * placeRange.get()) {
                 pendingPlaces.remove(target);
@@ -1873,6 +3233,8 @@ public class HighwayBuilder extends Module {
             }
             placingTarget = target;
             try {
+                if (crewAssigned && state == State.Restock)
+                    dev.monocle.client.systems.bots.BotSupplyRecovery.placing(target, stack, String.valueOf(crew().workflow()), crew().jobId());
                 BlockUtils.place(target, InteractionHand.MAIN_HAND, slot, false, 0, true, true, true);
             } finally {
                 placingTarget = null;
@@ -1896,15 +3258,43 @@ public class HighwayBuilder extends Module {
     }
 
     private void breakWorkBlock(BlockPos position) {
+        breakWorkBlock(position, false);
+    }
+
+    private boolean crewMayMine(BlockPos position) {
+        if (!crewAssigned) return true;
+        if (crewIsTraveling() || !crew().allowsWork(position)) return false;
+        // Recovery and temporary footsteps are mandatory even for a paving-only workflow.
+        boolean recovery = switch (state) {
+            case Restock, MineShulkerBlockade, MineEnderChests, MineEChestBlockade -> true;
+            default -> false;
+        };
+        return recovery || temporarySteps.contains(position) || crew().ownsExcavation(position) && crew().miningAvailable(position) && !protectedCrewPaving(position);
+    }
+
+    private boolean protectedCrewPaving(BlockPos position) {
+        if (position.getY() < workOrigin.getY() - 1 || position.getY() > workOrigin.getY()) return false;
+        // Use the whole crew plan, never this worker's paving assignment (excavators have none).
+        return plannedPavingTargets(excavationRow(position) - 1).stream().anyMatch(target -> target.position().equals(position)
+            && crewPavingResolved(mc.level.getBlockState(position), target.replace(), blocksToPlace.get()));
+    }
+
+    private void breakWorkBlock(BlockPos position, boolean speculative) {
+        if (!crewMayMine(position)) return;
         BlockPos target = position.immutable();
         BlockState before = mc.level.getBlockState(target);
         int epoch = actionEpoch;
         State miningState = state;
         Runnable mine = () -> {
             if (!controlsPlayer() || epoch != actionEpoch || state != miningState || !waiting.isEmpty() || !mc.level.getBlockState(target).equals(before)) return;
-            if (target.distToCenterSqr(mc.player.getEyePosition()) > mc.player.blockInteractionRange() * mc.player.blockInteractionRange()) return;
+            if (!crewMayMine(target) || speculative && !canBreakAhead(target)) return;
+            double range = speculative ? speculativeMiningRange() : mc.player.blockInteractionRange();
+            if (target.distToCenterSqr(mc.player.getEyePosition()) > range * range) return;
             liquidPlacements.remove(target); // Intentionally cleared tunnel plugs must not be filled again behind us.
             pendingBreaks.putIfAbsent(target, before);
+            if (speculative) speculativeBreaks.add(target);
+            if (crewAssigned && state == State.Restock && (before.is(Blocks.ENDER_CHEST) || before.getBlock() instanceof ShulkerBoxBlock))
+                dev.monocle.client.systems.bots.BotSupplyRecovery.breaking(target, mc.player.getMainHandItem());
             BlockUtils.breakBlock(target, true);
         };
         if (rotation.get().mine) Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target), mine);
@@ -2025,7 +3415,7 @@ public class HighwayBuilder extends Module {
         if (mc.player.input != input) prevInput = mc.player.input;
         mc.player.input = input = new CustomPlayerInput();
 
-        placeTimer = breakTimer = count = 0;
+        placeTimer = breakTimer = count = breakCount = 0;
         ignoreCrystals.clear();
 
         normalMining = null;
@@ -2042,6 +3432,7 @@ public class HighwayBuilder extends Module {
         if (this.state != state) stopWorkMining();
         this.lastState = lastState;
         this.state = state;
+        timingPhase(stateTimingPhase());
 
         input.stop();
         status = switch (state) {
@@ -2095,7 +3486,13 @@ public class HighwayBuilder extends Module {
         for (MBlockPos pos : blockPosProvider.getLiquids()) barrier.add(pos.getBlockPos().immutable());
         for (HighwayPlan.Cell pos : HighwayPlan.liquidInlets(dir.offsetX, dir.offsetZ, width.get(), height.get(),
             operation.get() == Operation.Build && mineAboveRailings.get())) barrier.add(workOrigin.offset(pos.x(), pos.y(), pos.z()));
+        if (crewAssigned) barrier.removeIf(pos -> !crew().ownsSealing(pos));
         return barrier;
+    }
+
+    public boolean crewSealingTarget(BlockPos pos) {
+        return crewAssigned && controlsPlayer() && blockPosProvider != null && pos.distToCenterSqr(jobWorkPosition()) <= 144
+            && (liquidBarrier().contains(pos) || liquidPlacements.containsKey(pos));
     }
 
     private List<BlockPos> liquidTargets() {
@@ -2114,6 +3511,7 @@ public class HighwayBuilder extends Module {
         for (MBlockPos pos : blockPosProvider.getFloor()) targets.add(pos.getBlockPos().immutable());
         Vec3 eye = mc.player.getEyePosition();
         return targets.stream()
+            .filter(pos -> !crewAssigned || crew().ownsSealing(pos))
             .filter(pos -> doesDig() || !passage.contains(pos))
             .filter(pos -> needsLiquidSeal(mc.level.getBlockState(pos), liquidPlacements.containsKey(pos), false, pos.distToCenterSqr(eye), placeRange.get()))
             .sorted(Comparator.comparingInt((BlockPos pos) -> passage.contains(pos) && !barrier.contains(pos) ? 1 : 0)
@@ -2128,16 +3526,30 @@ public class HighwayBuilder extends Module {
 
     private boolean needsPassageSealing() {
         for (MBlockPos pos : blockPosProvider.getFront()) {
+            if (crewAssigned && !crew().ownsSealing(pos.getBlockPos())) continue;
             if (needsLiquidSeal(pos.getState(), liquidPlacements.containsKey(pos.getBlockPos()), pendingPlaces.containsKey(pos.getBlockPos()),
                 pos.getBlockPos().distToCenterSqr(mc.player.getEyePosition()), placeRange.get())) return true;
         }
         return false;
     }
 
+    private boolean crewPassageSealed() {
+        // Other lanes' blocks are never locally predicted by us: wait for their server-visible liquid plugs.
+        var cells = new ArrayList<>(HighwayPlan.liquidInlets(dir.offsetX, dir.offsetZ, width.get(), height.get(), mineAboveRailings.get()));
+        cells.addAll(HighwayPlan.front(dir.offsetX, dir.offsetZ, width.get(), height.get()));
+        for (HighwayPlan.Cell cell : cells) {
+            BlockPos pos = workOrigin.offset(cell.x(), cell.y(), cell.z());
+            BlockState block = mc.level.getBlockState(pos);
+            if (!mc.level.hasChunkAt(pos) || block.canBeReplaced() && !block.getFluidState().isEmpty() || pendingPlaces.containsKey(pos)) return false;
+        }
+        return true;
+    }
+
     private boolean needsBarrierSealing() {
         Set<BlockPos> barrier = liquidBarrier();
         barrier.addAll(liquidPlacements.keySet());
         for (BlockPos pos : barrier) {
+            if (crewAssigned && !crew().ownsSealing(pos)) continue;
             if (needsLiquidSeal(mc.level.getBlockState(pos), liquidPlacements.containsKey(pos), pendingPlaces.containsKey(pos),
                 pos.distToCenterSqr(mc.player.getEyePosition()), placeRange.get())) return true;
         }
@@ -2148,7 +3560,7 @@ public class HighwayBuilder extends Module {
         if (!controlsPlayer() || mobReturn != null) return;
         State sealingState = state;
         Set<BlockPos> road = new HashSet<>();
-        for (PavingTarget target : pavingTargets()) if (!target.filler()) {
+        for (PavingTarget target : plannedPavingTargets(0)) if (!target.filler()) {
             road.add(target.position());
             road.add(target.position().offset(-dir.offsetX, 0, -dir.offsetZ));
             road.add(target.position().offset(dir.offsetX, 0, dir.offsetZ));
@@ -2237,7 +3649,7 @@ public class HighwayBuilder extends Module {
                 DoubleMineBlock.rateLimited = true;
             } else if (mc.level.getBlockState(normalMining.blockPos).getBlock() != normalMining.block) {
                 normalMining = null;
-                count++;
+                breakCount++;
                 DoubleMineBlock.rateLimited = false;
             } else if (normalMining.isReady()) {
                 normalMining.stopDestroying();
@@ -2252,7 +3664,7 @@ public class HighwayBuilder extends Module {
                 packetMining = null;
             } else if (mc.level.getBlockState(packetMining.blockPos).getBlock() != packetMining.block) {
                 packetMining = null;
-                count++;
+                breakCount++;
             }
         }
     }
@@ -2320,8 +3732,9 @@ public class HighwayBuilder extends Module {
             return false;
         }
         // Filler is expendable even when a slot looks empty or previous stows were rejected.
-        if (cursorFillerDiscardAllowed(confirmedCursor, menu.getCarried(), fillerBlocks.get(), blocksToPlace.get())) {
-            mc.player.setYRot(dir.yaw + 90);
+        if ((!crewInventoryEnabled() || !confirmedCursor.has(DataComponents.CUSTOM_NAME))
+            && cursorFillerDiscardAllowed(confirmedCursor, menu.getCarried(), fillerBlocks.get(), blocksToPlace.get())) {
+            mc.player.setYRot(crewInventoryEnabled() ? crewTrashYaw() : dir.yaw + 90);
             mc.player.setXRot(-15);
             status = "Discarding expendable filler from cursor";
             if (!cursorDiscardReady) { cursorDiscardReady = true; return false; }
@@ -2363,7 +3776,7 @@ public class HighwayBuilder extends Module {
             net.minecraft.network.HashedStack.create(cursorMenu.getCarried(), mc.getConnection().decoratedHashOpsGenenerator())));
     }
 
-    static net.minecraft.network.protocol.game.ServerboundContainerClickPacket cursorSyncRequest(int menuId, net.minecraft.network.HashedStack carried) {
+    public static net.minecraft.network.protocol.game.ServerboundContainerClickPacket cursorSyncRequest(int menuId, net.minecraft.network.HashedStack carried) {
         // Slot -1 is a no-op (unlike outside/drop slot -999); impossible state -1 requests full server state.
         return new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(menuId, -1, (short) -1, (byte) 0,
             net.minecraft.world.inventory.ContainerInput.PICKUP, it.unimi.dsi.fastutil.ints.Int2ObjectMaps.emptyMap(), carried);
@@ -2450,9 +3863,18 @@ public class HighwayBuilder extends Module {
         return empty > emptyReserve ? emptyDestination : -1;
     }
 
+    static boolean restockSatisfied(boolean materials, int usableStacks, boolean emptyRoom, boolean mergeRoom, boolean minimumMet) {
+        // Paving refills use actual capacity, never estimates of obsidian from unmined ender chests.
+        return minimumMet && !mergeRoom && (!emptyRoom || !materials && usableStacks >= 1);
+    }
+
     public void onSupplyItemPickup(int itemId, int collectorId, int amount) {
         if (!job || !Utils.canUpdate() || mc.level != jobWorld) return;
         State.Restock.supplyItemPickup(this, itemId, collectorId, amount);
+    }
+
+    public boolean allowsRecoveryTool(BlockState block, ItemStack tool) {
+        return !block.is(Blocks.ENDER_CHEST) || !requireSilkTouchForEnderChestRecovery.get() || Utils.hasEnchantment(tool, Enchantments.SILK_TOUCH);
     }
 
     static boolean sameSupplyDrop(ItemStack expected, ItemStack actual) {
@@ -2509,11 +3931,6 @@ public class HighwayBuilder extends Module {
         Forward {
             @Override
             protected void tick(HighwayBuilder b) {
-                if (!b.pendingBreaks.isEmpty()) {
-                    b.status = "Waiting for server to confirm excavation";
-                    b.input.stop();
-                    return;
-                }
                 if (b.advancing && b.reachedNextSection()) {
                     b.advancing = false;
                     b.workOrigin = b.workOrigin.offset(b.dir.offsetX, 0, b.dir.offsetZ);
@@ -2523,19 +3940,24 @@ public class HighwayBuilder extends Module {
                     b.idleTicks = 0;
                 }
                 if (b.verifyAfterCombat) {
+                    b.diagnosticGate = "forward:combat-verification";
                     b.status = "Verifying paving after piglin clearing";
                     if (!b.paveSection(b.advancing ? b.advancingPaving : b.pavingTargets(), true)) return;
                     b.verifyAfterCombat = false;
                 }
-                if (!b.verifyUnderfoot()) return;
                 if (b.advancing) {
+                    b.diagnosticGate = "forward:passage";
                     if (checkPassage(b)) return;
+                    b.diagnosticGate = "forward:underfoot";
+                    if (!b.verifyUnderfoot()) return;
+                    b.diagnosticGate = "forward:paving";
                     b.paveSection(b.advancingPaving, false);
                     if (!b.controlsPlayer() || b.state != this || b.mobReturn != null) return;
                     b.paveAhead();
                     b.paveBehind();
                     if (!b.controlsPlayer() || b.state != this) return;
                     b.status = "Moving to next section";
+                    b.diagnosticGate = "forward:advance";
                     b.advanceRoad();
                     b.sealLiquids();
                     return;
@@ -2543,6 +3965,12 @@ public class HighwayBuilder extends Module {
 
                 boolean atEnd = !b.pavingWithinLength(0);
                 if (atEnd) {
+                    b.diagnosticGate = "forward:completion";
+                    if (!b.verifyUnderfoot()) return;
+                    if (b.crewAssigned) {
+                        for (List<PavingTarget> section : b.pavingChecks) if (!b.paveSection(section, true)) return;
+                        if (!b.pendingPlaces.isEmpty() || !b.pendingBreaks.isEmpty() || !b.temporarySteps.isEmpty()) return;
+                    }
                     b.paveBehind();
                     while (!b.pavingChecks.isEmpty()) b.retirePavingSection();
                     b.status = "Completed " + String.format("%.1f", b.completedDistance) + " blocks";
@@ -2555,12 +3983,22 @@ public class HighwayBuilder extends Module {
                     return;
                 }
                 if (b.paused) return;
-                if (b.hasSupplyContainer() && b.needsFoodRestock()) {
+                b.diagnosticGate = "forward:food-supply";
+                if ((b.crewInventoryEnabled() || b.hasSupplyContainer()) && b.needsFoodRestock()) {
                     b.restockTask.setFood();
                     return;
                 }
+                if (b.crewAssigned && b.doesDig()) {
+                    b.diagnosticGate = "forward:liquid-sealing";
+                    if (b.needsBarrierSealing() || b.needsPassageSealing()) { b.setState(FillLiquids); return; }
+                    if (!b.crewPassageSealed()) { b.input.stop(); b.idleTicks = 0; b.status = "Waiting for crew liquid sealing before excavation"; return; }
+                }
+                b.diagnosticGate = "forward:excavation";
                 if (checkExcavation(b)) return;
+                b.diagnosticGate = "forward:underfoot";
+                if (!b.verifyUnderfoot()) return;
                 if (!b.temporarySteps.isEmpty()) {
+                    b.diagnosticGate = "forward:temporary-steps";
                     if (b.mc.player.getY() > b.workOrigin.getY() + 0.25) {
                         b.status = "Returning before removing work steps";
                         if (!b.walkToWorkPosition(b.jobWorkPosition())) return;
@@ -2578,6 +4016,11 @@ public class HighwayBuilder extends Module {
                     }
                 }
 
+                // A reach/sealing retreat must return to the current work row before requesting
+                // permission for the NEXT row. Otherwise physical progress bounds our own permit.
+                b.diagnosticGate = "forward:return-to-row";
+                if (b.returnToCrewWorkRow()) return;
+                b.diagnosticGate = "forward:paving";
                 List<PavingTarget> targets = b.pavingTargets();
                 b.status = "Paving ahead";
                 b.paveSection(targets, false);
@@ -2585,15 +4028,37 @@ public class HighwayBuilder extends Module {
                 b.paveAhead();
                 b.paveBehind();
                 if (!b.controlsPlayer() || b.state != this) return;
+                // Receipts gate entry into this row, not excavation or placement elsewhere in the window.
+                if (b.hasPendingExcavation()) {
+                    b.diagnosticGate = "forward:excavation-ack";
+                    b.timingPhase(HighwayHud.Phase.Verification);
+                    b.status = "Waiting for server to confirm the next excavation row";
+                    b.input.stop();
+                    return;
+                }
+                if (b.crewAssigned) {
+                    b.diagnosticGate = "forward:paving-verification";
+                    // All owned floor/rail cells must resolve before publishing readiness for the shared row.
+                    if (!b.paveSection(targets, true)) return;
+                    b.diagnosticGate = "forward:crew-window";
+                    if (!b.crew().readyToAdvance(b.workOrigin.offset(b.dir.offsetX, 0, b.dir.offsetZ))) {
+                        b.timingPhase(HighwayHud.Phase.Crew);
+                        b.input.stop(); b.idleTicks = 0;
+                        b.status = "Waiting for the server-verified next row or crew work window (" + b.crew().windowStatus() + ")";
+                        return;
+                    }
+                }
                 b.advancingPaving = targets;
                 b.advancing = true;
                 b.status = "Moving to next section";
+                b.diagnosticGate = "forward:advance";
                 b.advanceRoad();
                 if (b.controlsPlayer() && b.state == this) b.sealLiquids();
             }
 
             private boolean checkExcavation(HighwayBuilder b) {
                 if (checkPassage(b)) return true;
+                if (!b.doesDig()) return false;
                 if (b.operation.get() == Operation.Build && b.floor.get() == Floor.Replace && needsToMine(b, b.blockPosProvider.getFloor(), false)) {
                     b.setState(b.needsBarrierSealing() ? FillLiquids : MineFloor);
                     return true;
@@ -2617,32 +4082,28 @@ public class HighwayBuilder extends Module {
                 if (!b.doesDig()) {
                     for (MBlockPos pos : b.blockPosProvider.getFront()) {
                         if (!pos.getState().getFluidState().isEmpty()) {
-                            b.pauseJob("Liquid in the passage. Use Build to seal and clear it; Repair and Pave only seal the floor and outside edges.");
+                            if (b.crewAssigned) waitForExcavation(b);
+                            else b.pauseJob("Liquid in the passage. Use Build to seal and clear it; Repair and Pave only seal the floor and outside edges.");
                             return true;
                         }
                     }
                 }
                 if (hasObstruction(b, b.blockPosProvider.getFront())) {
-                    if (!b.doesDig()) b.pauseJob("Passage obstructed. Repair and Pave preserve existing blocks; clear it or choose Build.");
+                    if (!b.doesDig() && b.crewAssigned) waitForExcavation(b);
+                    else if (!b.doesDig()) b.pauseJob("Passage obstructed. Repair and Pave preserve existing blocks; clear it or choose Build.");
                     else b.setState(b.needsBarrierSealing() ? FillLiquids : MineFront);
                     return true;
                 }
                 return false;
             }
 
-            private boolean hasObstruction(HighwayBuilder b, MBPIterator it) {
-                for (MBlockPos pos : it) {
-                    BlockState state = pos.getState();
-                    if (!state.getCollisionShape(b.mc.level, pos.getBlockPos()).isEmpty()) return true;
-                }
-                return false;
-            }
-
-            private boolean needsToMine(HighwayBuilder b, MBPIterator it, boolean mineBlocksToPlace) {
-                for (MBlockPos pos : it) {
-                    if (!pos.getState().isAir() && !pos.getState().canBeReplaced() && (mineBlocksToPlace || !b.blocksToPlace.get().contains(pos.getState().getBlock()))) return true;
-                }
-                return false;
+            private void waitForExcavation(HighwayBuilder b) {
+                b.input.stop();
+                b.status = "Waiting for crew excavation; paving reachable clear cells";
+                b.paveAvailable(b.pavingTargets(), true);
+                b.paveAhead();
+                b.paveBehind();
+                b.idleTicks = 0; // This worker cannot remove the other duty's obstruction.
             }
 
             private boolean isCrystalTrap(HighwayBuilder b) {
@@ -2742,79 +4203,164 @@ public class HighwayBuilder extends Module {
         },
 
         FillLiquids {
-            private int stalledTicks, confirmedPlacements, backstepTicks;
-            private Vec3 backstep;
-            private boolean verifyingRecovery;
+            private int confirmedPlacements, backstepTicks;
+            private long stalledSince;
+            private Vec3 backstep, backstepStart;
+            private boolean verifyingRecovery, retryInPlace, forcedBackstep;
+            private long retrySince;
+            private int retryBreaks;
+            private float retryProgress;
+            private BlockPos retryTarget;
 
             @Override
             protected void start(HighwayBuilder b) {
-                stalledTicks = backstepTicks = 0;
+                stalledSince = -1;
+                backstepTicks = 0;
                 confirmedPlacements = b.blocksPlaced;
                 backstep = null;
-                verifyingRecovery = false;
+                verifyingRecovery = retryInPlace = forcedBackstep = false;
+                retryTarget = null;
             }
 
             @Override
             protected boolean recoverSealing(HighwayBuilder b) {
                 if (verifyingRecovery) {
-                    if (b.predictionFlushRequested || b.predictionProbeSequence >= 0) return false;
+                    if (b.predictionFlushRequested || b.predictionProbeSequence >= 0) {
+                        b.tickPredictionFlush();
+                        if (b.paused || b.predictionFlushRequested || b.predictionProbeSequence >= 0) return true;
+                    }
                     verifyingRecovery = false;
-                    b.placeTimer = 0;
+                    b.placeTimer = b.breakTimer = 0;
                     resetReturnPath(b);
                     b.setState(Forward); // Rescan the passage and barrier after vanilla resolves predictions.
-                    return true;
+                    return false; // Continue normal work this tick, without a post-ACK cooldown.
+                }
+                if (retryInPlace) {
+                    if (b.blocksBroken != retryBreaks || !b.needsPassageSealing() && !b.needsBarrierSealing()) {
+                        b.setState(Forward);
+                        return false;
+                    }
+                    if (b.mc.gameMode.isDestroying() && retryTarget != null
+                        && retryTarget.equals(((MultiPlayerGameModeAccessor) b.mc.gameMode).monocle$getCurrentBreakingBlockPos())) {
+                        float progress = ((MultiPlayerGameModeAccessor) b.mc.gameMode).monocle$getBreakingProgress();
+                        if (progress > retryProgress) {
+                            retrySince = System.nanoTime(); // A slow mine making progress has not failed, including at zero reported ping.
+                            retryProgress = progress;
+                            b.idleTicks = 0;
+                            return false;
+                        }
+                        retryProgress = progress;
+                    }
+                    if (retrySince < 0 || !sealingRetryDue(System.nanoTime() - retrySince, PlayerUtils.getPing())) return false;
+                    retryInPlace = false;
+                    forcedBackstep = true;
+                }
+                if (backstep == null) {
+                    if (!forcedBackstep) {
+                        if (stalledSince < 0) return false; // Always give the sealing pass a chance to place first.
+                        if (confirmedPlacements != b.blocksPlaced) {
+                            confirmedPlacements = b.blocksPlaced;
+                            stalledSince = System.nanoTime();
+                        }
+                        if (!sealingRetryDue(System.nanoTime() - stalledSince, PlayerUtils.getPing())) return false;
+                        if (!b.needsPassageSealing() && !b.needsBarrierSealing()) {
+                            stalledSince = -1;
+                            return false;
+                        }
+                    }
+                    Vec3 target = backstepTarget(b.mc.player.position(), b.mc.player.getYRot(), .15);
+                    if (!forcedBackstep && !safeBackstep(b, target)) {
+                        retryFromHere(b);
+                        return false;
+                    }
+                    b.resetMobMovement();
+                    resetReturnPath(b);
+                    backstepStart = b.mc.player.position();
+                    backstep = target;
+                    backstepTicks = 0;
+                    // Start movement immediately; do not insert a separate setup tick.
                 }
                 if (backstep != null) {
                     b.input.stop();
-                    b.status = "Backing up one block before retrying sealing";
-                    if (++backstepTicks > 100 || !safeBackstep(b, backstep)) {
-                        backstep = null;
-                        stalledTicks = 0;
-                        b.pauseJob("Cannot safely complete the sealing-recovery backstep. Check the footing behind you, then Resume.");
-                        return true;
+                    b.status = "Nudging back 0.15 blocks before retrying sealing";
+                    if (!forcedBackstep && !safeBackstep(b, backstep)) {
+                        retryFromHere(b);
+                        return false;
                     }
                     Vec3 current = b.mc.player.position();
-                    if (current.distanceToSqr(backstep) < 0.0225) {
+                    if (sealingBackstepReached(backstepStart, current, backstep) || ++backstepTicks > sealingProbeTicks(PlayerUtils.getPing()) + 2) {
                         backstep = null;
                         resetReturnPath(b);
                         b.stopWorkMining();
                         verifyingRecovery = true;
                         b.requestPredictionFlush();
-                    } else if (b.waitForMob(b.mc.player.getBoundingBox().expandTowards(backstep.subtract(current)))) {
-                        backstepTicks = 0;
-                    } else {
+                        // Supersede any older probe with a fresh sequence after the nudge. Pending
+                        // block predictions remain intact, and an old ACK cannot satisfy the new probe.
+                        b.predictionProbeSequence = -1;
+                        b.predictionProbeAttempts = 0;
+                        b.tickPredictionFlush(); // Send verification immediately after the physical nudge.
+                    } else if (forcedBackstep || !b.waitForMob(b.mc.player.getBoundingBox().expandTowards(backstep.subtract(current)), true)) {
                         b.mc.player.setYRot((float) Rotations.getYaw(backstep) + 180);
                         b.input.backward(true);
                     }
                     return true;
                 }
-                if (confirmedPlacements != b.blocksPlaced) {
-                    confirmedPlacements = b.blocksPlaced;
-                    stalledTicks = 0;
-                }
-                if (!sealingRetryDue(++stalledTicks)) return false;
-                if (!b.needsPassageSealing() && !b.needsBarrierSealing()) {
-                    stalledTicks = 0;
-                    return false;
-                }
-                Vec3 target = backstepTarget(b.mc.player.position(), b.mc.player.getYRot());
-                if (!safeBackstep(b, target)) {
-                    stalledTicks = 0;
-                    b.pauseJob("No safe footing for the sealing-recovery backstep. Clear the space behind you, then Resume.");
-                    return true;
-                }
-                b.resetMobMovement(); // Cancel owned mining/queued actions before moving away from the seal.
+                return false;
+            }
+
+            @Override
+            protected boolean fastSealingRecovery() { return verifyingRecovery; }
+
+            private void retryFromHere(HighwayBuilder b) {
+                b.resetMobMovement();
                 resetReturnPath(b);
-                backstep = target;
-                backstepTicks = 0;
-                b.status = "Backing up one block before retrying sealing";
-                return true;
+                backstep = null;
+                forcedBackstep = false;
+                retryInPlace = true;
+                retrySince = -1; // Start the timer only when the first actual stationary attempt runs.
+                retryBreaks = b.blocksBroken;
+                retryProgress = 0;
+                retryTarget = null;
+            }
+
+            private void mineFromHere(HighwayBuilder b) {
+                if (retrySince < 0) retrySince = System.nanoTime();
+                b.status = "Retrying sealing obstruction from current position";
+                if (!b.doesDig() || b.breakTimer > 0) return;
+                List<MBPIterator> sections = new ArrayList<>();
+                sections.add(b.blockPosProvider.getFront());
+                if (b.operation.get() == Operation.Build) {
+                    if (b.floor.get() == Floor.Replace) sections.add(b.blockPosProvider.getFloor());
+                    if (b.railings.get()) sections.add(b.blockPosProvider.getRailings(0));
+                    if (b.mineAboveRailings.get()) sections.add(b.blockPosProvider.getRailings(1));
+                }
+                List<BlockPos> targets = new ArrayList<>();
+                for (MBPIterator section : sections) for (MBlockPos pos : section) targets.add(pos.getBlockPos().immutable());
+                for (BlockPos pos : miningOrder(targets, retryTarget, p -> 0)) {
+                    BlockState block = b.mc.level.getBlockState(pos);
+                    if (!b.crewMayMine(pos) || b.protectedCrewPaving(pos)
+                        || pos.distToCenterSqr(b.mc.player.getEyePosition()) > Math.pow(b.mc.player.blockInteractionRange(), 2)
+                        || !sealingRecoveryBlock(block, b.liquidPlacements.containsKey(pos), b.pendingPlaces.containsKey(pos), b.mc.level.getBlockEntity(pos) != null,
+                            b.mc.level.players().stream().anyMatch(player -> player.getBoundingBox().move(0, -.05, 0).intersects(new AABB(pos))))
+                        || !BlockUtils.canBreak(pos, block)) continue;
+                    int slot = State.Forward.findAndMoveBestToolToHotbar(b, block, false, false);
+                    if (slot < 0 || !b.controlsPlayer() || b.state != this) return;
+                    InvUtils.swap(slot, false);
+                    if (!pos.equals(retryTarget)) retryProgress = -1; // Allow native START (progress=0) to receive its first continuation tick.
+                    retryTarget = pos;
+                    b.breakWorkBlock(pos); // Native rotation, ownership, durability and prediction rules; no reach movement.
+                    b.breakCount++;
+                    b.breakTimer = b.breakDelay.get();
+                    return;
+                }
             }
 
             @Override
             protected void tick(HighwayBuilder b) {
                 b.input.stop();
+                if (retryInPlace) { mineFromHere(b); return; }
                 b.status = "Sealing the passage";
+                if (stalledSince < 0) stalledSince = System.nanoTime();
                 // Seal the incoming flow before excavating the previous barrier; keep the placement batch full.
                 b.sealLiquids();
                 if (b.controlsPlayer() && b.state == this && !b.needsPassageSealing() && !b.needsBarrierSealing()) b.setState(Forward);
@@ -2985,7 +4531,7 @@ public class HighwayBuilder extends Module {
                     return;
                 }
 
-                b.mc.player.setYRot(b.dir.opposite().yaw);
+                b.mc.player.setYRot(b.crewTrashYaw());
                 b.mc.player.setXRot(-25);
 
                 if (firstTick) {
@@ -2995,10 +4541,16 @@ public class HighwayBuilder extends Module {
 
                 if (!b.recoverCursor()) return;
 
+                int retainedFiller = 0;
                 for (int i = 0; i < b.mc.player.getInventory().getNonEquipmentItems().size(); i++) {
-                    if (i == skipSlot) continue;
+                    if (!b.crewInventoryEnabled() && i == skipSlot) continue;
 
                     ItemStack itemStack = b.mc.player.getInventory().getItem(i);
+                    if (b.crewInventoryEnabled() && b.crewAcceptsResource(CrewInventory.FILLERS, itemStack)
+                        && retainedFiller < b.crew().inventoryPolicy().filler()) {
+                        retainedFiller += itemStack.getCount();
+                        continue;
+                    }
 
                     if (canDiscardSupplyTrash(b, itemStack)) {
                         InvUtils.drop().slot(i);
@@ -3035,6 +4587,8 @@ public class HighwayBuilder extends Module {
             private boolean first,primed,initialized,trashTurned;
             private boolean stopTimerEnabled;
             private int stopTimer,moveTimer,rebreakTimer,timeout,inventoryTimer;
+            private BlockPos lastFarmChest;
+            private int farmPickupQuietTicks;
 
             @Override
             protected void start(HighwayBuilder b) {
@@ -3056,11 +4610,14 @@ public class HighwayBuilder extends Module {
 
                 stopTimerEnabled = false;
                 primed = false;
+                lastFarmChest = null;
+                farmPickupQuietTicks = 0;
             }
 
             @Override
             protected void tick(HighwayBuilder b) {
                 if (stopTimerEnabled) {
+                    if (b.crewAssigned && !finishFarmRecovery(b)) return;
                     if (stopTimer > 0) stopTimer--;
                     else b.setState(MineEChestBlockade);
 
@@ -3121,6 +4678,7 @@ public class HighwayBuilder extends Module {
                 BlockState blockState = b.mc.level.getBlockState(bp);
 
                 if (blockState.getBlock() == Blocks.ENDER_CHEST) {
+                    if (b.crewAssigned && !b.crew().clearance(bp)) { b.input.stop(); b.idleTicks = 0; b.status = "Waiting for crew pickup clearance"; return; }
                     if (b.mc.gui.screen() instanceof ContainerScreen screen) {
                         // wait for the screen to be properly loaded
                         if (screen.getMenu().containerId != b.containerId) return;
@@ -3193,7 +4751,7 @@ public class HighwayBuilder extends Module {
                     }
 
                     if (countItem(b, stack -> stack.is(ItemTags.PICKAXES)) <= b.savePickaxes.get()) {
-                        if (b.searchEnderChest.get() || b.searchShulkers.get()) {
+                        if (b.searchChestContents() || b.searchInventoryShulkers()) {
                             b.restockTask.setPickaxes();
                             return;
                         }
@@ -3201,9 +4759,38 @@ public class HighwayBuilder extends Module {
 
                     if (!first) primed = true;
 
-                    b.placeWorkBlock(bp, slot);
+                    if (b.placeWorkBlock(bp, slot)) lastFarmChest = bp;
                     timeout = 0;
                 }
+            }
+
+            private boolean finishFarmRecovery(HighwayBuilder b) {
+                b.input.stop();
+                b.status = "Recovering ender-chest farm drops before returning";
+                if (!b.recoverCursor() || lastFarmChest == null) return lastFarmChest == null;
+                BlockState remaining = b.crewVerifiedState(lastFarmChest);
+                if (remaining == null) return false;
+                if (remaining.is(Blocks.ENDER_CHEST)) {
+                    int slot = findAndMoveBestToolToHotbar(b, remaining, true);
+                    if (slot < 0 || !b.controlsPlayer()) return false;
+                    InvUtils.swap(slot, false);
+                    b.breakWorkBlock(lastFarmChest);
+                    farmPickupQuietTicks = 0;
+                    return false;
+                }
+                ItemEntity drop = b.mc.level.getEntitiesOfClass(ItemEntity.class, new AABB(lastFarmChest).inflate(4),
+                    item -> item.isAlive() && item.getItem().is(Items.OBSIDIAN)).stream()
+                    .min(Comparator.comparingDouble(item -> item.distanceToSqr(b.mc.player))).orElse(null);
+                if (drop != null) {
+                    farmPickupQuietTicks = 0;
+                    if (!makeObsidianRoom(b)) return false;
+                    b.walkToWorkPosition(new Vec3(drop.getX(), b.workOrigin.getY(), drop.getZ()));
+                    return false;
+                }
+                // A delayed item spawn must not race the return trip. Packet resolution remains a
+                // separate requirement; do not use a locally predicted broken chest as confirmation.
+                if (!b.pendingPlaces.isEmpty() || !b.pendingBreaks.isEmpty()) return false;
+                return ++farmPickupQuietTicks >= 20;
             }
 
             private static int obsidianRoom(Container inventory) {
@@ -3231,12 +4818,16 @@ public class HighwayBuilder extends Module {
                 }
                 b.input.stop();
                 int filler = expendableFillerSlot(b.mc.player.getInventory(), b.fillerBlocks.get(), b.blocksToPlace.get());
+                if (b.crewInventoryEnabled()) {
+                    filler = -1;
+                    for (int i = 0; i < 36; i++) if (b.crewAcceptsResource(CrewInventory.FILLERS, b.mc.player.getInventory().getItem(i))) { filler = i; break; }
+                }
                 if (filler < 0) {
                     b.error("Free room for eight obsidian before converting another ender chest. No expendable filler remains.");
                     return false;
                 }
                 b.status = "Making room for ender-chest obsidian";
-                b.mc.player.setYRot((float) Rotations.getYaw(Vec3.atCenterOf(pos.getBlockPos())) + 180);
+                b.mc.player.setYRot(b.crewInventoryEnabled() ? b.crewTrashYaw() : (float) Rotations.getYaw(Vec3.atCenterOf(pos.getBlockPos())) + 180);
                 b.mc.player.setXRot(-15);
                 if (!trashTurned) trashTurned = true;
                 else {
@@ -3252,17 +4843,17 @@ public class HighwayBuilder extends Module {
         Restock {
             private static final MBlockPos pos = new MBlockPos();
             private static final ItemStack[] ITEMS = new ItemStack[27];
-            private int minimumSlots,stopTimer,delayTimer,shulkersTaken;
+            private int stopTimer,delayTimer,shulkersTaken;
             private boolean breakContainer,indicateStopping,emptyChestVisit;
             private Predicate<ItemStack> shulkerPredicate;
             private int slot = -1;
-            private boolean session, initialized, protectedSite, pickupPending, returnPending, trackedContainer, resumeChestFarm, placementSent, containerOwned, trashTurned;
+            private boolean session, sessionMaterials, initialized, protectedSite, pickupPending, returnPending, trackedContainer, resumeChestFarm, placementSent, containerOwned, trashTurned;
             private Vec3 returnPosition;
             private Vec3 returnBackstep;
             private int returnBackstepTicks;
             private float returnYaw;
             private ItemStack containerItem = ItemStack.EMPTY, recoveryItem = ItemStack.EMPTY;
-            private int recoveryBaseline, recoveryCount, recoveredAmount, operationTicks, lastSupplyCount;
+            private int recoveryBaseline, recoveryCount, recoveredAmount, operationTicks, lastSupplyCount, containerSupplyBaseline;
             private boolean recoveryTakenByOther;
             private final Set<java.util.UUID> previousGroundItems = new HashSet<>();
             private int recoveryDropId = -1;
@@ -3292,10 +4883,17 @@ public class HighwayBuilder extends Module {
             @Override
             protected void start(HighwayBuilder b) {
                 if (!session) {
+                    if (b.crewAssigned && !b.crew().supplyReady(b)) {
+                        initialized = false; b.idleTicks = 0;
+                        String reason = b.crew().supplyWaitReason();
+                        if (!reason.isEmpty()) b.status = reason;
+                        return;
+                    }
                     returnBackstep = null;
-                    returnPosition = b.mc.player.position();
+                    returnPosition = b.crewAssigned ? b.jobWorkPosition() : b.mc.player.position();
                     returnYaw = b.mc.player.getYRot();
                     session = true;
+                    sessionMaterials = b.restockTask.materials;
                     protectedSite = pickupPending = returnPending = trackedContainer = false;
                     resumeChestFarm = b.lastState == MineEnderChests;
                     protectionPlan.clear();
@@ -3331,61 +4929,90 @@ public class HighwayBuilder extends Module {
                 pos.set(feet.getX(), feet.getY(), feet.getZ()).offset(supplyDirection);
                 if (!b.recoverCursor()) return;
 
-                // firstly search your inventory for shulkers that have the items you need
-                if (slot == -1 && b.searchShulkers.get()) {
-                    slot = findAndMoveToHotbar(b, shulkerPredicate);
-                    if (b.isJobPaused() || b.state != this) return;
+                // Repeat the expanded source order after each recovered container. An ender chest may
+                // supply inventory shulkers, which are then opened by that native step on the next pass.
+                for (Action source : b.supplySources()) {
+                    if (slot != -1) break;
+                    if (b.crewAssigned && b.restockTask.exhaustedSources.contains(source)) continue;
+                    b.status = "Restocking: " + source.name();
+                    if (source == Action.InventoryShulkers) {
+                        slot = findAndMoveToHotbar(b, shulkerPredicate);
+                        if (b.isJobPaused() || b.state != this) return;
 
-                    if (slot != -1 && !protectedSite && requiresProtection(b)) {
-                        protectedSite = true;
-                        b.setState(PlaceShulkerBlockade);
-                        return;
+                        if (slot != -1 && !protectedSite && requiresProtection(b)) {
+                            protectedSite = true;
+                            b.setState(PlaceShulkerBlockade);
+                            return;
+                        }
                     }
-                }
 
-                // next search your ender chest for raw items and shulkers containing items
-                if (slot == -1 && b.searchEnderChest.get() && countItem(b, stack -> stack.getItem().equals(Items.ENDER_CHEST)) > 0) {
-                    // todo handle pulling ecs from shulker boxes so we can search through them
+                    if (source == Action.EnderChestContents && countItem(b, stack -> stack.getItem().equals(Items.ENDER_CHEST)) > 0) {
+                        // todo handle pulling ecs from shulker boxes so we can search through them
 
-                    int searchSlots = b.enderChestSearchSlots();
-                    boolean stop = EChestMemory.isKnown(searchSlots);
-                    if (stop) {
-                        for (ItemStack stack : EChestMemory.ITEMS.subList(0, Math.min(searchSlots, EChestMemory.ITEMS.size()))) {
-                            if (b.restockTask.materials && stack.getItem() instanceof BlockItem bi) {
-                                if (b.blocksToPlace.get().contains(bi.getBlock()) || (b.mineEnderChests.get() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN) && bi == Items.ENDER_CHEST)) {
+                        int searchSlots = b.enderChestSearchSlots();
+                        boolean stop = EChestMemory.isKnown(searchSlots);
+                        if (stop) {
+                            for (ItemStack stack : EChestMemory.ITEMS.subList(0, Math.min(searchSlots, EChestMemory.ITEMS.size()))) {
+                                if (b.restockTask.materials && stack.getItem() instanceof BlockItem bi) {
+                                    if (b.blocksToPlace.get().contains(bi.getBlock()) || (b.farmEnderChests() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN) && bi == Items.ENDER_CHEST)) {
+                                        stop = false;
+                                        break;
+                                    }
+                                }
+                                if (b.restockTask.pickaxes && b.usablePickaxe(stack)) {
+                                    stop = false;
+                                    break;
+                                }
+                                if (b.restockTask.food && Utils.isFood(stack) && !Modules.get().get(AutoEat.class).blacklist.get().contains(stack.getItem())) {
+                                    stop = false;
+                                    break;
+                                }
+                                if (b.restockTask.resource >= 3 && b.crewAcceptsResource(b.restockTask.resource, stack)) { stop = false; break; }
+
+                                if (b.searchInventoryShulkers() && shulkerPredicate.test(stack)) {
                                     stop = false;
                                     break;
                                 }
                             }
-                            if (b.restockTask.pickaxes && b.usablePickaxe(stack)) {
-                                stop = false;
-                                break;
-                            }
-                            if (b.restockTask.food && Utils.isFood(stack) && !Modules.get().get(AutoEat.class).blacklist.get().contains(stack.getItem())) {
-                                stop = false;
-                                break;
-                            }
-
-                            if (b.searchShulkers.get() && shulkerPredicate.test(stack)) {
-                                stop = false;
-                                break;
-                            }
                         }
+
+                        if (!stop) slot = findAndMoveToHotbar(b, itemStack -> itemStack.getItem() == Items.ENDER_CHEST);
+                        if (b.isJobPaused() || b.state != this) return;
                     }
 
-                    if (!stop) slot = findAndMoveToHotbar(b, itemStack -> itemStack.getItem() == Items.ENDER_CHEST);
-                    if (b.isJobPaused() || b.state != this) return;
+                    if (source == Action.EnderChestFarm && b.crewAssigned && b.restockTask.materials && b.canFarmEnderChests()) {
+                        // Enter the existing conversion state only after reservation/travel and after all
+                        // previously placed containers have been recovered. Cleanup cannot be reordered.
+                        b.restockTask.complete();
+                        session = false;
+                        if (protectedSite) {
+                            resumeChestFarm = true;
+                            b.setState(MineShulkerBlockade);
+                        } else b.setState(MineEnderChests);
+                        return;
+                    }
                 }
 
                 // by this point we have searched shulkers and your ender chest, and no more items could be found to pull from
                 if (slot == -1) {
                     boolean restockOccurred = (
-                        (b.restockTask.materials && (hasItem(b, stack -> stack.getItem() instanceof BlockItem bi && b.blocksToPlace.get().contains(bi.getBlock())) || b.mineEnderChests.get() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN) && countItem(b, itemStack -> itemStack.getItem() == Items.ENDER_CHEST) > b.saveEchests.get())) ||
+                        (b.restockTask.materials && (hasItem(b, stack -> stack.getItem() instanceof BlockItem bi && b.blocksToPlace.get().contains(bi.getBlock())) || b.canFarmEnderChests())) ||
                             (b.restockTask.pickaxes && countItem(b, b::usablePickaxe) > b.savePickaxes.get()) ||
                             (b.restockTask.food && hasItem(b, itemStack -> Utils.isFood(itemStack) && !Modules.get().get(AutoEat.class).blacklist.get().contains(itemStack.getItem())))
+                            || b.restockTask.resource >= 3 && b.crewResourceCount(b.restockTask.resource) > 0
                     );
 
                     if (restockOccurred) {
+                        if (b.restockTask.supplyCount() < b.restockTask.minimumSupply && !(b.restockTask.materials && b.canFarmEnderChests())) {
+                            b.forecastRetryAt = Double.POSITIVE_INFINITY;
+                            b.warning("No additional %s could be taken. Disabling predictive restock trips for this job; live low-stock restocking remains enabled.", b.restockTask.item());
+                        }
+                        b.restockTask.complete();
+                        returnPending = true;
+                        initialized = true;
+                    } else if (b.crewInventoryEnabled()) {
+                        // Finish the native return/protection cleanup before handing inventory ownership to a peer exchange.
+                        b.crewPendingResource = b.restockTask.resource;
                         b.restockTask.complete();
                         returnPending = true;
                         initialized = true;
@@ -3395,6 +5022,11 @@ public class HighwayBuilder extends Module {
                 }
 
                 ItemStack supplyStack = b.mc.player.getInventory().getItem(slot);
+                if (!supplyStack.is(Items.ENDER_CHEST) && !shulkerPredicate.test(supplyStack)) {
+                    // The hotbar swap can be rejected or superseded. Never place whatever now occupies that slot.
+                    delayTimer = Math.max(3, b.inventoryDelay.get());
+                    return;
+                }
                 int containers = supplyStack.is(Items.ENDER_CHEST) && b.enderChestSearchSlots() == 54 && !resumeChestFarm ? 2 : 1;
                 int restockSlots = emptySlots(b) - b.minEmpty.get() - containers + (supplyStack.getCount() <= containers ? 1 : 0);
 
@@ -3409,8 +5041,6 @@ public class HighwayBuilder extends Module {
                     b.error("Free one inventory slot for supply-container recovery before restocking from this stack.");
                     return;
                 }
-
-                minimumSlots = b.restockTask.materials ? Math.max(1, restockSlots) : 1;
 
                 secondChest = null;
                 secondPlacementSent = secondOwned = pairReady = false;
@@ -3445,6 +5075,7 @@ public class HighwayBuilder extends Module {
                 trackedContainer = false;
                 initialized = true;
                 lastSupplyCount = availableSupplyCount(b);
+                containerSupplyBaseline = availableSupplyCount(b);
             }
 
             @Override
@@ -3489,8 +5120,17 @@ public class HighwayBuilder extends Module {
                     if (emptyChestVisit) {
                         emptyChestVisit = false;
                         initialized = false;
+                        if (b.crewAssigned) {
+                            b.restockTask.exhaustedSources.add(Action.EnderChestContents);
+                            start(b);
+                            return;
+                        }
                         b.pauseJob("No usable supplies could be taken from the ender chest. The placed containers are recovered; free space for a shulker plus its contents, lower the empty-slot reserve, or add loose supplies, then Resume.");
                         return;
+                    }
+                    if (indicateStopping && !b.restockTask.tasksInactive() && b.restockTask.supplyCount() < b.restockTask.minimumSupply) {
+                        indicateStopping = false;
+                        b.warning("Restock inventory changed during recovery; checking %s again before returning to the crew.", b.restockTask.item());
                     }
                     if (indicateStopping || b.restockTask.tasksInactive()) {
                         b.restockTask.complete();
@@ -3514,7 +5154,7 @@ public class HighwayBuilder extends Module {
                 }
                 if (++operationTicks > 600) {
                     operationTicks = 0;
-                    b.pauseJob("Restocking made no progress. Check the supply container and inventory space, then resume.");
+                    b.pauseRecoverably("Restocking made no progress. Check the supply container and inventory space, then resume.");
                     return;
                 }
                 // this should only tick if there's a valid slot we can restock from
@@ -3549,22 +5189,20 @@ public class HighwayBuilder extends Module {
 
                 if (secondChest != null && !breakContainer && !pairReady && !prepareDoubleChest(b)) return;
 
-                // calculate the amount of materials we have already pulled
+                // Tools and food keep their existing minimum quota; paving uses all usable capacity.
                 int slotsPulled = 0;
-                if (b.restockTask.materials) {
-                    slotsPulled += countSlots(b, itemStack -> itemStack.getItem() instanceof BlockItem bi && b.blocksToPlace.get().contains(bi.getBlock()));
-                    if (b.mineEnderChests.get() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN))
-                        slotsPulled += (Math.max(0, countItem(b, itemStack -> itemStack.getItem() == Items.ENDER_CHEST) - b.saveEchests.get()) * 8) / 64;
-                }
                 if (b.restockTask.pickaxes)
                     slotsPulled += countSlots(b, b::usablePickaxe) - b.savePickaxes.get();
                 if (b.restockTask.food)
                     slotsPulled += countSlots(b, itemStack -> Utils.isFood(itemStack) && !Modules.get().get(AutoEat.class).blacklist.get().contains(itemStack.getItem()));
+                if (b.restockTask.resource >= 3) slotsPulled += countSlots(b, stack -> b.crewAcceptsResource(b.restockTask.resource, stack));
 
 
-                // whether we have pulled the minimum amount of items we want
-                boolean suppliedEnough = (slotsPulled >= minimumSlots
-                    || emptySlots(b) <= reservedRestockSlots(b) && discardableSupplySlot(b) < 0) && !hasPartialRestockRoom(b);
+                boolean suppliedEnough = restockSatisfied(b.restockTask.materials, slotsPulled,
+                    emptySlots(b) > reservedRestockSlots(b) || discardableSupplySlot(b) >= 0, hasPartialRestockRoom(b),
+                    b.restockTask.supplyCount() >= b.restockTask.minimumSupply);
+                if (b.crewInventoryEnabled()) suppliedEnough = b.restockTask.supplyCount() >= b.restockTask.minimumSupply
+                    || suppliedEnough && !(emptySlots(b) > reservedRestockSlots(b) || hasPartialRestockRoom(b));
                 if (suppliedEnough && !containerItem.is(Items.ENDER_CHEST)
                     && !indicateStopping && !b.mc.level.getBlockState(pos.getBlockPos()).isAir()) {
                     indicateStopping = true;
@@ -3606,12 +5244,16 @@ public class HighwayBuilder extends Module {
                                 return;
                             }
 
-                            // we have taken everything we can from the shulker box, and since slotsPulled >= minimumSlots is false, we should keep going
+                            // This box has no more transferable supplies; recover it before trying another source.
                             // close the screen, break the shulker box, look for more containers to loot from
                             b.mc.gui.screen().onClose();
+                            if (availableSupplyCount(b) <= containerSupplyBaseline) {
+                                b.restockTask.rejectedShulkers.add(containerItem.copy());
+                                b.warning("Supply shulker yielded no %s; skipping this unchanged box for the current restock.", b.restockTask.item());
+                            }
                             breakContainer = true;
                         } else {
-                            if (!b.searchShulkers.get()) breakContainer = true;
+                            if (!b.searchInventoryShulkers()) breakContainer = true;
                             handleContainerBlock(b, blockPos);
                         }
                     }
@@ -3642,7 +5284,7 @@ public class HighwayBuilder extends Module {
                             }
 
                             // The batch is full, unavailable or space-limited; recover both placed chests normally.
-                            emptyChestVisit = shulkersTaken == 0 && slotsPulled <= 0;
+                            emptyChestVisit = shulkersTaken == 0 && availableSupplyCount(b) <= containerSupplyBaseline;
                             if (suppliedEnough && slotsPulled > 0) {
                                 indicateStopping = true;
                                 stopTimer = 12;
@@ -3650,7 +5292,7 @@ public class HighwayBuilder extends Module {
                             b.mc.gui.screen().onClose();
                             breakContainer = true;
                         } else {
-                            if (!b.searchEnderChest.get()) breakContainer = true;
+                            if (!b.searchChestContents()) breakContainer = true;
                             handleContainerBlock(b, blockPos);
                         }
                     }
@@ -3677,6 +5319,12 @@ public class HighwayBuilder extends Module {
                         if (!b.mc.level.getBlockState(blockPos.below()).isFaceSturdy(b.mc.level, blockPos.below(), Direction.UP)
                             || !b.mc.level.getBlockState(blockPos.above()).isAir()) {
                             b.pauseJob("Restocking needs a solid floor and clear space above the supply box behind you.");
+                            return;
+                        }
+                        if (!ItemStack.isSameItemSameComponents(containerItem, b.mc.player.getInventory().getItem(slot))) {
+                            if (placementSent || b.pendingPlaces.containsKey(blockPos)) return;
+                            initialized = false;
+                            delayTimer = Math.max(3, b.inventoryDelay.get());
                             return;
                         }
                         if (b.placeWorkBlock(blockPos, slot)) placementSent = true;
@@ -3741,13 +5389,14 @@ public class HighwayBuilder extends Module {
 
             private boolean restockItems(HighwayBuilder b, Container inv) {
                 if (!b.recoverCursor()) return true;
+                if (b.restockTask.resource >= 3) return grabFromInventory(b, inv, stack -> b.crewAcceptsResource(b.restockTask.resource, stack));
                 if (b.restockTask.materials) {
                     // take raw material
                     if (grabFromInventory(b, inv, itemStack -> itemStack.getItem() instanceof BlockItem bi && b.blocksToPlace.get().contains(bi.getBlock())))
                         return true;
 
                     // prefer taking raw material before echests
-                    if (b.mineEnderChests.get() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN)) {
+                    if (b.farmEnderChests() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN)) {
                         if (grabFromInventory(b, inv, itemStack -> itemStack.getItem() == Items.ENDER_CHEST)) return true;
                     }
                 }
@@ -3766,7 +5415,7 @@ public class HighwayBuilder extends Module {
             }
 
             private boolean takeShulkerBatch(HighwayBuilder b, Container inv) {
-                if (!b.searchShulkers.get()) return false;
+                if (!b.searchInventoryShulkers()) return false;
                 int source = shulkerRestockSlot(inv, shulkerPredicate, shulkersTaken, b.maxShulkersPerRestock.get());
                 int reserve = reservedRestockSlots(b) + 1; // Leave room to unpack a collected box after recovering the chests.
                 if (source < 0 || reserve >= 36) return false;
@@ -3810,8 +5459,9 @@ public class HighwayBuilder extends Module {
             }
 
             private boolean wantsRestockItem(HighwayBuilder b, ItemStack stack) {
+                if (b.restockTask.resource >= 3) return b.crewAcceptsResource(b.restockTask.resource, stack);
                 return b.restockTask.materials && stack.getItem() instanceof BlockItem block
-                    && (b.blocksToPlace.get().contains(block.getBlock()) || b.mineEnderChests.get() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN) && stack.is(Items.ENDER_CHEST))
+                    && (b.blocksToPlace.get().contains(block.getBlock()) || b.farmEnderChests() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN) && stack.is(Items.ENDER_CHEST))
                     || b.restockTask.pickaxes && b.usablePickaxe(stack)
                     || b.restockTask.food && Utils.isFood(stack) && !Modules.get().get(AutoEat.class).blacklist.get().contains(stack.getItem());
             }
@@ -3834,17 +5484,13 @@ public class HighwayBuilder extends Module {
                 shulkerPredicate = itemStack -> {
                     if (!Utils.isShulker(itemStack.getItem())) return false;
                     Utils.getItemsInContainerItem(itemStack, ITEMS);
-
-                    for (ItemStack stack : ITEMS) {
-                        if (wantsRestockItem(b, stack)) return true;
-                    }
-
-                    return false;
+                    return usableSupplyBox(itemStack, ITEMS, stack -> wantsRestockItem(b, stack), b.restockTask.rejectedShulkers);
                 };
             }
 
             private void handleContainerBlock(HighwayBuilder b, BlockPos bp) {
                 if (breakContainer) {
+                    if (b.crewAssigned && !b.crew().clearance(bp)) { b.status = "Waiting for players to clear crew supply pickup space"; b.idleTicks = operationTicks = 0; return; }
                     if (!reservePickupSpace(b)) return;
                     BlockState state = b.mc.level.getBlockState(bp);
                     int toolSlot = findContainerTool(b, state);
@@ -3934,7 +5580,12 @@ public class HighwayBuilder extends Module {
 
             @Override
             protected void finishSupplyJob(HighwayBuilder b) {
+                // Start the hint cooldown after returning, not before a potentially long flight/container run.
+                b.forecastRetryAt = Math.max(b.forecastRetryAt, System.nanoTime() / 1e9 + 45);
                 // Only opt into discarding boxes after all placed containers are recovered and we have returned.
+                if (b.crewAssigned && sessionMaterials && b.canFarmEnderChests()
+                    && !hasItem(b, stack -> stack.getItem() instanceof BlockItem block && b.blocksToPlace.get().contains(block.getBlock()))) resumeChestFarm = true;
+                // Forward releases the reservation after trash cleanup AND all placement/break ACKs.
                 if (!b.keepShulkers.get()) b.setState(ThrowOutTrash, resumeChestFarm ? MineEnderChests : Forward);
                 else if (resumeChestFarm) b.setState(MineEnderChests, PlaceEChestBlockade);
                 else b.setState(Forward);
@@ -4034,39 +5685,103 @@ public class HighwayBuilder extends Module {
             }
 
             private int availableSupplyCount(HighwayBuilder b) {
+                if (b.restockTask.resource >= 3) return b.crewResourceCount(b.restockTask.resource);
                 if (b.restockTask.pickaxes) return countItem(b, b::usablePickaxe);
                 if (b.restockTask.food) return countItem(b, stack -> Utils.isFood(stack) && !Modules.get().get(AutoEat.class).blacklist.get().contains(stack.getItem()));
+                // Placing our search chests is not supply depletion. Count them until their tracked recovery completes.
+                int ownedChests = (containerOwned && containerItem.is(Items.ENDER_CHEST) ? 1 : 0) + (secondOwned ? 1 : 0);
                 return countItem(b, stack -> stack.getItem() instanceof BlockItem block && b.blocksToPlace.get().contains(block.getBlock()))
-                    + (b.mineEnderChests.get() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN) ? countItem(b, stack -> stack.is(Items.ENDER_CHEST)) * 8 : 0);
+                    + (b.farmEnderChests() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN) ? (countItem(b, stack -> stack.is(Items.ENDER_CHEST)) + ownedChests) * 8 : 0);
             }
 
             private boolean trackRecoveryDrop(ItemEntity item) {
+                HighwayBuilder builder = Modules.get().get(HighwayBuilder.class);
+                if (builder.crewAssigned && !builder.crewReturnedStack.isEmpty() && !ItemStack.isSameItemSameComponents(builder.crewReturnedStack, item.getItem())) return false;
                 if (!sameSupplyDrop(recoveryItem, item.getItem())) return false;
                 if (!Utils.isShulker(recoveryItem.getItem())) return true;
                 if (previousGroundItems.contains(item.getUUID())) return false;
-                if (recoveryDropUuid != null) return recoveryDropId == item.getId() && recoveryDropUuid.equals(item.getUUID());
+                if (recoveryDropUuid != null) {
+                    if (!recoveryDropUuid.equals(item.getUUID())) return false;
+                    recoveryDropId = item.getId(); // IDs change when the same drop is loaded after reconnect.
+                    return true;
+                }
                 if (!new AABB(pos.getBlockPos()).inflate(4).intersects(item.getBoundingBox())) return false;
                 recoveryDropId = item.getId();
                 recoveryDropUuid = item.getUUID();
                 return true;
             }
 
+            @Override protected boolean crewOwnsDrop(HighwayBuilder b, ItemEntity item) {
+                return session && trackedContainer && (breakContainer || pickupPending) && trackRecoveryDrop(item);
+            }
+
+            @Override protected boolean reconfigureReady(HighwayBuilder b) {
+                return !session || !pickupPending && !secondOwned && !secondPlacementSent && protectionBlocks.isEmpty()
+                    && (!(containerOwned || placementSent) || returnPending);
+            }
+
+            @Override protected int supplyProgress(HighwayBuilder b) {
+                // Actual native milestones, not status strings or timers reset by wait loops.
+                return java.util.Objects.hash(session, initialized, pickupPending, returnPending, placementSent,
+                    containerOwned, secondOwned, secondPlacementSent, breakContainer, recoveredAmount,
+                    shulkersTaken, availableSupplyCount(b), protectionBlocks.size(),
+                    b.mc.level.getBlockState(pos.getBlockPos()), b.mc.player.blockPosition());
+            }
+
+            @Override protected boolean supplyStarted() { return session; }
+
+            @Override protected void diagnose(JsonObject d) {
+                JsonObject supply = new JsonObject(); supply.addProperty("session", session); supply.addProperty("position", pos.getBlockPos().toShortString());
+                supply.addProperty("slot", slot); supply.addProperty("initialized", initialized); supply.addProperty("owned", containerOwned);
+                supply.addProperty("placementSent", placementSent); supply.addProperty("secondOwned", secondOwned);
+                supply.addProperty("pickupPending", pickupPending); supply.addProperty("returnPending", returnPending); supply.addProperty("breakContainer", breakContainer);
+                supply.addProperty("dropId", recoveryDropId); supply.addProperty("dropUuid", String.valueOf(recoveryDropUuid));
+                supply.addProperty("recovered", recoveredAmount); supply.addProperty("expected", recoveryCount); supply.addProperty("operationTicks", operationTicks);
+                d.add("supply", supply);
+            }
+
+            @Override protected void worldChanged() {
+                operationTicks = delayTimer = protectionTicks = returnBackstepTicks = 0;
+                returnBackstep = null;
+                recoveryDropId = -1;
+            }
+
+            @Override protected void retrySupply(HighwayBuilder b) {
+                operationTicks = delayTimer = protectionTicks = 0;
+                // Never reset placement intent, drop identity, cursor transfers or owned containers.
+                // Only an entirely uncommitted attempt may reselect its source/site from scratch.
+                if (restartableSupply(placementSent || containerOwned || secondPlacementSent || secondOwned || pickupPending,
+                    !protectionBlocks.isEmpty() || protectedSite, returnPending,
+                    b.mc.player.containerMenu != b.mc.player.inventoryMenu || !b.mc.player.containerMenu.getCarried().isEmpty()
+                        || b.cursorSyncPending || b.cursorRecoveryRequired,
+                    !b.pendingPlaces.isEmpty() || !b.pendingBreaks.isEmpty())) {
+                    session = initialized = false;
+                    slot = -1;
+                    b.relocateCrewSupplySite();
+                    if (b.crewAssigned) b.crew().retryUncommittedSupply();
+                } else retryReturn(b);
+            }
+
             @Override
             protected void supplyItemPickup(HighwayBuilder b, int itemId, int collectorId, int amount) {
                 if (!session || !trackedContainer || !Utils.isShulker(recoveryItem.getItem()) || returnPending || !(breakContainer || pickupPending)) return;
                 if (!(b.mc.level.getEntity(itemId) instanceof ItemEntity item) || !trackRecoveryDrop(item)) return;
+                Entity collector = b.mc.level.getEntity(collectorId);
+                if (b.crewAssigned && collector != null && amount > 0)
+                    b.crew().supplyBanter(item.getUUID(), collector.getUUID(), Math.min(amount, item.getItem().getCount()));
                 boolean localCollector = collectorId == b.mc.player.getId();
                 int collected = supplyPickupAmount(localCollector, amount, item.getItem().getCount());
                 if (!localCollector && amount > 0) recoveryTakenByOther = true;
                 recoveredAmount += collected;
                 if (collected > 0) {
+                    b.crewReturning = false; b.crewReturnedStack = ItemStack.EMPTY;
                     operationTicks = 0;
                     b.idleTicks = 0;
                 }
             }
 
             private int discardableSupplySlot(HighwayBuilder b) {
-                int filler = expendableFillerSlot(b.mc.player.getInventory(), b.fillerBlocks.get(), b.blocksToPlace.get());
+                int filler = b.crewInventoryEnabled() ? -1 : expendableFillerSlot(b.mc.player.getInventory(), b.fillerBlocks.get(), b.blocksToPlace.get());
                 if (filler >= 0) return filler;
                 for (int i = 0; i < b.mc.player.getInventory().getNonEquipmentItems().size(); i++) {
                     if (canDiscardSupplyTrash(b, b.mc.player.getInventory().getItem(i))) return i;
@@ -4080,7 +5795,7 @@ public class HighwayBuilder extends Module {
                 if (discard < 0) { trashTurned = false; return false; }
                 b.status = "Making inventory room for supplies";
                 // Throw away from the container and wait for the server to receive our facing first.
-                b.mc.player.setYRot((float) Rotations.getYaw(Vec3.atCenterOf(pos.getBlockPos())) + 180);
+                b.mc.player.setYRot(b.crewInventoryEnabled() ? b.crewTrashYaw() : (float) Rotations.getYaw(Vec3.atCenterOf(pos.getBlockPos())) + 180);
                 b.mc.player.setXRot(-15);
                 if (!trashTurned) trashTurned = true;
                 else {
@@ -4110,6 +5825,7 @@ public class HighwayBuilder extends Module {
                 boolean dropPresent = groundDrop instanceof ItemEntity && groundDrop.getUUID().equals(recoveryDropUuid);
                 if (shulker ? supplyPickupComplete(recoveredAmount, recoveryCount, dropPresent, recoveryTakenByOther)
                     : countItem(b, stack -> sameSupplyDrop(recoveryItem, stack)) >= recoveryBaseline + recoveryCount) {
+                    if (b.crewAssigned) dev.monocle.client.systems.bots.BotSupplyRecovery.recovered(pos.getBlockPos());
                     pickupPending = false;
                     if (secondOwned) {
                         // Reuse single-container recovery, with a fresh baseline after the first pickup.
@@ -4122,12 +5838,24 @@ public class HighwayBuilder extends Module {
                         recoveryItem = ItemStack.EMPTY;
                         breakContainer = true;
                         doubleOpenAttempts = 0;
-                    } else returnPending = true;
+                    } else {
+                        // The pickup is confirmed. A subsequent source search must not retain ownership of this old box.
+                        containerOwned = placementSent = trackedContainer = false;
+                        returnPending = true;
+                    }
                     operationTicks = 0;
                     b.idleTicks = 0;
                     return;
                 }
                 if (recoveryTakenByOther) {
+                    if (b.crewAssigned && b.crewReturning) {
+                        recoveryTakenByOther = false;
+                        if (recoveryDropUuid != null) previousGroundItems.add(recoveryDropUuid);
+                        recoveryDropId = -1; recoveryDropUuid = null;
+                        b.status = "Waiting for crew member to return the tracked shulker";
+                        operationTicks = b.idleTicks = 0;
+                        return;
+                    }
                     b.pauseJob("Another player collected the supply drop. Retrieve it, then Stop and start a new job; Resume cannot verify that transfer.");
                     return;
                 }
@@ -4143,7 +5871,7 @@ public class HighwayBuilder extends Module {
                 if (!reservePickupSpace(b)) return;
                 if (++operationTicks > 300) {
                     operationTicks = 0;
-                    b.pauseJob("The server has not confirmed that you picked up the supply drop. Check the ground near the supply position; the builder will not leave it behind.");
+                    b.pauseRecoverably("The server has not confirmed that you picked up the supply drop. Check the ground near the supply position; the builder will not leave it behind.");
                     return;
                 }
                 Vec3 pickupPosition = Vec3.atBottomCenterOf(pos.getBlockPos());
@@ -4297,6 +6025,9 @@ public class HighwayBuilder extends Module {
         };
 
         protected boolean canDiscardSupplyTrash(HighwayBuilder b, ItemStack stack) {
+            if (b.crewInventoryEnabled()) return b.crew().inventoryPolicy().trash() && !stack.isEmpty() && !stack.has(DataComponents.CUSTOM_NAME)
+                && (isExpendableFiller(stack, b.fillerBlocks.get(), b.blocksToPlace.get())
+                || !CrewInventory.keep(stack, b.blocksToPlace.get(), b.fillerBlocks.get(), List.of()));
             if (Utils.isShulker(stack.getItem())) return shouldEjectShulker(stack, b.keepShulkers.get(), supply ->
                 supply.getItem() instanceof BlockItem block && (b.blocksToPlace.get().contains(block.getBlock()) || b.fillerBlocks.get().contains(block.getBlock()))
                     || supply.is(Items.ENDER_CHEST) || supply.is(ItemTags.PICKAXES)
@@ -4316,12 +6047,13 @@ public class HighwayBuilder extends Module {
         }
 
         protected boolean recoverSealing(HighwayBuilder b) { return false; }
+        protected boolean fastSealingRecovery() { return false; }
 
         protected void resetReturnPath(HighwayBuilder b) {
             b.input.stop();
             b.walkGoal = null;
             b.walkPath = List.of();
-            b.walkIndex = b.walkTicks = b.idleTicks = 0;
+            b.walkIndex = b.walkTicks = b.walkFailures = b.idleTicks = 0;
             b.lastWalkDistance = Double.MAX_VALUE;
         }
 
@@ -4343,6 +6075,15 @@ public class HighwayBuilder extends Module {
         protected void supplyItemPickup(HighwayBuilder b, int itemId, int collectorId, int amount) {
         }
 
+        protected boolean crewOwnsDrop(HighwayBuilder b, ItemEntity item) { return false; }
+
+        protected boolean reconfigureReady(HighwayBuilder b) { return true; }
+        protected int supplyProgress(HighwayBuilder b) { return 0; }
+        protected boolean supplyStarted() { return false; }
+        protected void retrySupply(HighwayBuilder b) { }
+        protected void worldChanged() { }
+        protected void diagnose(JsonObject d) { }
+
         protected boolean protectSupplySite(HighwayBuilder b, boolean clear) {
             return true;
         }
@@ -4356,14 +6097,30 @@ public class HighwayBuilder extends Module {
         protected abstract void tick(HighwayBuilder b);
 
         protected void mine(HighwayBuilder b, MBPIterator it, boolean mineBlocksToPlace, State nextState, State lastState) {
+            mine(b, it, mineBlocksToPlace, nextState, lastState, false);
+        }
+
+        protected void mine(HighwayBuilder b, MBPIterator it, boolean mineBlocksToPlace, State nextState, State lastState, boolean speculative) {
             boolean breaking = false;
             boolean finishedBreaking = false; // if you can multi break this lets you mine blocks between tasks in a single tick
+
+            BlockPos active = b.normalMining != null ? b.normalMining.blockPos : b.mc.gameMode.isDestroying()
+                ? ((MultiPlayerGameModeAccessor) b.mc.gameMode).monocle$getCurrentBreakingBlockPos() : null;
+            boolean shared = b.crewAssigned && b.crew().breakOrder() && !b.crewDetachedSupply();
+            if (active != null || speculative || shared) {
+                List<BlockPos> targets = new ArrayList<>();
+                for (MBlockPos pos : it) targets.add(pos.getBlockPos().immutable());
+                if (shared) targets = b.crew().excavationOrder(targets);
+                it = new PositionIterator(miningOrder(targets, active, speculative ? b::excavationRow : pos -> 0), false);
+            }
 
             // extract all candidates for double mining and enqueue them to be mined. After those we can break the remaining
             // blocks normally
             if (b.doubleMine.get()) {
-                // todo hold the best mining tool before performing the double mining checks so we dont double mine blocks unnecessarily
                 ArrayDeque<BlockPos> toDoubleMine = new ArrayDeque<>();
+                // Classify with the tool we would actually use, not the currently held paving block.
+                // Reuse scores for repeated block states; do not swap inventory while scanning candidates.
+                var tools = new java.util.HashMap<BlockState, Integer>();
 
                 it.save();
                 it.forEach(pos -> {
@@ -4371,12 +6128,15 @@ public class HighwayBuilder extends Module {
                     if (
                         BlockUtils.canBreak(pos.getBlockPos(), pos.getState())
                             && (mineBlocksToPlace || !b.blocksToPlace.get().contains(pos.getState().getBlock()))
-                            && !BlockUtils.canInstaBreak(pos.getBlockPos()) && (!Modules.get().get(SpeedMine.class).instamine() || pos.getState().getDestroyProgress(b.mc.player, b.mc.level, pos.getBlockPos()) <= 0.5)
                             && (b.normalMining == null || !pos.getBlockPos().equals(b.normalMining.blockPos))
                             && (b.packetMining == null || !pos.getBlockPos().equals(b.packetMining.blockPos))
-                            && pos.getBlockPos().distToCenterSqr(b.mc.player.getEyePosition()) <= b.mc.player.blockInteractionRange() * b.mc.player.blockInteractionRange()
+                            && b.crewMayMine(pos.getBlockPos())
+                            && (!speculative || !b.pendingBreaks.containsKey(pos.getBlockPos()) && b.canBreakAhead(pos.getBlockPos()))
+                            && pos.getBlockPos().distToCenterSqr(b.mc.player.getEyePosition()) <= Math.pow(speculative ? b.speculativeMiningRange() : b.mc.player.blockInteractionRange(), 2)
                     ) {
-                        toDoubleMine.add(pos.getBlockPos().mutable());
+                        int tool = tools.computeIfAbsent(pos.getState(), state -> findBestToolSlot(b, state, false));
+                        if (tool >= 0 && shouldDoubleMine(b.mc.player.isCreative(), BlockUtils.getBreakDelta(tool, pos.getState()), Modules.get().get(SpeedMine.class).instamine()))
+                            toDoubleMine.add(pos.getBlockPos().mutable());
                     }
                 });
 
@@ -4387,15 +6147,15 @@ public class HighwayBuilder extends Module {
                 // have a tool to mine it with, but also we want to lock the slot to the tool while we are mining even
                 // the ArrayDequeue is empty
                 if (!toDoubleMine.isEmpty()) {
-                    int slot = findAndMoveBestToolToHotbar(b, b.mc.level.getBlockState(toDoubleMine.peek()), false);
+                    int slot = findAndMoveBestToolToHotbar(b, b.mc.level.getBlockState(toDoubleMine.peek()), false, !speculative);
                     if (slot == -1) return;
 
                     InvUtils.swap(slot, false);
-                    doubleMine(b, toDoubleMine);
+                    doubleMine(b, toDoubleMine, speculative);
                 }
 
                 if (b.normalMining != null || b.packetMining != null) {
-                    int slot = findAndMoveBestToolToHotbar(b, b.normalMining != null ? b.normalMining.blockState : b.packetMining.blockState, false);
+                    int slot = findAndMoveBestToolToHotbar(b, b.normalMining != null ? b.normalMining.blockState : b.packetMining.blockState, false, !speculative);
                     if (slot == -1) return;
 
                     InvUtils.swap(slot, false);
@@ -4404,20 +6164,24 @@ public class HighwayBuilder extends Module {
             }
 
             for (MBlockPos pos : it) {
-                if (b.count >= b.blocksPerTick.get()) return;
+                if (b.breakCount >= b.blocksPerTick.get()) return;
                 if (b.breakTimer > 0) return;
 
                 BlockState state = pos.getState();
+                if (!b.crewMayMine(pos.getBlockPos())) continue;
+                if (speculative && (!b.canBreakAhead(pos.getBlockPos()) || b.pendingBreaks.containsKey(pos.getBlockPos())
+                    && !(b.mc.gameMode.isDestroying() && pos.getBlockPos().equals(((MultiPlayerGameModeAccessor) b.mc.gameMode).monocle$getCurrentBreakingBlockPos())))) continue;
                 if (state.isAir() || state.canBeReplaced() && !state.getFluidState().isEmpty()
                     || (!mineBlocksToPlace && b.blocksToPlace.get().contains(state.getBlock()))) continue;
 
                 if (!BlockUtils.canBreak(pos.getBlockPos(), state)) {
+                    if (speculative) continue;
                     b.pauseJob("Unbreakable obstruction at " + pos.getBlockPos().toShortString() + ".");
                     return;
                 }
-                if (!b.reach(pos.getBlockPos(), b.mc.player.blockInteractionRange())) return;
+                if (!speculative && !b.reach(pos.getBlockPos(), b.mc.player.blockInteractionRange())) return;
 
-                int slot = findAndMoveBestToolToHotbar(b, state, false);
+                int slot = findAndMoveBestToolToHotbar(b, state, false, !speculative);
                 if (slot == -1) return;
 
                 InvUtils.swap(slot, false);
@@ -4425,7 +6189,7 @@ public class HighwayBuilder extends Module {
                 BlockPos mcPos = pos.getBlockPos();
                 boolean multiBreak = b.blocksPerTick.get() > 1 && BlockUtils.canInstaBreak(mcPos) && !b.rotation.get().mine;
                 if (BlockUtils.canBreak(mcPos)) {
-                    b.breakWorkBlock(mcPos);
+                    b.breakWorkBlock(mcPos, speculative);
                     breaking = true;
 
                     b.breakTimer = b.breakDelay.get();
@@ -4434,7 +6198,7 @@ public class HighwayBuilder extends Module {
                         b.lastBreakingPos.set(pos);
                     }
 
-                    b.count++;
+                    b.breakCount++;
 
                     // can only multi break if we aren't rotating and the block can be insta-mined
                     if (!multiBreak) break;
@@ -4445,16 +6209,16 @@ public class HighwayBuilder extends Module {
 
             // we quickly jump to the next state, to remove micro delays in the process and allow us to break blocks
             // between tasks if we can multi break
-            if (finishedBreaking || !breaking) {
+            if (!speculative && (finishedBreaking || !breaking)) {
                 b.setState(nextState, lastState);
             }
         }
 
-        private void doubleMine(HighwayBuilder b, ArrayDeque<BlockPos> blocks) {
+        private void doubleMine(HighwayBuilder b, ArrayDeque<BlockPos> blocks, boolean speculative) {
             if (b.breakTimer > 0) return;
 
             if (b.normalMining == null) {
-                DoubleMineBlock block = new DoubleMineBlock(b, blocks.pop());
+                DoubleMineBlock block = new DoubleMineBlock(b, blocks.pop(), speculative);
                 b.normalMining = block.startDestroying();
 
                 b.breakTimer = b.breakDelay.get();
@@ -4464,7 +6228,7 @@ public class HighwayBuilder extends Module {
             if (DoubleMineBlock.rateLimited) return;
 
             if (b.packetMining == null && !blocks.isEmpty()) {
-                DoubleMineBlock block = new DoubleMineBlock(b, blocks.pop());
+                DoubleMineBlock block = new DoubleMineBlock(b, blocks.pop(), speculative);
 
                 if (block != null) {
                     b.packetMining = b.normalMining.packetMine();
@@ -4555,31 +6319,22 @@ public class HighwayBuilder extends Module {
         }
 
         protected int findAndMoveBestToolToHotbar(HighwayBuilder b, BlockState blockState, boolean noSilkTouch) {
+            return findAndMoveBestToolToHotbar(b, blockState, noSilkTouch, true);
+        }
+
+        private int findAndMoveBestToolToHotbar(HighwayBuilder b, BlockState blockState, boolean noSilkTouch, boolean required) {
             if (!b.recoverCursor()) return -1;
             // Check for creative
             if (b.mc.player.isCreative()) return b.mc.player.getInventory().getSelectedSlot();
 
-            // Find best tool
-            double bestScore = -1;
-            int bestSlot = -1;
-
-            for (int i = 0; i < b.mc.player.getInventory().getNonEquipmentItems().size(); i++) {
-                double score = AutoTool.getScore(b.mc.player.getInventory().getItem(i), blockState, false, false, AutoTool.EnchantPreference.None, itemStack -> {
-                    if (noSilkTouch && Utils.hasEnchantment(itemStack, Enchantments.SILK_TOUCH)) return false;
-                    return !b.dontBreakTools.get() || HighwayPlan.usableTool(itemStack.getMaxDamage() - itemStack.getDamageValue(), itemStack.getMaxDamage(), b.breakDurability.get());
-                });
-
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestSlot = i;
-                }
-            }
+            int bestSlot = findBestToolSlot(b, blockState, noSilkTouch);
 
             if (bestSlot == -1) {
                 if (!blockState.requiresCorrectToolForDrops()) {
                     for (int i = 0; i < 9; i++) if (!b.mc.player.getInventory().getItem(i).isDamageableItem()) return i;
                 }
-                if (!b.restockTask.pickaxes && b.hasSupplyContainer()) { b.restockTask.setPickaxes(); return -1; }
+                if (!required) return -1;
+                if (!b.restockTask.pickaxes && (b.crewInventoryEnabled() || b.hasSupplyContainer())) { b.restockTask.setPickaxes(); return -1; }
                 b.pauseJob(noSilkTouch ? "Need a usable pickaxe without Silk Touch to convert ender chests." : "No suitable tool above the durability reserve. Add a tool, then Resume.");
                 return -1;
             }
@@ -4591,7 +6346,8 @@ public class HighwayBuilder extends Module {
                 // If we are in the process of restocking pickaxes and happen to need one, we should allow using it
                 // as long as it has enough durability, since we will obtain more shortly thereafter
                 if (count <= b.savePickaxes.get() && !(b.restockTask.pickaxes && b.usablePickaxe(bestStack))) {
-                    if (!b.restockTask.pickaxes && (b.searchEnderChest.get() || b.searchShulkers.get())) {
+                    if (!required) return -1;
+                    if (!b.restockTask.pickaxes && (b.crewInventoryEnabled() || b.searchChestContents() || b.searchInventoryShulkers())) {
                         b.restockTask.setPickaxes();
                     } else {
                         b.error("Found less than the minimum amount of pickaxes required: " + count + "/" + (b.savePickaxes.get() + 1));
@@ -4614,6 +6370,19 @@ public class HighwayBuilder extends Module {
             return hotbarSlot;
         }
 
+        private int findBestToolSlot(HighwayBuilder b, BlockState blockState, boolean noSilkTouch) {
+            double bestScore = -1;
+            int bestSlot = -1;
+            for (int i = 0; i < b.mc.player.getInventory().getNonEquipmentItems().size(); i++) {
+                double score = AutoTool.getScore(b.mc.player.getInventory().getItem(i), blockState, false, false, AutoTool.EnchantPreference.None, stack -> {
+                    if (noSilkTouch && Utils.hasEnchantment(stack, Enchantments.SILK_TOUCH)) return false;
+                    return !b.dontBreakTools.get() || HighwayPlan.usableTool(stack.getMaxDamage() - stack.getDamageValue(), stack.getMaxDamage(), b.breakDurability.get());
+                });
+                if (score > bestScore) { bestScore = score; bestSlot = i; }
+            }
+            return bestSlot;
+        }
+
         protected int findBlocksToPlace(HighwayBuilder b) {
             if (!b.recoverCursor()) return -1;
             // find a block and move it to your hotbar
@@ -4623,10 +6392,12 @@ public class HighwayBuilder extends Module {
             if (slot == -1) {
                 if (b.isJobPaused() || !b.recoverCursor()) return -1;
                 if (hasItem(b, road)) return -1; // A queued hotbar source must finish before this carried stack can move.
-                if (b.mineEnderChests.get() && b.blocksToPlace.get().contains(Blocks.OBSIDIAN) && countItem(b, stack -> stack.getItem().equals(Items.ENDER_CHEST)) > b.saveEchests.get()) {
+                if (b.crewInventoryEnabled() || b.crewAssigned && !b.supplySources().isEmpty()) {
+                    b.restockTask.setMaterials();
+                } else if (b.canFarmEnderChests()) {
                     // can grind echests for obsidian
                     b.setState(MineEnderChests);
-                } else if (b.searchEnderChest.get() || b.searchShulkers.get()) {
+                } else if (b.searchChestContents() || b.searchInventoryShulkers()) {
                     // start restocking if we're allowed
                     b.restockTask.setMaterials();
                 } else {
@@ -4736,7 +6507,12 @@ public class HighwayBuilder extends Module {
 
     private class PlannedBlockPosProvider implements IBlockPosProvider {
         private MBPIterator positions(List<HighwayPlan.Cell> cells) {
-            return new PositionIterator(cells.stream().map(p -> workOrigin.offset(p.x(), p.y(), p.z())).toList(), false);
+            return positions(cells, true);
+        }
+
+        private MBPIterator positions(List<HighwayPlan.Cell> cells, boolean excavation) {
+            return new PositionIterator(cells.stream().map(p -> workOrigin.offset(p.x(), p.y(), p.z()))
+                .filter(p -> !crewAssigned || (excavation ? crew().ownsExcavation(p) : crew().owns(p))).toList(), false);
         }
 
         @Override public MBPIterator getFront() {
@@ -4749,7 +6525,7 @@ public class HighwayBuilder extends Module {
             return positions(HighwayPlan.railings(dir.offsetX, dir.offsetZ, width.get(), height.get(), level));
         }
         @Override public MBPIterator getLiquids() {
-            return positions(HighwayPlan.liquids(dir.offsetX, dir.offsetZ, width.get(), height.get(), mineAboveRailings.get()));
+            return positions(HighwayPlan.liquids(dir.offsetX, dir.offsetZ, width.get(), height.get(), mineAboveRailings.get()), false);
         }
 
         @Override
@@ -4807,27 +6583,34 @@ public class HighwayBuilder extends Module {
 
         private int normalStartTime, packetStartTime, firstStopTime = -1;
         private boolean packet;
+        private final boolean speculative;
 
         public DoubleMineBlock(HighwayBuilder b, BlockPos pos) {
+            this(b, pos, false);
+        }
+
+        private DoubleMineBlock(HighwayBuilder b, BlockPos pos, boolean speculative) {
             this.b = b;
             this.blockPos = pos;
             this.blockState = b.mc.level.getBlockState(this.blockPos);
             this.block = this.blockState.getBlock();
             this.direction = BlockUtils.getDirection(pos);
             this.packet = false;
+            this.speculative = speculative;
         }
 
         public DoubleMineBlock startDestroying() {
-            if (!b.controlsPlayer()) return this;
+            if (!allowed()) return this;
             b.liquidPlacements.remove(blockPos);
             b.pendingBreaks.putIfAbsent(blockPos.immutable(), blockState);
+            if (speculative) b.speculativeBreaks.add(blockPos.immutable());
             b.mc.gameMode.startPrediction(b.mc.level, sequence -> new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, this.blockPos, this.direction, sequence));
             normalStartTime = b.mc.player.tickCount;
             return this;
         }
 
         public DoubleMineBlock stopDestroying() {
-            if (!b.controlsPlayer() || !b.waiting.isEmpty()) return this;
+            if (!allowed() || !b.waiting.isEmpty()) return this;
             if (firstStopTime < 0) firstStopTime = b.mc.player.tickCount;
             b.mc.gameMode.startPrediction(b.mc.level, sequence -> new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, this.blockPos, this.direction, sequence));
             return this;
@@ -4844,13 +6627,18 @@ public class HighwayBuilder extends Module {
         }
 
         public boolean shouldRemove() {
-            boolean distance = blockPos.distToCenterSqr(b.mc.player.getEyePosition()) > b.mc.player.blockInteractionRange() * b.mc.player.blockInteractionRange();
+            double range = speculative ? b.speculativeMiningRange() : b.mc.player.blockInteractionRange();
+            boolean distance = blockPos.distToCenterSqr(b.mc.player.getEyePosition()) > range * range;
 
             // Bound the wait after submitting completion, without timing out legitimate slow mining.
             // Changing the held item or resending STOP must not extend that wait indefinitely.
             boolean timeout = miningConfirmationExpired(b.mc.player.tickCount, firstStopTime);
 
-            return distance || timeout;
+            return distance || timeout || !allowed();
+        }
+
+        private boolean allowed() {
+            return b.controlsPlayer() && b.crewMayMine(blockPos) && (!speculative || b.canBreakAhead(blockPos));
         }
 
         public double progress() {
@@ -4878,7 +6666,16 @@ public class HighwayBuilder extends Module {
         return firstStopTick >= 0 && tick - firstStopTick >= 60;
     }
 
+    static boolean shouldDoubleMine(boolean creative, double bestToolDelta, boolean speedMineInstamine) {
+        return !creative && Double.isFinite(bestToolDelta) && bestToolDelta > 0 && bestToolDelta < 1
+            && (!speedMineInstamine || bestToolDelta <= 0.5);
+    }
+
     private class RestockTask {
+        private final Set<Action> exhaustedSources = new HashSet<>();
+        private final List<ItemStack> rejectedShulkers = new ArrayList<>();
+        private int minimumSupply;
+        private int resource = -1;
         public boolean materials;
         public boolean pickaxes;
         public boolean food;
@@ -4900,8 +6697,16 @@ public class HighwayBuilder extends Module {
             setTask(2);
         }
 
-        private void setTask(@Range(from = 0, to = 2) int value) {
+        private void setTask(@Range(from = 0, to = 4) int value) {
+            setTask(value, false);
+        }
+
+        private void setTask(@Range(from = 0, to = 4) int value, boolean anticipated) {
+            if (forecastRestockAt == 0) forecastRestockAt = System.nanoTime() / 1e9;
             complete();
+            exhaustedSources.clear();
+            rejectedShulkers.clear();
+            resource = value;
 
             switch (value) {
                 case 0 -> materials = true;
@@ -4909,21 +6714,31 @@ public class HighwayBuilder extends Module {
                 case 2 -> food = true;
             }
 
+            minimumSupply = value >= 3 ? 1 : restockMinimum(value, supplyCount(), b.savePickaxes.get(), anticipated);
+            if (b.crewInventoryEnabled()) minimumSupply = Math.max(minimumSupply, b.crewResourceTarget(value));
             setState(State.Restock);
             b.info("Starting new restock task for " + item());
         }
 
+        private int supplyCount() {
+            if (resource >= 3) return b.crewResourceCount(resource);
+            return State.Forward.countItem(b, stack -> materials ? b.forecastPavingCount(stack) > 0 : pickaxes ? b.usablePickaxe(stack)
+                : food && Utils.isFood(stack) && !Modules.get().get(AutoEat.class).blacklist.get().contains(stack.getItem()));
+        }
+
         public void complete() {
+            resource = -1;
             materials = false;
             pickaxes = false;
             food = false;
         }
 
         public boolean tasksInactive() {
-            return !materials && !pickaxes && !food;
+            return !materials && !pickaxes && !food && resource < 0;
         }
 
         public String item() {
+            if (resource >= 3) return CrewInventory.name(resource);
             if (materials) return "building materials";
             if (pickaxes) return "pickaxes";
             if (food) return "food";

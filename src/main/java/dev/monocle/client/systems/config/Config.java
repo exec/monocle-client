@@ -30,6 +30,39 @@ public class Config extends System<Config> {
     private final SettingGroup sgModules = settings.createGroup("Modules");
     private final SettingGroup sgChat = settings.createGroup("Chat");
     private final SettingGroup sgMisc = settings.createGroup("Misc");
+    private final SettingGroup sgNotifications = settings.createGroup("Notification Feed");
+    private final SettingGroup sgBots = settings.createGroup("Bots");
+
+    public final Setting<Boolean> banterMode = sgBots.add(new BoolSetting.Builder()
+        .name("banter-mode")
+        .description("When rare edge cases are caused by other workers, a worker makes it known to the general public that the other is a bitch. Sends public chat; limited to one message per confirmed incident.")
+        .defaultValue(false).build());
+
+    public final Setting<Integer> botJobHistoryDays = sgBots.add(new IntSetting.Builder()
+        .name("job-history-retention-days").description("Delete finished Bots job history after this many days. Zero disables history retention. Active jobs and recovery records are never expired.")
+        .defaultValue(30).range(0, 3650).sliderMax(90).build());
+
+    public final Setting<Boolean> notificationFeed = sgNotifications.add(new BoolSetting.Builder()
+        .name("enabled").description("Show notifications explicitly routed to the shared feed.").defaultValue(true).build());
+    public final Setting<dev.monocle.client.utils.render.Notifications.Output> moduleNotificationOutput = sgNotifications.add(new EnumSetting.Builder<dev.monocle.client.utils.render.Notifications.Output>()
+        .name("overhauled-module-output").description("Destination for all built-in modules' feedback and toggles. Legacy setting name retained. IRC, commands, outgoing server messages and actionable chat confirmations are unchanged; Notifier categories keep their own settings.")
+        .defaultValue(dev.monocle.client.utils.render.Notifications.Output.Feed).build());
+    public final Setting<Integer> notificationWidth = sgNotifications.add(new IntSetting.Builder()
+        .name("width").description("Card width in GUI-scaled pixels.").defaultValue(240).range(100, 500).build());
+    public final Setting<Integer> notificationHeight = sgNotifications.add(new IntSetting.Builder()
+        .name("maximum-height-percent").description("Maximum screen height; always keeps a bottom margin.").defaultValue(40).range(10, 100).build());
+    public final Setting<Integer> notificationRight = sgNotifications.add(new IntSetting.Builder()
+        .name("right-offset").description("Distance from the right edge in GUI-scaled pixels.").defaultValue(12).range(8, 1000).build());
+    public final Setting<Integer> notificationTop = sgNotifications.add(new IntSetting.Builder()
+        .name("top-offset").description("Distance from the top edge in GUI-scaled pixels.").defaultValue(12).range(8, 1000).build());
+    public final Setting<Double> notificationDuration = sgNotifications.add(new DoubleSetting.Builder()
+        .name("duration").description("Seconds before a card expires; grouped updates renew its lifetime.").defaultValue(6).range(1, 30).build());
+    public final Setting<Integer> notificationLines = sgNotifications.add(new IntSetting.Builder()
+        .name("maximum-lines").description("Maximum body lines per card.").defaultValue(3).range(1, 6).build());
+    public final Setting<Boolean> notificationGrouping = sgNotifications.add(new BoolSetting.Builder()
+        .name("group-updates").description("Update matching source/key cards without reordering them.").defaultValue(true).build());
+    public final Setting<Boolean> notificationSound = sgNotifications.add(new BoolSetting.Builder()
+        .name("sound").description("Play a sound for new visible cards, at most once per second.").defaultValue(false).build());
 
     // Visual
 

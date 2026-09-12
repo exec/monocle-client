@@ -19,17 +19,59 @@ public final class HighwayPlanTest {
         if (!assertionsEnabled) throw new IllegalStateException("Run with assertions enabled (-ea).");
 
         geometry();
+        cachedGeometry();
         liquidInlets();
         supplyLayout();
         paving();
         pavingLength();
+        excavationAhead();
         hud();
+        timingTotals();
         pavingLookback();
         passingSections();
         roadHeight();
         durability();
         routes();
+        supplyTravel();
         System.out.println("Highway Builder checks passed: geometry, continuous paving, reach, durability, and safe local routes.");
+    }
+
+    private static void cachedGeometry() {
+        var front = HighwayPlan.front(0, 1, 5, 3);
+        var paving = HighwayPlan.paving(0, 1, 5, true, true, true);
+        var inlets = HighwayPlan.liquidInlets(0, 1, 5, 3, true);
+        assert front == HighwayPlan.front(0, 1, 5, 3);
+        assert paving == HighwayPlan.paving(0, 1, 5, true, true, true);
+        assert inlets == HighwayPlan.liquidInlets(0, 1, 5, 3, true);
+        assert !front.equals(HighwayPlan.front(0, 1, 5, 4));
+        assert !paving.equals(HighwayPlan.paving(0, 1, 5, true, false, true));
+        assert !inlets.equals(HighwayPlan.liquidInlets(0, 1, 5, 3, false));
+        for (List<?> list : List.of(front, paving, inlets)) {
+            try { list.clear(); throw new AssertionError("Shared shapes must be immutable"); }
+            catch (UnsupportedOperationException expected) { }
+        }
+        try { HighwayPlan.paving(0, 0, 5, false, false, false); throw new AssertionError("Empty shapes must validate too"); }
+        catch (IllegalArgumentException expected) { }
+    }
+
+    private static void supplyTravel() {
+        for (Cell target : List.of(new Cell(5000, 64, 0), new Cell(-5000, 64, 0), new Cell(2, 64, 5000), new Cell(-3, 64, -5000))) {
+            Cell current = new Cell(0, 64, 0);
+            int steps = 0;
+            while (!current.equals(target)) {
+                Cell next = HighwayPlan.travelWaypoint(current, target, 8);
+                long dx = next.x() - current.x(), dz = next.z() - current.z();
+                assert dx * dx + dz * dz <= 81 && next.y() == current.y() : "Unlimited overall travel still uses bounded same-level waypoints";
+                assert Math.hypot(target.x() - next.x(), target.z() - next.z()) < Math.hypot(target.x() - current.x(), target.z() - current.z());
+                current = next;
+                assert ++steps < 1000 : "Waypoints must converge without rounding loops";
+            }
+        }
+        assert HighwayPlan.travelWaypoint(new Cell(0, 64, 0), new Cell(0, 64, 0), 8).equals(new Cell(0, 64, 0));
+        try {
+            HighwayPlan.travelWaypoint(new Cell(0, 64, 0), new Cell(0, 65, 0), 8);
+            throw new AssertionError("Service travel cannot silently path to another elevation");
+        } catch (IllegalArgumentException expected) {}
     }
 
     private static void geometry() {
@@ -230,7 +272,7 @@ public final class HighwayPlanTest {
         for (boolean diagonal : new boolean[] {false, true}) {
             double sectionLength = diagonal ? Math.sqrt(2) : 1;
             for (int completed = 0; completed <= 25; completed++) for (int retained = 0; retained <= 6; retained++) {
-                for (int ahead = 1; ahead <= 2; ahead++) for (int limit : new int[] {0, 1, 2, 20}) {
+                for (int ahead = 1; ahead <= 5; ahead++) for (int limit : new int[] {0, 1, 2, 20}) {
                     boolean allowed = HighwayPlan.withinLength(diagonal, completed * sectionLength, retained + ahead, limit);
                     assert allowed == (limit == 0 || (completed + retained + ahead) * sectionLength <= limit + 0.001)
                         : "Preplacement and required sections share distance accounting, including unretired lookback";
@@ -241,6 +283,40 @@ public final class HighwayPlanTest {
         assert !HighwayPlan.withinLength(false, 13, 8, 20) : "The final required row must not preplace beyond the test/distance limit";
         assert HighwayPlan.withinLength(true, 8 * Math.sqrt(2), 6, 20);
         assert !HighwayPlan.withinLength(true, 8 * Math.sqrt(2), 7, 20) : "Diagonal preplacement must account for sqrt(2), not round down";
+    }
+
+    private static void timingTotals() {
+        HighwayHud hud = new HighwayHud();
+        assert hud.timingSummary().contains("Start a highway");
+        hud.reset(100); hud.resetTiming(100);
+        hud.timingPhase(100, HighwayHud.Phase.Mining);
+        hud.update(110, 0, 0);
+        hud.timingPhase(110, HighwayHud.Phase.Travel);
+        hud.timingPhase(115, HighwayHud.Phase.Supply);
+        hud.timingPhase(118, HighwayHud.Phase.Verification);
+        hud.timingPhase(120, HighwayHud.Phase.Paused);
+        hud.update(124, 0, 0);
+        assert hud.timingSeconds(HighwayHud.Phase.Mining) == 10;
+        assert hud.timingSeconds(HighwayHud.Phase.Travel) == 5;
+        assert hud.timingSeconds(HighwayHud.Phase.Supply) == 3;
+        assert hud.timingSeconds(HighwayHud.Phase.Verification) == 2;
+        assert hud.timingSeconds(HighwayHud.Phase.Paused) == 4;
+        hud.stopTiming(125);
+        String stopped = hud.timingSummary();
+        hud.update(130, 0, 0);
+        assert hud.timingSummary().equals(stopped) : "Completed timing reports freeze";
+        hud.reset(130); hud.resumeTiming(130); // Native lane handoff resets the distance HUD, not this job's totals.
+        assert hud.timingSeconds(HighwayHud.Phase.Paused) == 10;
+        hud.timingPhase(130, HighwayHud.Phase.Paving);
+        hud.update(129, 0, 0); // Monotonic-clock regression cannot double count.
+        hud.update(131, 0, 0);
+        assert hud.timingSeconds(HighwayHud.Phase.Paving) == 1;
+        hud.resetTiming(200);
+        hud.timingPhase(200, HighwayHud.Phase.Paving);
+        for (int second = 1; second <= 650_000; second++) hud.update(200 + second, 0, 0);
+        assert hud.timingSeconds(HighwayHud.Phase.Paving) == 650_000;
+        assert hud.timingSeconds(HighwayHud.Phase.Mining) == 0 && hud.sampleCount() <= 62;
+        assert hud.timingSummary().contains("650000.0s (100.0%)") : "Infinite sessions use a fixed array of weighted time totals";
     }
 
     private static void hud() {
@@ -270,6 +346,42 @@ public final class HighwayPlanTest {
         assert hud.distance() == 0 && hud.rate(0) == 0 && !hud.jammed();
         hud.update(500_002.5, 10, 0);
         assert hud.rate(10) == 4 : "A fresh session uses available elapsed time, not a full unobserved window";
+    }
+
+    private static void excavationAhead() {
+        for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
+            if (dx == 0 && dz == 0) continue;
+            for (int width = dx != 0 && dz != 0 ? 3 : 1; width <= 5; width++) for (int rows = 1; rows <= 5; rows++) {
+                var front = HighwayPlan.front(dx, dz, width, 3);
+                var ahead = HighwayPlan.excavationAhead(dx, dz, width, 3, rows, false, false, false);
+                assert new HashSet<>(ahead).size() == ahead.size();
+                assert ahead.stream().noneMatch(front::contains) : "Required first-row excavation is never speculative";
+                final int headingX = dx, headingZ = dz;
+                assert ahead.stream().allMatch(p -> HighwayPlan.backgroundRow(headingX, headingZ, p.x(), p.z()));
+                if (rows == 1) assert ahead.isEmpty() : "Setting one disables extra excavation";
+                else assert ahead.contains(new Cell(dx * rows, 0, dz * rows));
+                rotated(ahead, HighwayPlan.excavationAhead(-dz, dx, width, 3, rows, false, false, false));
+            }
+            for (int row = -2; row <= 5; row++) {
+                assert HighwayPlan.backgroundRow(dx, dz, dx * row, dz * row) == (row > 1)
+                    : "An unresolved speculative break becomes required when it reaches the next row";
+            }
+        }
+        assert HighwayPlan.excavationAhead(1, 0, 5, 3, 5, false, false, false).size() == 60;
+        var full = HighwayPlan.excavationAhead(1, 0, 5, 3, 5, true, true, true);
+        assert full.size() == 104 : "Lookahead covers requested floor replacement and rail clearance as well as body blocks";
+        assert full.contains(new Cell(5, -1, 0)) && full.contains(new Cell(5, 2, -3));
+        for (int invalid : new int[] {0, 6}) {
+            try { HighwayPlan.excavationAhead(1, 0, 5, 3, invalid, false, false, false); throw new AssertionError("Invalid lookahead accepted"); }
+            catch (IllegalArgumentException expected) { }
+        }
+        assert HighwayPlan.reachedRow(5, 5, 100) == 5;
+        assert HighwayPlan.reachedRow(5, 3.5, 100) == 3 : "A rubberband must lower actual crew progress";
+        assert HighwayPlan.reachedRow(5, 8, 100) == 5 : "Walking ahead is not a completed section";
+        assert HighwayPlan.reachedRow(5, 4.89, 100) == 4;
+        assert HighwayPlan.reachedRow(5, 4.9, 100) == 5 : "Keep the existing ten-centimeter section arrival tolerance";
+        assert HighwayPlan.reachedRow(105, 105, 100) == 100;
+        assert HighwayPlan.reachedRow(0, -4, 100) == 0;
     }
 
     private static void pavingLookback() {
@@ -350,6 +462,12 @@ public final class HighwayPlanTest {
         assert HighwayPlan.route(start, start, floor, safe).equals(List.of(start));
         assert HighwayPlan.route(start, start, p -> false, safe).isEmpty();
         assert HighwayPlan.route(start, goal, floor, safe).size() == 5;
+        var escape = List.of(new Cell(3, 64, 0), new Cell(2, 64, 0), new Cell(2, 64, 1), new Cell(2, 64, 2),
+            new Cell(3, 64, 2), new Cell(4, 64, 2), new Cell(5, 64, 2), new Cell(6, 64, 2));
+        var retreat = HighwayPlan.route(escape.getFirst(), escape.getLast(), escape::contains, safe, 24);
+        assert !retreat.isEmpty() && retreat.get(1).equals(new Cell(2, 64, 0))
+            : "Escaping pickup space may initially approach the supplier: a greedy distance-only step would deadlock";
+        validRoute(retreat, escape.getFirst(), escape.getLast(), escape::contains, safe);
 
         Predicate<Cell> detourFloor = p -> floor.test(p) && !(p.x() == 2 && Math.abs(p.z()) <= 1);
         BiPredicate<Cell, Cell> detourEdges = (from, to) -> !(from.equals(start) && to.equals(start.add(1, 0, 0)));
@@ -360,6 +478,11 @@ public final class HighwayPlanTest {
         assert HighwayPlan.route(start, goal, p -> floor.test(p) && p.x() != 2, safe).isEmpty() : "An impassable wall must not be crossed";
         assert HighwayPlan.route(start, goal.add(0, 1, 0), floor, safe).isEmpty() : "Unsafe goal must not be entered";
         assert HighwayPlan.route(start, start.add(13, 0, 0), floor, safe).isEmpty();
+        assert HighwayPlan.route(start, start.add(16, 0, 16), floor, safe, 24).size() == 33
+            : "A nearby joining worker can cross the admission area's corner on existing supported ground";
+        assert HighwayPlan.route(start, start.add(25, 0, 0), floor, safe, 24).isEmpty();
+        assert HighwayPlan.route(start, start.add(16, 0, 0), p -> floor.test(p) && p.x() != 8, safe, 24).isEmpty()
+            : "A larger crew setup radius must not tunnel through obstructions or unsupported ground";
         assert HighwayPlan.route(start, start.add(9, 0, 9), floor, safe).isEmpty();
         validRoute(HighwayPlan.route(start, start.add(12, 0, 0), floor, safe), start, start.add(12, 0, 0), floor, safe);
 

@@ -25,6 +25,8 @@ import dev.monocle.client.systems.config.Config;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.misc.InventoryTweaks;
 import dev.monocle.client.systems.modules.player.FastUse;
+import dev.monocle.client.systems.modules.player.AutoEat;
+import dev.monocle.client.systems.modules.player.AutoGap;
 import dev.monocle.client.systems.modules.player.Multitask;
 import dev.monocle.client.systems.modules.render.ESP;
 import dev.monocle.client.systems.modules.render.Freecam;
@@ -219,7 +221,7 @@ public abstract class MinecraftMixin implements IMinecraft {
         return customTitle;
     }
 
-    // Have to add this condition if we want to draw back a bow using packets, without it getting cancelled by vanilla code
+    // Native automated use must survive physical key releases, including focus/screen changes.
     @WrapWithCondition(method = "handleKeybinds", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/multiplayer/MultiPlayerGameMode;releaseUsingItem(Lnet/minecraft/world/entity/player/Player;)V"))
     private boolean wrapStopUsing(MultiPlayerGameMode instance, Player player) {
         return HB$stopUsingItem();
@@ -227,6 +229,7 @@ public abstract class MinecraftMixin implements IMinecraft {
 
     @Unique
     private boolean HB$stopUsingItem() {
+        if (Modules.get().get(AutoEat.class).ownsItemUse() || Modules.get().get(AutoGap.class).ownsItemUse()) return false;
         HighwayBuilder b = Modules.get().get(HighwayBuilder.class);
         return !b.controlsPlayer() || !b.drawingBow;
     }

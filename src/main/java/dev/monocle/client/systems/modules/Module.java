@@ -17,6 +17,8 @@ import dev.monocle.client.utils.misc.ISerializable;
 import dev.monocle.client.utils.misc.Keybind;
 import dev.monocle.client.utils.player.ChatUtils;
 import dev.monocle.client.utils.render.color.Color;
+import dev.monocle.client.utils.render.Notifications;
+import dev.monocle.client.utils.render.NotificationFeed.Severity;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.nbt.CompoundTag;
@@ -125,29 +127,53 @@ public abstract class Module implements ISerializable<Module>, Comparable<Module
 
     public void sendToggledMsg() {
         if (Config.get().chatFeedback.get() && chatFeedback) {
+            if (feed(Component.literal(isActive() ? "Enabled" : "Disabled"), isActive() ? Severity.Success : Severity.Info, "toggle")) return;
             ChatUtils.forceNextPrefixClass(getClass());
             ChatUtils.sendMsg(this.hashCode(), ChatFormatting.GRAY, "Toggled (highlight)%s(default) %s(default).", title, isActive() ? ChatFormatting.GREEN + "on" : ChatFormatting.RED + "off");
         }
     }
 
     public void info(Component message) {
+        if (feed(message, Severity.Info, "")) return;
         ChatUtils.forceNextPrefixClass(getClass());
         ChatUtils.sendMsg(title, message);
     }
 
     public void info(String message, Object... args) {
+        if (feedFormatted(message, Severity.Info, args)) return;
         ChatUtils.forceNextPrefixClass(getClass());
         ChatUtils.infoPrefix(title, message, args);
     }
 
     public void warning(String message, Object... args) {
+        if (feedFormatted(message, Severity.Warning, args)) return;
         ChatUtils.forceNextPrefixClass(getClass());
         ChatUtils.warningPrefix(title, message, args);
     }
 
     public void error(String message, Object... args) {
+        if (feedFormatted(message, Severity.Error, args)) return;
         ChatUtils.forceNextPrefixClass(getClass());
         ChatUtils.errorPrefix(title, message, args);
+    }
+
+    private boolean usesFeed() {
+        return getClass().getName().startsWith("dev.monocle.client.systems.modules.")
+            && Notifications.migratedModule(name) && Config.get() != null
+            && Config.get().moduleNotificationOutput.get() != Notifications.Output.Chat;
+    }
+
+    private boolean feedFormatted(String message, Severity severity, Object... args) {
+        if (!usesFeed()) return false;
+        // Reuse Meteor's formatting parser so (highlight)/(default) never leak into cards.
+        return feed(ChatUtils.formatMsg(String.format(message, args), ChatFormatting.GRAY), severity, "");
+    }
+
+    /** Return true only when the legacy chat send should be suppressed. Both keeps its original Component/click actions. */
+    private boolean feed(Component message, Severity severity, String key) {
+        if (!usesFeed()) return false;
+        if (mc.level != null) Notifications.post(title, key, severity, message.getString());
+        return Config.get().moduleNotificationOutput.get() == Notifications.Output.Feed;
     }
 
     public boolean isActive() {

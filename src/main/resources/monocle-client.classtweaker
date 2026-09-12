@@ -36,6 +36,10 @@ accessible   field   net/minecraft/world/entity/projectile/FishingHook currentSt
 
 accessible   method  net/minecraft/client/multiplayer/MultiPlayerGameMode startPrediction (Lnet/minecraft/client/multiplayer/ClientLevel;Lnet/minecraft/client/multiplayer/prediction/PredictiveAction;)V
 
+# HighwayBuilder#crewRowResolved: reject vanilla's unresolved local predictions, including other modules.
+accessible   method  net/minecraft/client/multiplayer/ClientLevel getBlockStatePredictionHandler ()Lnet/minecraft/client/multiplayer/prediction/BlockStatePredictionHandler;
+accessible   field   net/minecraft/client/multiplayer/prediction/BlockStatePredictionHandler serverVerifiedStates Lit/unimi/dsi/fastutil/longs/Long2ObjectOpenHashMap;
+
 # GuiGraphicsExtractorAccessor
 accessible   class   net/minecraft/client/gui/GuiGraphicsExtractor$ScissorStack
 # WireframeEntityRenderer#getBuffer

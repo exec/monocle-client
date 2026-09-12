@@ -433,9 +433,18 @@ public class ElytraFly extends Module {
 
     /** A short-lived world-space request; zero also owns grounded restocking without taking off. */
     public boolean requestAutopilot(Vec3 velocity) {
+        return requestAutopilot(velocity, 1);
+    }
+
+    /** Survey-only higher ceiling; printing, restocking and ordinary travel keep their existing limits. */
+    public boolean requestSurveyAutopilot(Vec3 velocity) {
+        return requestAutopilot(velocity, Math.min(6, horizontalSpeed.get()));
+    }
+
+    private boolean requestAutopilot(Vec3 velocity, double maximum) {
         if (!mc.isSameThread()) throw new IllegalStateException("Request flight from the client thread.");
         if (velocity == null || !Double.isFinite(velocity.x) || !Double.isFinite(velocity.y) || !Double.isFinite(velocity.z)
-            || velocity.lengthSqr() > 1 + 1e-9) throw new IllegalArgumentException("Autopilot velocity must be finite and at most one block/tick.");
+            || !Double.isFinite(maximum) || maximum < 0 || velocity.lengthSqr() > maximum * maximum + 1e-9) throw new IllegalArgumentException("Autopilot velocity exceeds its configured ceiling.");
         if (!isActive() || flightMode.get() != ElytraFlightModes.Vanilla || mc.player == null || mc.level == null
             || !mc.player.isAlive() || (mc.player.isInWater() || mc.player.isInLava()) && velocity.lengthSqr() != 0) {
             clearAutopilot();

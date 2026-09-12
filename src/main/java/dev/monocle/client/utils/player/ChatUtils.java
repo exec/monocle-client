@@ -207,7 +207,7 @@ public class ChatUtils {
         return PREFIX;
     }
 
-    private static MutableComponent formatMsg(String message, ChatFormatting defaultColor) {
+    public static MutableComponent formatMsg(String message, ChatFormatting defaultColor) {
         StringReader reader = new StringReader(message);
         MutableComponent text = Component.empty();
         Style style = Style.EMPTY.applyFormats(defaultColor);

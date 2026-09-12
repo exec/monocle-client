@@ -5,6 +5,7 @@
 
 package dev.monocle.client.systems.modules.player;
 
+import dev.monocle.client.MonocleClient;
 import dev.monocle.client.events.entity.player.ItemUseCrosshairTargetEvent;
 import dev.monocle.client.events.world.TickEvent;
 import dev.monocle.client.pathing.PathManagers;
@@ -117,7 +118,7 @@ public class AutoEat extends Module {
 
     private final Setting<Integer> hungerThreshold = sgThreshold.add(new IntSetting.Builder()
         .name("hunger-threshold")
-        .description("The level of hunger you eat at.")
+        .description("Start eating at this hunger level, then continue until hunger is full.")
         .defaultValue(16)
         .range(1, 19)
         .sliderRange(1, 19)
@@ -128,11 +129,12 @@ public class AutoEat extends Module {
     // Module state
     public boolean eating;
     private int slot = -1, prevSlot = -1, retryTicks, eatingTicks, lastFoodCount, lastHunger;
-    private boolean wasUsePressed;
+    private boolean wasUsePressed, mealPending;
     private String status = "Idle";
 
     private final java.util.Map<Module, Long> wasAura = new java.util.HashMap<>();
     private Object eatingWorld;
+    private Object eatingPlayer;
     private ItemStack eatingStack = ItemStack.EMPTY;
     private boolean wasBaritone = false;
 
@@ -140,11 +142,12 @@ public class AutoEat extends Module {
         super(Categories.Player, "auto-eat", "Food management for travel and building: full-inventory supplies, protected food and hunger-aware selection.");
     }
 
-    @Override public void onActivate() { retryTicks = eatingTicks = 0; status = "Ready"; }
+    @Override public void onActivate() { retryTicks = eatingTicks = 0; mealPending = false; status = "Ready"; }
 
     @Override
     public void onDeactivate() {
         stopEating();
+        mealPending = false;
         retryTicks = 0;
         status = "Inactive";
     }
@@ -152,22 +155,30 @@ public class AutoEat extends Module {
     /**
      * Main tick handler for the module's eating logic
      */
-    @EventHandler(priority = EventPriority.LOW)
+    @EventHandler(priority = EventPriority.HIGH)
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null) {
+        if ((eating || mealPending) && (mc.player != eatingPlayer || mc.level != eatingWorld)) {
+            stopEating();
+            mealPending = false;
+            retryTicks = 0;
+        }
+        if (mc.player == null || !mc.player.isAlive()) {
             if (eating) stopEating();
+            mealPending = false;
             return;
         }
-        if (retryTicks > 0) { retryTicks--; return; }
-        if (Modules.get().get(AutoGap.class).isEating() || !thresholdReached()) {
+        if (!mc.player.getFoodData().needsFood()) mealPending = false;
+        if (Modules.get().get(AutoGap.class).isEating() || !mealNeeded()) {
             if (eating) stopEating();
             status = Modules.get().get(AutoGap.class).isEating() ? "Yielding to Auto Gap" : "Ready";
             return;
         }
 
-        if (mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.containerMenu.getCarried().isEmpty() || mc.gui.screen() != null) {
+        // Chat, pause menus and the Bots GUI are harmless. Only an actual inventory
+        // transaction blocks food selection; background clients still need to eat.
+        if (mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.containerMenu.getCarried().isEmpty()) {
             if (eating) stopEating();
-            status = "Waiting for inventory / screen";
+            status = "Waiting for inventory transaction";
             return;
         }
         if (eating && slot != SlotUtils.OFFHAND && mc.player.getInventory().getSelectedSlot() != slot) {
@@ -176,6 +187,7 @@ public class AutoEat extends Module {
             status = "Yielding to slot change";
             return;
         }
+        if (retryTicks > 0) { retryTicks--; return; }
 
         if (!eating && mc.player.isUsingItem()) return;
 
@@ -190,18 +202,19 @@ public class AutoEat extends Module {
         }
 
         int foodCount = stackIn(slot).getCount(), hunger = mc.player.getFoodData().getFoodLevel();
-        if (foodCount != lastFoodCount || hunger != lastHunger) eatingTicks = 0;
+        if (foodCount < lastFoodCount || hunger > lastHunger) eatingTicks = 0;
         lastFoodCount = foodCount;
         lastHunger = hunger;
         if (++eatingTicks >= 100) {
-            stopEating();
-            retryTicks = 40;
-            status = "Eating stalled; retrying shortly";
+            logEatingStall();
+            restartEating();
             return;
         }
 
         status = "Eating " + stackIn(slot).getHoverName().getString();
-        eat();
+        // Claim eating now; start native use after Highway Builder and BlockUtils
+        // have canceled their old mining later in this tick.
+        setPressed(true);
     }
 
     @EventHandler
@@ -216,6 +229,8 @@ public class AutoEat extends Module {
 
         eating = true;
         eatingWorld = mc.level;
+        eatingPlayer = mc.player;
+        mealPending = mc.player.getFoodData().needsFood();
         eatingTicks = 0;
         lastFoodCount = stackIn(this.slot).getCount();
         lastHunger = mc.player.getFoodData().getFoodLevel();
@@ -243,14 +258,59 @@ public class AutoEat extends Module {
     private void eat() {
         setPressed(true);
         if (!mc.player.isUsingItem()) {
-            mc.gameMode.useItem(mc.player, slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND);
+            // Vanilla normally cancels mining through key handling, which GUIs skip.
+            if (mc.gameMode.isDestroying()) mc.gameMode.stopDestroyBlock();
+            var result = mc.gameMode.useItem(mc.player, slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND);
+            if (!mc.player.isUsingItem()) status = "Waiting for food use to start: " + result;
         }
+    }
+
+    private void restartEating() {
+        if (ownsItemUse()) mc.gameMode.releaseUsingItem(mc.player);
+        setPressed(false);
+        eatingTicks = 0;
+        retryTicks = 2;
+        // Keep the food slot, aura pause and builder pause through a rejected/stuck use.
+        status = "Restarting stalled food use";
+    }
+
+    private void logEatingStall() {
+        MonocleClient.LOG.warn("Auto Eat stalled: focused={}, screen={}, selected={}, foodSlot={}, using={}, hand={}, hunger={}, useTicks={}, mining={}, food={}, status={}",
+            mc.isWindowActive(), mc.gui.screen() == null ? "none" : mc.gui.screen().getClass().getSimpleName(),
+            mc.player.getInventory().getSelectedSlot(), slot, mc.player.isUsingItem(), mc.player.getUsedItemHand(), mc.player.getFoodData().getFoodLevel(),
+            mc.player.getTicksUsingItem(), mc.gameMode.isDestroying(), stackIn(slot), status);
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST - 200)
+    private void onPostTick(TickEvent.Post event) {
+        // Retry after input handling, slot synchronization and mining cleanup, even with a GUI/unfocused window.
+        if (retryTicks == 0 && ownsFoodSlot() && mealNeeded() && !Modules.get().get(AutoGap.class).isEating()) eat();
+    }
+
+    /** Own the food-use action, not the physical mouse button (which focus/screens can release). */
+    public boolean ownsItemUse() {
+        return ownsFoodSlot() && mc.player.isUsingItem()
+            && mc.player.getUsedItemHand() == (slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND)
+            && sameFoodUse(eatingStack, stackIn(slot), mc.player.getUseItem());
+    }
+
+    private boolean ownsFoodSlot() {
+        return isActive() && eating && mc.player != null && mc.player == eatingPlayer && mc.level == eatingWorld
+            && mc.player.isAlive()
+            && mc.player.containerMenu == mc.player.inventoryMenu && mc.player.containerMenu.getCarried().isEmpty()
+            && (slot == SlotUtils.OFFHAND || mc.player.getInventory().getSelectedSlot() == slot)
+            && sameFoodUse(eatingStack, stackIn(slot), stackIn(slot));
+    }
+
+    static boolean sameFoodUse(ItemStack expected, ItemStack held, ItemStack using) {
+        return !expected.isEmpty() && expected.has(DataComponents.FOOD)
+            && ItemStack.isSameItemSameComponents(expected, held) && ItemStack.isSameItemSameComponents(expected, using);
     }
 
     void stopEating() {
         if (!eating && wasAura.isEmpty() && !wasBaritone) return;
 
-        if (mc.player != null && mc.level == eatingWorld && ItemStack.isSameItemSameComponents(stackIn(slot), eatingStack)
+        if (mc.player != null && mc.player == eatingPlayer && mc.level == eatingWorld && ItemStack.isSameItemSameComponents(stackIn(slot), eatingStack)
             && (slot == SlotUtils.OFFHAND || mc.player.getInventory().getSelectedSlot() == slot)) {
             if (mc.player.isUsingItem() && mc.player.getUsedItemHand() == (slot == SlotUtils.OFFHAND ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND)
                 && mc.player.getUseItem().get(DataComponents.FOOD) != null) mc.gameMode.releaseUsingItem(mc.player);
@@ -259,6 +319,7 @@ public class AutoEat extends Module {
         setPressed(wasUsePressed);
 
         eating = false;
+        // Retain meal context across temporary inventory/Auto Gap handoffs.
         slot = -1;
         prevSlot = -1;
 
@@ -308,9 +369,18 @@ public class AutoEat extends Module {
     }
 
     public boolean shouldEat() {
-        return mc.player != null && retryTicks == 0 && mc.gui.screen() == null
+        return mc.player != null && retryTicks == 0
             && mc.player.containerMenu == mc.player.inventoryMenu && mc.player.containerMenu.getCarried().isEmpty()
-            && thresholdReached() && findSlot() != -1;
+            && mealNeeded() && findSlot() != -1;
+    }
+
+    private boolean mealNeeded() {
+        return continueMeal(mealPending && mc.player == eatingPlayer && mc.level == eatingWorld,
+            thresholdReached(), mc.player.getFoodData().getFoodLevel());
+    }
+
+    static boolean continueMeal(boolean pending, boolean threshold, int hunger) {
+        return threshold || pending && hunger < 20;
     }
 
     private boolean thresholdReached() {

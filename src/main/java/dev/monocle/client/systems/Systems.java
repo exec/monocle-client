@@ -45,6 +45,8 @@ public class Systems {
         // Registers the colors from config tab. This allows rainbow colours to work for friends.
         config.settings.registerColorSettings(null);
 
+        add(new dev.monocle.client.systems.bots.Bots());
+
         add(new Macros());
         add(new Friends());
         add(new Accounts());

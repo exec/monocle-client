@@ -99,6 +99,16 @@ public class AutoReplenish extends Module {
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null) return;
+        var modules = Modules.get();
+        if (modules.get(dev.monocle.client.systems.modules.misc.InventoryTweaks.class).isBusy()
+            || modules.get(AutoTotem.class).needsInventory()
+            || modules.get(ChestSwap.class).controlsChest()
+            || modules.get(dev.monocle.client.systems.modules.combat.KillAura.class).attacking
+            || modules.isActive(dev.monocle.client.systems.modules.world.HighwayBuilder.class)
+            || modules.get(dev.monocle.client.systems.modules.world.PrinterHelper.class).controlsInventory()) {
+            fillItems(); // Do not later restore a slot deliberately changed by another module.
+            return;
+        }
 
         if (mc.gui.screen() == null && prevHadOpenScreen) {
             fillItems();
@@ -179,6 +189,7 @@ public class AutoReplenish extends Module {
 
         for (int i = SlotUtils.MAIN_END; i >= (searchHotbar.get() ? SlotUtils.HOTBAR_START : SlotUtils.MAIN_START); i--) {
             if (i == excludedSlot) continue;
+            if (Modules.get().get(dev.monocle.client.systems.modules.misc.InventoryTweaks.class).isPinnedSlot(i)) continue;
 
             ItemStack stack = mc.player.getInventory().getItem(i);
             if (stack.getItem() != lookForStack.getItem()) continue;

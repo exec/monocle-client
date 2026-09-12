@@ -8,8 +8,10 @@ import dev.monocle.client.gui.widgets.WWidget;
 import dev.monocle.client.gui.widgets.containers.WContainer;
 import dev.monocle.client.gui.widgets.containers.WHorizontalList;
 import dev.monocle.client.gui.widgets.containers.WVerticalList;
+import dev.monocle.client.gui.widgets.containers.WSection;
 import dev.monocle.client.gui.widgets.pressable.WButton;
 import dev.monocle.client.settings.Settings;
+import dev.monocle.client.systems.bots.Bots;
 import dev.monocle.client.systems.modules.world.HighwayBuilder;
 import dev.monocle.client.utils.render.color.Color;
 import net.minecraft.util.StringUtil;
@@ -19,7 +21,8 @@ import static dev.monocle.client.MonocleClient.mc;
 public class HighwayBuilderScreen extends WindowScreen {
     private final HighwayBuilder builder;
     private final Settings buildSettings;
-    private WLabel status, plan, stats, readiness, supplies;
+    private WLabel status, plan, stats, readiness, supplies, timings;
+    private int timingTicks;
     private WContainer setup;
     private WHorizontalList actions;
     private WButton preview;
@@ -62,6 +65,12 @@ public class HighwayBuilderScreen extends WindowScreen {
         details.add(theme.horizontalSeparator("Supplies")).expandX();
         supplies = details.add(theme.label(builder.getSuppliesSummary(), 205)).widget();
 
+        WSection timingSection = add(theme.section("Timing breakdown (local job)", false)).expandX().widget();
+        timingSection.add(theme.label("Controller phase time, not CPU time. Background mining/paving can continue during a verification or entity wait. Same-job crew handoffs retain totals; a new job resets them.", 580));
+        timings = timingSection.add(theme.label(builder.getTimingSummary(), 580)).expandX().widget();
+        timingSection.add(theme.button("Copy timings")).widget().action = () -> mc.keyboardHandler.setClipboard(
+            "Monocle " + dev.monocle.client.MonocleClient.VERSION + "\n" + builder.getTimingSummary());
+
         add(theme.horizontalSeparator()).expandX();
         WHorizontalList bottom = add(theme.horizontalList()).expandX().widget();
         preview = bottom.add(theme.button("Show world preview")).widget();
@@ -73,10 +82,9 @@ public class HighwayBuilderScreen extends WindowScreen {
 
         WButton advanced = bottom.add(theme.button("Advanced & keybind")).expandCellX().right().widget();
         advanced.action = () -> {
-            if (builder.hasJob() && !builder.isJobPaused()) builder.pauseJob();
             mc.gui.setScreen(new ModuleScreen(theme, builder));
         };
-        advanced.tooltip = "Open all settings and the module keybind. Pauses an active build before editing.";
+        advanced.tooltip = "Inspect all settings and the module keybind without pausing. Changing the build layout still pauses for review.";
 
         rebuildControls();
         refreshLabels();
@@ -86,6 +94,16 @@ public class HighwayBuilderScreen extends WindowScreen {
         shownJob = builder.hasJob();
         shownPaused = builder.isJobPaused();
         actions.clear();
+
+        if (Bots.get().crew.localAssigned()) {
+            WButton manage = actions.add(theme.button("Manage crew in Bots")).expandX().widget();
+            manage.action = () -> dev.monocle.client.gui.tabs.Tabs.get().stream().filter(tab -> tab.name.equals("Bots")).findFirst().ifPresent(tab -> tab.openScreen(theme));
+            manage.tooltip = "Crew lifecycle is controlled from the host's Bots tab. Emergency module disable remains available.";
+            enterAction = manage.action;
+            setup.clear();
+            setup.add(theme.label("This highway belongs to a bot crew.\nUse the host's Bots tab to inspect, pause, resume or end the job.", 310));
+            return;
+        }
 
         WButton primary = actions.add(theme.button(!shownJob ? "Start" : shownPaused ? "Resume" : "Pause"))
             .expandX().widget();
@@ -129,6 +147,7 @@ public class HighwayBuilderScreen extends WindowScreen {
     @Override
     public void tick() {
         super.tick();
+        if (++timingTicks % 20 == 0) timings.set(builder.getTimingSummary());
         if (shownJob != builder.hasJob() || shownPaused != builder.isJobPaused()) rebuildControls();
         if (!shownJob || shownPaused) buildSettings.tick(setup, theme);
         builder.updatePreview();

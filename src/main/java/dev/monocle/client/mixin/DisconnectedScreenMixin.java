@@ -8,11 +8,11 @@ package dev.monocle.client.mixin;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.misc.AutoReconnect;
 import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.StringWidget;
+import net.minecraft.network.DisconnectionDetails;
 import net.minecraft.client.gui.layouts.LinearLayout;
-import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.DisconnectedScreen;
 import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.network.chat.Component;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -29,10 +29,17 @@ public abstract class DisconnectedScreenMixin extends Screen {
     @Shadow
     @Final
     private LinearLayout layout;
+    @Shadow @Final private DisconnectionDetails details;
     @Unique
     private Button reconnectBtn;
-    @Unique
-    private double time = Modules.get().get(AutoReconnect.class).time.get() * 20;
+    @Unique private Button pauseBtn;
+    @Unique private StringWidget retryStatus;
+    @Unique private long deadline;
+    @Unique private long remaining;
+    @Unique private boolean initialized;
+    @Unique private boolean paused;
+    @Unique private boolean cancelled;
+    @Unique private boolean connecting;
 
     protected DisconnectedScreenMixin(Component title) {
         super(title);
@@ -42,43 +49,68 @@ public abstract class DisconnectedScreenMixin extends Screen {
     private void addButtons(CallbackInfo ci) {
         AutoReconnect autoReconnect = Modules.get().get(AutoReconnect.class);
 
-        if (autoReconnect.lastServerConnection != null && !autoReconnect.button.get()) {
-            reconnectBtn = new Button.Builder(Component.literal(getText()), _ -> tryConnecting()).build();
-            layout.addChild(reconnectBtn);
+        if (!initialized) {
+            initialized = true;
+            remaining = (long) (autoReconnect.retryDelay() * 1_000_000_000L);
+            deadline = System.nanoTime() + remaining;
+        }
 
-            layout.addChild(
-                new Button.Builder(Component.literal("Toggle Auto Reconnect"), _ -> {
-                    autoReconnect.toggle();
-                    reconnectBtn.setMessage(Component.literal(getText()));
-                    time = autoReconnect.time.get() * 20;
-                }).build()
-            );
+        if (autoReconnect.lastServerConnection != null && !autoReconnect.button.get()) {
+            String server = autoReconnect.lastServerConnection.right().name;
+            layout.addChild(new StringWidget(Component.literal("Reconnect to " + server), font).setMaxWidth(300));
+            retryStatus = layout.addChild(new StringWidget(300, 12, Component.empty(), font));
+            reconnectBtn = new Button.Builder(Component.literal("Reconnect Now"), _ -> tryConnecting(true)).build();
+            layout.addChild(reconnectBtn);
+            pauseBtn = layout.addChild(new Button.Builder(Component.literal("Pause Retries"), _ -> {
+                if (!autoReconnect.isActive() || cancelled) {
+                    autoReconnect.enable();
+                    cancelled = paused = false;
+                    deadline = System.nanoTime() + (long) (autoReconnect.retryDelay() * 1_000_000_000L);
+                } else if (paused) {
+                    paused = false;
+                    deadline = System.nanoTime() + remaining;
+                } else {
+                    paused = true;
+                    remaining = Math.max(0, deadline - System.nanoTime());
+                }
+                updateStatus();
+            }).build());
+            layout.addChild(new Button.Builder(Component.literal("Cancel Retries"), _ -> {
+                cancelled = true;
+                autoReconnect.disable();
+                updateStatus();
+            }).build());
+            updateStatus();
         }
     }
 
     @Override
     public void tick() {
         AutoReconnect autoReconnect = Modules.get().get(AutoReconnect.class);
-        if (!autoReconnect.isActive() || autoReconnect.lastServerConnection == null) return;
-
-        if (time <= 0) {
-            tryConnecting();
-        } else {
-            time -= 1;
-            if (reconnectBtn != null) reconnectBtn.setMessage(Component.literal(getText()));
-        }
+        if (mc.gui.screen() != (Object) this || connecting) return;
+        updateStatus();
+        if (!autoReconnect.isActive() || autoReconnect.lastServerConnection == null || paused || cancelled
+            || !autoReconnect.stopReason(details.reason()).isEmpty()) return;
+        if (System.nanoTime() >= deadline) tryConnecting(false);
     }
 
     @Unique
-    private String getText() {
-        String reconnectText = "Reconnect";
-        if (Modules.get().isActive(AutoReconnect.class)) reconnectText += " " + String.format("(%.1f)", time / 20);
-        return reconnectText;
+    private void updateStatus() {
+        if (retryStatus == null) return;
+        AutoReconnect reconnect = Modules.get().get(AutoReconnect.class);
+        String stop = reconnect.stopReason(details.reason());
+        String status = cancelled ? "Cancelled" : !reconnect.isActive() ? "Auto Reconnect off"
+            : !stop.isEmpty() ? stop : paused ? "Paused"
+            : String.format(java.util.Locale.ROOT, "Retry in %.1fs", Math.max(0, deadline - System.nanoTime()) / 1_000_000_000.0);
+        retryStatus.setMessage(Component.literal(status + " · Attempts: " + reconnect.attempts()));
+        pauseBtn.setMessage(Component.literal(!reconnect.isActive() || cancelled ? "Enable Retries" : paused ? "Resume Retries" : "Pause Retries"));
+        pauseBtn.active = stop.isEmpty();
     }
 
     @Unique
-    private void tryConnecting() {
-        var lastServer = Modules.get().get(AutoReconnect.class).lastServerConnection;
-        ConnectScreen.startConnecting(new TitleScreen(), mc, lastServer.left(), lastServer.right(), false, null);
+    private void tryConnecting(boolean manual) {
+        if (connecting || mc.gui.screen() != (Object) this) return;
+        connecting = true;
+        Modules.get().get(AutoReconnect.class).reconnect(manual);
     }
 }

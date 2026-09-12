@@ -158,6 +158,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
     @Inject(method = "handleTakeItemEntity", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/multiplayer/ClientLevel;getEntity(I)Lnet/minecraft/world/entity/Entity;", ordinal = 0))
     private void onHandleTakeItemEntity(ClientboundTakeItemEntityPacket packet, CallbackInfo ci) {
         Modules.get().get(HighwayBuilder.class).onSupplyItemPickup(packet.getItemId(), packet.getPlayerId(), packet.getAmount());
+        dev.monocle.client.systems.bots.Bots.get().crew.pickup(packet.getItemId(), packet.getPlayerId(), packet.getAmount());
         Modules.get().get(PrinterHelper.class).onSupplyItemPickup(packet.getItemId(), packet.getPlayerId(), packet.getAmount());
         Entity itemEntity = minecraft.level.getEntity(packet.getItemId());
         Entity entity = minecraft.level.getEntity(packet.getPlayerId());

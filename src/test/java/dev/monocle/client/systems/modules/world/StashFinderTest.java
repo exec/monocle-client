@@ -45,6 +45,13 @@ public final class StashFinderTest {
         StashFinder.retainReview(removed, small, 400);
         assert removed.getTotal() == 0 && removed.note.equals(small.note) && removed.review == StashFinder.Review.Ignored;
         assert removed.firstSeen == 100 && removed.lastSeen == 400 : "Rescanning a cleared finding must preserve review history";
+        var shared = new StashFinder.Chunk(small.chunkPos); shared.chests = 15;
+        StashFinder.mergeFinding(records, shared, 450);
+        assert records.size() == 2 && records.get(1).chests == 15;
+        assert shared.note.equals(small.note) && shared.review == small.review && shared.firstSeen == small.firstSeen;
+        StashFinder.mergeFinding(records, shared, 450);
+        assert records.size() == 2 : "Repeated network delivery must not duplicate notebook coordinates";
+        records.set(1, small);
         StashFinder.retainReview(same, null, 500);
         assert same.firstSeen == 500 && same.lastSeen == 500;
         assert StashFinder.findings(records, "", false, StashFinder.Sort.Shulkers, 0, 0).equals(List.of(large));

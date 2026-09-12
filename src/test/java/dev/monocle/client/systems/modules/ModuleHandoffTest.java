@@ -32,6 +32,16 @@ public final class ModuleHandoffTest {
         assert calls(KillAura.class, "onTick").contains("activationRevision");
         assert calls(Surround.class, "onDeactivate").contains("activationRevision");
         assert calls(AutoGap.class, "onTick").containsAll(List.of("getCarried", "getSelectedSlot"));
+        for (String method : List.of("onTick", "onPostTick", "ownsFoodSlot", "ownsItemUse")) {
+            assert java.util.Collections.disjoint(calls(AutoGap.class, method), List.of("screen", "isWindowActive", "isFocused", "isDown"))
+                : "Auto Gap must retain food use through background, chat and pause screens";
+        }
+        assert !calls(AutoGap.class, "onTick").contains("eat") && calls(AutoGap.class, "onTick").contains("setPressed");
+        assert calls(AutoGap.class, "onPostTick").containsAll(List.of("ownsFoodSlot", "eat"));
+        assert calls(AutoGap.class, "eat").containsAll(List.of("isDestroying", "stopDestroyBlock", "useItem"));
+        assert calls(AutoGap.class, "ownsItemUse").containsAll(List.of("ownsFoodSlot", "getUsedItemHand", "sameFoodUse"));
+        assert AutoGap.class.getDeclaredMethod("onTick", dev.monocle.client.events.world.TickEvent.Pre.class)
+            .getAnnotation(meteordevelopment.orbit.EventHandler.class).priority() > meteordevelopment.orbit.EventPriority.MEDIUM;
         System.out.println("Module handoff checks passed: revision-owned restoration, food slot identity, mending reserves and deferred combat guards.");
     }
 

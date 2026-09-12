@@ -125,6 +125,7 @@ public class MonocleClient implements ClientModInitializer {
 
         // Load systems
         Systems.init();
+        EVENT_BUS.subscribe(dev.monocle.client.utils.render.Notifications.INSTANCE);
 
         // Subscribe after systems are loaded
         EVENT_BUS.subscribe(this);

@@ -41,8 +41,13 @@ jobs:
           test "$(unzip -p "build/libs/$jar" fabric.mod.json | jq -r .version)" = "$version"
           mkdir -p dist
           cp "build/libs/$jar" dist/
+          host="monocle-host-$version.zip"
+          test -s "host-service/build/distributions/$host"
+          unzip -t "host-service/build/distributions/$host"
+          cp "host-service/build/distributions/$host" dist/
           cd dist
           sha256sum "$jar" > "$jar.sha256"
+          sha256sum "$host" > "$host.sha256"
       - uses: actions/upload-artifact@v7
         with:
           name: monocle-${{ github.run_number }}

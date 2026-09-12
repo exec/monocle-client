@@ -1,94 +1,37 @@
-/*
- * This file is derived from the Meteor Client distribution (https://github.com/MeteorDevelopment/meteor-client).
- * Copyright (c) Meteor Development.
- */
-
+/* Derived from Meteor Client; Copyright (c) Meteor Development. */
 package dev.monocle.client.systems.modules.misc.swarm;
 
-import dev.monocle.client.commands.Commands;
+import dev.monocle.client.systems.bots.Bots;
+
 import dev.monocle.client.pathing.PathManagers;
-import dev.monocle.client.utils.player.ChatUtils;
 import net.minecraft.world.level.block.Block;
-
-import java.io.DataInputStream;
+import java.net.*;
 import java.io.IOException;
-import java.net.Socket;
 
-public class SwarmWorker extends Thread {
-    private Socket socket;
+public class SwarmWorker extends SwarmConnection {
     public Block target;
-
+    private final String ip;
+    private final int port;
     public SwarmWorker(String ip, int port) {
-        try {
-            socket = new Socket(ip, port);
-        } catch (Exception e) {
-            socket = null;
-            ChatUtils.warningPrefix("Swarm", "Server not found at %s on port %s.", ip, port);
-            e.printStackTrace();
-        }
-
-        if (socket != null) start();
+        this(ip, port, Bots.get().crewKey.get());
     }
-
-    @Override
-    public void run() {
-        ChatUtils.infoPrefix("Swarm", "Connected to Swarm host on at %s on port %s.", getIp(socket.getInetAddress().getHostAddress()), socket.getPort());
-
-        try {
-            DataInputStream in = new DataInputStream(socket.getInputStream());
-
-
-            while (!isInterrupted()) {
-                String read = in.readUTF();
-
-                if (read.startsWith("swarm")) {
-                    ChatUtils.infoPrefix("Swarm", "Received command: (highlight)%s", read);
-
-                    try {
-                        Commands.dispatch(read);
-                    } catch (Exception e) {
-                        ChatUtils.error("Error fetching command.");
-                        e.printStackTrace();
-                    }
-                }
-            }
-
-            in.close();
-        } catch (IOException e) {
-            ChatUtils.errorPrefix("Swarm", "Error in connection to host.");
-            e.printStackTrace();
-            disconnect();
-        }
+    public SwarmWorker(String ip, int port, String key) {
+        super(new Socket(), key, false);
+        this.ip = ip;
+        this.port = port;
+        start();
     }
-
-    public void disconnect() {
-        try {
-            socket.close();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-
-        PathManagers.get().stop();
-
-        ChatUtils.infoPrefix("Swarm", "Disconnected from host.");
-
-        interrupt();
+    @Override protected void connectSocket() throws IOException {
+        // localhost explicitly uses IPv4 to match the default 127.0.0.1 host bind, not an OS-dependent ::1.
+        InetAddress address = InetAddress.getByName(ip.equalsIgnoreCase("localhost") ? "127.0.0.1" : ip);
+        if (!address.isLoopbackAddress() && !address.isSiteLocalAddress()) throw new IOException("Use a LAN or loopback Bots host");
+        socket.connect(new InetSocketAddress(address, port), 3000);
     }
-
     public void tick() {
-        if (target == null) return;
-
-        PathManagers.get().stop();
-        PathManagers.get().mine(target);
-
-        target = null;
-    }
-
-    public String getConnection() {
-        return getIp(socket.getInetAddress().getHostAddress()) + ":" + socket.getPort();
-    }
-
-    private String getIp(String ip) {
-        return ip.equals("127.0.0.1") ? "localhost" : ip;
+        if (target != null) {
+            PathManagers.get().stop();
+            PathManagers.get().mine(target);
+            target = null;
+        }
     }
 }

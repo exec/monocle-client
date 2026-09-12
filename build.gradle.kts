@@ -1,3 +1,5 @@
+import java.util.zip.ZipFile
+
 plugins {
     alias(libs.plugins.fabric.loom)
 }
@@ -64,6 +66,9 @@ configurations {
 }
 
 dependencies {
+    // The client and future standalone host consume one compiled decision core.
+    implementation(project(":coordinator-core"))
+    include(project(":coordinator-core"))
     // Fabric
     minecraft(libs.minecraft)
     implementation(libs.fabric.loader)
@@ -92,6 +97,7 @@ dependencies {
     }
 
     // Libraries (JAR-in-JAR)
+    jij("org.luaj:luaj-jse:3.0.1") { isTransitive = false }
     jij(libs.orbit)
     jij(libs.starscript)
     jij(libs.discord.ipc)
@@ -120,7 +126,8 @@ java {
 val jijExcluded = setOf("org.slf4j", "jsr305")
 listOf("api", "implementation", "include").forEach { configName ->
     configurations.named(configName).configure {
-        defaultDependencies {
+        // Must run even when include already contains the shared coordinator project.
+        withDependencies {
             configurations.getByName("jij").incoming.resolutionResult.allComponents
                 .mapNotNull { it.id as? ModuleComponentIdentifier }
                 .forEach { id ->
@@ -169,6 +176,26 @@ tasks {
         archiveVersion.set("v${project.version}-${libs.versions.minecraft.get()}")
     }
 
+    val bundledLibrariesCheck = register("bundledLibrariesCheck") {
+        group = "verification"
+        description = "Checks that release JARs embed and register every required library, including transitives."
+        dependsOn(jar)
+        doLast {
+            ZipFile(jar.get().archiveFile.get().asFile).use { archive ->
+                val metadata = archive.getInputStream(archive.getEntry("fabric.mod.json")).bufferedReader().use { it.readText() }
+                jij.resolvedConfiguration.resolvedArtifacts.forEach { artifact ->
+                    val id = artifact.moduleVersion.id
+                    if (jijExcluded.none { "${id.group}:${id.name}:${id.version}".contains(it) }) {
+                        val path = "META-INF/jars/${artifact.file.name}"
+                        check(archive.getEntry(path) != null && metadata.contains("\"$path\"")) {
+                            "Release JAR is missing a registered bundled library: $path"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     val highwayBuilderCheck = register<JavaExec>("highwayBuilderCheck") {
         group = "verification"
         description = "Checks Highway Builder planning and recovery rules without starting Minecraft."
@@ -210,6 +237,15 @@ tasks {
     }
 
     val moduleChecks = mapOf(
+        "botsCheck" to "dev.monocle.client.systems.bots.BotsTest",
+        "swarmCrewCheck" to "dev.monocle.client.systems.modules.misc.swarm.SwarmCrewTest",
+        "crewInventoryCheck" to "dev.monocle.client.systems.modules.misc.swarm.CrewInventoryTest",
+        "encounterHistoryCheck" to "dev.monocle.client.utils.world.EncounterHistoryTest",
+        "notificationFeedCheck" to "dev.monocle.client.utils.render.NotificationFeedTest",
+        "autoReconnectCheck" to "dev.monocle.client.systems.modules.misc.AutoReconnectTest",
+        "chatRoutingCheck" to "dev.monocle.client.utils.network.ChatRoutingTest",
+        "ircCheck" to "dev.monocle.client.utils.network.IrcConnectionTest",
+        "autoTotemCheck" to "dev.monocle.client.systems.modules.combat.AutoTotemTest",
         "chestSwapCheck" to "dev.monocle.client.systems.modules.player.ChestSwapTest",
         "elytraSettingsCheck" to "dev.monocle.client.systems.modules.movement.ElytraSettingsTest",
         "scaffoldCheck" to "dev.monocle.client.systems.modules.movement.ScaffoldTest",
@@ -245,6 +281,15 @@ tasks {
     }
 
     test {
+        exclude("**/BotsTest*.class", "**/BotJobsTest*.class", "**/BotWorkflowsTest*.class", "**/BotLuaTest*.class", "**/BotRuntimeTest*.class", "**/BotSchedulerTest*.class", "**/BotTaskDataTest*.class", "**/BotProfilesTest*.class", "**/BotActionsTest*.class", "**/BotStashHuntTest*.class", "**/WorkflowCodeBoxTest*.class") // Run by botsCheck.
+        exclude("**/SwarmCrewTest*.class")
+        exclude("**/CrewInventoryTest*.class") // Run by crewInventoryCheck.
+        exclude("**/ChatRoutingTest*.class")
+        exclude("**/AutoReconnectTest*.class")
+        exclude("**/NotificationFeedTest*.class")
+        exclude("**/EncounterHistoryTest*.class")
+        exclude("**/IrcConnectionTest*.class")
+        exclude("**/AutoTotemTest*.class")
         exclude("**/ChestSwapTest*.class")
         exclude("**/ElytraSettingsTest*.class")
         exclude("**/ScaffoldTest*.class")
@@ -265,6 +310,8 @@ tasks {
     }
 
     check {
+        dependsOn(bundledLibrariesCheck)
+        dependsOn(":coordinator-core:check", ":host-service:check")
         dependsOn(highwayBuilderCheck, highwaySupplyCheck, monocleStyleCheck, monocleFontCheck)
         dependsOn(moduleChecks)
     }

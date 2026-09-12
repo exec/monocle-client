@@ -5,6 +5,8 @@
 
 package dev.monocle.client.systems.modules.misc;
 
+import dev.monocle.client.systems.config.Config;
+
 import com.mojang.authlib.GameProfile;
 import it.unimi.dsi.fastutil.chars.Char2CharMap;
 import it.unimi.dsi.fastutil.chars.Char2CharOpenHashMap;
@@ -315,6 +317,12 @@ public class BetterChat extends Module {
 
             MutableComponent sendButton = getSendButton(message);
             warningMessage.append(sendButton);
+
+            if (Config.get().moduleNotificationOutput.get() != dev.monocle.client.utils.render.Notifications.Output.Chat) {
+                dev.monocle.client.utils.render.Notifications.post(title, "coordinate-protection",
+                    dev.monocle.client.utils.render.NotificationFeed.Severity.Warning,
+                    "Message blocked: possible coordinates. Review the confirmation in chat to send anyway.");
+            }
 
             ChatUtils.sendMsg(warningMessage);
 

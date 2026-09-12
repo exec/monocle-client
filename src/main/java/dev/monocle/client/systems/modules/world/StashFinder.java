@@ -8,6 +8,9 @@ package dev.monocle.client.systems.modules.world;
 import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import dev.monocle.client.MonocleClient;
 import dev.monocle.client.events.render.Render3DEvent;
 import dev.monocle.client.events.world.ChunkDataEvent;
@@ -31,7 +34,6 @@ import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.utils.Utils;
 import dev.monocle.client.utils.misc.Keybind;
 import dev.monocle.client.utils.misc.text.RunnableClickEvent;
-import dev.monocle.client.utils.player.ChatUtils;
 import dev.monocle.client.utils.render.MonocleToast;
 import dev.monocle.client.utils.render.RenderUtils;
 import dev.monocle.client.utils.render.color.SettingColor;
@@ -118,7 +120,7 @@ public class StashFinder extends Module {
 
     private final Setting<Mode> notificationMode = sgGeneral.add(new EnumSetting.Builder<Mode>()
         .name("notification-mode")
-        .description("The mode to use for notifications.")
+        .description("Chat uses the shared overhauled-module output destination. Toast keeps Minecraft's native toast; Both sends to both destinations.")
         .defaultValue(Mode.Both)
         .visible(sendNotifications::get)
         .build()
@@ -283,12 +285,12 @@ public class StashFinder extends Module {
         if (isCurrentScope(scope) && scanQueue.size() < 4096) scanQueue.add(event.chunk().getPos());
     }
 
-    private void scan(LevelChunk loaded) {
-        if (readOnly) return;
+    private Chunk scan(LevelChunk loaded) {
+        if (readOnly) return null;
         // Check the distance.
         double chunkXAbs = Math.abs(loaded.getPos().x() * 16.0);
         double chunkZAbs = Math.abs(loaded.getPos().z() * 16.0);
-        if (Math.sqrt(chunkXAbs * chunkXAbs + chunkZAbs * chunkZAbs) < minimumDistance.get()) return;
+        if (Math.sqrt(chunkXAbs * chunkXAbs + chunkZAbs * chunkZAbs) < minimumDistance.get()) return null;
 
         Chunk chunk = new Chunk(loaded.getPos());
 
@@ -320,7 +322,7 @@ public class StashFinder extends Module {
             int i = existing;
 
             if (i < 0) {
-                if (chunks.size() >= 10000) return;
+                if (chunks.size() >= 10000) return chunk;
                 chunks.add(chunk);
             } else prevChunk = chunks.set(i, chunk);
             retainReview(chunk, prevChunk, System.currentTimeMillis());
@@ -347,6 +349,74 @@ public class StashFinder extends Module {
                 }
             }
         }
+        return chunk;
+    }
+
+    public boolean surveyChunkLoaded(int x, int z) {
+        return mc.level != null && mc.level.getChunkSource().getChunk(x, z, ChunkStatus.FULL, false) != null;
+    }
+
+    /** Native surveys share detection thresholds and notebook semantics, even when the module is off. */
+    public JsonObject surveyScan(int x, int z) {
+        if (!mc.isSameThread()) throw new IllegalStateException("Scan chunks on the client thread");
+        ensureScope();
+        if (!isCurrentScope(scope) || readOnly) throw new IllegalStateException("Stash notebook is not writable in this world");
+        LevelChunk loaded = mc.level.getChunkSource().getChunk(x, z, ChunkStatus.FULL, false);
+        if (loaded == null) throw new IllegalStateException("Survey chunk unloaded before scanning");
+        Chunk found = scan(loaded);
+        if (found == null) return null;
+        if (!chunks.contains(found)) {
+            if (qualifies(found, minimumStorageCount.get(), minimumShulkers.get())) throw new IllegalStateException("Worker stash notebook is full (10,000 findings)");
+            return null;
+        }
+        JsonObject record = new JsonObject(); record.addProperty("cx", x); record.addProperty("cz", z);
+        int[] counts = {found.chests, found.barrels, found.shulkers, found.enderChests, found.furnaces, found.dispensersDroppers, found.hoppers, found.otherStorage};
+        JsonArray encoded = new JsonArray(); for (int count : counts) encoded.add(count); record.add("counts", encoded);
+        return record;
+    }
+
+    public void surveyFlush() {
+        flush();
+        if (dirty || readOnly) throw new IllegalStateException("Stash notebook could not be saved");
+    }
+
+    public static Chunk decodeFinding(JsonObject record) {
+        try {
+            for (String key : List.of("cx", "cz")) if (!record.getAsJsonPrimitive(key).isNumber()) throw new IllegalArgumentException("Non-numeric chunk coordinate");
+            Chunk c = new Chunk(new ChunkPos(record.get("cx").getAsBigDecimal().intValueExact(), record.get("cz").getAsBigDecimal().intValueExact()));
+            JsonArray counts = record.getAsJsonArray("counts");
+            if (counts.size() != 8) throw new IllegalArgumentException("Expected eight storage counts");
+            int[] n = new int[8]; for (int i = 0; i < n.length; i++) {
+                if (!counts.get(i).getAsJsonPrimitive().isNumber()) throw new IllegalArgumentException("Non-numeric storage count");
+                n[i] = counts.get(i).getAsBigDecimal().intValueExact();
+            }
+            c.chests = n[0]; c.barrels = n[1]; c.shulkers = n[2]; c.enderChests = n[3]; c.furnaces = n[4]; c.dispensersDroppers = n[5]; c.hoppers = n[6]; c.otherStorage = n[7];
+            validate(List.of(c)); return c;
+        } catch (IOException | RuntimeException e) { throw new IllegalArgumentException("Invalid shared stash finding", e); }
+    }
+
+    /** Merge and atomically save before the host acknowledges delivery. Never import another user's notes. */
+    public void acceptSurvey(String world, String targetDimension, JsonArray findings) {
+        if (!mc.isSameThread()) throw new IllegalStateException("Merge findings on the client thread");
+        if (world.isBlank() || world.length() > 1024 || net.minecraft.resources.Identifier.tryParse(targetDimension) == null || findings.size() > 16)
+            throw new IllegalArgumentException("Invalid survey notebook scope or batch");
+        String incomingScope = world + "\n" + targetDimension;
+        boolean current = scope.equals(incomingScope);
+        if (current && readOnly) throw new IllegalStateException("Host notebook is read-only; repair it before acknowledging findings");
+        Path file = new File(new File(MonocleClient.FOLDER, "stashes/notebooks"), scopeId(world, targetDimension) + ".json").toPath();
+        try {
+            List<Chunk> merged = new ArrayList<>(current ? chunks : readNotebook(file));
+            for (JsonElement entry : findings) mergeFinding(merged, decodeFinding(entry.getAsJsonObject()), System.currentTimeMillis());
+            writeNotebook(file, merged);
+            if (current) { chunks = merged; dirty = false; }
+        } catch (IOException e) { throw new IllegalStateException("Host stash save failed; worker retains findings for retry", e); }
+    }
+
+    static void mergeFinding(List<Chunk> records, Chunk incoming, long now) {
+        int index = records.indexOf(incoming);
+        if (index < 0 && records.size() >= 10000) throw new IllegalStateException("Host stash notebook is full (10,000 findings)");
+        retainReview(incoming, index < 0 ? null : records.get(index), now);
+        if (index < 0) records.add(incoming); else records.set(index, incoming);
     }
 
     @Override
@@ -565,7 +635,7 @@ public class StashFinder extends Module {
             .append(Component.literal("]").withStyle(ChatFormatting.GRAY))
             .append(Component.literal(" · " + dimension + " · " + chunk.getTotal() + " storage / " + chunk.shulkers + " shulkers").withStyle(ChatFormatting.GRAY));
 
-        ChatUtils.sendMsg(message);
+        info(message);
     }
 
     @EventHandler

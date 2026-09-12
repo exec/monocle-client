@@ -7,13 +7,19 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 
 /** Geometry and bounded walking shared by the builder, preview and regression check. */
-final class HighwayPlan {
+public final class HighwayPlan {
     static final int PAVING_LOOKBACK = 2;
-    record Cell(int x, int y, int z) {
+    private record Shape(int dx, int dz, int width, int height, int flags) {}
+    // Finite validated configuration space: 224 fronts, 256 paving shapes, 448 inlet shapes.
+    // These contain relative coordinates only; world state and server confirmations are never cached.
+    private static final ConcurrentHashMap<Shape, List<Cell>> FRONTS = new ConcurrentHashMap<>(), INLETS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Shape, List<PavingCell>> PAVING = new ConcurrentHashMap<>();
+    public record Cell(int x, int y, int z) {
         Cell add(int dx, int dy, int dz) { return new Cell(x + dx, y + dy, z + dz); }
         double distanceSquared(Cell other) {
             return (double) (x - other.x) * (x - other.x) + (double) (y - other.y) * (y - other.y) + (double) (z - other.z) * (z - other.z);
@@ -50,6 +56,12 @@ final class HighwayPlan {
     }
 
     static List<PavingCell> paving(int dx, int dz, int width, boolean floor, boolean railings, boolean supports) {
+        validate(dx, dz, width, 1);
+        return PAVING.computeIfAbsent(new Shape(dx, dz, width, 1, (floor ? 1 : 0) | (railings ? 2 : 0) | (supports ? 4 : 0)),
+            key -> buildPaving(dx, dz, width, floor, railings, supports));
+    }
+
+    private static List<PavingCell> buildPaving(int dx, int dz, int width, boolean floor, boolean railings, boolean supports) {
         List<PavingCell> result = new ArrayList<>();
         if (floor) for (Cell cell : floor(dx, dz, width)) result.add(new PavingCell(cell, false));
         if (railings && supports) for (Cell cell : railings(dx, dz, width, 1, -1)) result.add(new PavingCell(cell, true));
@@ -73,12 +85,45 @@ final class HighwayPlan {
 
     static List<Cell> front(int dx, int dz, int width, int height) {
         validate(dx, dz, width, height);
+        return FRONTS.computeIfAbsent(new Shape(dx, dz, width, height, 0), key -> buildFront(dx, dz, width, height));
+    }
+
+    private static List<Cell> buildFront(int dx, int dz, int width, int height) {
         List<Cell> result = new ArrayList<>();
         if (dx != 0 && dz != 0) {
             row(result, (dx + dz) / 2 + dz * (left(width) - 1), (dz - dx) / 2 - dx * (left(width) - 1), -dz, dx, width - 1, 0, height, false);
         }
         row(result, dx + dz * left(width), dz - dx * left(width), -dz, dx, width, 0, height, false);
-        return result;
+        return List.copyOf(result);
+    }
+
+    static List<Cell> excavationAhead(int dx, int dz, int width, int height, int rows, boolean replaceFloor, boolean rails, boolean aboveRails) {
+        if (rows < 1 || rows > 5) throw new IllegalArgumentException("Excavation lookahead must be between 1 and 5");
+        var section = new ArrayList<>(front(dx, dz, width, height));
+        if (replaceFloor) section.addAll(floor(dx, dz, width));
+        if (rails) section.addAll(railings(dx, dz, width, height, 0));
+        if (aboveRails) section.addAll(railings(dx, dz, width, height, 1));
+        var result = new LinkedHashSet<Cell>();
+        for (int offset = 1; offset < rows; offset++) for (Cell cell : section) result.add(cell.add(dx * offset, 0, dz * offset));
+        // The diagonal stencil overlaps neighboring sections. The required first row stays foreground work.
+        result.removeAll(section);
+        return List.copyOf(result);
+    }
+
+    static boolean backgroundRow(int dx, int dz, int x, int z) {
+        return x * dx + z * dz > dx * dx + dz * dz;
+    }
+
+    static int reachedRow(int workRow, double physicalRow, int lastRow) {
+        return Math.clamp(Math.min(workRow, (int) Math.floor(physicalRow + .1)), 0, Math.max(0, lastRow));
+    }
+
+    static Cell travelWaypoint(Cell start, Cell goal, int maximum) {
+        if (start.y != goal.y || maximum < 1 || maximum > 8) throw new IllegalArgumentException("Supply travel uses short, same-level highway waypoints");
+        double distance = Math.hypot(goal.x - start.x, goal.z - start.z);
+        if (distance <= maximum) return goal;
+        return new Cell(start.x + (int) Math.round((goal.x - start.x) * maximum / distance), start.y,
+            start.z + (int) Math.round((goal.z - start.z) * maximum / distance));
     }
 
     static List<Cell> railings(int dx, int dz, int width, int height, int level) {
@@ -111,6 +156,12 @@ final class HighwayPlan {
     }
 
     static List<Cell> liquidInlets(int dx, int dz, int width, int height, boolean aboveRailings) {
+        validate(dx, dz, width, height);
+        return INLETS.computeIfAbsent(new Shape(dx, dz, width, height, aboveRailings ? 1 : 0),
+            key -> buildLiquidInlets(dx, dz, width, height, aboveRailings));
+    }
+
+    private static List<Cell> buildLiquidInlets(int dx, int dz, int width, int height, boolean aboveRailings) {
         var excavation = new LinkedHashSet<>(front(dx, dz, width, height));
         if (aboveRailings) excavation.addAll(railings(dx, dz, width, height, 1));
         var entrance = new HashSet<Cell>();
@@ -139,8 +190,14 @@ final class HighwayPlan {
     }
 
     // A restock/reach adjustment is local: never wander more than 12 blocks from its starting point.
-    static List<Cell> route(Cell start, Cell goal, Predicate<Cell> standable, BiPredicate<Cell, Cell> stepSafe) {
-        if (start.distanceSquared(goal) > 144 || !standable.test(goal)) return List.of();
+    public static List<Cell> route(Cell start, Cell goal, Predicate<Cell> standable, BiPredicate<Cell, Cell> stepSafe) {
+        return route(start, goal, standable, stepSafe, 12);
+    }
+
+    static List<Cell> route(Cell start, Cell goal, Predicate<Cell> standable, BiPredicate<Cell, Cell> stepSafe, int radius) {
+        if (radius < 1 || radius > 24) throw new IllegalArgumentException("Walking radius must be between 1 and 24");
+        int rangeSquared = radius * radius;
+        if (start.distanceSquared(goal) > rangeSquared || !standable.test(goal)) return List.of();
         ArrayDeque<Cell> queue = new ArrayDeque<>();
         HashMap<Cell, Cell> previous = new HashMap<>();
         queue.add(start);
@@ -156,7 +213,7 @@ final class HighwayPlan {
             for (int[] offset : new int[][] {{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
                 for (int dy : new int[] {0, 1, -1}) {
                     Cell next = current.add(offset[0], dy, offset[1]);
-                    if (Math.abs(next.y - start.y) > 3 || next.distanceSquared(start) > 144 || previous.containsKey(next) || !standable.test(next) || !stepSafe.test(current, next)) continue;
+                    if (Math.abs(next.y - start.y) > 3 || next.distanceSquared(start) > rangeSquared || previous.containsKey(next) || !standable.test(next) || !stepSafe.test(current, next)) continue;
                     previous.put(next, current);
                     queue.add(next);
                 }

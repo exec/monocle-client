@@ -40,6 +40,8 @@ public class Commands {
         add(new FriendsCommand());
         add(new CommandsCommand());
         add(new InventoryCommand());
+        add(new IrcCommand());
+        add(new ChatCommand());
         add(new NbtCommand());
         add(new NotebotCommand());
         add(new PeekCommand());
@@ -49,7 +51,7 @@ public class Commands {
         add(new ResetCommand());
         add(new SayCommand());
         add(new ServerCommand());
-        add(new SwarmCommand());
+        add(new BotCommand());
         add(new ToggleCommand());
         add(new SettingCommand());
         add(new SpectateCommand());

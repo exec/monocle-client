@@ -18,9 +18,8 @@ import dev.monocle.client.commands.arguments.PlayerArgumentType;
 import dev.monocle.client.pathing.PathManagers;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
-import dev.monocle.client.systems.modules.misc.swarm.Swarm;
+import dev.monocle.client.systems.bots.Bots;
 import dev.monocle.client.systems.modules.misc.swarm.SwarmConnection;
-import dev.monocle.client.systems.modules.misc.swarm.SwarmWorker;
 import dev.monocle.client.systems.modules.world.InfinityMiner;
 import dev.monocle.client.utils.misc.text.MonocleClickEvent;
 import dev.monocle.client.utils.player.ChatUtils;
@@ -37,23 +36,49 @@ import org.jspecify.annotations.Nullable;
 import java.util.List;
 import java.util.Random;
 
-public class SwarmCommand extends Command {
+public class BotCommand extends Command {
 
-    private final static SimpleCommandExceptionType SWARM_NOT_ACTIVE = new SimpleCommandExceptionType(Component.literal("The swarm module must be active to use this command."));
+    private final static SimpleCommandExceptionType BOTS_NOT_ACTIVE = new SimpleCommandExceptionType(Component.literal("Enable connections in Right Shift → Bots first."));
     private @Nullable ObjectIntPair<String> pendingConnection;
 
-    public SwarmCommand() {
-        super("swarm", "Sends commands to connected swarm workers.");
+    public BotCommand() {
+        super("bot", "Manage bot connections, crews and jobs. Open Right Shift → Bots for the dashboard.");
     }
 
     @Override
     public void build(LiteralArgumentBuilder<ClientSuggestionProvider> builder) {
+        builder.executes(_ -> {
+            dev.monocle.client.gui.tabs.Tabs.get(dev.monocle.client.gui.tabs.builtin.BotsTab.class).openScreen(dev.monocle.client.gui.GuiThemes.get());
+            return SINGLE_SUCCESS;
+        });
+        builder.then(literal("host").executes(_ -> crewAction(() -> {
+            Bots bots = Bots.get(); bots.mode.set(Bots.Mode.Host); bots.startHost(); bots.save();
+        })));
+        builder.then(literal("export-workflow").then(argument("workflow-id", StringArgumentType.word()).executes(context -> crewAction(() ->
+            info("Exported workflow and captured gameplay profiles to %s", Bots.get().tasks().exportWorkflow(StringArgumentType.getString(context, "workflow-id")))))));
+        builder.then(literal("highway")
+            .then(literal("start").then(argument("road-length", IntegerArgumentType.integer(16, 4096)).executes(context -> crewAction(() -> Bots.get().startSelectedHighway(IntegerArgumentType.getInteger(context, "road-length"))))))
+            .then(literal("status").executes(_ -> crewAction(() -> Bots.get().controlCrew().status())))
+            .then(literal("pause").executes(_ -> crewAction(() -> Bots.get().controlCrew().pause())))
+            .then(literal("resume").executes(_ -> crewAction(() -> Bots.get().controlCrew().resume())))
+            .then(literal("leave").executes(_ -> crewAction(() -> Bots.get().controlCrew().leave())))
+            .then(literal("end").then(literal("confirm").executes(_ -> crewAction(() -> Bots.get().endCrewExecution(Bots.get().selectedCrew()))))));
+        builder.then(literal("jobs").executes(_ -> crewAction(() -> {
+            for (var job : Bots.get().jobs()) info("%s · %s · %s · %d/%d · %s", job.id(), job.name(), job.status(), job.progress(), job.length(), job.unclaimed() ? "Unclaimed" : Bots.get().crewLabel(job.crewId()));
+        })));
+        var job = argument("job-id", StringArgumentType.word());
+        job.then(literal("pause").executes(context -> crewAction(() -> Bots.get().pauseJob(java.util.UUID.fromString(StringArgumentType.getString(context, "job-id"))))));
+        job.then(literal("resume").executes(context -> crewAction(() -> Bots.get().resumeJob(java.util.UUID.fromString(StringArgumentType.getString(context, "job-id"))))));
+        job.then(literal("release").then(literal("confirm").executes(context -> crewAction(() -> Bots.get().releaseJob(java.util.UUID.fromString(StringArgumentType.getString(context, "job-id")))))));
+        job.then(literal("cancel").then(literal("confirm").executes(context -> crewAction(() -> Bots.get().cancelJob(java.util.UUID.fromString(StringArgumentType.getString(context, "job-id")))))));
+        builder.then(literal("job").then(job));
         builder.then(literal("disconnect").executes(_ -> {
-            Swarm swarm = Modules.get().get(Swarm.class);
+            Bots swarm = Bots.get();
             if (swarm.isActive()) {
-                swarm.close();
+                if (swarm.mode.get() == Bots.Mode.Worker) swarm.disable();
+                else swarm.close();
             } else {
-                throw SWARM_NOT_ACTIVE.create();
+                throw BOTS_NOT_ACTIVE.create();
             }
 
             return SINGLE_SUCCESS;
@@ -61,7 +86,7 @@ public class SwarmCommand extends Command {
 
         builder.then(literal("join")
             .then(argument("ip", StringArgumentType.string())
-                .then(argument("port", IntegerArgumentType.integer(0, 65535))
+                .then(argument("port", IntegerArgumentType.integer(1, 65535))
                     .executes(context -> {
                         String ip = StringArgumentType.getString(context, "ip");
                         int port = IntegerArgumentType.getInteger(context, "port");
@@ -71,7 +96,7 @@ public class SwarmCommand extends Command {
                         info("Are you sure you want to connect to '%s:%s'?", ip, port);
                         info(Component.literal("Click here to confirm").setStyle(Style.EMPTY
                             .applyFormats(ChatFormatting.UNDERLINE, ChatFormatting.GREEN)
-                            .withClickEvent(new MonocleClickEvent(".swarm join confirm"))
+                            .withClickEvent(new MonocleClickEvent(".bot join confirm"))
                         ));
 
                         return SINGLE_SUCCESS;
@@ -80,37 +105,25 @@ public class SwarmCommand extends Command {
             )
             .then(literal("confirm").executes(_ -> {
                 if (pendingConnection == null) {
-                    error("No pending swarm connections.");
+                    error("No pending bot connections.");
                     return SINGLE_SUCCESS;
                 }
 
-                Swarm swarm = Modules.get().get(Swarm.class);
-                swarm.enable();
-
-                swarm.close();
-                swarm.mode.set(Swarm.Mode.Worker);
-                swarm.worker = new SwarmWorker(pendingConnection.left(), pendingConnection.rightInt());
-
+                Bots swarm = Bots.get();
+                swarm.connectWorker(pendingConnection.left(), pendingConnection.rightInt());
                 pendingConnection = null;
-
-                try {
-                    info("Connected to (highlight)%s.", swarm.worker.getConnection());
-                } catch (NullPointerException _) {
-                    error("Error connecting to swarm host.");
-                    swarm.close();
-                    swarm.toggle();
-                }
+                info("Worker connection requested. Bots will authenticate and retry automatically while enabled.");
 
                 return SINGLE_SUCCESS;
             }))
         );
 
         builder.then(literal("connections").executes(_ -> {
-            Swarm swarm = Modules.get().get(Swarm.class);
+            Bots swarm = Bots.get();
             if (swarm.isActive()) {
                 if (swarm.isHost()) {
                     if (swarm.host.getConnectionCount() > 0) {
-                        ChatUtils.info("--- Swarm Connections (highlight)(%s/%s)(default) ---", swarm.host.getConnectionCount(), swarm.host.getConnections().length);
+                        ChatUtils.info("--- Bots Connections (highlight)(%s/%s)(default) ---", swarm.host.getConnectionCount(), swarm.host.getConnections().length);
 
                         for (int i = 0; i < swarm.host.getConnections().length; i++) {
                             SwarmConnection connection = swarm.host.getConnections()[i];
@@ -124,37 +137,37 @@ public class SwarmCommand extends Command {
                     info("Connected to (highlight)%s", swarm.worker.getConnection());
                 }
             } else {
-                throw SWARM_NOT_ACTIVE.create();
+                throw BOTS_NOT_ACTIVE.create();
             }
 
             return SINGLE_SUCCESS;
         }));
 
         builder.then(literal("follow").executes(context -> {
-                Swarm swarm = Modules.get().get(Swarm.class);
+                Bots swarm = Bots.get();
                 if (swarm.isActive()) {
                     if (swarm.isHost()) {
-                        swarm.host.sendMessage(context.getInput() + " " + mc.player.getName().getString());
+                        swarm.sendMessage(context.getInput() + " " + mc.player.getName().getString());
                     } else if (swarm.isWorker()) {
                         error("The follow host command must be used by the host.");
                     }
                 } else {
-                    throw SWARM_NOT_ACTIVE.create();
+                    throw BOTS_NOT_ACTIVE.create();
                 }
 
                 return SINGLE_SUCCESS;
             }).then(argument("player", PlayerArgumentType.create()).executes(context -> {
                 Player playerEntity = PlayerArgumentType.get(context);
 
-                Swarm swarm = Modules.get().get(Swarm.class);
+                Bots swarm = Bots.get();
                 if (swarm.isActive()) {
                     if (swarm.isHost()) {
-                        swarm.host.sendMessage(context.getInput());
+                        swarm.sendMessage(context.getInput());
                     } else if (swarm.isWorker() && playerEntity != null) {
                         PathManagers.get().follow(entity -> entity.getName().getString().equalsIgnoreCase(playerEntity.getName().getString()));
                     }
                 } else {
-                    throw SWARM_NOT_ACTIVE.create();
+                    throw BOTS_NOT_ACTIVE.create();
                 }
                 return SINGLE_SUCCESS;
             }))
@@ -163,10 +176,10 @@ public class SwarmCommand extends Command {
         builder.then(literal("goto")
             .then(argument("x", IntegerArgumentType.integer())
                 .then(argument("z", IntegerArgumentType.integer()).executes(context -> {
-                    Swarm swarm = Modules.get().get(Swarm.class);
+                    Bots swarm = Bots.get();
                     if (swarm.isActive()) {
                         if (swarm.isHost()) {
-                            swarm.host.sendMessage(context.getInput());
+                            swarm.sendMessage(context.getInput());
                         } else if (swarm.isWorker()) {
                             int x = IntegerArgumentType.getInteger(context, "x");
                             int z = IntegerArgumentType.getInteger(context, "z");
@@ -174,7 +187,7 @@ public class SwarmCommand extends Command {
                             PathManagers.get().moveTo(new BlockPos(x, 0, z), true);
                         }
                     } else {
-                        throw SWARM_NOT_ACTIVE.create();
+                        throw BOTS_NOT_ACTIVE.create();
                     }
                     return SINGLE_SUCCESS;
                 }))
@@ -182,85 +195,85 @@ public class SwarmCommand extends Command {
         );
 
         builder.then(literal("infinity-miner").executes(context -> {
-                Swarm swarm = Modules.get().get(Swarm.class);
+                Bots swarm = Bots.get();
                 if (swarm.isActive()) {
                     if (swarm.isHost()) {
-                        swarm.host.sendMessage(context.getInput());
+                        swarm.sendMessage(context.getInput());
                     } else if (swarm.isWorker()) {
                         runInfinityMiner();
                     }
                 } else {
-                    throw SWARM_NOT_ACTIVE.create();
+                    throw BOTS_NOT_ACTIVE.create();
                 }
                 return SINGLE_SUCCESS;
             })
             .then(argument("target", BlockStateArgument.block(REGISTRY_ACCESS)).executes(context -> {
-                    Swarm swarm = Modules.get().get(Swarm.class);
+                    Bots swarm = Bots.get();
                     if (swarm.isActive()) {
                         if (swarm.isHost()) {
-                            swarm.host.sendMessage(context.getInput());
+                            swarm.sendMessage(context.getInput());
                         } else if (swarm.isWorker()) {
                             Modules.get().get(InfinityMiner.class).targetBlocks.set(List.of(context.getArgument("target", BlockInput.class).getState().getBlock()));
                             runInfinityMiner();
                         }
                     } else {
-                        throw SWARM_NOT_ACTIVE.create();
+                        throw BOTS_NOT_ACTIVE.create();
                     }
                     return SINGLE_SUCCESS;
                 })
                 .then(argument("repair", BlockStateArgument.block(REGISTRY_ACCESS)).executes(context -> {
-                    Swarm swarm = Modules.get().get(Swarm.class);
+                    Bots swarm = Bots.get();
                     if (swarm.isActive()) {
                         if (swarm.isHost()) {
-                            swarm.host.sendMessage(context.getInput());
+                            swarm.sendMessage(context.getInput());
                         } else if (swarm.isWorker()) {
                             Modules.get().get(InfinityMiner.class).targetBlocks.set(List.of(context.getArgument("target", BlockInput.class).getState().getBlock()));
                             Modules.get().get(InfinityMiner.class).repairBlocks.set(List.of(context.getArgument("repair", BlockInput.class).getState().getBlock()));
                             runInfinityMiner();
                         }
                     } else {
-                        throw SWARM_NOT_ACTIVE.create();
+                        throw BOTS_NOT_ACTIVE.create();
                     }
                     return SINGLE_SUCCESS;
                 })))
             .then(literal("logout").then(argument("logout", BoolArgumentType.bool()).executes(context -> {
-                Swarm swarm = Modules.get().get(Swarm.class);
+                Bots swarm = Bots.get();
                 if (swarm.isActive()) {
                     if (swarm.isHost()) {
-                        swarm.host.sendMessage(context.getInput());
+                        swarm.sendMessage(context.getInput());
                     } else if (swarm.isWorker()) {
                         Modules.get().get(InfinityMiner.class).logOut.set(BoolArgumentType.getBool(context, "logout"));
                     }
                 } else {
-                    throw SWARM_NOT_ACTIVE.create();
+                    throw BOTS_NOT_ACTIVE.create();
                 }
                 return SINGLE_SUCCESS;
             })))
             .then(literal("walkhome").then(argument("walkhome", BoolArgumentType.bool()).executes(context -> {
-                Swarm swarm = Modules.get().get(Swarm.class);
+                Bots swarm = Bots.get();
                 if (swarm.isActive()) {
                     if (swarm.isHost()) {
-                        swarm.host.sendMessage(context.getInput());
+                        swarm.sendMessage(context.getInput());
                     } else if (swarm.isWorker()) {
                         Modules.get().get(InfinityMiner.class).walkHome.set(BoolArgumentType.getBool(context, "walkhome"));
                     }
                 } else {
-                    throw SWARM_NOT_ACTIVE.create();
+                    throw BOTS_NOT_ACTIVE.create();
                 }
                 return SINGLE_SUCCESS;
             }))));
 
         builder.then(literal("mine")
             .then(argument("block", BlockStateArgument.block(REGISTRY_ACCESS)).executes(context -> {
-                Swarm swarm = Modules.get().get(Swarm.class);
+                Bots swarm = Bots.get();
                 if (swarm.isActive()) {
                     if (swarm.isHost()) {
-                        swarm.host.sendMessage(context.getInput());
+                        swarm.sendMessage(context.getInput());
                     } else if (swarm.isWorker()) {
                         swarm.worker.target = context.getArgument("block", BlockInput.class).getState().getBlock();
                     }
                 } else {
-                    throw SWARM_NOT_ACTIVE.create();
+                    throw BOTS_NOT_ACTIVE.create();
                 }
                 return SINGLE_SUCCESS;
             }))
@@ -269,44 +282,44 @@ public class SwarmCommand extends Command {
         builder.then(literal("toggle")
             .then(argument("module", ModuleArgumentType.create())
                 .executes(context -> {
-                    Swarm swarm = Modules.get().get(Swarm.class);
+                    Bots swarm = Bots.get();
                     if (swarm.isActive()) {
                         if (swarm.isHost()) {
-                            swarm.host.sendMessage(context.getInput());
+                            swarm.sendMessage(context.getInput());
                         } else if (swarm.isWorker()) {
                             Module module = ModuleArgumentType.get(context);
                             module.toggle();
                         }
                     } else {
-                        throw SWARM_NOT_ACTIVE.create();
+                        throw BOTS_NOT_ACTIVE.create();
                     }
                     return SINGLE_SUCCESS;
                 }).then(literal("on")
                     .executes(context -> {
-                        Swarm swarm = Modules.get().get(Swarm.class);
+                        Bots swarm = Bots.get();
                         if (swarm.isActive()) {
                             if (swarm.isHost()) {
-                                swarm.host.sendMessage(context.getInput());
+                                swarm.sendMessage(context.getInput());
                             } else if (swarm.isWorker()) {
                                 Module m = ModuleArgumentType.get(context);
                                 m.enable();
                             }
                         } else {
-                            throw SWARM_NOT_ACTIVE.create();
+                            throw BOTS_NOT_ACTIVE.create();
                         }
                         return SINGLE_SUCCESS;
                     })).then(literal("off")
                     .executes(context -> {
-                        Swarm swarm = Modules.get().get(Swarm.class);
+                        Bots swarm = Bots.get();
                         if (swarm.isActive()) {
                             if (swarm.isHost()) {
-                                swarm.host.sendMessage(context.getInput());
+                                swarm.sendMessage(context.getInput());
                             } else if (swarm.isWorker()) {
                                 Module m = ModuleArgumentType.get(context);
                                 m.disable();
                             }
                         } else {
-                            throw SWARM_NOT_ACTIVE.create();
+                            throw BOTS_NOT_ACTIVE.create();
                         }
                         return SINGLE_SUCCESS;
                     })
@@ -315,55 +328,55 @@ public class SwarmCommand extends Command {
         );
 
         builder.then(literal("scatter").executes(context -> {
-            Swarm swarm = Modules.get().get(Swarm.class);
+            Bots swarm = Bots.get();
             if (swarm.isActive()) {
                 if (swarm.isHost()) {
-                    swarm.host.sendMessage(context.getInput());
+                    swarm.sendMessage(context.getInput());
                 } else if (swarm.isWorker()) {
                     scatter(100);
                 }
             } else {
-                throw SWARM_NOT_ACTIVE.create();
+                throw BOTS_NOT_ACTIVE.create();
             }
             return SINGLE_SUCCESS;
         }).then(argument("radius", IntegerArgumentType.integer()).executes(context -> {
-            Swarm swarm = Modules.get().get(Swarm.class);
+            Bots swarm = Bots.get();
             if (swarm.isActive()) {
                 if (swarm.isHost()) {
-                    swarm.host.sendMessage(context.getInput());
+                    swarm.sendMessage(context.getInput());
                 } else if (swarm.isWorker()) {
                     scatter(IntegerArgumentType.getInteger(context, "radius"));
                 }
             } else {
-                throw SWARM_NOT_ACTIVE.create();
+                throw BOTS_NOT_ACTIVE.create();
             }
             return SINGLE_SUCCESS;
         })));
 
         builder.then(literal("stop").executes(context -> {
-            Swarm swarm = Modules.get().get(Swarm.class);
+            Bots swarm = Bots.get();
             if (swarm.isActive()) {
                 if (swarm.isHost()) {
-                    swarm.host.sendMessage(context.getInput());
+                    swarm.sendMessage(context.getInput());
                 } else if (swarm.isWorker()) {
                     PathManagers.get().stop();
                 }
             } else {
-                throw SWARM_NOT_ACTIVE.create();
+                throw BOTS_NOT_ACTIVE.create();
             }
             return SINGLE_SUCCESS;
         }));
 
         builder.then(literal("exec").then(argument("command", StringArgumentType.greedyString()).executes(context -> {
-            Swarm swarm = Modules.get().get(Swarm.class);
+            Bots swarm = Bots.get();
             if (swarm.isActive()) {
                 if (swarm.isHost()) {
-                    swarm.host.sendMessage(context.getInput());
+                    swarm.sendMessage(context.getInput());
                 } else if (swarm.isWorker()) {
                     ChatUtils.sendPlayerMsg(StringArgumentType.getString(context, "command"));
                 }
             } else {
-                throw SWARM_NOT_ACTIVE.create();
+                throw BOTS_NOT_ACTIVE.create();
             }
             return SINGLE_SUCCESS;
         })));
@@ -374,6 +387,11 @@ public class SwarmCommand extends Command {
         infinityMiner.disable();
 //        infinityMiner.smartModuleToggle.set(true);
         infinityMiner.enable();
+    }
+
+    private int crewAction(Runnable action) {
+        try { action.run(); } catch (RuntimeException e) { error("%s", e.getMessage()); }
+        return SINGLE_SUCCESS;
     }
 
     private void scatter(int radius) {

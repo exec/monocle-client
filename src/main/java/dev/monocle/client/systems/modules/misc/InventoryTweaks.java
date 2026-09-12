@@ -366,6 +366,9 @@ public class InventoryTweaks extends Module {
     public String getStatus() { return loadoutError != null ? loadoutError : status; }
     @Override public String getInfoString() { return getStatus(); }
     public boolean isBusy() { return operation != null; }
+    public boolean isPinnedSlot(int slot) {
+        return isActive() && getLoadout().stream().anyMatch(rule -> rule.hotbarSlot() == slot);
+    }
     public boolean hasLoadout() { return !getLoadout().isEmpty(); }
     public boolean showLegacyButtons() { return legacyButtons.get(); }
 
@@ -464,7 +467,7 @@ public class InventoryTweaks extends Module {
             status = "Capture a loadout first.";
             return;
         }
-        if (otherInventoryWork()) { status = "Finish eating or pause the active builder/mending job first."; return; }
+        if (otherInventoryWork()) { status = "Waiting for food, combat, equipment or the active builder/mending job."; return; }
         if (!isActive()) enable();
         operation = requested;
         operationMenu = menu;
@@ -718,6 +721,9 @@ public class InventoryTweaks extends Module {
     private boolean otherInventoryWork() {
         HighwayBuilder builder = Modules.get().get(HighwayBuilder.class);
         return mc.player.isUsingItem() || Modules.get().get(AutoEat.class).eating || Modules.get().get(AutoGap.class).isEating()
+            || Modules.get().get(dev.monocle.client.systems.modules.combat.AutoTotem.class).needsInventory()
+            || Modules.get().get(dev.monocle.client.systems.modules.combat.KillAura.class).attacking
+            || Modules.get().get(dev.monocle.client.systems.modules.player.ChestSwap.class).controlsChest()
             || Modules.get().isActive(AutoMend.class) || builder.hasJob() && !builder.isJobPaused()
             || Modules.get().get(dev.monocle.client.systems.modules.world.PrinterHelper.class).controlsInventory();
     }
@@ -733,7 +739,8 @@ public class InventoryTweaks extends Module {
     }
 
     public static boolean protectedStack(ItemStack stack) {
-        return stack.has(DataComponents.MAX_DAMAGE) || stack.has(DataComponents.UNBREAKABLE)
+        return stack.is(net.minecraft.world.item.Items.TOTEM_OF_UNDYING)
+            || stack.has(DataComponents.MAX_DAMAGE) || stack.has(DataComponents.UNBREAKABLE)
             || stack.has(DataComponents.CUSTOM_NAME) || stack.has(DataComponents.CUSTOM_DATA)
             || !stack.getEnchantments().isEmpty()
             || !stack.getOrDefault(DataComponents.STORED_ENCHANTMENTS, net.minecraft.world.item.enchantment.ItemEnchantments.EMPTY).isEmpty()
@@ -836,6 +843,9 @@ public class InventoryTweaks extends Module {
             if (playerSource && (source.getContainerSlot() < 0 || source.getContainerSlot() >= 36)) continue;
             ItemStack stack = source.getItem();
             if (stack.isEmpty() || stack.has(DataComponents.BUNDLE_CONTENTS) || !stealing && antiDropItems.get().contains(stack.getItem())) continue;
+            if (!stealing && (protectedForDeposit(stack) || isPinnedSlot(source.getContainerSlot()))) continue;
+            int available = stealing ? stack.getCount() : Math.min(stack.getCount(),
+                Math.max(0, InventoryLoadout.count(inventory, stack) - InventoryLoadout.target(getLoadout(), stack)));
             ListMode filter = stealing ? stealFilter.get() : dumpFilter.get();
             List<Item> items = stealing ? stealItems.get() : dumpItems.get();
             if (filter == ListMode.Whitelist && !items.contains(stack.getItem()) || filter == ListMode.Blacklist && items.contains(stack.getItem())) continue;
@@ -845,9 +855,10 @@ public class InventoryTweaks extends Module {
                     boolean playerDestination = destination.container == inventory;
                     if (stealing != playerDestination || !destination.isActive() || destination.isFake() || !destination.mayPlace(stack)) continue;
                     if (playerDestination && (destination.getContainerSlot() < 0 || destination.getContainerSlot() >= 36)) continue;
+                    if (playerDestination && isPinnedSlot(destination.getContainerSlot())) continue;
                     ItemStack held = destination.getItem();
                     if (held.isEmpty() != empty || !empty && !ItemStack.isSameItemSameComponents(stack, held)) continue;
-                    int amount = Math.min(stack.getCount(), Math.min(stack.getMaxStackSize(), destination.getMaxStackSize(stack)) - held.getCount());
+                    int amount = Math.min(available, Math.min(stack.getMaxStackSize(), destination.getMaxStackSize(stack)) - held.getCount());
                     if (amount > 0) return new InventoryLoadout.Move(from, to, amount);
                 }
             }

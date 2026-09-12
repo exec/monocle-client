@@ -75,7 +75,7 @@ public final class InventoryManagerTest {
 
     private static void valuableProtection() {
         for (var item : List.of(Items.DIAMOND_PICKAXE, Items.SHEARS, Items.BOW, Items.ELYTRA,
-            Items.SHULKER_BOX, Items.ENDER_CHEST, Items.CHEST, Items.BARREL, Items.FURNACE, Items.BUNDLE)) {
+            Items.TOTEM_OF_UNDYING, Items.SHULKER_BOX, Items.ENDER_CHEST, Items.CHEST, Items.BARREL, Items.FURNACE, Items.BUNDLE)) {
             ItemStack stack = new ItemStack(item);
             assert InventoryTweaks.protectedStack(stack) : "Tools, equipment and containers are protected: " + item;
             protectedFromDisposal(stack);
@@ -132,6 +132,10 @@ public final class InventoryManagerTest {
             }
             MethodModel tick = model.methods().stream().filter(method -> method.methodName().equalsString("onTickPre")).findFirst().orElseThrow();
             var tickCalls = calls(tick);
+            var work = model.methods().stream().filter(method -> method.methodName().equalsString("otherInventoryWork")).findFirst().orElseThrow();
+            assert callIndex(calls(work), "needsInventory") >= 0 && callIndex(calls(work), "controlsChest") >= 0;
+            var legacy = model.methods().stream().filter(method -> method.methodName().equalsString("legacyMove")).findFirst().orElseThrow();
+            for (String guard : List.of("protectedForDeposit", "isPinnedSlot", "target")) assert callIndex(calls(legacy), guard) >= 0;
             assert callIndex(tickCalls, "sameContext") < callIndex(tickCalls, "tickTransfer") : "Recheck exact menu, screen and world before any transfer step";
             assert callIndex(tickCalls, "otherInventoryWork") < callIndex(tickCalls, "tickTransfer") : "Yield to builders, eating and mending before continuing an inventory move";
             MethodModel cleanup = model.methods().stream().filter(method -> method.methodName().equalsString("cleanupForSpace")).findFirst().orElseThrow();

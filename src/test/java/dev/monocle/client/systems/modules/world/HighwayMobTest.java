@@ -193,7 +193,7 @@ public final class HighwayMobTest {
         assert builder.methods().stream().anyMatch(candidate -> candidate.methodName().equalsString("pauseJob") && call(candidate, "releaseControls") >= 0);
         assert call(method(builder, "onDeactivate"), "releaseControls") >= 0 : "Disabling cancels queued combat";
 
-        MethodModel wait = method(builder, "waitForMob");
+        MethodModel wait = obstructionWait(builder);
         int acquire = field(wait, "combatMob", Opcode.PUTFIELD);
         assert acquire >= 0 && call(wait, "mobTargetAllowed") < acquire && call(wait, "mobTargetAllowed") >= 0;
         assert field(wait, "clearPiglins", Opcode.GETFIELD) >= 0 && field(wait, "clearPiglins", Opcode.GETFIELD) < acquire;
@@ -214,7 +214,7 @@ public final class HighwayMobTest {
             for (int i = 0; i < instructions.size(); i++) {
                 if (!(instructions.get(i) instanceof FieldInstruction write) || write.opcode() != Opcode.PUTFIELD || !write.name().equalsString("combatMob")) continue;
                 if (candidate.methodName().equalsString("waitForMob")) continue;
-                assert Set.of("onActivate", "onDeactivate", "tickMobCombat").contains(candidate.methodName().stringValue());
+                assert Set.of("onActivate", "onDeactivate", "tickMobCombat", "refreshJobWorld").contains(candidate.methodName().stringValue());
                 assert instructions.subList(Math.max(0, i - 3), i).stream().anyMatch(instruction -> instruction.opcode() == Opcode.ACONST_NULL)
                     : "Only waitForMob may acquire a combat target; other paths may only clear it";
             }
@@ -233,7 +233,7 @@ public final class HighwayMobTest {
     }
 
     private static void pavingGuards(ClassModel builder, MethodModel forward) {
-        MethodModel tick = method(builder, "onTick"), wait = method(builder, "waitForMob");
+        MethodModel tick = method(builder, "onTick"), wait = obstructionWait(builder);
         int reset = field(tick, "waitingForMob", Opcode.PUTFIELD), signal = field(wait, "waitingForMob", Opcode.PUTFIELD);
         assert reset >= 0 && reset < call(tick, "tick") && call(tick, "tick") < call(tick, "paveWhileWaiting")
             && field(tick, "waitingForMob", Opcode.GETFIELD) < call(tick, "paveWhileWaiting")
@@ -259,8 +259,16 @@ public final class HighwayMobTest {
         for (String name : List.of("controlsPlayer", "hasChunkAt", "distToCenterSqr", "getEyePosition", "containsKey", "canBeReplaced",
             "liquidSupplySlot", "canPlaceBlock", "findHotbarSlot", "placeWorkBlock"))
             assert call(available, name) >= 0 : "Optional paving lost a live placement/supply guard: " + name;
-        for (String name : List.of("state", "mobReturn", "predictionFlushRequested", "pendingBreaks", "count", "placementsPerTick", "placeTimer", "placeRange", "pendingPlaces"))
+        for (String name : List.of("state", "mobReturn", "predictionFlushRequested", "count", "placementsPerTick", "placeTimer", "placeRange", "pendingPlaces"))
             assert field(available, name, Opcode.GETFIELD) >= 0 : "Optional paving must retain ownership, prediction and rate limits: " + name;
+        MethodModel pending = method(builder, "hasPendingExcavation"), background = method(builder, "isBackgroundExcavation");
+        assert call(available, "hasPendingExcavation") < 0 && field(pending, "pendingBreaks", Opcode.GETFIELD) >= 0 && call(pending, "anyMatch") >= 0
+            : "Keep excavation receipts for row entry, without blocking optional paving elsewhere";
+        assert builder.methods().stream().anyMatch(candidate -> candidate.methodName().stringValue().startsWith("lambda$hasPendingExcavation$")
+            && call(candidate, "isBackgroundExcavation") >= 0) : "Only speculative pending breaks may bypass that gate";
+        assert field(background, "speculativeBreaks", Opcode.GETFIELD) >= 0 && field(background, "workOrigin", Opcode.GETFIELD) >= 0
+            && call(background, "contains") >= 0 && call(background, "backgroundRow") >= 0
+            : "A pending break must promote back to mandatory work when its row approaches";
         for (String name : List.of("waitingForMob", "state", "mobReturn", "predictionFlushRequested"))
             assert field(waiting, name, Opcode.GETFIELD) >= 0 : "The wait-only pass must be gated before enumerating targets";
         assert call(waiting, "controlsPlayer") >= 0 && field(available, "Forward", Opcode.GETSTATIC) >= 0
@@ -387,6 +395,13 @@ public final class HighwayMobTest {
         assert end >= 0 : "Missing actual setting field " + name;
         while (start >= 0 && !(code.get(start) instanceof FieldInstruction field && field.opcode() == Opcode.PUTFIELD)) start--;
         return code.subList(start + 1, end);
+    }
+
+    private static MethodModel obstructionWait(ClassModel model) {
+        MethodModel strict = model.methods().stream().filter(m -> m.methodName().equalsString("waitForMob") && m.methodType().stringValue().endsWith("AABB;)Z")).findFirst().orElseThrow();
+        List<Instruction> code = elements(strict).stream().filter(Instruction.class::isInstance).map(Instruction.class::cast).toList();
+        assert code.stream().anyMatch(i -> i.opcode() == Opcode.ICONST_0) : "Placement must never ignore crew collisions";
+        return model.methods().stream().filter(m -> m.methodName().equalsString("waitForMob") && m.methodType().stringValue().endsWith("AABB;Z)Z")).findFirst().orElseThrow();
     }
 
     private static List<CodeElement> elements(MethodModel method) { return method.code().orElseThrow().elementList(); }

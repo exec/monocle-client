@@ -14,3 +14,5 @@ plugins {
 }
 
 rootProject.name = "monocle-client"
+include("coordinator-core")
+include("host-service")
