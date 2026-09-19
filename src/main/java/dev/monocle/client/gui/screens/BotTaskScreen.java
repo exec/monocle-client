@@ -54,7 +54,7 @@ public final class BotTaskScreen extends WindowScreen {
         feedback = add(theme.label("", contentWidth)).expandX().widget();
         try { if (id == null) createEditor(); else inspect(); }
         catch (RuntimeException e) { error(e); }
-        add(theme.button("Back to Bots")).expandX().widget().action = this::onClose;
+        add(theme.button("Back to Workers")).expandX().widget().action = this::onClose;
     }
 
     private void createEditor() {
@@ -63,6 +63,9 @@ public final class BotTaskScreen extends WindowScreen {
         for (var value : bots.workflows().all()) if (!value.script().isEmpty() || !bots.workflows().compile(value.id()).get("duty").getAsString().equals("Supply"))
             choices.add(new Choice(value.id(), (value.script().isEmpty() ? "Native · " : "Lua · ") + value.folder() + " / " + value.name()));
         Choice[] crews = bots.presets().stream().map(p -> new Choice(p.name(), bots.crewLabel(p.name()))).toArray(Choice[]::new);
+        for (var item : bots.operations().list()) {
+            JsonObject value=item.getAsJsonObject();if(!value.get("builtin").getAsBoolean())choices.add(new Choice("package:"+value.get("id").getAsString(),"Captured · "+value.get("folder").getAsString()+" / "+value.get("name").getAsString()));
+        }
         if (choices.isEmpty() || crews.length == 0) throw new IllegalStateException("Create a crew and a runnable workflow first.");
         add(theme.label("Queue work for one worker or a whole crew. Higher priority requests a safe interruption; equal priority waits its turn. Completing an interruption resumes the suspended task.", contentWidth).color(theme.textSecondaryColor()));
         WTable fields = add(theme.table()).expandX().widget();
@@ -97,6 +100,18 @@ public final class BotTaskScreen extends WindowScreen {
         arguments.clear(); parameters = null;
         WTable fields = arguments.add(theme.table()).expandX().widget();
         switch (workflow.get().id()) {
+            case "task-stash-scan" -> {
+                JsonObject selected;
+                try { selected=dev.monocle.client.systems.modules.Modules.get().get(dev.monocle.client.systems.modules.world.SchematicSelector.class).selectionBounds("Main stash"); }
+                catch(RuntimeException e){selected=new JsonObject();for(String axis:List.of("X","Y","Z")){int coordinate=mc.player==null?0:axis.equals("X")?mc.player.getBlockX():axis.equals("Y")?mc.player.getBlockY():mc.player.getBlockZ();selected.addProperty("min"+axis,coordinate);selected.addProperty("max"+axis,coordinate);}}
+                fields.add(theme.label("Stash name"));WTextBox name=fields.add(theme.textBox("Main stash")).expandX().widget();fields.row();
+                fields.add(theme.label("Home name"));WTextBox home=fields.add(theme.textBox("")).expandX().widget();fields.row();
+                WIntEdit warmup=integer(fields,"Home warmup (seconds)",15,0,3600),cooldown=integer(fields,"Home cooldown (minutes)",10,0,1440);
+                Map<String,WIntEdit> bounds=new LinkedHashMap<>();
+                for(String axis:List.of("X","Y","Z"))for(String end:List.of("min","max")){String key=end+axis;int limit=axis.equals("Y")?2048:29_900_000;bounds.put(key,integer(fields,key,selected.get(key).getAsInt(),-limit,limit));}
+                parameters=()->{JsonObject p=new JsonObject();p.addProperty("name",name.get());p.addProperty("homeName",home.get());p.addProperty("homeWarmupTicks",warmup.get()*20);p.addProperty("homeCooldownTicks",cooldown.get()*1200);bounds.forEach((key,value)->p.addProperty(key,value.get()));return dev.monocle.coordinator.StashCatalog.plan(p);};
+                arguments.add(theme.label("Optional Home name runs /home [name] before scanning. Bounds copy the current wooden-pickaxe selection. Workers inspect disjoint containers; no items or terrain are changed.",contentWidth-20));
+            }
             case "task-stash-hunt" -> {
                 int ox = mc.player == null ? 0 : mc.player.getBlockX(), oz = mc.player == null ? 0 : mc.player.getBlockZ();
                 WIntEdit minX = integer(fields, "Minimum X", ox, -29_900_000, 29_900_000);
@@ -128,9 +143,9 @@ public final class BotTaskScreen extends WindowScreen {
             }
             case "task-tpa" -> {
                 WTextBox target = string(fields, "Target name / UUID", mc.player == null ? mc.getUser().getName() : mc.player.getName().getString());
-                WIntEdit warmup = integer(fields, "Warmup ticks", 60, 0, 1200), timeout = integer(fields, "Timeout ticks", 600, 20, 72_000);
+                WIntEdit warmup = integer(fields, "Warmup ticks", 300, 0, 1200), acceptDelay=integer(fields,"Accept delay ticks",10,0,200), timeout = integer(fields, "Timeout ticks", 1200, 20, 72_000);
                 WIntEdit radius = integer(fields, "Arrival radius", 8, 1, 16);
-                parameters = () -> { JsonObject a = new JsonObject(); a.addProperty("target", target.get().strip()); a.addProperty("warmupTicks", warmup.get()); a.addProperty("timeoutTicks", timeout.get()); a.addProperty("radius", radius.get()); return a; };
+                parameters = () -> { JsonObject a = new JsonObject(); a.addProperty("target", target.get().strip()); a.addProperty("warmupTicks", warmup.get());a.addProperty("acceptDelayTicks",acceptDelay.get()); a.addProperty("timeoutTicks", timeout.get()); a.addProperty("radius", radius.get()); return a; };
                 arguments.add(theme.label("20 ticks ≈ one second. TPA waits for observed arrival near the target, not just the warmup timer; the server may require the target to accept.", contentWidth - 20).color(theme.textSecondaryColor()));
             }
             case "task-drop" -> {
@@ -173,6 +188,10 @@ public final class BotTaskScreen extends WindowScreen {
     }
 
     private void describeWorkflow() {
+        if(workflow.get().id().startsWith("package:")) {
+            JsonObject record=bots.operations().get(workflow.get().id().substring(8));
+            workflowDetails.set(record.get("name").getAsString()+" · portable captured package\nProfiles and native configuration come from the saved snapshot. JSON arguments override workflow inputs. Existing jobs are immutable.");return;
+        }
         BotWorkflows.Workflow selected = bots.workflows().get(workflow.get().id());
         workflowDetails.set(selected.name() + (selected.script().isEmpty() ? " · native highway preset" : " · Lua program")
             + "\nProfiles captured at queue time: " + (selected.profiles().isEmpty() ? "none declared" : String.join(", ", selected.profiles()))
@@ -246,9 +265,18 @@ public final class BotTaskScreen extends WindowScreen {
         }, "Finished task history deleted.");
     }
     public static String describe(Bots bots, BotScheduler.TaskView task) {
-        return task.name() + " · " + task.status() + "\n" + task.workflowName() + " · priority " + task.priority()
+        String report=task.name() + " · " + task.status() + "\n" + task.workflowName() + " · priority " + task.priority()
             + " · " + bots.crewLabel(task.crewId()) + "\nWorkers: " + String.join(", ", task.targets().stream().map(id -> workerName(bots, id)).toList())
             + "\n" + task.detail();
+        StringBuilder debug=new StringBuilder(report);
+        for(var value:bots.tasks().stashDiagnostics(task.id())){
+            JsonObject s=value.getAsJsonObject();debug.append("\n\n").append(workerName(bots,UUID.fromString(s.get("worker").getAsString()))).append(" · ").append(s.get("status").getAsString()).append(" · ").append(s.get("phase").getAsString())
+                .append("\n").append(s.get("detail").getAsString()).append("\nTarget ").append(s.get("target").getAsString()).append(" · movement ").append(s.get("movementTarget").getAsString())
+                .append("\n").append(s.get("observed")).append(" observed · ").append(s.get("unscanned")).append(" unscanned · ").append(s.get("missingChunks")).append(" missing chunks")
+                .append("\nLast action: ").append(s.get("lastAction").getAsString());
+            if(s.has("events")){var events=s.getAsJsonArray("events");for(int i=Math.max(0,events.size()-6);i<events.size();i++){JsonObject e=events.get(i).getAsJsonObject();debug.append("\n").append(e.get("phase").getAsString()).append(": ").append(e.get("reason").getAsString());}}
+        }
+        return debug.toString();
     }
     private static String workerName(Bots bots, UUID id) { return bots.allMembers().stream().filter(m -> m.id().equals(id)).map(m -> m.name()).findFirst().orElse(id.toString()); }
     private void requireHost() { if (bots.mode.get() != Bots.Mode.Host) throw new IllegalStateException("Only the host can manage task queues."); }

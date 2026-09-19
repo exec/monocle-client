@@ -36,7 +36,7 @@ final class BotJobs {
             loaded = true;
             if (migrated) save();
         } catch (IOException | RuntimeException e) {
-            failure = "Cannot read Bots jobs at " + file + ": " + e.getMessage() + ". The original file has been left untouched.";
+            failure = "Cannot read Workers jobs at " + file + ": " + e.getMessage() + ". The original file has been left untouched.";
             throw new IllegalStateException(failure, e);
         }
     }
@@ -54,7 +54,7 @@ final class BotJobs {
             Files.writeString(temporary, JSON.toJson(root));
             // Refuse an unsafe replacement if this filesystem cannot atomically preserve the previous catalog.
             Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException e) { throw new IllegalStateException("Could not save Bots jobs; assignment changes were stopped: " + e.getMessage(), e); }
+        } catch (IOException e) { throw new IllegalStateException("Could not save Workers jobs; assignment changes were stopped: " + e.getMessage(), e); }
         finally { if (temporary != null) try { Files.deleteIfExists(temporary); } catch (IOException ignored) { } }
     }
 

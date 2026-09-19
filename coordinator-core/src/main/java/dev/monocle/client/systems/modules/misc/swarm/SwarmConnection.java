@@ -15,11 +15,12 @@ import java.util.HexFormat;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.function.Function;
+import dev.monocle.coordinator.CrewTransport;
 
-/** Shared authenticated, ordered, bounded LAN transport. Socket threads never access game state. */
+/** Shared authenticated, ordered, bounded protocol over LAN TCP or WebSocket. I/O threads never access game state. */
 public class SwarmConnection extends Thread {
     private static final SecureRandom RANDOM = new SecureRandom();
-    public final Socket socket;
+    private final CrewTransport transport;
     private final String configuredKey;
     private final Function<String, String> keyResolver;
     private final boolean hostSide;
@@ -32,21 +33,28 @@ public class SwarmConnection extends Thread {
     private Thread writer;
 
     public SwarmConnection(Socket socket, String key, boolean hostSide) {
-        this(socket, key, null, hostSide);
+        this(CrewTransport.socket(socket), key, null, hostSide);
     }
     public SwarmConnection(Socket socket, Function<String, String> keyResolver) {
-        this(socket, null, keyResolver, true);
+        this(CrewTransport.socket(socket), null, keyResolver, true);
     }
-    private SwarmConnection(Socket socket, String key, Function<String, String> keyResolver, boolean hostSide) {
-        super("Monocle Bots reader");
-        this.socket = socket;
+    public SwarmConnection(CrewTransport transport, String key, boolean hostSide) {
+        this(transport, key, null, hostSide);
+    }
+    public SwarmConnection(CrewTransport transport, Function<String, String> keyResolver) {
+        this(transport, null, keyResolver, true);
+    }
+    private SwarmConnection(CrewTransport transport, String key, Function<String, String> keyResolver, boolean hostSide) {
+        super("Monocle Workers reader");
+        this.transport = transport;
         this.configuredKey = key;
         this.keyResolver = keyResolver;
         this.hostSide = hostSide;
         setDaemon(true);
     }
 
-    public boolean connected() { return ready && !socket.isClosed(); }
+    public boolean connected() { return ready && !closed(); }
+    public boolean closed() { return transport.closed(); }
     public String failure() { return failure; }
     public String credentialId() { return credentialId; }
     /** Credentials are encrypted even though ordinary LAN status messages are only authenticated. */
@@ -78,11 +86,10 @@ public class SwarmConnection extends Thread {
         } catch (Exception e) { throw new IllegalArgumentException("Invalid crew credential transfer", e); }
     }
     public String poll() { return incoming.poll(); }
-    protected void connectSocket() throws IOException {}
     public boolean send(String message) {
         if (!connected()) return false;
         if (message.length() > 16000 || !outgoing.offer(message)) {
-            failure = "Bots message queue exceeded its limit";
+            failure = "Workers message queue exceeded its limit";
             disconnect();
             return false;
         }
@@ -98,71 +105,67 @@ public class SwarmConnection extends Thread {
         return MessageDigest.isEqual(mac(key, text).getBytes(StandardCharsets.US_ASCII), signature.getBytes(StandardCharsets.US_ASCII));
     }
     public static String credentialSelector(String key) {
-        if (key == null || key.length() < 24) throw new IllegalArgumentException("Bots keys must contain at least 24 characters");
+        if (key == null || key.length() < 24) throw new IllegalArgumentException("Workers keys must contain at least 24 characters");
         try { return mac(key, "monocle-bots-crew"); }
-        catch (Exception e) { throw new IllegalStateException("Cannot generate Bots credential selector", e); }
+        catch (Exception e) { throw new IllegalStateException("Cannot generate Workers credential selector", e); }
     }
 
     @Override public void run() {
         try {
             if (keyResolver == null && (configuredKey == null || configuredKey.length() < 24))
-                throw new IOException("Set the same Bots key (24+ characters) on both clients");
-            connectSocket();
-            socket.setSoTimeout(10000);
-            socket.setTcpNoDelay(true);
-            var in = new DataInputStream(socket.getInputStream());
-            var out = new DataOutputStream(socket.getOutputStream());
+                throw new IOException("Set the same Workers key (24+ characters) on both clients");
+            transport.open();
             String nonce = UUID.randomUUID().toString();
             String localSelector = hostSide ? "" : credentialSelector(configuredKey);
-            out.writeUTF("monocle-crew-6:" + nonce + (hostSide ? "" : ":" + localSelector));
-            out.flush();
-            String peer = in.readUTF();
+            transport.write("monocle-crew-6:" + nonce + (hostSide ? "" : ":" + localSelector));
+            transport.flush();
+            String peer = transport.read();
             if (!peer.matches("monocle-crew-6:[0-9a-f-]{36}" + (hostSide ? ":[0-9a-f]{64}" : "")))
-                throw new IOException("Incompatible Bots protocol; install the same build on every account");
+                throw new IOException("Incompatible Workers protocol; install the same build on every account");
             String peerNonce = peer.substring("monocle-crew-6:".length(), "monocle-crew-6:".length() + 36);
             String selected = hostSide ? peer.substring(peer.length() - 64) : localSelector;
             final String key = hostSide && keyResolver != null ? keyResolver.apply(selected) : configuredKey;
             if (key == null || key.length() < 24 || !MessageDigest.isEqual(credentialSelector(key).getBytes(StandardCharsets.US_ASCII), selected.getBytes(StandardCharsets.US_ASCII)))
-                throw new IOException("Bots key mismatch or unknown crew");
+                throw new IOException("Workers key mismatch or unknown crew");
             String context = selected + ":" + (hostSide ? nonce + ":" + peerNonce : peerNonce + ":" + nonce);
             String sendDirection = hostSide ? "host" : "worker", receiveDirection = hostSide ? "worker" : "host";
-            out.writeUTF(mac(key, context + sendDirection));
-            out.flush();
-            if (!authentic(key, context + receiveDirection, in.readUTF())) throw new IOException("Bots key mismatch");
+            transport.write(mac(key, context + sendDirection));
+            transport.flush();
+            if (!authentic(key, context + receiveDirection, transport.read())) throw new IOException("Workers key mismatch");
             handoffKey = new SecretKeySpec(HexFormat.of().parseHex(mac(key, context + "credential-handoff")), "AES");
             credentialId = selected;
             ready = true;
             writer = new Thread(() -> {
                 long sequence = 0;
                 try {
-                    while (!socket.isClosed()) {
+                    while (!closed()) {
                         String message = outgoing.take();
-                        out.writeUTF(message);
-                        out.writeUTF(mac(key, context + sendDirection + sequence++ + ":" + message));
-                        out.flush();
+                        transport.write(message);
+                        transport.write(mac(key, context + sendDirection + sequence++ + ":" + message));
+                        transport.flush();
                     }
                 } catch (Exception e) { disconnect(); }
-            }, "Monocle Bots writer");
+            }, "Monocle Workers writer");
             writer.setDaemon(true);
             writer.start();
             long sequence = 0;
-            while (!socket.isClosed()) {
-                String message = in.readUTF();
-                if (message.length() > 16000 || !authentic(key, context + receiveDirection + sequence++ + ":" + message, in.readUTF()))
-                    throw new IOException("Invalid Bots message");
-                if (!incoming.offer(message)) throw new IOException("Bots receive queue full");
+            while (!closed()) {
+                String message = transport.read();
+                if (message.length() > 16000 || !authentic(key, context + receiveDirection + sequence++ + ":" + message, transport.read()))
+                    throw new IOException("Invalid Workers message");
+                if (!incoming.offer(message)) throw new IOException("Workers receive queue full");
             }
         } catch (Exception e) {
             // Socket.connect may close the socket itself on failure; only explicit cancellation suppresses errors.
-            if (!isInterrupted()) failure = e.getMessage() == null ? "Bots connection lost" : e.getMessage();
+            if (!isInterrupted()) failure = e.getMessage() == null ? "Workers connection lost" : e.getMessage();
         } finally { disconnect(); }
     }
     public void disconnect() {
         ready = false;
         handoffKey = null;
-        try { socket.close(); } catch (IOException ignored) {}
+        transport.close();
         if (writer != null) writer.interrupt();
         interrupt();
     }
-    public String getConnection() { return String.valueOf(socket.getRemoteSocketAddress()); }
+    public String getConnection() { return transport.endpoint(); }
 }

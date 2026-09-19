@@ -1,6 +1,7 @@
 package dev.monocle.coordinator;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonParser;
 import dev.monocle.client.systems.bots.BotLua;
 import java.util.ArrayList;
@@ -39,10 +40,45 @@ public final class CoordinatorCoreTest {
         assert TaskFiles.read(path).equals(invalid) : "Malformed recovery data must never be overwritten as an empty ledger";
     }
 
+    private static void liveConfiguration() {
+        JsonObject task = new JsonObject(), runs = new JsonObject(), run = new JsonObject();
+        run.addProperty("id", UUID.randomUUID().toString()); run.addProperty("status", "Running");
+        runs.add(WORKER.toString(), run); task.add("runs", runs); task.addProperty("status", "Running");
+        JsonObject modules = JsonParser.parseString("{\"speed\":{\"active\":true,\"settings\":\"{}\"}}").getAsJsonObject();
+        rejects(() -> TaskWire.configure(task, WORKER, modules));
+        run.addProperty("configurationVersion", 1);
+        TaskWire.configure(task, WORKER, modules);
+        assert TaskWire.configurationToSend(run, 0).get("revision").getAsInt() == 1;
+        assert TaskWire.configurationToSend(run, 999) == null;
+        assert TaskWire.configurationToSend(run, 1000) != null;
+        JsonObject before = task.deepCopy();
+        rejects(() -> TaskWire.configure(task, WORKER, modules));
+        assert task.equals(before) : "Pending updates cannot be silently replaced";
+        JsonObject ack = TaskWire.message("status"); ack.addProperty("run", TaskWire.text(run, "id")); ack.addProperty("status", "Running"); ack.addProperty("configRevision", 1);
+        TaskWire.applyStatus(task, run, ack, true);
+        assert TaskWire.configurationToSend(run, 2000) == null;
+        TaskWire.configure(task, null, modules);
+        assert TaskWire.configurationToSend(run, 2001).get("revision").getAsInt() == 2;
+        ack.addProperty("configRevision", 2); ack.addProperty("configError", "Unknown setting");
+        TaskWire.applyStatus(task, run, ack, true);
+        assert TaskWire.text(run, "status").equals("Running") && TaskWire.configurationToSend(run, 3000) == null : "Rejected settings do not stop the job or retry forever";
+        ack.addProperty("configRevision", 1); ack.addProperty("configError", ""); TaskWire.applyStatus(task, run, ack, true);
+        assert run.get("configRevision").getAsInt() == 2 && TaskWire.text(run, "configError").equals("Unknown setting");
+        rejects(() -> TaskWire.configure(task, OTHER, modules));
+        rejects(() -> TaskWire.checkedConfiguration(JsonParser.parseString("{\"highway-builder\":{\"active\":true,\"settings\":\"{}\"}}").getAsJsonObject()));
+        task.addProperty("cancelled", true); rejects(() -> TaskWire.configure(task, WORKER, modules));
+    }
+
     public static void main(String[] args) throws Exception {
         boolean enabled = false; assert enabled = true;
         if (!enabled) throw new IllegalStateException("Run with assertions enabled");
+        liveConfiguration();
+        stashScan();
         supplyRecovery();
+        highwayStartup();
+        independentSupplies();
+        OperationsLibraryTest.run();
+        CrewTelemetryTest.run();
         for (String absent : List.of("net.minecraft.client.Minecraft", "net.fabricmc.loader.api.FabricLoader", "org.lwjgl.glfw.GLFW")) {
             try { Class.forName(absent, false, CoordinatorCoreTest.class.getClassLoader()); throw new AssertionError("Core acquired game dependency: " + absent); }
             catch (ClassNotFoundException expected) { }
@@ -80,6 +116,118 @@ public final class CoordinatorCoreTest {
         timing(); lua(); observations(); verification(); dispatch();
         System.out.println("Coordinator core checks passed without Minecraft/Fabric/LWJGL: queues, recovery, teleport, Lua, player observations and row verification authority.");
     }
+    private static void stashScan() throws Exception {
+        JsonObject p=JsonParser.parseString("{\"name\":\"Depot\",\"minX\":-2,\"maxX\":2,\"minY\":116,\"maxY\":117,\"minZ\":-1,\"maxZ\":1}").getAsJsonObject();
+        p=StashCatalog.plan(p);
+        assert p.get("homeName").getAsString().isEmpty()&&p.get("homeWarmupTicks").getAsInt()==300&&p.get("homeCooldownTicks").getAsInt()==12_000;
+        JsonObject home=p.deepCopy();home.addProperty("homeName","main-stash_1");home.addProperty("homeWarmupTicks",400);home.addProperty("homeCooldownTicks",24_000);assert StashCatalog.plan(home).get("homeName").getAsString().equals("main-stash_1");
+        JsonObject badHome=p.deepCopy();badHome.addProperty("homeName","bad home");rejects(()->StashCatalog.plan(badHome));
+        for(int workers=1;workers<=5;workers++)for(int x=-2;x<=2;x++)for(int y=116;y<=117;y++)for(int z=-1;z<=1;z++){
+            int owners=0;for(int index=0;index<workers;index++){JsonObject a=p.deepCopy();a.addProperty("workerCount",workers);a.addProperty("workerIndex",index);if(StashCatalog.owns(a,x,y,z))owners++;}assert owners==1;
+        }
+        var root=java.nio.file.Files.createTempDirectory("monocle-stash-check-");
+        StashCatalog.define(root,"A","server\nnether",p);
+        StashCatalog.define(root,"A","server\nnether",home,"00000000-0000-0000-0000-000000000001");
+        JsonObject routed=StashCatalog.route(root,"A","server\nnether",p,"00000000-0000-0000-0000-000000000001");assert routed.get("homeName").getAsString().equals("main-stash_1")&&StashCatalog.list(root).get(0).getAsJsonObject().getAsJsonObject("homes").size()==1;
+        StashCatalog.cacheRemote(root,StashCatalog.list(root));assert StashCatalog.remote(root).size()==1;
+        assert StashCatalog.list(root).size()==1&&StashCatalog.list(root).get(0).getAsJsonObject().get("observed").getAsInt()==0 : "Exported definitions are visible before scanning";
+        JsonObject observation=JsonParser.parseString("{\"x\":0,\"y\":116,\"z\":0,\"status\":\"observed\",\"block\":\"minecraft:chest\",\"reason\":\"\",\"items\":{\"minecraft:stone\":1728},\"shulkers\":[]}").getAsJsonObject();
+        StashCatalog.save(root,"A","server\nnether",p,observation);StashCatalog.save(root,"A","server\nnether",p,observation);
+        assert StashCatalog.list(root).size()==1 && StashCatalog.list(root).get(0).getAsJsonObject().getAsJsonObject("items").get("minecraft:stone").getAsInt()==1728 : "Retries never add stock twice";
+        JsonObject missed=observation.deepCopy();missed.addProperty("status","unscanned");missed.add("items",new JsonObject());missed.addProperty("reason","Opening timed out");
+        StashCatalog.save(root,"A","server\nnether",p,missed);
+        assert StashCatalog.list(root).get(0).getAsJsonObject().get("unscanned").getAsInt()==1;
+        JsonObject inferred=observation.deepCopy();inferred.addProperty("inferred",true);StashCatalog.save(root,"A","server\nnether",p,inferred);
+        assert StashCatalog.list(root).get(0).getAsJsonObject().get("inferred").getAsInt()==1&&StashCatalog.list(root).get(0).getAsJsonObject().get("observed").getAsInt()==0 : "Estimates never masquerade as observed containers";
+        assert StashCatalog.get(root,"B","server\nnether","Depot").isEmpty();
+        JsonObject invalid=observation.deepCopy();invalid.addProperty("x",3);JsonObject assignment=p;
+        rejects(()->StashCatalog.save(root,"A","server\nnether",assignment,invalid));
+        invalid.addProperty("x",0);invalid.getAsJsonObject("items").addProperty("minecraft:stone",-1);rejects(()->StashCatalog.observation(assignment,invalid));
+        JsonObject refillDb=JsonParser.parseString("{containers:{'1,116,2':{status:'observed',shulkers:[{slot:0,dominant:'minecraft:obsidian',mixed:false,items:{'minecraft:obsidian':1728}},{slot:1,dominant:'minecraft:golden_apple',mixed:false,items:{'minecraft:golden_apple':1728}}]},'2,116,2':{status:'observed',inferred:true,shulkers:[{slot:0,dominant:'minecraft:obsidian',mixed:false,items:{'minecraft:obsidian':1728}}]}}}").getAsJsonObject();
+        JsonObject needs=JsonParser.parseString("{'minecraft:obsidian':3456,'minecraft:golden_apple':1728,'minecraft:netherrack':100}").getAsJsonObject();JsonArray refill=StashCatalog.refill(refillDb,needs,"minecraft:obsidian",27);
+        assert refill.size()==2&&refill.get(0).getAsJsonObject().get("resource").getAsString().equals("minecraft:obsidian") : "Primary shortage is first; inferred stock and sub-box shortages are skipped";
+        JsonObject withdrawalPlan=p.deepCopy();withdrawalPlan.addProperty("name","Withdrawals");StashCatalog.define(root,"A","server\nnether",withdrawalPlan);JsonObject withdrawalObservation=observation.deepCopy();JsonArray receipt=refill.deepCopy();receipt.forEach(v->{v.getAsJsonObject().addProperty("x",0);v.getAsJsonObject().addProperty("z",0);});StashCatalog.save(root,"A","server\nnether",withdrawalPlan,withdrawalObservation);StashCatalog.invalidateWithdrawn(root,"A","server\nnether","Withdrawals",receipt);
+        assert StashCatalog.get(root,"A","server\nnether","Withdrawals").getAsJsonObject("containers").getAsJsonObject("0,116,0").get("status").getAsString().equals("unscanned") : "Withdrawn containers cannot remain authoritative";
+        var decision=BotLua.next("return function(ctx) return bot.stash_scan(ctx.args) end",new JsonObject(),p,null,null);
+        assert decision.action().get("type").getAsString().equals("StashScan");
+        JsonObject telemetry=JsonParser.parseString("{\"name\":\"Depot\",\"phase\":\"Reading\",\"reason\":\"Awaiting contents\",\"target\":\"0,116,0\",\"movementTarget\":\"\",\"lastAction\":\"Requested opening\",\"discovery\":1,\"volume\":30,\"discovered\":1,\"observed\":0,\"unscanned\":0,\"missingChunks\":0,\"attempts\":1}").getAsJsonObject();
+        JsonObject run=new JsonObject();for(int i=0;i<100;i++){telemetry.addProperty("reason","Retry "+i);StashCatalog.telemetry(run,telemetry);}assert run.getAsJsonArray("stashEvents").size()==64;
+        StashCatalog.telemetry(run,telemetry);assert run.getAsJsonArray("stashEvents").size()==64;
+    }
+
+    private static void independentSupplies() {
+        JsonObject empty=JsonParser.parseString("{loose:[0,0,0,0,0],shulkers:[0,0,0,0,0],echest:[0,0,0,0,0],target:[512,3,16,0,4],echestKnown:true}").getAsJsonObject();
+        assert !ResourceLedger.possibleDonor(empty,ResourceLedger.MATERIALS);
+        empty.addProperty("echestKnown",false);assert !ResourceLedger.possibleDonor(empty,ResourceLedger.MATERIALS);
+        empty.getAsJsonArray("loose").set(4,new com.google.gson.JsonPrimitive(1));assert ResourceLedger.possibleDonor(empty,ResourceLedger.MATERIALS);
+        empty.addProperty("echestKnown",true);empty.getAsJsonArray("shulkers").set(0,new com.google.gson.JsonPrimitive(513));assert ResourceLedger.possibleDonor(empty,ResourceLedger.MATERIALS);
+        JsonObject absent=JsonParser.parseString("{independentSupplies:true,workflow:{version:1,id:'highway-default',name:'Highway Builder',actions:['Excavating','Paving','InventoryShulkers'],duty:'Build'},members:['"+WORKER+"'],activeMembers:[],awayMembers:{'"+WORKER+"':true},suppliers:{}}").getAsJsonObject();
+        HighwayCoordinator.applyWorkflowDuties(absent, java.util.Set.of());
+        absent.remove("awayMembers");rejects(()->HighwayCoordinator.applyWorkflowDuties(absent,java.util.Set.of()));
+        assert RoadForecast.breakTicks(0.1)==10 && RoadForecast.breakTicks(2)==1;
+        assert RoadForecast.miningTicks(0.1,true,2)==7.5 && RoadForecast.miningTicks(0.1,false,2)==12;
+        assert RoadForecast.rate(100,100,1000,20,5,10)==4;
+        assert RoadForecast.rate(0,0,0,20,5,10)==0;
+        JsonObject prediction=JsonParser.parseString("{nextBlocks:100,blocksPerSecond:4,ageTicks:10}").getAsJsonObject();
+        JsonArray predictionWorkers=new JsonArray();JsonObject predictionWorker=new JsonObject();predictionWorker.add("roadPrediction",prediction);predictionWorkers.add(predictionWorker);
+        assert RoadForecast.crew(predictionWorkers).get("nextBlocks").getAsInt()==100;
+        prediction.addProperty("nextBlocks",1025);rejects(()->RoadForecast.checked(prediction));
+        BotChat chat=new BotChat();UUID commandId=UUID.randomUUID();assert chat.first(commandId)&&!chat.first(commandId);
+        assert BotChat.command("/home stash1").equals("/home stash1");rejects(()->BotChat.command("hello\n/stop"));rejects(()->BotChat.command("x".repeat(257)));
+        for(int i=0;i<300;i++)chat.append(WORKER,"Default","Worker","world","received","message "+i);
+        assert chat.json().size()==256 && chat.json().get(0).getAsJsonObject().get("text").getAsString().equals("message 44");
+        BotChat colors=new BotChat();UUID other=UUID.randomUUID();
+        JsonArray parts=JsonParser.parseString("[{text:'[Rank] ',color:'#ff5500'},{text:'Alice: hello',color:'#55ffff'}]").getAsJsonArray();
+        colors.append(WORKER,"Default","Worker","world","received","[Rank] Alice: hello",parts);
+        colors.append(other,"Default","Other","world","received","[Rank] Alice: hello",parts);
+        JsonArray grouped=BotChat.grouped(colors.json());
+        assert grouped.size()==1 && grouped.get(0).getAsJsonObject().getAsJsonArray("recipients").size()==2;
+        assert grouped.get(0).getAsJsonObject().get("parts").equals(parts);
+        colors.append(other,"Default","Other","world","received","[Rank] Alice: hello",parts);
+        assert BotChat.grouped(colors.json()).size()==2 : "Repeated messages from one worker are not duplicates";
+        colors.append(other,"Default","Other","world","received","Private message",null);
+        assert BotChat.grouped(colors.json()).size()==3 : "Preserve distinct DMs";
+        colors.append(WORKER,"Default","Worker","world","received","wrong",parts);
+        assert !colors.json().get(colors.json().size()-1).getAsJsonObject().has("parts") : "Mismatched color runs degrade to plain chat";
+        rejects(()->colors.append(WORKER,"Default","Worker","world","received","x",JsonParser.parseString("[{text:'x',color:'red;bad'}]").getAsJsonArray()));
+        JsonObject ledger=JsonParser.parseString("{loose:[64,2,16,0,1],shulkers:[128,3,32,0,0],echest:[512,6,64,0,2],inventory:{},storage:{},echestKnown:true}").getAsJsonObject();
+        JsonObject counts=ResourceLedger.resourceCounts(ledger);
+        assert counts.getAsJsonObject("inventory").get("obsidian").getAsInt()==192 && counts.getAsJsonObject("inventory").get("pickaxes").getAsInt()==5;
+        assert counts.getAsJsonObject("enderChest").get("food").getAsInt()==64 && counts.getAsJsonObject("total").get("obsidian").getAsInt()==704 && counts.get("enderChestKnown").getAsBoolean();
+        JsonObject assignment = JsonParser.parseString("{x:0,y:116,z:100,length:512,layout:{dx:0,dz:1,width:5}}").getAsJsonObject();
+        var locations = JsonParser.parseString("[{x:1,y:116,z:137},{x:2,y:116,z:137}]");
+        assert HighwayCoordinator.checkedSupplyContainers(assignment, locations).size() == 2;
+        assert HighwayCoordinator.checkedSupplyContainers(assignment, null).isEmpty();
+        for (String invalid : List.of("null", "{}", "[{}]", "[null]", "[{x:1,y:116,z:137.5}]",
+            "[{x:'1',y:116,z:137}]", "[{x:2147483648,y:116,z:137}]", "[{x:18,y:116,z:137}]",
+            "[{x:0,y:127,z:137}]", "[{x:0,y:116,z:-29}]", "[{x:0,y:116,z:625}]", "[{},{},{}]"))
+            assert HighwayCoordinator.checkedSupplyContainers(assignment, JsonParser.parseString(invalid)).isEmpty() : invalid;
+        assignment.addProperty("independentSupplies", true);
+        assignment.add("activeMembers", new com.google.gson.JsonArray());
+        var away = new JsonObject(); away.addProperty(WORKER.toString(), true); assignment.add("awayMembers", away);
+        HighwayCoordinator.validateActiveMembers(assignment, java.util.Set.of(WORKER));
+        assignment.getAsJsonArray("activeMembers").add(WORKER.toString());
+        rejects(() -> HighwayCoordinator.validateActiveMembers(assignment, java.util.Set.of(WORKER)));
+    }
+
+    private static void highwayStartup() throws Exception {
+        var library = new dev.monocle.client.systems.bots.BotWorkflows(
+            java.nio.file.Files.createTempDirectory("monocle-highway-start-check-").resolve("workflows.json"));
+        var packaged = library.packageWorkflows("highway-default");
+        for (var entry : packaged.getAsJsonObject("highways").entrySet()) {
+            String script = packaged.getAsJsonObject("programs").getAsJsonObject(entry.getKey()).get("script").getAsString();
+            JsonObject args = new JsonObject(); args.addProperty("length", 128);
+            var first = BotLua.next(script, new JsonObject(), args, new JsonObject(), new JsonObject());
+            assert TaskWire.text(first.action(), "type").equals("Highway") : "Native jobs must not visit historical supplies before joining their new crew";
+            assert TaskWire.text(first.action(), "workflow").equals(entry.getKey());
+            var finished = BotLua.next(script, first.state(), args, new JsonObject(), new JsonObject());
+            assert TaskWire.text(finished.action(), "type").equals("Done");
+        }
+        var recovery = library.packageWorkflows("task-recover");
+        String script = recovery.getAsJsonObject("programs").getAsJsonObject("task-recover").get("script").getAsString();
+        assert TaskWire.text(BotLua.next(script, new JsonObject(), new JsonObject(), new JsonObject(), new JsonObject()).action(), "type").equals("RecoverSupplies")
+            : "Explicit recovery workflows must remain available";
+    }
 
     private static void dispatch() {
         JsonObject older = task("older", 0), urgent = task("urgent", 10);
@@ -111,6 +259,16 @@ public final class CoordinatorCoreTest {
         run(urgent).addProperty("id", WORKER.toString());
         assert TaskWire.applyStatus(urgent, run(urgent), report, true);
         assert urgent.get("paused").getAsBoolean();
+        JsonObject independent = task("independent", 0); JsonObject independentRun = run(independent);
+        independentRun.addProperty("id", WORKER.toString()); independent.addProperty("status", "Running"); independent.addProperty("paused", false);
+        assert TaskWire.applyStatus(independent, independentRun, report, true, true);
+        assert !independent.get("paused").getAsBoolean() && TaskWire.text(independentRun, "status").equals("Inspection required") : "One restarting worker must not pause an independent crew";
+        assert !HighwayCoordinator.resumeMemberRequired(true, true, false) && !HighwayCoordinator.resumeMemberRequired(true, false, true);
+        assert HighwayCoordinator.resumeMemberRequired(true, true, true) && HighwayCoordinator.resumeMemberRequired(false, false, false) : "Independent resume ignores offline/away members; shared resume still requires everyone";
+        assert HighwayCoordinator.detachAllowed(List.of(WORKER), WORKER) : "The last builder can restock against the saved verified front";
+        assert HighwayCoordinator.needsServiceFront(true, false) && HighwayCoordinator.needsServiceFront(false, true);
+        assert !HighwayCoordinator.needsServiceFront(true, true) : "Visible active builders remain the freshest return target";
+        assert HighwayCoordinator.serviceFrontRow(0, 128) == 1 : "A new job must publish its first work row, not the excluded origin";
         QueuePolicy.resume(urgent); report.addProperty("status", "Running");
         assert TaskWire.applyStatus(urgent, run(urgent), report, true) && !run(urgent).has("resumeInspection");
         report.addProperty("status", "Complete"); TaskWire.applyStatus(urgent, run(urgent), report, true);
@@ -174,6 +332,9 @@ public final class CoordinatorCoreTest {
         assert RowVerification.mask(false, 11, 15, Map.of(), confirmed) == 31;
         assert RowVerification.mask(false, 11, 15, host, null) == 0;
         assert RowVerification.mask(false, 11, 15, host, new RowVerification.Progress(10, true, 10, 31)) == 0;
+        assert HighwayCoordinator.canAdvance(11, 15, 11, 1) : "A server-resolved row may advance";
+        assert !HighwayCoordinator.canAdvance(11, 15, 11, 0) : "Missing paving in any lane must hold the crew";
+        assert !HighwayCoordinator.canAdvance(16, 15, 11, 31) : "The row window remains bounded";
         assert RowVerification.checkpoint(true, 0, 8, 10, host, List.of()) == 10;
         assert RowVerification.checkpoint(true, 0, 10, 10, Map.of(), List.of(confirmed)) == 9;
         assert RowVerification.checkpoint(false, 0, 10, 10, Map.of(), List.of(confirmed)) == 10;
@@ -226,16 +387,16 @@ public final class CoordinatorCoreTest {
         return trace;
     }
     private static void timing() {
-        JsonObject tpa = new JsonObject(); tpa.addProperty("warmup", 60);
+        JsonObject tpa = new JsonObject(); tpa.addProperty("acceptDelay", 10);
         assert !QueuePolicy.teleportWarmupReady(tpa, 100_000);
         tpa.addProperty("acknowledgedAt", 10_000);
-        assert !QueuePolicy.teleportWarmupReady(tpa, 9_999) && !QueuePolicy.teleportWarmupReady(tpa, 12_999);
-        assert QueuePolicy.teleportWarmupReady(tpa, 13_000);
+        assert !QueuePolicy.teleportWarmupReady(tpa, 9_999) && !QueuePolicy.teleportWarmupReady(tpa, 10_499);
+        assert QueuePolicy.teleportWarmupReady(tpa, 10_500);
         for (String flag : List.of("accepted", "recovered")) {
-            tpa.addProperty(flag, true); assert !QueuePolicy.teleportWarmupReady(tpa, 13_000); tpa.remove(flag);
+            tpa.addProperty(flag, true); assert !QueuePolicy.teleportWarmupReady(tpa, 10_500); tpa.remove(flag);
         }
-        tpa.addProperty("warmup", 1.5); rejects(() -> QueuePolicy.teleportWarmupReady(tpa, 13_000));
-        tpa.addProperty("warmup", 72_001); rejects(() -> QueuePolicy.teleportWarmupReady(tpa, 13_000));
+        tpa.addProperty("acceptDelay", 1.5); rejects(() -> QueuePolicy.teleportWarmupReady(tpa, 10_500));
+        tpa.addProperty("acceptDelay", 201); rejects(() -> QueuePolicy.teleportWarmupReady(tpa, 10_500));
         assert QueuePolicy.validTeleportTtl(1000, 31_000) && !QueuePolicy.validTeleportTtl(1000, 31_001);
         assert !QueuePolicy.validTeleportTtl(1000, 999) && !QueuePolicy.validTeleportTtl(Long.MIN_VALUE, Long.MAX_VALUE);
         assert QueuePolicy.sameTeleportServer("EXAMPLE.org\nminecraft:overworld", "example.org\nminecraft:the_nether");

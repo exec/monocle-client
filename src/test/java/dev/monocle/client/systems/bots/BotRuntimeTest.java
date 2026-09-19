@@ -133,6 +133,10 @@ public final class BotRuntimeTest {
             : "Durable command intent wins over an older native snapshot; never resend it";
         assert BotRuntime.unresolvedOther(Map.of(id(run), run), UUID.randomUUID()).orElseThrow() == run;
         assert BotRuntime.unresolvedOther(Map.of(id(run), run), id(run)).isEmpty() : "Only the original checkpoint may reconcile its uncertain effects";
+        run.addProperty("requestedStatus", "Cancelled");
+        assert !BotRuntime.blocksNewWork(run) && BotRuntime.unresolvedOther(Map.of(id(run), run), UUID.randomUUID()).isEmpty()
+            : "A host-cancelled receipt remains durable but cannot trap later work";
+        run.remove("requestedStatus");
         frame.remove("commandSent"); nativeState.addProperty("tpaSent", true);
         assert BotRuntime.uncertainTeleport(frame) && BotRuntime.hasUncertainAction(run);
         nativeState.addProperty("state", "Failed");

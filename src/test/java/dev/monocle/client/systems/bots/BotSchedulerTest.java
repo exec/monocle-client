@@ -71,16 +71,16 @@ final class BotSchedulerTest {
         assert !BotScheduler.validTeleportTtl(1000, 31_001);
         assert !BotScheduler.validTeleportTtl(Long.MIN_VALUE, Long.MAX_VALUE) : "TTL subtraction cannot overflow into a valid interval";
 
-        JsonObject teleport = new JsonObject(); teleport.addProperty("warmup", 60);
+        JsonObject teleport = new JsonObject(); teleport.addProperty("acceptDelay", 10);
         assert !BotScheduler.teleportWarmupReady(teleport, 100_000) : "Time before the command acknowledgment never counts as warmup";
         teleport.addProperty("acknowledgedAt", 10_000);
         assert !BotScheduler.teleportWarmupReady(teleport, 9_999);
-        assert !BotScheduler.teleportWarmupReady(teleport, 12_999);
-        assert BotScheduler.teleportWarmupReady(teleport, 13_000);
+        assert !BotScheduler.teleportWarmupReady(teleport, 10_499);
+        assert BotScheduler.teleportWarmupReady(teleport, 10_500);
         teleport.addProperty("accepted", true);
-        assert !BotScheduler.teleportWarmupReady(teleport, 13_000) : "Acceptance intent is at-most-once";
+        assert !BotScheduler.teleportWarmupReady(teleport, 10_500) : "Acceptance intent is at-most-once";
         teleport.remove("accepted"); teleport.addProperty("recovered", true);
-        assert !BotScheduler.teleportWarmupReady(teleport, 13_000) : "Host restart cannot silently accept an old request";
+        assert !BotScheduler.teleportWarmupReady(teleport, 10_500) : "Host restart cannot silently accept an old request";
 
         JsonObject execution = new JsonObject(), action = new JsonObject();
         action.addProperty("type", "Tpa"); execution.add("action", action);

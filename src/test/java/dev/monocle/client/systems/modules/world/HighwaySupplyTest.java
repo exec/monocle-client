@@ -1,7 +1,10 @@
 package dev.monocle.client.systems.modules.world;
 
+import dev.monocle.client.systems.modules.misc.InventoryTweaks;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Set;
+import java.util.UUID;
 
 import net.minecraft.SharedConstants;
 import net.minecraft.core.component.DataComponents;
@@ -29,9 +32,50 @@ public final class HighwaySupplyTest {
         assert assertionsEnabled = true;
         if (!assertionsEnabled) throw new IllegalStateException("Run with assertions enabled (-ea).");
         miningClassification();
+        assert HighwayBuilder.fallbackToolSlot(-1,false,slot->slot==3)==3;
+        assert HighwayBuilder.fallbackToolSlot(-1,true,slot->true)==-1;
+        assert HighwayBuilder.fallbackToolSlot(2,false,slot->true)==2;
+        assert HighwayBuilder.fallbackToolSlot(-1,false,slot->false)==-1;
         worldRecovery();
+        lifecycleRecovery();
         crewRetreatRecovery();
+        supplyPlacementClearance();
+        var actualFeet = new net.minecraft.world.phys.Vec3(-49999.64178544834, 116, .4579810321312172);
+        var padded = dev.monocle.client.utils.world.PrinterFlight.body(actualFeet, .72, 1.8);
+        assert Math.floor(padded.minX) == -50001 : "Reproduce the live off-center front-edge failure";
+        assert Math.floor(HighwayBuilder.crewTravelFooting(padded).minX) == -50000 : "Require floor beneath the body, not its collision padding";
+        assert Math.floor(HighwayBuilder.crewTravelFooting(padded.move(-.2, 0, 0)).minX) == -50001 : "Real unsupported footing is still rejected";
+        for (int[] direction : new int[][] {{1,0},{-1,0},{0,1},{0,-1}}) for (int lane = -2; lane <= 2; lane++) {
+            var pair = HighwayPlan.laneSupplyLayout(direction[0], direction[1], 5, lane);
+            assert pair.positions().size() == 2;
+            for (var cell : pair.positions()) assert Math.abs(lane + cell.x() * direction[1] - cell.z() * direction[0]) <= 2
+                : "Both ender chests stay inside the five-wide pavement, including outer lanes";
+        }
         forecasts();
+        for (boolean current : List.of(false, true)) for (boolean work : List.of(false, true)) for (boolean away : List.of(false, true))
+            assert HighwayBuilder.crewWorldChunksReady(current, work, away) == (current && (work || away));
+        assert HighwayBuilder.crewRepairRows(20, 0, 14).equals(List.of(20, 19, 18, 17, 16, 15))
+            : "A reduced crew must reclaim every potentially orphaned lane row";
+        assert HighwayBuilder.crewRepairRows(0, 0, 0).isEmpty();
+        assert HighwayBuilder.crewRepairRows(20, 0, 2).equals(List.of(20, 19, 18));
+        assert HighwayBuilder.supplyReservationChanged(new net.minecraft.core.BlockPos(0, 116, 10), new net.minecraft.core.BlockPos(0, 116, 11));
+        assert !HighwayBuilder.supplyReservationChanged(new net.minecraft.core.BlockPos(0, 116, 10), new net.minecraft.core.BlockPos(0, 116, 10));
+        assert HighwayBuilder.crewVerificationRepairRow(21, 0, 18, false) == 18
+            : "An overshooting returner must reclaim its unfinished row 19, not wait forever at row 21";
+        assert HighwayBuilder.crewVerificationRepairRow(21, 0, 18, true) == 21
+            : "A peer whose duties are already resolved keeps working in place";
+        assert HighwayBuilder.crewVerificationRepairRow(27, 0, 20, false) == 20;
+        assert HighwayBuilder.crewVerificationRepairRow(28, 0, 20, false) == 28;
+        assert HighwayBuilder.crewVerificationRepairRow(21, 20, 18, false) == 21;
+        assert HighwayBuilder.crewVerificationRepairRow(18, 0, 18, false) == 18;
+        assert HighwayBuilder.crewVerificationRepairRow(18, 0, 21, false) == 18;
+        assert !HighwayBuilder.placementProbeDue(103, 100, -1);
+        assert HighwayBuilder.placementProbeDue(104, 100, -1);
+        assert !HighwayBuilder.placementProbeDue(105, 100, 104);
+        assert HighwayBuilder.placementProbeDue(108, 100, 104);
+        for (boolean boat : List.of(false, true)) for (boolean alive : List.of(false, true))
+            for (boolean intersects : List.of(false, true)) for (boolean riding : List.of(false, true))
+                assert HighwayBuilder.blockingBoatTarget(boat, alive, intersects, riding) == (boat && alive && intersects && !riding);
         for (boolean crew : List.of(false, true)) for (boolean job : List.of(false, true)) for (boolean ending : List.of(false, true)) {
             assert HighwayBuilder.retainCrewOnToggle(crew, job, ending) == (crew && job && !ending)
                 : "Only manual off toggles retain bot work; completion/cancellation still really stop it";
@@ -39,6 +83,9 @@ public final class HighwaySupplyTest {
         assert !HighwayBuilder.crewFlightLeg(2) && HighwayBuilder.crewFlightLeg(2.01);
         assert HighwayBuilder.crewFlightLeg(1, false) && !HighwayBuilder.crewFlightLeg(.75, false)
             : "A returner flies into its lane instead of landing two blocks early";
+        assert HighwayBuilder.crewSupplyFallback(new net.minecraft.core.BlockPos(8, 90, -4), 116, true).equals(new net.minecraft.core.BlockPos(8, 116, -4));
+        assert HighwayBuilder.crewSupplyFallback(new net.minecraft.core.BlockPos(8, 90, -4), 116, false) == null
+            : "A blocked rear supply route falls back only to the runner's current supported road block";
         assert !HighwayBuilder.crewFlightLeg(1, true) && HighwayBuilder.crewFlightLeg(3, true)
             : "Container staging retains its original landing distance";
         var crewOrigin = new net.minecraft.core.BlockPos(-10, 116, 20);
@@ -75,7 +122,7 @@ public final class HighwaySupplyTest {
                 : "Only an entirely uncommitted restock can release its reservation and restart";
         }
         assert !HighwayBuilder.supplyRetryDue(19, 0) && HighwayBuilder.supplyRetryDue(20, 0);
-        assert HighwayBuilder.supplyRetryDue(600, 2) && !HighwayBuilder.supplyRetryDue(600, 3);
+        assert HighwayBuilder.supplyRetryDue(600, 2) && HighwayBuilder.supplyRetryDue(600, 300) : "Changed surroundings remain retryable after the third attempt";
         for (int attempts = 0; attempts <= 3; attempts++) for (boolean world : new boolean[] {false, true})
             for (boolean grounded : new boolean[] {false, true}) for (boolean paused : new boolean[] {false, true}) {
                 assert HighwayBuilder.crewRetryAllowed(attempts, world, grounded, paused) == (attempts < 3 && world && grounded && !paused)
@@ -84,6 +131,10 @@ public final class HighwaySupplyTest {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(VanillaRegistries.createLookup()).forEach(DataComponentInitializers.PendingComponents::apply);
+        assert InventoryTweaks.dedicatedSupplyScore(new ItemStack[] {new ItemStack(Items.OBSIDIAN, 64), ItemStack.EMPTY}, s -> s.is(Items.OBSIDIAN)) == 64;
+        assert InventoryTweaks.dedicatedSupplyScore(new ItemStack[] {new ItemStack(Items.OBSIDIAN, 64), new ItemStack(Items.NETHERITE_SWORD)}, s -> s.is(Items.OBSIDIAN)) == 0 : "PvP kits remain untouched";
+        assert InventoryTweaks.dedicatedSupplyScore(new ItemStack[] {new ItemStack(Items.STONE, 32)}, s -> s.is(Items.STONE)) == 32 : "Paving is not hardcoded to obsidian";
+        assert InventoryTweaks.dedicatedSupplyScore(new ItemStack[] {ItemStack.EMPTY}, s -> true) == 0;
         var glider = new ItemStack(Items.ELYTRA);
         assert HighwayBuilder.usableCrewGlider(glider);
         glider.setDamageValue(glider.getMaxDamage() - 10);
@@ -119,6 +170,16 @@ public final class HighwaySupplyTest {
         assert HighwayBuilder.sameSupplyDrop(empty, explicitEmpty) : "Absent and empty container components mean the same empty box";
         assert HighwayBuilder.sameSupplyDrop(new ItemStack(Items.OBSIDIAN), new ItemStack(Items.OBSIDIAN, 8));
         assert !HighwayBuilder.sameSupplyDrop(new ItemStack(Items.ENDER_CHEST), new ItemStack(Items.OBSIDIAN, 8));
+        UUID oldDrop = UUID.randomUUID(), newDrop = UUID.randomUUID();
+        assert HighwayBuilder.supplyDropCandidate(new ItemStack(Items.OBSIDIAN), new ItemStack(Items.OBSIDIAN, 8), Set.of(oldDrop), null, newDrop)
+            : "Non-Silk-Touch ender-chest drops must acquire a tracked entity identity";
+        assert !HighwayBuilder.supplyDropCandidate(new ItemStack(Items.OBSIDIAN), new ItemStack(Items.OBSIDIAN, 8), Set.of(oldDrop), null, oldDrop)
+            : "Pre-existing nearby obsidian is not this recovery drop";
+        assert !HighwayBuilder.supplyDropCandidate(new ItemStack(Items.OBSIDIAN), new ItemStack(Items.OBSIDIAN, 8), Set.of(), newDrop, oldDrop)
+            : "A tracked recovery cannot jump to another matching stack";
+        assert !HighwayBuilder.supplyRecoveryAbandoned(39, 299);
+        assert HighwayBuilder.supplyRecoveryAbandoned(40, 1) && HighwayBuilder.supplyRecoveryAbandoned(1, 300)
+            : "Solo and crew recovery share the same bounded fallback";
         ItemStack namedChest = new ItemStack(Items.ENDER_CHEST);
         namedChest.set(DataComponents.CUSTOM_NAME, Component.literal("Supplies"));
         assert HighwayBuilder.sameSupplyDrop(new ItemStack(Items.ENDER_CHEST), namedChest) : "Keep existing ender-chest count recovery independent of item names";
@@ -131,6 +192,16 @@ public final class HighwaySupplyTest {
         assert !HighwayBuilder.supplyPickupComplete(1, 1, true, false) : "Wait until vanilla removes the collected ground entity";
         assert !HighwayBuilder.supplyPickupComplete(1, 1, false, true) : "Another player's pickup must not confirm recovery";
         assert HighwayBuilder.supplyPickupComplete(1, 1, false, false) : "A self-collector packet plus ground removal confirms the box regardless of inventory contents";
+        assert HighwayBuilder.awaitingSupplyPlacement(10, 9, false);
+        assert HighwayBuilder.awaitingSupplyPlacement(10, 6, true);
+        assert !HighwayBuilder.awaitingSupplyPlacement(10, 6, false) : "An unobserved container retries placement; it never enters pickup recovery";
+        int absent = 0;
+        for (int tick = 0; tick < 39; tick++) absent = HighwayBuilder.supplyMissingTicks(absent, true, false, false);
+        assert absent < 40 : "Allow delayed entity packets before declaring a supply unavailable";
+        assert HighwayBuilder.supplyMissingTicks(absent, true, false, false) == 40;
+        assert HighwayBuilder.supplyMissingTicks(absent, false, false, false) == 0 : "Unloaded chunks are not evidence of loss";
+        assert HighwayBuilder.supplyMissingTicks(absent, true, true, false) == 0 : "Restored container cancels absence";
+        assert HighwayBuilder.supplyMissingTicks(absent, true, false, true) == 0 : "A visible drop must still be collected";
         cursorRecovery();
         restockStopsWalking();
         miningRecovery();
@@ -259,13 +330,15 @@ public final class HighwaySupplyTest {
                     else if (constant.constantValue() instanceof Integer number) value = number;
                 }
                 if (lookahead != null && element instanceof java.lang.classfile.instruction.InvokeInstruction call && call.name().equalsString("defaultValue")) {
-                    assert value == 5 : lookahead + " must default to five";
+                    assert value == 3 : lookahead + " must default to the proven three-row window";
                     checked++; lookahead = null;
                 }
             }
-            assert checked == 2 : "Both production setting builders must expose a five-row default";
-            for (String method : List.of("breakAhead", "canBreakAhead", "speculativeMiningRange", "tickPredictionFlush", "paveAvailable", "crewReconfigureReady", "crewReleaseReady", "crewMayMine", "protectedCrewPaving", "plannedPavingTargets", "crewNeedsCleanup", "crewRowResolved", "crewVerifiedState", "crewCurrentRow")) {
-                var code = compiled.methods().stream().filter(m -> m.methodName().equalsString(method)).findFirst().orElseThrow().code().orElseThrow().elementList();
+            assert checked == 2 : "Both production setting builders must expose the proven three-row default";
+            for (String method : List.of("breakAhead", "canBreakAhead", "speculativeBreakRetryDue", "speculativeMiningRange", "tickPredictionFlush", "paveAvailable", "crewReconfigureReady", "crewReleaseReady", "crewMayMine", "protectedCrewPaving", "plannedPavingTargets", "crewNeedsCleanup", "crewRowResolved", "crewVerifiedState", "crewCurrentRow")) {
+                var code = compiled.methods().stream().filter(m -> m.methodName().equalsString(method))
+                    .filter(m -> !method.equals("crewRowResolved") || m.methodType().stringValue().contains("ZLcom/google/gson/JsonObject;"))
+                    .findFirst().orElseThrow().code().orElseThrow().elementList();
                 var calls = code.stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
                     .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(call -> call.name().stringValue()).toList();
                 if (method.equals("breakAhead")) {
@@ -276,6 +349,8 @@ public final class HighwaySupplyTest {
                 }
                 if (method.equals("canBreakAhead")) assert calls.containsAll(List.of("crewMayMine", "speculativeMiningRange", "excavationNeighborsSafe", "getBlockEntity", "players"))
                     : "Background excavation retains bounded reach, supply ownership, liquid checks and player footing protection";
+                if (method.equals("speculativeBreakRetryDue")) assert calls.containsAll(List.of("containsKey", "getOrDefault", "excavationRow"))
+                    : "An unresolved speculative break retries at most once per newly advanced road row";
                 if (method.equals("speculativeMiningRange")) assert calls.containsAll(List.of("blockInteractionRange", "max"))
                     : "Only speculative mining uses the greater of native interaction reach and Place Range";
                 if (method.equals("tickPredictionFlush")) assert calls.contains("hasPendingExcavation");
@@ -291,6 +366,10 @@ public final class HighwaySupplyTest {
                     : "Road geometry does not disappear when a worker is assigned excavation-only duties";
                 if (method.equals("crewNeedsCleanup")) assert calls.containsAll(List.of("reconfigureReady", "getCarried"));
                 if (method.equals("crewRowResolved")) {
+                    var fullRow = compiled.methods().stream().filter(m -> m.methodName().equalsString(method)
+                        && !m.methodType().stringValue().contains("ZLcom/google/gson/JsonObject;")).findFirst().orElseThrow().code().orElseThrow().elementList();
+                    assert fullRow.stream().anyMatch(e -> e instanceof java.lang.classfile.instruction.ConstantInstruction c
+                        && Integer.valueOf(0).equals(c.constantValue())) : "Public authority verification must disable ownership filtering";
                     assert calls.containsAll(List.of("isSameThread", "front", "paving", "crewVerifiedState", "crewClearanceResolved", "crewPavingResolved"));
                     assert !calls.contains("owns") && !calls.contains("pavingTargets") && !calls.contains("doesPave") && !calls.contains("doesDig")
                         : "Authority verifies the full job geometry, independent of this worker's role";
@@ -305,6 +384,12 @@ public final class HighwaySupplyTest {
                 if (method.equals("crewCurrentRow")) assert calls.containsAll(List.of("isSameThread", "origin", "startPosition", "reachedRow"))
                     : "Report physically reached original-job progress, not granted rows or packet counts";
             }
+            var gapCalls = compiled.methods().stream().filter(m -> m.methodName().equalsString("crewRepairVerificationGap")).findFirst().orElseThrow()
+                .code().orElseThrow().elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
+            assert gapCalls.containsAll(List.of("controlsPlayer", "crewNeedsCleanup", "crewRowResolved", "crewVerificationRepairRow", "stopWorkMining", "workChanged"));
+            assert !gapCalls.contains("walkToWorkPosition") && !gapCalls.contains("stopJob") && !gapCalls.contains("resetSupplyJob")
+                : "Gap recovery reclaims logical work without forcing a retreat or restarting resource recovery";
         }
     }
 
@@ -356,23 +441,28 @@ public final class HighwaySupplyTest {
             assert methodCalls(compiled, "onTick").containsAll(List.of("crewAwaitingRejoin", "crewNeedsCleanup", "crewQuiesce"))
                 : "Returning suppliers must wait for a host lane handoff instead of running Forward against the distant service origin";
             assert methodCalls(compiled, "resumeJob").contains("crewAwaitingRejoin") : "A safe rendezvous wait cannot require walking back to the old supply site";
-            assert methodCalls(compiled, "crewTravelClear").containsAll(List.of("loaded", "noCollision", "getEntities", "crewVerifiedState", "crewClearanceResolved", "isShapeFullBlock"));
+            var travelClear = methodCalls(compiled, "crewTravelClear");
+            assert travelClear.containsAll(List.of("loaded", "crewVerifiedState", "crewClearanceResolved", "isShapeFullBlock"));
+            assert !travelClear.contains("noCollision") && !travelClear.contains("getEntities")
+                : "Supply routing ignores entities while retaining block, chunk and footing checks";
             assert methodCalls(compiled, "crewReturnCorridorClear").containsAll(List.of("crewDetachedSupply", "controlsPlayer", "segmentClear"))
                 : "Return overshoot must use a real body/landing sweep, not just assume the extra block is clear";
-            var travelEntities = compiled.methods().stream().filter(m -> m.methodName().stringValue().startsWith("lambda$crewTravelClear$")).findFirst().orElseThrow();
-            var checkedTypes = travelEntities.code().orElseThrow().elementList().stream()
-                .filter(java.lang.classfile.instruction.TypeCheckInstruction.class::isInstance)
-                .map(java.lang.classfile.instruction.TypeCheckInstruction.class::cast).map(i -> i.type().asInternalName()).toList();
-            assert checkedTypes.containsAll(List.of("net/minecraft/world/entity/LivingEntity", "net/minecraft/world/entity/player/Player"))
-                : "The shared supply travel predicate must distinguish players from obstructing mobs";
+            assert HighwayBuilder.entitiesBlockWork(false) && !HighwayBuilder.entitiesBlockWork(true)
+                : "Entities block exact work placement, never movement routing";
             assert methodCalls(compiled, "crewMayMine").containsAll(List.of("crewIsTraveling", "allowsWork", "ownsExcavation", "miningAvailable", "contains")) : "All mining retains duty ownership, shared-target exclusion, site reservation and temporary-step recovery";
-            assert methodCalls(compiled, "crewPrepareRejoin").containsAll(List.of("onGround", "isFallFlying", "recoverCursor", "reconfigureReady", "crewReconfigureReady"));
+            assert methodCalls(compiled, "crewPrepareRejoin").containsAll(List.of("onGround", "isFallFlying", "recoverCursor", "crewRestockIdle", "crewReconfigureReady"));
+            assert methodCalls(compiled, "crewTravelSupply").contains("crewReconfigureReady")
+                && methodCalls(compiled, "crewTravelRejoin").contains("crewRestockIdle") : "Travel cannot take ownership from unfinished native work";
+            assert methodCalls(compiled, "crewCancelTravel").containsAll(List.of("stop", "stopCrewFlight", "brakeCrewFlight"));
+            assert methodCalls(compiled, "crewBeginSupply").contains("crewCancelTravel") : "Rejected admission must revoke the previous return destination";
+            assert methodCalls(compiled, "crewCloseSharedSupply").contains("crewCancelTravel") : "A withdrawn shared shulker must clear its travel target";
+            assert compiled.methods().stream().noneMatch(m -> m.methodName().stringValue().contains("PitStop")) : "There is no collective inventory top-up controller";
             assert methodCalls(compiled, "crewYield").contains("crewSupplyYieldWaypoint") : "Active workers use routed retreat, not greedy steps away from supplies";
             assert methodCalls(compiled, "crewYield").contains("supplyYieldDistance")
                 && methodCalls(compiled, "crewSupplyYieldWaypoint").contains("supplyYieldDistance")
                 : "Yield arrival and route goals share the reservation's compact/legacy pickup margin";
-            assert methodCalls(compiled, "relocateCrewSupplySite").contains("compactSupply")
-                : "Compact relocation must stay behind the reservation instead of entering active work";
+            assert methodCalls(compiled, "relocateCrewSupplySite").containsAll(List.of("standable", "crewPositionWaypoint"))
+                : "Relocation requires a supported reachable supply position";
             var yielding = methodCalls(compiled, "crewSupplyYieldWaypoint");
             assert yielding.containsAll(List.of("crewPositionWaypoint", "standable")) && !yielding.contains("placeWorkBlock") && !yielding.contains("breakWorkBlock")
                 : "Yielding only walks supported routes; it cannot create an unverified road to escape";
@@ -502,6 +592,24 @@ public final class HighwaySupplyTest {
         assert HighwaySupplyForecast.describe(360000).equals("~100h");
     }
 
+    private static void lifecycleRecovery() throws Exception {
+        var running = HighwayBuilder.Lifecycle.Running;
+        var paused = running.pause();
+        assert paused.hasJob() && paused.paused() : "Pausing preserves the execution";
+        var waiting = paused.worldLost();
+        assert waiting.hasJob() && waiting.paused() && waiting.suspended();
+        assert waiting.pause() == waiting : "A host pause during disconnection cannot discard the world gate";
+        assert waiting.worldLost() == waiting : "Repeated disconnect callbacks are idempotent";
+        assert HighwayBuilder.Lifecycle.Idle.worldLost() == HighwayBuilder.Lifecycle.Idle;
+        assert HighwayBuilder.Lifecycle.Idle.pause() == HighwayBuilder.Lifecycle.Idle : "Late pause cannot revive a cancelled job";
+        for (var phase : HighwayBuilder.Lifecycle.values())
+            assert (phase.hasJob() && !phase.paused() && !phase.suspended()) == (phase == running);
+        for (String removed : List.of("job", "paused", "suspended", "waitingForWorld")) {
+            assert java.util.Arrays.stream(HighwayBuilder.class.getDeclaredFields()).noneMatch(f -> f.getName().equals(removed))
+                : "No writable lifecycle compatibility flags: " + removed;
+        }
+    }
+
     private static void worldRecovery() throws Exception {
         String original = "play.6b6t.org\nminecraft:the_nether\nworker-a";
         for (int tick = 0; tick < 1200; tick++) {
@@ -513,6 +621,11 @@ public final class HighwaySupplyTest {
         }
         assert HighwayBuilder.worldResumeAllowed(original, new String(original), true) : "A new world object on the same account/server/dimension can recover";
         assert !HighwayBuilder.worldResumeAllowed("", "", true);
+        assert HighwayBuilder.playerSessionChanged(true, true, 55262, 20703) : "Tick rollback invalidates old cooldowns even in the same world/player object";
+        assert HighwayBuilder.playerSessionChanged(true, false, 100, 101) : "Respawn can replace the player without replacing the world";
+        assert HighwayBuilder.playerSessionChanged(false, true, 100, 101);
+        assert !HighwayBuilder.playerSessionChanged(true, true, 100, 100) : "Repeated same-tick checks are harmless";
+        assert !HighwayBuilder.playerSessionChanged(true, true, 100, 101) : "Normal ticking preserves inventory throttling";
         try (var bytes = HighwayBuilder.class.getResourceAsStream("HighwayBuilder.class")) {
             var code = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes());
             var diagnostics = methodCalls(code, "diagnosticSnapshot");
@@ -527,8 +640,90 @@ public final class HighwaySupplyTest {
             assert methodCalls(code, "onTick").contains("waitForWorld") && methodCalls(code, "resumeJob").contains("refreshJobWorld");
             var refresh = methodCalls(code, "refreshJobWorld");
             assert refresh.containsAll(List.of("worldReady", "resetPredictionTracking", "resetCursorRecovery", "worldChanged"));
+            assert methodCalls(code, "onTick").contains("jobSessionChanged") && refresh.contains("jobSessionChanged");
+            var resetFields = code.methods().stream().filter(m -> m.methodName().equalsString("refreshJobWorld")).findFirst().orElseThrow()
+                .code().orElseThrow().elementList().stream()
+                .filter(java.lang.classfile.instruction.FieldInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.FieldInstruction.class::cast)
+                .filter(f -> f.opcode() == java.lang.classfile.Opcode.PUTFIELD).map(f -> f.name().stringValue()).toList();
+            assert resetFields.containsAll(List.of("jobPlayer", "jobPlayerTick", "crewInventoryTick", "crewLedgerTick", "crewTrashSlot", "crewTrashStack",
+                "crewTravelTick", "crewLaunchTick", "crewRunUntil", "crewTravelProgressTick", "crewYieldSearchTick", "crewRetryAt"))
+                : "Every player-clock cooldown/cache is invalidated with the old session";
+            assert resetFields.stream().noneMatch(List.of("crewPendingResource", "restockTask", "crewReturnedStack", "crewSupplyOrigin")::contains)
+                : "Clock recovery preserves outstanding supply work";
             assert !refresh.contains("resetSupplyJob") && !refresh.contains("complete") && !refresh.contains("recovered")
                 : "Reconnect invalidates transient proofs, never claims supply recovery or discards ownership";
+        }
+    }
+
+    private static void supplyPlacementClearance() throws Exception {
+        var stateType = Class.forName(HighwayBuilder.class.getName() + "$State");
+        var rejoin = HighwayBuilder.class.getDeclaredMethod("crewRejoinState", stateType);
+        rejoin.setAccessible(true);
+        for (var state : stateType.getEnumConstants()) {
+            assert (boolean) rejoin.invoke(null, state) == List.of("Center", "Forward").contains(((Enum<?>) state).name())
+                : "Restored idle Center can rejoin without running the road FSM; recovery states cannot";
+        }
+        for (var target : List.of(new net.minecraft.core.BlockPos(-81954, 116, 0), new net.minecraft.core.BlockPos(20, 116, -30))) {
+            for (int[] direction : List.of(new int[] {1, 0}, new int[] {-1, 0}, new int[] {0, 1}, new int[] {0, -1})) {
+                var farther = target.offset(-direction[0], 0, -direction[1]);
+                assert HighwayBuilder.flexibleSupplyPosition(target, direction[0], direction[1], p -> p.equals(farther)).equals(farther)
+                    : "A blocked preferred supply tile must select the next supported tile away from work";
+                assert HighwayBuilder.flexibleSupplyPosition(target, direction[0], direction[1], p -> true).equals(target);
+                assert HighwayBuilder.flexibleSupplyPosition(target, direction[0], direction[1], p -> false) == null;
+            }
+            for (var direction : dev.monocle.client.utils.misc.HorizontalDirection.values()) {
+                var facing = HighwayPlan.supplyLayout(direction.offsetX, direction.offsetZ, 5, false).facing();
+                var center = net.minecraft.world.phys.Vec3.atBottomCenterOf(target);
+                // Feet are in the neighboring block, but 0.02 blocks of the body still clip the box.
+                var feet = center.add(facing.x() * .78, 0, facing.z() * .78);
+                var body = new net.minecraft.world.phys.AABB(feet.x - .3, feet.y, feet.z - .3, feet.x + .3, feet.y + 1.8, feet.z + .3);
+                assert !net.minecraft.core.BlockPos.containing(feet).equals(target);
+                assert new net.minecraft.world.phys.AABB(target).intersects(body);
+                var stance = HighwayBuilder.supplyPlacementStance(target, facing);
+                assert stance.equals(center.add(facing.x() * 2, 0, facing.z() * 2));
+                var retreat = center.add(-facing.x() * 2, 0, -facing.z() * 2);
+                assert HighwayBuilder.supplyPlacementStance(target, facing, point -> true).equals(stance);
+                assert HighwayBuilder.supplyPlacementStance(target, facing, point -> point.equals(retreat)).equals(retreat)
+                    : "An unpaved front cannot prevent restocking from the supported completed-road side";
+                assert HighwayBuilder.supplyPlacementStance(target, facing, point -> false) == null
+                    : "Never walk into an unsupported stance when both approaches fail";
+                for (double distance : new double[] {.78, .86, 1, 1.25, 1.5, 1.84}) {
+                    var approaching = center.add(facing.x() * distance, 0, facing.z() * distance);
+                    assert approaching.distanceTo(stance) > .15
+                        : "Clearing the collision boundary must not count as reaching the placement stance";
+                }
+                var closestAccepted = stance.add(-facing.x() * .15, 0, -facing.z() * .15);
+                var cleared = body.move(closestAccepted.subtract(feet));
+                assert !new net.minecraft.world.phys.AABB(target).inflate(1, 0, 1).intersects(cleared)
+                    : "Even the walking arrival tolerance leaves a full block between body and container";
+            }
+        }
+        try (var bytes = HighwayBuilder.class.getResourceAsStream("HighwayBuilder.class")) {
+            var compiled = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes());
+            var resume = methodCalls(compiled, "resumeJob");
+            var crewResume = methodCalls(compiled, "resumeCrewJob");
+            assert crewResume.containsAll(List.of("isPausedByHost", "crewNeedsCleanup", "beginCrew", "enable", "resumeJob"))
+                : "Host resume restores missing runners but respects host pause and supply recovery";
+            assert crewResume.indexOf("crewNeedsCleanup") < crewResume.indexOf("beginCrew");
+            assert methodCalls(compiled, "releaseControls").contains("<init>")
+                : "Releasing input can fall back to native keyboard control";
+            assert resume.contains("resumeDetachedReturn")
+                && resume.indexOf("resumeDetachedReturn") < resume.indexOf("crewAwaitingRejoin")
+                : "A displaced supplier must enter the live return path before the old work-position distance gate";
+            assert resume.indexOf("isPausedByHost") < resume.indexOf("resumeDetachedReturn")
+                : "Module activation must not override a host pause";
+            var manualReturn = methodCalls(compiled, "crewPrepareManualReturn");
+            for (String check : List.of("refreshJobWorld", "crewNeedsCleanup", "crewSupplyContainers")) {
+                assert manualReturn.indexOf(check) >= 0 && manualReturn.indexOf(check) < manualReturn.indexOf("crewFinishResourceWait")
+                    : "Manual return must preserve physical supply recovery and require the correct world: " + check;
+            }
+            assert !manualReturn.contains("finishCrewReturn") && !manualReturn.contains("resetPredictionTracking")
+                : "A resume request cannot grant itself a lane or erase block confirmation state";
+            var calls = methodCalls(compiled, "placeWorkBlock");
+            assert calls.contains("supplyApproach") && calls.contains("walkToWorkPosition");
+            assert calls.indexOf("supplyApproach") < calls.indexOf("canPlaceBlock")
+                : "Both single and paired supply containers clear the player before the shared collision/placement gate";
         }
     }
 
@@ -848,7 +1043,10 @@ public final class HighwaySupplyTest {
                     assert code.stream().anyMatch(element -> element instanceof java.lang.classfile.instruction.FieldInstruction field
                         && field.name().equalsString("returnPending")) : "Only returning supplies can trigger this recovery";
                 }
-                if (name.equals("safeBackstep")) assert calls.containsAll(List.of("onGround", "noCollision", "standable", "isWithinBounds"));
+                if (name.equals("safeBackstep")) {
+                    assert calls.containsAll(List.of("onGround", "getBlockCollisions", "standable", "isWithinBounds"));
+                    assert !calls.contains("noCollision") : "Backstep safety must ignore entity collisions";
+                }
                 if (name.equals("tick")) assert calls.containsAll(List.of("backward", "safeBackstep", "resetReturnPath", "walkToWorkPosition"));
                 if (!name.equals("tick")) assert !calls.contains("toggle") && !calls.contains("resetSupplyJob") && !calls.contains("setState")
                     : "Reset pathing, never discard container ownership or the supply session";
@@ -908,6 +1106,16 @@ public final class HighwaySupplyTest {
     }
 
     private static void shulkerRetention() {
+        try (var bytes = HighwaySupplyTest.class.getClassLoader().getResourceAsStream("dev/monocle/client/systems/modules/world/HighwayBuilder.class")) {
+            var compiled = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes());
+            for (String name : List.of("prepareCrewInventory", "crewMakeTransferRoom"))
+                assert methodCalls(compiled, name).contains("discardCrewTrash") : "Every crew cleanup path must honor shulker retention";
+            assert methodCalls(compiled, "discardCrewTrash").contains("discardShulker");
+            assert methodCalls(compiled, "discardShulker").contains("shouldEjectShulker");
+            var begin = compiled.methods().stream().filter(m -> m.methodName().equalsString("beginCrew")).findFirst().orElseThrow();
+            assert begin.code().orElseThrow().elementList().stream().noneMatch(e -> e instanceof java.lang.classfile.instruction.FieldInstruction f
+                && f.opcode() == java.lang.classfile.Opcode.GETFIELD && f.name().equalsString("keepShulkers")) : "Crew setup must not override Keep Shulkers";
+        } catch (java.io.IOException e) { throw new AssertionError(e); }
         var registries = VanillaRegistries.createLookup();
         java.util.function.Predicate<ItemStack> usefulSupply = stack -> stack.is(Items.OBSIDIAN) || stack.is(Items.NETHERRACK)
             || stack.is(Items.ENDER_CHEST) || stack.is(Items.DIAMOND_PICKAXE) || stack.is(Items.COOKED_BEEF);

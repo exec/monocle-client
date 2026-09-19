@@ -1,6 +1,6 @@
 # Experimental shared-width highway crews — 0.3.15
 
-Legacy guide for 0.3.x. Current builds use **Right Shift → Bots** and **`.bot`**; see the [Bots control-room guide](bots.md) for multi-crew management and host-side recovery.
+Legacy guide for 0.3.x. Current builds use **Right Shift → Workers** and **`.worker`** (`.bot` remains an alias); see the [Workers control-room guide](bots.md) for multi-crew management and host-side recovery.
 
 Swarm coordinates one road job with players working side by side across its width. Everyone shares the same road origin and length, but keeps a distinct walking lane. Each floor column belongs to the nearest walking lane; equidistant seam columns alternate between the neighboring workers by row. On a five-wide road with two players, the left pair and right pair stay assigned while the middle column alternates. Players do not swap sides. Railings/supports outside the road belong to the edge workers. Workers need Monocle running and Swarm connected, but do not manually enable Highway Builder.
 

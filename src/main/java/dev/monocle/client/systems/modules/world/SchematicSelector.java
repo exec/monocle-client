@@ -260,6 +260,19 @@ public class SchematicSelector extends Module {
     }
 
     public boolean isBusy() { return capture != null || writing; }
+    public com.google.gson.JsonObject selectionBounds(String name) {
+        if (mc.level == null || selectionWorld != mc.level || pos1 == null || pos2 == null) throw new IllegalStateException("Select both stash corners in this world first");
+        com.google.gson.JsonObject p = new com.google.gson.JsonObject(); p.addProperty("name", name);
+        p.addProperty("minX", Math.min(pos1.getX(), pos2.getX())); p.addProperty("maxX", Math.max(pos1.getX(), pos2.getX()));
+        p.addProperty("minY", Math.min(pos1.getY(), pos2.getY())); p.addProperty("maxY", Math.max(pos1.getY(), pos2.getY()));
+        p.addProperty("minZ", Math.min(pos1.getZ(), pos2.getZ())); p.addProperty("maxZ", Math.max(pos1.getZ(), pos2.getZ()));
+        return dev.monocle.coordinator.StashCatalog.plan(p);
+    }
+    public void selectionBounds(com.google.gson.JsonObject bounds){
+        if(mc.level==null)throw new IllegalStateException("Join the stash world before editing its selection");
+        com.google.gson.JsonObject p=dev.monocle.coordinator.StashCatalog.plan(bounds);
+        pos1=new BlockPos(p.get("minX").getAsInt(),p.get("minY").getAsInt(),p.get("minZ").getAsInt());pos2=new BlockPos(p.get("maxX").getAsInt(),p.get("maxY").getAsInt(),p.get("maxZ").getAsInt());selectionWorld=mc.level;setStatus("Loaded stash selection; click either corner to replace it.");
+    }
     public String getStatus() { return status; }
 
     private String selectionSummary() {

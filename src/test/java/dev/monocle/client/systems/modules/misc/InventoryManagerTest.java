@@ -10,6 +10,7 @@ import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.world.SimpleContainer;
 import net.minecraft.util.Unit;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -33,10 +34,29 @@ public final class InventoryManagerTest {
         Bootstrap.bootStrap();
         BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(VanillaRegistries.createLookup()).forEach(DataComponentInitializers.PendingComponents::apply);
         contextIdentity();
+        managedPolicyPlanning();
         disposalReserves();
         valuableProtection();
         controllerGuards();
-        System.out.println("Inventory Manager checks passed: context identity, explicit disposal permission, loadout reserves, protected valuables, space-pressure gating, and main-thread cancellation guards.");
+        System.out.println("Inventory Manager checks passed: context identity, workflow policies, explicit disposal permission, loadout reserves, protected valuables, space-pressure gating, and main-thread cancellation guards.");
+    }
+
+    private static void managedPolicyPlanning() {
+        var inventory = new SimpleContainer(36);
+        var policy = new InventoryTweaks.ManagedPolicy(
+            List.of(new InventoryTweaks.ManagedSlot(7, stack -> stack.is(Items.OBSIDIAN))),
+            stack -> stack.is(Items.NETHERRACK), 64, stack -> stack.is(Items.ROTTEN_FLESH), 180);
+        inventory.setItem(0, new ItemStack(Items.NETHERRACK, 64));
+        inventory.setItem(1, new ItemStack(Items.NETHERRACK, 32));
+        inventory.setItem(9, new ItemStack(Items.OBSIDIAN, 64));
+        assert InventoryTweaks.managedAction(inventory, policy).drop() == 1 : "Keep the filler reserve and discard only a later excess stack";
+        inventory.setItem(1, ItemStack.EMPTY);
+        var arrange = InventoryTweaks.managedAction(inventory, policy);
+        assert arrange.from() == 9 && arrange.to() == 7 : "Workflow hotbar changes are planned by Inventory Manager";
+        inventory.setItem(7, inventory.removeItemNoUpdate(9));
+        assert InventoryTweaks.managedAction(inventory, policy).equals(InventoryTweaks.ManagedAction.NONE);
+        inventory.setItem(2, new ItemStack(Items.ROTTEN_FLESH));
+        assert InventoryTweaks.managedAction(inventory, policy).drop() == 2 : "Explicit workflow trash wins before cosmetic arrangement";
     }
 
     private static void contextIdentity() {

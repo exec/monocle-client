@@ -23,12 +23,12 @@ public final class BotWorkflows {
     private boolean loaded;
     private String failure;
 
-    public BotWorkflows(Path file) { this.file = file; }
+    public BotWorkflows(Path file) { this.file = file; loaded = file == null; }
     private static Map<String, Workflow> builtins() {
         Map<String, Workflow> values = new LinkedHashMap<>();
         addBuiltin(values, "highway-supplies", "Carried supplies", List.of(new Step(Action.InventoryShulkers, ""),
             new Step(Action.EnderChestContents, ""), new Step(Action.EnderChestFarm, "")));
-        addBuiltin(values, DEFAULT_ID, "Highway Builder", List.of(new Step(Action.Excavating, ""), new Step(Action.Paving, ""), new Step(Action.Call, "highway-supplies")));
+        addBuiltin(values, DEFAULT_ID, "6b6t Highway Builder", List.of(new Step(Action.Excavating, ""), new Step(Action.Paving, ""), new Step(Action.Call, "highway-supplies")));
         addBuiltin(values, "highway-excavate", "Excavation crew", List.of(new Step(Action.Excavating, ""), new Step(Action.Call, "highway-supplies")));
         addBuiltin(values, "highway-pave", "Paving crew", List.of(new Step(Action.Paving, ""), new Step(Action.Call, "highway-supplies")));
         for (var entry : Map.of("travel", "Travel to coordinates", "drop", "Drop items", "tpa", "TPA rendezvous", "wait", "Wait", "modules", "Run configured modules", "profile", "Set profile").entrySet()) {
@@ -39,6 +39,10 @@ public final class BotWorkflows {
         }
         values.put("task-stash-hunt", new Workflow("task-stash-hunt", "Distributed stash hunt", "Stash Hunting", true, List.of(),
             "return function(ctx)\n  if ctx.state.started then return bot.done() end\n  ctx.state.started = true\n  return bot.stash_hunt(ctx.args)\nend\n", List.of(), List.of("Current")));
+        values.put("task-stash-scan", new Workflow("task-stash-scan", "Inspect stash", "Stash Management", true, List.of(),
+            "return function(ctx)\n if ctx.state.started then return bot.done(ctx.result) end\n ctx.state.started=true\n return bot.stash_scan(ctx.args)\nend", List.of(), List.of("Current")));
+        values.put("task-stash-resupply",new Workflow("task-stash-resupply","Resupply from stash","Stash Management",true,List.of(),
+            "return function(ctx)\n if not ctx.state.loaded then ctx.state.loaded=true; return bot.stash_resupply(ctx.args) end\n if not ctx.state.returning then ctx.state.returning=true; return bot.tpa({target=ctx.args.target,warmupTicks=ctx.args.warmupTicks,acceptDelayTicks=ctx.args.acceptDelayTicks,timeoutTicks=1200}) end\n return bot.done(ctx.result)\nend",List.of(),List.of("Current")));
         values.put("task-recover", new Workflow("task-recover", "Recover supplies", "Common Tasks", true, List.of(),
             "return function(ctx)\n if ctx.state.started then return bot.done() end\n ctx.state.started=true\n return bot.recover(ctx.args)\nend", List.of(), List.of("Current")));
         return values;
@@ -184,7 +188,9 @@ public final class BotWorkflows {
             JsonObject program = new JsonObject(); program.addProperty("name", value.name());
             if (value.script().isEmpty()) {
                 JsonObject plan = compileEntry(key); highways.add(key, plan);
-                program.addProperty("script", "return function(ctx)\n if not ctx.state.recovered then\n  ctx.state.recovered=true\n  return bot.recover(ctx.args.recovery or {})\n end\n if ctx.state.started then return bot.done() end\n ctx.state.started=true\n local a=ctx.args\n a.workflow='" + key + "'\n return bot.highway(a)\nend");
+                // Native restocking handles its own supplies. Historical recovery is an explicit
+                // workflow action, not a prerequisite that can send a new crew to an old jobsite.
+                program.addProperty("script", "return function(ctx)\n if ctx.state.started then return bot.done() end\n ctx.state.started=true\n local a=ctx.args\n a.workflow='" + key + "'\n return bot.highway(a)\nend");
             } else program.addProperty("script", value.script());
             programs.add(key, program);
         }
@@ -233,7 +239,7 @@ public final class BotWorkflows {
             }
             loaded = true;
         } catch (IOException | RuntimeException e) {
-            failure = "Cannot read Bots workflows at " + file + ": " + e.getMessage() + ". Original file left untouched.";
+            failure = "Cannot read Workers workflows at " + file + ": " + e.getMessage() + ". Original file left untouched.";
             throw new IllegalStateException(failure, e);
         }
     }
@@ -246,7 +252,7 @@ public final class BotWorkflows {
         try {
             Files.createDirectories(file.getParent()); temporary = Files.createTempFile(file.getParent(), "bot-workflows-", ".tmp");
             Files.writeString(temporary, root.toString()); Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException e) { throw new IllegalStateException("Could not save Bots workflows: " + e.getMessage(), e); }
+        } catch (IOException e) { throw new IllegalStateException("Could not save Workers workflows: " + e.getMessage(), e); }
         finally { if (temporary != null) try { Files.deleteIfExists(temporary); } catch (IOException ignored) { } }
     }
 }

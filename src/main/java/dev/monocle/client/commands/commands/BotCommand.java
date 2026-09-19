@@ -19,6 +19,7 @@ import dev.monocle.client.pathing.PathManagers;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.bots.Bots;
+import dev.monocle.coordinator.HighwayJobs;
 import dev.monocle.client.systems.modules.misc.swarm.SwarmConnection;
 import dev.monocle.client.systems.modules.world.InfinityMiner;
 import dev.monocle.client.utils.misc.text.MonocleClickEvent;
@@ -38,11 +39,11 @@ import java.util.Random;
 
 public class BotCommand extends Command {
 
-    private final static SimpleCommandExceptionType BOTS_NOT_ACTIVE = new SimpleCommandExceptionType(Component.literal("Enable connections in Right Shift → Bots first."));
+    private final static SimpleCommandExceptionType BOTS_NOT_ACTIVE = new SimpleCommandExceptionType(Component.literal("Enable connections in Right Shift → Workers first."));
     private @Nullable ObjectIntPair<String> pendingConnection;
 
     public BotCommand() {
-        super("bot", "Manage bot connections, crews and jobs. Open Right Shift → Bots for the dashboard.");
+        super("worker", "Manage worker connections, crews and jobs. Open Right Shift → Workers for the dashboard.", "bot");
     }
 
     @Override
@@ -57,7 +58,7 @@ public class BotCommand extends Command {
         builder.then(literal("export-workflow").then(argument("workflow-id", StringArgumentType.word()).executes(context -> crewAction(() ->
             info("Exported workflow and captured gameplay profiles to %s", Bots.get().tasks().exportWorkflow(StringArgumentType.getString(context, "workflow-id")))))));
         builder.then(literal("highway")
-            .then(literal("start").then(argument("road-length", IntegerArgumentType.integer(16, 4096)).executes(context -> crewAction(() -> Bots.get().startSelectedHighway(IntegerArgumentType.getInteger(context, "road-length"))))))
+            .then(literal("start").then(argument("road-length", IntegerArgumentType.integer(16, HighwayJobs.MAX_LENGTH)).executes(context -> crewAction(() -> Bots.get().startSelectedHighway(IntegerArgumentType.getInteger(context, "road-length"))))))
             .then(literal("status").executes(_ -> crewAction(() -> Bots.get().controlCrew().status())))
             .then(literal("pause").executes(_ -> crewAction(() -> Bots.get().controlCrew().pause())))
             .then(literal("resume").executes(_ -> crewAction(() -> Bots.get().controlCrew().resume())))
@@ -67,6 +68,9 @@ public class BotCommand extends Command {
             for (var job : Bots.get().jobs()) info("%s · %s · %s · %d/%d · %s", job.id(), job.name(), job.status(), job.progress(), job.length(), job.unclaimed() ? "Unclaimed" : Bots.get().crewLabel(job.crewId()));
         })));
         var job = argument("job-id", StringArgumentType.word());
+        job.then(literal("configure").then(argument("modules-json", StringArgumentType.greedyString()).executes(context -> crewAction(() ->
+            Bots.get().tasks().configure(java.util.UUID.fromString(StringArgumentType.getString(context, "job-id")), null,
+                com.google.gson.JsonParser.parseString(StringArgumentType.getString(context, "modules-json")).getAsJsonObject())))));
         job.then(literal("pause").executes(context -> crewAction(() -> Bots.get().pauseJob(java.util.UUID.fromString(StringArgumentType.getString(context, "job-id"))))));
         job.then(literal("resume").executes(context -> crewAction(() -> Bots.get().resumeJob(java.util.UUID.fromString(StringArgumentType.getString(context, "job-id"))))));
         job.then(literal("release").then(literal("confirm").executes(context -> crewAction(() -> Bots.get().releaseJob(java.util.UUID.fromString(StringArgumentType.getString(context, "job-id")))))));
@@ -96,7 +100,7 @@ public class BotCommand extends Command {
                         info("Are you sure you want to connect to '%s:%s'?", ip, port);
                         info(Component.literal("Click here to confirm").setStyle(Style.EMPTY
                             .applyFormats(ChatFormatting.UNDERLINE, ChatFormatting.GREEN)
-                            .withClickEvent(new MonocleClickEvent(".bot join confirm"))
+                            .withClickEvent(new MonocleClickEvent(".worker join confirm"))
                         ));
 
                         return SINGLE_SUCCESS;
@@ -105,14 +109,14 @@ public class BotCommand extends Command {
             )
             .then(literal("confirm").executes(_ -> {
                 if (pendingConnection == null) {
-                    error("No pending bot connections.");
+                    error("No pending worker connections.");
                     return SINGLE_SUCCESS;
                 }
 
                 Bots swarm = Bots.get();
                 swarm.connectWorker(pendingConnection.left(), pendingConnection.rightInt());
                 pendingConnection = null;
-                info("Worker connection requested. Bots will authenticate and retry automatically while enabled.");
+                info("Worker connection requested. Workers will authenticate and retry automatically while enabled.");
 
                 return SINGLE_SUCCESS;
             }))
@@ -123,7 +127,7 @@ public class BotCommand extends Command {
             if (swarm.isActive()) {
                 if (swarm.isHost()) {
                     if (swarm.host.getConnectionCount() > 0) {
-                        ChatUtils.info("--- Bots Connections (highlight)(%s/%s)(default) ---", swarm.host.getConnectionCount(), swarm.host.getConnections().length);
+                        ChatUtils.info("--- Worker Connections (highlight)(%s/%s)(default) ---", swarm.host.getConnectionCount(), swarm.host.getConnections().length);
 
                         for (int i = 0; i < swarm.host.getConnections().length; i++) {
                             SwarmConnection connection = swarm.host.getConnections()[i];

@@ -4,6 +4,7 @@ import com.google.gson.*;
 import com.mojang.serialization.JsonOps;
 import dev.monocle.client.MonocleClient;
 import dev.monocle.client.events.packets.InventoryEvent;
+import dev.monocle.client.events.game.OpenScreenEvent;
 import dev.monocle.client.events.packets.PacketEvent;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import dev.monocle.client.systems.modules.Module;
@@ -49,18 +50,28 @@ import static dev.monocle.client.MonocleClient.mc;
 
 /** One client-thread native action. The host owns scheduling, profiles and teleport commands. */
 public final class BotActions {
-    private static final Set<String> TYPES = Set.of("Travel", "StashHunt", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies");
+    private static final Set<String> TYPES = Set.of("Travel", "StashHunt", "StashScan", "StashResupply", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies");
     private static final Set<String> EXTERNAL = Set.of("Highway", "SetProfile");
     private static final Set<String> RESERVED_MODULES = Set.of("highway-builder", "printer-helper");
+    private static final Map<String,Long> HOME_USE=new HashMap<>();
     private final Bots bots;
     private JsonObject action, pending, originals = new JsonObject(), result;
     private String state = "Complete", detail = "Idle", dimension = "";
     private int elapsed, remaining, dropWait, lastTick = -1, launchTick = -1, launchAttempts;
     private boolean suspended, suspendRequested, checkpoint, armed, acknowledged, listening, modulesApplied, modulesArmed, restoredModuleLease, tpaSent, runOnly, enabledFly;
+    private long homeReadyAt;
     private ClientInput previousInput;
     private LocalPlayer inputPlayer;
     private final CustomPlayerInput input = new CustomPlayerInput();
     private BotStashHunt survey;
+    private BotStashScan stashScan;
+    private BotStashResupply stashResupply;
+    private Vec3 scanMovement;
+    public JsonObject stashTelemetry() { return stashScan == null ? null : stashScan.telemetry(); }
+    public JsonObject stashPending() { return stashScan == null ? null : stashScan.pending(); }
+    public int stashDelivery() { return stashScan == null ? 0 : stashScan.delivery(); }
+    public void acknowledgeStash(int delivery) { if (stashScan != null) stashScan.acknowledge(delivery); }
+    public JsonObject stashWithdrawal(){return stashResupply==null||result==null?null:result.deepCopy();}
     private BotSupplyRecovery recovery;
     private boolean recoveryReady;
     public boolean recoveryReady() { return recoveryReady; }
@@ -74,8 +85,21 @@ public final class BotActions {
         String type = string(a, "type", 32);
         if (!TYPES.contains(type)) throw new IllegalArgumentException("Unsupported native action: " + type);
         switch (type) {
+            case "StashScan" -> a = dev.monocle.coordinator.StashCatalog.plan(a);
+            case "StashResupply" -> {
+                a=dev.monocle.coordinator.StashCatalog.plan(a);JsonArray picks=a.getAsJsonArray("picks");if(picks==null||picks.isEmpty()||picks.size()>54)throw new IllegalArgumentException("Stash resupply needs 1–54 selected shulkers");
+                for(JsonElement value:picks){JsonObject p=value.getAsJsonObject();integer(p,"x",-29_900_000,29_900_000);integer(p,"y",-2048,2048);integer(p,"z",-29_900_000,29_900_000);integer(p,"slot",0,215);identifier(string(p,"resource",128));}
+            }
             case "StashHunt" -> a = BotStashHunt.validate(a);
             case "RecoverSupplies" -> {
+                if (a.has("x") || a.has("y") || a.has("z")) {
+                    number(a, "x", -29_999_984, 29_999_984); number(a, "z", -29_999_984, 29_999_984); number(a, "y", -2048, 2048);
+                }
+                if (a.has("execution")) UUID.fromString(string(a, "execution", 36));
+                if (a.has("inspectTransfersBefore")) {
+                    double cutoff = number(a, "inspectTransfersBefore", 1, System.currentTimeMillis());
+                    if (cutoff != Math.rint(cutoff)) throw new IllegalArgumentException("Expected integer inspection cutoff");
+                }
                 optionalInteger(a, "searchRadius", 16, 4, 32);
                 optionalInteger(a, "retryTicks", 100, 20, 1200);
                 optionalNumber(a, "flyBeyond", 8, 4, 32);
@@ -103,7 +127,8 @@ public final class BotActions {
             case "Tpa" -> {
                 String target = string(a, "target", 36);
                 if (!target.matches("[A-Za-z0-9_]{1,16}")) UUID.fromString(target);
-                optionalInteger(a, "warmupTicks", 100, 0, 72_000);
+                optionalInteger(a, "warmupTicks", 300, 0, 72_000);
+                optionalInteger(a, "acceptDelayTicks", 10, 0, 200);
                 optionalInteger(a, "timeoutTicks", 1200, 1, 1_728_000);
                 optionalNumber(a, "radius", 8, 1, 16);
                 if (a.get("warmupTicks").getAsInt() >= a.get("timeoutTicks").getAsInt()) throw new IllegalArgumentException("Teleport timeout must exceed warmup");
@@ -121,49 +146,61 @@ public final class BotActions {
         release();
         action = validate(next); pending = null; originals = new JsonObject(); result = null;
         survey = type().equals("StashHunt") ? new BotStashHunt(action) : null;
+        stashScan = type().equals("StashScan") ? new BotStashScan(action) : null; scanMovement = null;
+        stashResupply=type().equals("StashResupply")?new BotStashResupply(action):null;
+        if (stashScan != null) {
+            var selector=Modules.get().get(dev.monocle.client.systems.modules.world.SchematicSelector.class);
+            if(selector.isActive())selector.disable();
+        }
         recoveryReady = false;
         recovery = Set.of("RecoverSupplies", "Highway").contains(type()) ? new BotSupplyRecovery(bots, action.has("recovery") ? validateRecovery(action.getAsJsonObject("recovery")) : type().equals("RecoverSupplies") ? action : new JsonObject()) : null;
         elapsed = dropWait = launchAttempts = 0; launchTick = lastTick = -1;
         remaining = type().equals("DropItems") ? action.get("count").getAsInt() : action.has("ticks") ? action.get("ticks").getAsInt() : 0;
+        homeReadyAt=0;
         suspended = suspendRequested = checkpoint = armed = acknowledged = modulesApplied = modulesArmed = restoredModuleLease = tpaSent = runOnly = false;
         dimension = action.has("dimension") ? action.get("dimension").getAsString() : Utils.canUpdate() ? mc.level.dimension().identifier().toString() : "";
         state = "Running"; detail = "Starting " + type();
-        listen(type().equals("DropItems") || survey != null);
+        listen(type().equals("DropItems") || survey != null || stashScan != null || stashResupply!=null);
     }
 
     public JsonObject tick() {
         clientThread();
         boolean observeOnly = observesPendingDrop(state, suspended, issuedDrop());
         if (!shouldTick(state, suspended, observeOnly, suspendRequested)) return status();
-        if (!Utils.canUpdate()) { releaseMovement(); detail = "Waiting for a world"; return status(); }
+        if (!Utils.canUpdate()) { disconnected(); detail = "Waiting for a world"; return status(); }
         if (lastTick == mc.player.tickCount) return status();
         lastTick = mc.player.tickCount;
         try {
             if (observeOnly) { listen(true); settleDrop(); return status(); }
             if (suspendRequested) {
-                if (recovery != null && !recovery.suspend()) { detail = "Landing before suspending supply recovery"; recovery.tick(); return status(); }
+                if (recovery != null && !recovery.suspend()) { detail = "Landing before suspending supply recovery"; return status(); }
                 if (pending != null) settleDrop();
                 if (type().equals("Tpa") && tpaSent) { teleport(); if (state.equals("Running")) return status(); }
-                if ((type().equals("Travel") || survey != null) && !landBeforeHandoff()) return status();
+                if (!landBeforeHandoff()) return status();
                 if (!safeModuleRestore()) { landBeforeHandoff(); return status(); }
                 if (pending == null) { suspended = true; release(); }
                 return status();
             }
+            if (Set.of("StashScan","StashResupply").contains(type())&&!prepareStashHome()) return status();
             if (!type().equals("Tpa") && !EXTERNAL.contains(type()) && !dimension.isEmpty() && !dimension.equals(mc.level.dimension().identifier().toString())) {
                 fail("Dimension changed; this action will not follow into another world"); return status();
             }
-            if (type().equals("Highway") && bots.crew.localAssigned()) recoveryReady = true; // Live native recovery still owns its own container state.
-            if (recovery != null && !recoveryReady && !nativeBusy()) {
+            // Native highways own their supply journal once assigned; an unrelated old journal
+            // must not prevent a fresh crew from receiving and starting its highway action.
+            if (type().equals("Highway")) recoveryReady = true;
+            if (recovery != null && shouldRecover(type(), recoveryReady) && !nativeBusy()) {
                 recoveryReady = recovery.tick(); detail = recovery.detail();
                 if (!recoveryReady) return status();
             }
-            if (type().equals("RecoverSupplies")) { if (recoveryReady) complete("Workflow supplies recovered"); else detail = "Waiting for native supply ownership to yield"; return status(); }
+            if (type().equals("RecoverSupplies")) { if (recoveryReady) complete(recovery.detail()); else detail = "Waiting for native supply ownership to yield"; return status(); }
             if (EXTERNAL.contains(type())) { detail = "Waiting for host-managed " + type(); return status(); }
             if (type().equals("Wait")) { if (remaining > 0) remaining--; if (remaining == 0) complete("Wait complete"); return status(); }
-            if (nativeBusy()) { releaseMovement(); detail = "Waiting for Highway Builder / Printer Helper to release control"; return status(); }
+            if (nativeBusy()) { stopStashNavigation(); releaseMovement(); detail = "Waiting for Highway Builder / Printer Helper to release control"; return status(); }
             switch (type()) {
                 case "Travel" -> travel();
                 case "StashHunt" -> survey();
+                case "StashScan" -> scanStash();
+                case "StashResupply" -> resupplyStash();
                 case "DropItems" -> drop();
                 case "Modules" -> runModules();
                 case "Tpa" -> teleport();
@@ -171,6 +208,23 @@ public final class BotActions {
             }
         } catch (RuntimeException error) { fail(error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()); }
         return status();
+    }
+
+    private boolean prepareStashHome(){
+        String home=action.get("homeName").getAsString();if(home.isEmpty())return true;
+        long now=System.currentTimeMillis(),cooldown=action.get("homeCooldownTicks").getAsLong()*50L;
+        String server=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+home.toLowerCase(Locale.ROOT);
+        if(homeReadyAt==0){
+            long ready=HOME_USE.getOrDefault(server,0L)+cooldown;
+            if(now<ready){detail="Waiting "+Math.max(1,(ready-now+999)/1000)+"s for /home "+home+" cooldown";return false;}
+            mc.getConnection().sendCommand("home "+home);HOME_USE.put(server,now);homeReadyAt=now+action.get("homeWarmupTicks").getAsLong()*50L;
+        }
+        if(now<homeReadyAt){detail="Waiting "+Math.max(1,(homeReadyAt-now+999)/1000)+"s for /home "+home+" warmup";return false;}
+        return true;
+    }
+
+    static boolean shouldRecover(String type, boolean recoveryReady) {
+        return !recoveryReady && !type.equals("Highway");
     }
 
     /** Persist snapshot() before acknowledging; no destructive packet is emitted in the prepare tick. */
@@ -187,15 +241,22 @@ public final class BotActions {
         if (pending != null && !pending.get("issued").getAsBoolean()) { pending = null; checkpoint = armed = false; }
         if (pending != null) { releaseMovement(); listen(true); detail = "Waiting for authoritative drop confirmation before suspending"; return false; }
         if (state.equals("Running") && type().equals("Tpa") && tpaSent) { detail = "Waiting for the outstanding teleport to resolve before yielding"; return false; }
-        if ((type().equals("Travel") || survey != null) && Utils.canUpdate() && !mc.player.onGround()) {
+        if (Utils.canUpdate() && !mc.player.onGround()) {
             detail = "Landing before handing off movement and profile settings"; return false;
         }
         if (!safeModuleRestore()) { detail = "Land before restoring the temporary flight module"; return false; }
         if (survey != null) Modules.get().get(dev.monocle.client.systems.modules.world.StashFinder.class).surveyFlush();
         suspended = true; release(); return true;
     }
-    public void resume() { clientThread(); suspendRequested = suspended = false; lastTick = -1; listen((type().equals("DropItems") || survey != null) && state.equals("Running")); }
-    public void disconnected() { clientThread(); releaseMovement(); }
+    public void resume() { clientThread(); suspendRequested = suspended = false; lastTick = -1; listen((type().equals("DropItems") || survey != null || stashScan != null) && state.equals("Running")); }
+    public void disconnected() {
+        clientThread();
+        stopStashNavigation();
+        if (recovery != null) recovery.disconnected();
+        if (stashScan != null) stashScan.close();
+        if(stashResupply!=null)stashResupply.close();
+        releaseMovement();
+    }
     public void stop() {
         clientThread();
         if (!state.equals("Running")) { release(); return; }
@@ -215,10 +276,13 @@ public final class BotActions {
         JsonObject s = status(); s.addProperty("version", 1);
         if (action != null) s.add("action", action.deepCopy());
         s.addProperty("elapsed", elapsed); s.addProperty("remaining", remaining); s.addProperty("dimension", dimension);
+        if(homeReadyAt>0)s.addProperty("homeReadyAt",homeReadyAt);
         s.addProperty("suspended", suspended); s.addProperty("suspendRequested", suspendRequested); s.addProperty("tpaSent", tpaSent);
         s.add("originalModules", originals.deepCopy());
         if (pending != null) s.add("pendingDrop", pending.deepCopy());
         if (survey != null) s.add("survey", survey.snapshot());
+        if (stashScan != null) s.add("stashScan", stashScan.snapshot());
+        if(stashResupply!=null)s.add("stashResupply",stashResupply.snapshot());
         return s;
     }
 
@@ -236,6 +300,7 @@ public final class BotActions {
         detail = string(snapshot, "detail", 1024); state = restoredState;
         dimension = string(snapshot, "dimension", 128, true);
         if (!dimension.isEmpty()) identifier(dimension);
+        if(snapshot.has("homeReadyAt")){homeReadyAt=snapshot.get("homeReadyAt").getAsLong();if(homeReadyAt<0||homeReadyAt>System.currentTimeMillis()+3_600_000)throw new IllegalArgumentException("Invalid saved home warmup");}
         suspended = snapshot.get("suspended").getAsBoolean(); suspendRequested = snapshot.get("suspendRequested").getAsBoolean(); tpaSent = snapshot.get("tpaSent").getAsBoolean();
         if (snapshot.has("originalModules")) {
             originals = snapshot.getAsJsonObject("originalModules").deepCopy();
@@ -248,6 +313,11 @@ public final class BotActions {
             if (survey == null) throw new IllegalArgumentException("Unexpected survey checkpoint");
             survey.restore(snapshot.getAsJsonObject("survey"));
         }
+        if (snapshot.has("stashScan")) {
+            if (stashScan == null) throw new IllegalArgumentException("Unexpected stash checkpoint");
+            stashScan.restore(snapshot.getAsJsonObject("stashScan"));
+        }
+        if(snapshot.has("stashResupply")){if(stashResupply==null)throw new IllegalArgumentException("Unexpected stash resupply checkpoint");stashResupply.restore(snapshot.getAsJsonObject("stashResupply"));}
         if (snapshot.has("pendingDrop")) {
             if (!type().equals("DropItems")) throw new IllegalArgumentException("Unexpected pending drop");
             pending = snapshot.getAsJsonObject("pendingDrop").deepCopy();
@@ -257,7 +327,7 @@ public final class BotActions {
             // The durable prepared record may already have produced a packet before the process died.
             pending.addProperty("issued", true); armed = checkpoint = false; acknowledged = false;
         }
-        listen(issuedDrop() || (type().equals("DropItems") || survey != null) && state.equals("Running") && !suspended);
+        listen(issuedDrop() || (type().equals("DropItems") || survey != null || stashScan != null || stashResupply!=null) && state.equals("Running") && !suspended);
         } catch (RuntimeException error) { fail("Invalid saved action: " + error.getMessage()); throw error; }
     }
 
@@ -319,6 +389,11 @@ public final class BotActions {
     }
 
     @EventHandler private void inventory(InventoryEvent event) {
+        if (!mc.isSameThread() || !Utils.canUpdate()) return;
+        if (stashScan != null && state.equals("Running") && !suspended && !suspendRequested) {
+            try { stashScan.inventory(event); }
+            catch (RuntimeException e) { fail("Stash scan could not save container " + stashScan.target() + ": " + (e.getMessage()==null?e.getClass().getSimpleName():e.getMessage())); }
+        }
         if (!mc.isSameThread() || pending == null || !pending.get("issued").getAsBoolean() || !Utils.canUpdate()
             || event.packet.containerId() != mc.player.inventoryMenu.containerId) return;
         List<ItemStack> items = event.packet.items();
@@ -329,6 +404,9 @@ public final class BotActions {
         ItemStack after = items.get(menuSlot), before = decodeStack(pending.get("stack"));
         if (!after.isEmpty() && !ItemStack.isSameItemSameComponents(before, after)) return;
         acknowledged = confirmedDrop(pending.get("beforeTotal").getAsInt(), pending.get("amount").getAsInt(), total, pending.get("beforeCount").getAsInt(), after.getCount());
+    }
+    @EventHandler private void screen(OpenScreenEvent event) {
+        if(stashScan!=null&&state.equals("Running")&&!suspended&&!suspendRequested&&stashScan.suppressScreen()&&event.screen instanceof AbstractContainerScreen<?>)event.cancel();
     }
 
     private void refreshInventory() {
@@ -387,18 +465,20 @@ public final class BotActions {
     }
 
     private void travel() {
+        travel(new Vec3(action.get("x").getAsDouble(), action.get("y").getAsDouble(), action.get("z").getAsDouble()), action.get("radius").getAsDouble(), action.get("flyBeyond").getAsDouble(), true);
+    }
+    private void travel(Vec3 goal, double radius, double flyBeyond, boolean finish) {
         if (!acquireMovement()) return;
         input.stop(); brakeFlight();
         if (mc.player.isPassenger() || mc.player.isInWater() || mc.player.isInLava()) { detail = "Travel needs an unmounted player outside fluid"; return; }
         if (Modules.get().get(AutoEat.class).eating || Modules.get().get(AutoGap.class).isEating() || Modules.get().get(KillAura.class).attacking || mc.player.isUsingItem() || TickRate.INSTANCE.getTimeSinceLastTick() >= 1.5f) { detail = "Travel waiting for combat, eating or server lag"; return; }
-        Vec3 from = mc.player.position(), goal = new Vec3(action.get("x").getAsDouble(), action.get("y").getAsDouble(), action.get("z").getAsDouble());
-        double radius = action.get("radius").getAsDouble(), distance = from.distanceTo(goal);
-        if (distance <= radius && mc.player.onGround() && !mc.player.isFallFlying() && standable(BlockPos.containing(from))) { complete("Destination reached on safe footing"); return; }
+        Vec3 from = mc.player.position(); double distance = from.distanceTo(goal);
+        if (distance <= radius && mc.player.onGround() && !mc.player.isFallFlying() && standable(BlockPos.containing(from))) { if (finish) complete("Destination reached on safe footing"); return; }
         ElytraFly fly = Modules.get().get(ElytraFly.class);
         ItemStack glider = mc.player.getItemBySlot(EquipmentSlot.CHEST);
         boolean equipped = glider.has(DataComponents.GLIDER) && (!glider.isDamageableItem() || glider.getMaxDamage() - glider.getDamageValue() > 10);
         Vec3 waypoint = localGoal(from, goal, 8);
-        boolean useFlight = !runOnly && equipped && fly.flightMode.get() == ElytraFlightModes.Vanilla && distance > Math.max(radius + 2, action.get("flyBeyond").getAsDouble());
+        boolean useFlight = !runOnly && equipped && fly.flightMode.get() == ElytraFlightModes.Vanilla && distance > Math.max(radius + 2, flyBeyond);
         if (mc.player.isFallFlying()) {
             if (!fly.isActive()) { fail("ElytraFly was disabled in flight; control returned to the player"); return; }
             if (distance <= radius + 3 || !useFlight) {
@@ -522,7 +602,7 @@ public final class BotActions {
     }
     private boolean clearBody(AABB box) {
         if (box.minY < mc.level.getMinY() || box.maxY > mc.level.getMaxY() + 1 || !PrinterFlight.loaded(box, mc.level.getChunkSource()::hasChunk)
-            || !mc.level.noCollision(mc.player, box) || !mc.level.getEntities(mc.player, box, e -> e instanceof LivingEntity && !(survey != null && e instanceof Player)).isEmpty()) return false;
+            || !mc.level.noCollision(mc.player, box) || !mc.level.getEntities(mc.player, box, e -> e instanceof LivingEntity && !(e instanceof Player)).isEmpty()) return false;
         for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY, box.minZ), BlockPos.containing(Math.nextDown(box.maxX), Math.nextDown(box.maxY), Math.nextDown(box.maxZ)))) {
             BlockState block = verified(pos);
             if (block == null || !mc.level.getWorldBorder().isWithinBounds(pos) || !block.getFluidState().isEmpty() || block.is(Blocks.FIRE) || block.is(Blocks.SOUL_FIRE) || block.is(Blocks.POWDER_SNOW)) return false;
@@ -580,6 +660,8 @@ public final class BotActions {
         launchTick = -1;
     }
     private void release() {
+        stopStashNavigation();
+        if (stashScan != null) stashScan.close();
         if (recovery != null) recovery.close();
         releaseMovement();
         if (action != null && type().equals("Modules") && (modulesApplied || restoredModuleLease)) for (var entry : originals.entrySet()) {
@@ -594,9 +676,34 @@ public final class BotActions {
         return !type().equals("Modules") || !modulesApplied && !restoredModuleLease || !originals.has("elytra-fly") || originals.get("elytra-fly").getAsBoolean()
             || !Utils.canUpdate() || mc.player.onGround() || !Modules.get().get(ElytraFly.class).isActive();
     }
+    private dev.monocle.client.pathing.BaritoneUtils.StashNavigation stashNavigation;
+    private void stopStashNavigation() {
+        if (stashNavigation != null) { stashNavigation.close(); stashNavigation = null; }
+    }
     private boolean nativeBusy() {
         return bots.crew.localAssigned() || Modules.get().get(HighwayBuilder.class).hasJob() || Modules.get().get(PrinterHelper.class).isActive()
-            || !type().equals("Modules") && dev.monocle.client.pathing.PathManagers.get().isPathing();
+            || !type().equals("Modules") && stashNavigation == null && dev.monocle.client.pathing.PathManagers.get().isPathing();
+    }
+    private void scanStash() {
+        if (!dev.monocle.client.pathing.BaritoneUtils.IS_AVAILABLE) { fail("Stash scanning requires Baritone for Minecraft 26.2; install it in this profile's mods folder"); return; }
+        releaseMovement(); brakeFlight();
+        if (mc.player.isFallFlying()) { landBeforeHandoff(); detail = "Landing before opening stash containers"; return; }
+        if (Modules.get().get(AutoEat.class).eating || mc.player.isUsingItem() || TickRate.INSTANCE.getTimeSinceLastTick() >= 1.5f) { stopStashNavigation(); detail = "Scan waiting for eating or server response"; return; }
+        if (scanMovement == null || scanMovement.distanceToSqr(mc.player.position()) > .04) { scanMovement = mc.player.position(); stashScan.moved(); }
+        stashScan.tick();
+        detail = stashScan.detail();
+        if (stashScan.done()) { result = stashScan.telemetry(); complete("Stash scan complete; inspect unscanned counts and missing chunks before trusting coverage"); return; }
+        if (stashScan.approaching()) {
+            if (stashNavigation == null) stashNavigation = new dev.monocle.client.pathing.BaritoneUtils.StashNavigation();
+            stashNavigation.moveTo(stashScan.navigationTarget(),stashScan.hasHopperPerch()?0:stashScan.targetIsHopper()?2:-1);
+            detail += " · Baritone navigating to container";
+        } else stopStashNavigation();
+    }
+    private void resupplyStash(){
+        if(!dev.monocle.client.pathing.BaritoneUtils.IS_AVAILABLE){fail("Stash resupply requires Baritone for Minecraft 26.2");return;}
+        releaseMovement();brakeFlight();stashResupply.tick();detail=stashResupply.detail();
+        if(stashResupply.done()){result=stashResupply.result();complete("Stash supplies loaded into the ender chest");return;}
+        if(stashResupply.approaching()){if(stashNavigation==null)stashNavigation=new dev.monocle.client.pathing.BaritoneUtils.StashNavigation();stashNavigation.moveTo(stashResupply.target(),-1);}else stopStashNavigation();
     }
     private void complete(String message) { state = "Complete"; detail = message; release(); }
     private void fail(String message) { state = "Failed"; detail = message; checkpoint = armed = false; release(); }

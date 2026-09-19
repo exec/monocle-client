@@ -11,6 +11,7 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import dev.monocle.client.mixininterface.IVec3;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.render.Chams;
+import dev.monocle.client.systems.modules.player.Derp;
 import dev.monocle.client.systems.modules.world.SchematicSelector;
 import dev.monocle.client.utils.player.Rotations;
 import net.minecraft.client.model.geom.ModelPart;
@@ -96,6 +97,13 @@ public abstract class AvatarRendererMixin
 
     @Inject(method = "extractRenderState(Lnet/minecraft/world/entity/Avatar;Lnet/minecraft/client/renderer/entity/state/AvatarRenderState;F)V", at = @At("RETURN"))
     private void extractRenderState$rotations(Avatar entity, AvatarRenderState state, float partialTicks, CallbackInfo ci) {
+        Derp derp = Modules.get().get(Derp.class);
+        if (derp.isActive() && entity == mc.player) {
+            state.yRot = 0;
+            state.bodyRot = derp.visualYaw();
+            state.xRot = derp.visualPitch();
+            return;
+        }
         if (Rotations.rotating && entity == mc.player) {
             state.yRot = 0;
             state.bodyRot = Rotations.serverYaw;

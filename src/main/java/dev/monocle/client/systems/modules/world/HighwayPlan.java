@@ -42,6 +42,14 @@ public final class HighwayPlan {
 
     record SupplyLayout(List<Cell> positions, Cell facing, Cell approach) {}
 
+    static SupplyLayout laneSupplyLayout(int dx, int dz, int width, int offset) {
+        SupplyLayout layout = supplyLayout(dx, dz, width, true);
+        if (offset < width / 2) return layout;
+        Cell first = layout.positions().getFirst();
+        // At the outer lane the second chest goes inward, not into the railing.
+        return new SupplyLayout(List.of(first, first.add(-dz, 0, dx)), layout.facing(), layout.approach());
+    }
+
     static SupplyLayout supplyLayout(int dx, int dz, int width, boolean doubleChest) {
         validate(dx, dz, width, 1);
         boolean diagonal = dx != 0 && dz != 0;

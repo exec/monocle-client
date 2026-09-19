@@ -12,8 +12,9 @@ public class SwarmHost {
 
     public SwarmHost(int port) {
         try {
-            listener = new CrewListener(Bots.get().bindAddress.get(), port, Bots.get()::keyForSelector);
-        } catch (IOException e) { Bots.get().error("Cannot start Bots: %s", e.getMessage()); }
+            int webPort = Bots.get().webPort.get();
+            listener = new CrewListener(Bots.get().bindAddress.get(), port, Bots.get()::keyForSelector, webPort == 0 ? -1 : webPort);
+        } catch (IOException e) { Bots.get().error("Cannot start Workers host: %s", e.getMessage()); }
     }
     public void disconnect() {
         if (listener != null) listener.close();

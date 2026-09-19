@@ -7,6 +7,7 @@ import static dev.monocle.coordinator.TaskWire.text;
 
 /** Validated native highway definitions shared by both hosting adapters. */
 public final class HighwayJobs {
+    public static final int MAX_LENGTH = 100_000;
     private HighwayJobs() {}
     public static boolean overlaps(JsonObject first, JsonObject second) {
         if (!text(first,"scope").equals(text(second,"scope"))) return false;
@@ -20,6 +21,7 @@ public final class HighwayJobs {
     }
     public static JsonObject definition(JsonObject task, JsonObject action) {
         if (task.has("nativeDefinition")) return checked(task.getAsJsonObject("nativeDefinition"));
+        if (task.has("preparedDefinition")) return checked(task.getAsJsonObject("preparedDefinition"));
         JsonObject packaged = task.getAsJsonObject("package");
         JsonObject definition = packaged.getAsJsonObject("geometry").deepCopy();
         definition.addProperty("id", UUID.randomUUID().toString()); definition.addProperty("name", text(task,"name"));
@@ -43,7 +45,7 @@ public final class HighwayJobs {
         String scope = text(job, "scope");
         if (scope.isBlank() || scope.length() > 1024) throw new IllegalArgumentException("A job needs its server and dimension");
         int length = integer(job, "length"), progress = job.has("progress") ? integer(job, "progress") : 0;
-        if (length < 16 || length > 4096 || progress < 0 || progress > length) throw new IllegalArgumentException("Invalid job length or progress");
+        if (length < 16 || length > MAX_LENGTH || progress < 0 || progress > length) throw new IllegalArgumentException("Invalid job length (16–100,000) or progress");
         for (String axis : List.of("x", "z")) if (Math.abs((long) integer(job, axis)) > 29_900_000) throw new IllegalArgumentException("Job is outside supported world bounds");
         if (integer(job, "y") < -2048 || integer(job, "y") > 2048) throw new IllegalArgumentException("Invalid job height");
         JsonObject layout = job.getAsJsonObject("layout");

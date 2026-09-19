@@ -1,0 +1,75 @@
+// Optional browser QA; Playwright is a testing tool, never a host/runtime dependency.
+import assert from 'node:assert/strict';
+const { chromium } = await import(process.env.MONOCLE_PLAYWRIGHT_MODULE || 'playwright');
+const url = process.argv[2];
+if (!url) throw new Error('Start :host-service:webUiPreview, then supply its /ui/ URL.');
+const browser = await chromium.launch({ headless: true, ...(process.env.MONOCLE_CHROMIUM_PATH ? { executablePath: process.env.MONOCLE_CHROMIUM_PATH } : {}) });
+const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+const errors = []; page.on('pageerror', error => errors.push(error.message));
+page.on('dialog', dialog => dialog.accept());
+try {
+  await page.goto(url); await page.getByLabel('Host API token').fill('wrong-api-token-123456789012345678901234');
+  await page.getByRole('button', { name: 'Enter control room' }).click();
+  await page.locator('#login-error').filter({ hasText: 'Access rejected' }).waitFor();
+  await page.getByLabel('Host API token').fill('test-api-token-123456789012345678901234');
+  await page.getByRole('button', { name: 'Enter control room' }).click();
+  await page.getByRole('heading', { name: 'Operations overview' }).waitFor();
+  await page.getByRole('cell', { name: 'Atlas', exact: false }).first().waitFor();
+  await page.screenshot({ path: '/tmp/monocle-webui-desktop.png', fullPage: true });
+  await page.locator('[data-page=jobs]').click();
+  const job = page.locator('.job-card').filter({ hasText: 'Long road' });
+  await job.getByRole('button', { name: 'Pause', exact: true }).click();
+  await job.locator('.pill').filter({ hasText: 'Paused' }).waitFor();
+  await job.getByRole('button', { name: 'Resume', exact: true }).click();
+  await job.locator('.pill').filter({ hasText: 'Running' }).waitFor();
+  await job.getByRole('button', { name: 'Inspect', exact: true }).click();
+  await page.locator('#inspect-dialog[open]').waitFor();
+  await page.getByRole('spinbutton', { name: 'Job priority', exact: true }).fill('17');
+  await page.locator('#inspect-content .priority-row').first().getByRole('button', { name: 'Set priority' }).click();
+  await page.getByRole('spinbutton', { name: 'Job priority', exact: true }).filter({ visible: true }).waitFor();
+  await page.locator('#inspect-dialog .close-dialog').click();
+  await job.getByText('Priority 17', { exact: true }).waitFor();
+  await job.getByRole('button', { name: 'Cancel job', exact: true }).click();
+  await page.locator('[data-page=history]').click();
+  await page.locator('.job-card').filter({ hasText: 'Long road' }).locator('.pill').filter({ hasText: 'Cancelled' }).waitFor();
+  await page.getByRole('button', { name: '+ New job', exact: true }).click();
+  await page.getByLabel('Workflow source').selectOption('wait'); await page.getByLabel('Job name').fill('Browser retry smoke');
+  let firstRequest, retryRequest;
+  await page.route('**/ui/api/control', async route => {
+    const data = route.request().postDataJSON();
+    if (data.op === 'submit' && !firstRequest) { firstRequest = data; await route.abort('failed'); }
+    else { if (data.op === 'submit') retryRequest = data; await route.continue(); }
+  });
+  await page.getByRole('button', { name: 'Dispatch job' }).click();
+  await page.getByRole('button', { name: 'Retry same submission' }).waitFor();
+  assert.equal(await page.locator('#job-fields').evaluate(fieldset => fieldset.disabled), true);
+  assert.equal(await page.getByLabel('Job name').isDisabled(), true);
+  await page.getByRole('button', { name: 'Retry same submission' }).click();
+  await page.locator('#job-dialog').waitFor({ state: 'hidden' });
+  assert.deepEqual(retryRequest, firstRequest, 'A failed response must preserve the identical request/UUID');
+  await page.unroute('**/ui/api/control'); await page.locator('[data-page=jobs]').click();
+  await page.locator('.job-card').filter({ hasText: 'Browser retry smoke' }).waitFor();
+  await page.getByRole('button', { name: '+ New job', exact: true }).click();
+  await page.getByLabel('Workflow source').selectOption('package');
+  const script = 'return function(ctx) if ctx.state.started then return bot.done() end ctx.state.started=true return bot.wait(200) end';
+  await page.getByLabel('Workflow package (.json)').setInputFiles({ name: 'workflow.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ version: 1, entry: 'test', programs: { test: { name: 'Uploaded package smoke', script } }, profiles: { Current: {} }, highways: {} })) });
+  await page.locator('#package-summary').filter({ hasText: 'Uploaded package smoke' }).waitFor();
+  await page.getByRole('button', { name: 'Dispatch job' }).click();
+  await page.locator('#job-dialog').waitFor({ state: 'hidden' });
+  await page.locator('.job-card').filter({ hasText: 'Uploaded package smoke' }).waitFor();
+  await page.route('**/ui/api/status', route => route.abort('failed'));
+  await page.getByRole('button', { name: 'Refresh host status' }).click();
+  await page.locator('#connection').filter({ hasText: 'Stale snapshot' }).waitFor();
+  assert.equal(await page.locator('#new-job').isDisabled(), true);
+  await page.unroute('**/ui/api/status'); await page.getByRole('button', { name: 'Refresh host status' }).click();
+  await page.locator('#connection').filter({ hasText: 'Host connected' }).waitFor();
+  await page.getByRole('button', { name: 'Disconnect console' }).click();
+  await page.getByRole('button', { name: 'Explore a read-only demo' }).click();
+  assert.equal(await page.locator('#new-job').isDisabled(), true);
+  await page.locator('[data-page=jobs]').click(); assert.equal(await page.getByRole('button', { name: 'Cancel job', exact: true }).isDisabled(), true);
+  await page.locator('[data-page=overview]').click(); await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: '/tmp/monocle-webui-mobile.png', fullPage: true });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'No page-wide mobile overflow');
+  assert.deepEqual(errors, [], 'No browser runtime errors');
+  console.log('WebUI browser checks passed: authentication, native job controls, priority, cancellation/history, workflow upload, retry identity, stale-state gating and responsive read-only demo.');
+} finally { await browser.close(); }

@@ -22,11 +22,13 @@ public final class Main {
             Files.createDirectories(directory);
             JsonObject config = new JsonObject(), crews = new JsonObject();
             config.addProperty("bind", "127.0.0.1"); config.addProperty("workerPort", 6969); config.addProperty("apiPort", 6970); config.addProperty("historyDays", 30);
+            config.addProperty("webPort", 0);
+            config.addProperty("uiOrigin", "");
             config.addProperty("apiToken", secret()); crews.addProperty("Default", secret()); config.add("crews", crews);
             if (Files.getFileStore(directory).supportsFileAttributeView("posix")) Files.createFile(file, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
             else Files.createFile(file);
             TaskFiles.write(file, config);
-            System.out.println("Created " + file + ". Copy the Default crew key into each worker's Bots settings. Treat this file as a password."); return;
+            System.out.println("Created " + file + ". Copy the Default crew key into each worker's Workers settings. Treat this file as a password."); return;
         }
         if (!Files.isRegularFile(file) || Files.size(file) > 16_384) throw new IllegalArgumentException("Initialize the host data directory first");
         JsonObject config = TaskFiles.read(file);
@@ -47,11 +49,14 @@ public final class Main {
             return;
         }
         Map<String, String> crews = new LinkedHashMap<>(); config.getAsJsonObject("crews").entrySet().forEach(e -> crews.put(e.getKey(), e.getValue().getAsString()));
-        try (HostService host = new HostService(directory, text(config, "bind"), HostService.integer(config, "workerPort", 1, 65535), crews, HostService.integer(config, "historyDays", -1, 3650));
-             ControlApi api = new ControlApi(host, apiPort, text(config, "apiToken"))) {
+        int webPort = config.has("webPort") ? HostService.integer(config, "webPort", 0, 65535) : 0;
+        try (HostService host = new HostService(directory, text(config, "bind"), HostService.integer(config, "workerPort", 1, 65535), crews, HostService.integer(config, "historyDays", -1, 3650), webPort == 0 ? -1 : webPort);
+             ControlApi api = new ControlApi(host, apiPort, text(config, "apiToken"), text(config, "uiOrigin"))) {
             CountDownLatch stopped = new CountDownLatch(1);
             Runtime.getRuntime().addShutdownHook(new Thread(() -> { api.close(); host.close(); stopped.countDown(); }, "Monocle host shutdown"));
             System.out.println("Monocle host listening at " + text(config, "bind") + ":" + host.port() + "; local control API 127.0.0.1:" + api.port());
+            System.out.println("Operator WebUI: http://127.0.0.1:" + api.port() + "/ui/ (use the API token, not the crew key).");
+            if (host.webPort() >= 0) System.out.println("Worker web ingress: ws://127.0.0.1:" + host.webPort() + "/v1/workers; remote workers require an HTTPS reverse proxy.");
             System.out.println("Capabilities: " + HostService.ACTIONS + ". Native highways use the shared coordinator; inspect status.highways for worker diagnostics.");
             stopped.await();
         }

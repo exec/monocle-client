@@ -1,10 +1,10 @@
 # Programmable bot workflows
 
-Monocle includes its own Lua interpreter. **You do not install Lua, LuaJ, or a separate scripting mod.** Each worker needs the same Monocle build and a trusted connection to the host. See [Bots setup](bots.md) for connecting accounts.
+Monocle includes its own Lua interpreter. **You do not install Lua, LuaJ, or a separate scripting mod.** Each worker needs the same Monocle build and a trusted connection to the host. See [Workers setup](bots.md) for connecting accounts.
 
 ## Start from the GUI
 
-Open **Right Shift → Bots → Workflows**. **Common Tasks** contains Travel, Drop items, TPA, Wait, Run configured modules, and Set profile. Queue one directly, or duplicate a definition to edit its Lua. Custom workflows have names, folders, declared workflow dependencies, and declared profiles. The editor validates syntax on save; editing never executes a draft.
+Open **Right Shift → Workers → Workflows**. **Common Tasks** contains Travel, Drop items, TPA, Wait, Run configured modules, and Set profile. Queue one directly, or duplicate a definition to edit its Lua. Custom workflows have names, folders, declared workflow dependencies, and declared profiles. The editor validates syntax on save; editing never executes a draft.
 
 **Stash Hunting → Distributed stash hunt** is an immutable built-in program; duplicate it to customize it. The Jobs tab also has a dedicated **Create stash hunt** form. It uses the same queues, priorities and profile package as other programmable jobs. All targets receive the same bounds; host-assigned worker indices divide that area, including when a nested workflow calls the survey action.
 
@@ -114,6 +114,8 @@ end
 **Join running job** on a directly assigned/queued native highway preset first transfers that task's captured workflow and profiles to the new worker, then waits for its prepared Highway action before redistributing lanes. A custom Lua program cannot currently accept a new worker midway through its Highway action: rerunning its entry could repeat earlier item transfers or profile changes. Select its workers before starting. This restriction does not affect returning workers, whose original Lua frames are already saved.
 
 Highway source steps reuse inventory shulkers, ender-chest contents, and ender-chest farming in the preset's configured order. Native supply recovery, filler disposal, cursor cleanup, and protected container handling remain enabled. Eligible suppliers temporarily leave the active lanes for a safe rear supply site while the others continue, then rejoin in their original roster order. There is no separate Lua stash scanner or generic `bot.restock()` action in this build; calling a highway preset reuses its native restocking.
+
+> **Supply priority invariant:** ender-chest farming is an emergency last resort, never ordinary resupply. When highway stash resupply is added, its intended order is inventory shulkers → ender-chest contents → crew sharing → stash resupply → ender-chest farming. Keep a small managed ender-chest reserve for that final fallback; do not move farming earlier merely because it is locally available.
 
 ## Profiles, priority, and returning to work
 

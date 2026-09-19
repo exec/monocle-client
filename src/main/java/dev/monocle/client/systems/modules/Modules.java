@@ -431,6 +431,7 @@ public class Modules extends System<Modules> {
     }
 
     private void initPlayer() {
+        add(new AirMine());
         add(new AirPlace());
         add(new AntiAFK());
         add(new AntiHunger());
@@ -444,6 +445,7 @@ public class Modules extends System<Modules> {
         add(new AutoTool());
         add(new BreakDelay());
         add(new ChestSwap());
+        add(new Derp());
         add(new EXPThrower());
         add(new FakePlayer());
         add(new FastUse());
@@ -482,6 +484,7 @@ public class Modules extends System<Modules> {
         add(new HighJump());
         add(new Jesus());
         add(new LongJump());
+        add(new LobbySkip());
         add(new NoFall());
         add(new NoSlow());
         add(new Parkour());
@@ -561,6 +564,7 @@ public class Modules extends System<Modules> {
         add(new SchematicSelector());
         add(new PrinterHelper());
         add(new StashFinder());
+        add(new StashManager());
         add(new SpawnProofer());
         add(new Timer());
         add(new VeinMiner());

@@ -52,6 +52,7 @@ public class ElytraFly extends Module {
     private final SettingGroup sgSafety = settings.createGroup("Safety");
     private final SettingGroup sgAutopilot = settings.createGroup("Autopilot", false);
     private final SettingGroup sgInventory = settings.createGroup("Inventory", false);
+    private final SettingGroup sgHud = settings.createGroup("HUD", false);
     private final SettingGroup sgAdvanced = settings.createGroup("Advanced", false);
 
     // General
@@ -97,6 +98,13 @@ public class ElytraFly extends Module {
         .defaultValue(1)
         .min(0)
         .visible(() -> flightMode.get() != ElytraFlightModes.Pitch40 && flightMode.get() != ElytraFlightModes.Bounce)
+        .build()
+    );
+
+    public final Setting<HudDisplay> hudDisplay = sgHud.add(new EnumSetting.Builder<HudDisplay>()
+        .name("hud-display")
+        .description("What Elytra Fly shows beside its name in the active-modules HUD.")
+        .defaultValue(HudDisplay.BPS)
         .build()
     );
 
@@ -707,7 +715,22 @@ public class ElytraFly extends Module {
 
     @Override
     public String getInfoString() {
-        return currentMode.getHudString();
+        return switch (hudDisplay.get()) {
+            case BPS -> mc.player == null ? "0.0 BPS" : String.format(java.util.Locale.ROOT, "%.1f BPS",
+                horizontalBps(mc.player.getX(), mc.player.getZ(), mc.player.xo, mc.player.zo));
+            case Mode -> currentMode.getHudString();
+            case None -> null;
+        };
+    }
+
+    public static double horizontalBps(double x, double z, double previousX, double previousZ) {
+        return Math.hypot(x - previousX, z - previousZ) * 20;
+    }
+
+    public enum HudDisplay {
+        BPS,
+        Mode,
+        None
     }
 
     public enum ChestSwapMode {

@@ -19,6 +19,7 @@ public class CustomPlayerInput extends ClientInput {
 
     public void stop() {
         this.keyPresses = Input.EMPTY;
+        this.moveVector = Vec2.ZERO;
     }
 
     public void forward(boolean bool) {

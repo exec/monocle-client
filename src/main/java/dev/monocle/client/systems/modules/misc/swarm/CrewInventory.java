@@ -38,11 +38,8 @@ public final class CrewInventory extends dev.monocle.coordinator.ResourceLedger 
     }
     private static boolean shulker(ItemStack stack) { return stack.getItem() instanceof BlockItem block && block.getBlock() instanceof ShulkerBoxBlock; }
 
-    /** Index is left-to-right facing progress, not player yaw or packet arrival order. */
-    public static float trashYaw(float forward, int index, int count) {
-        if (count < 1 || index < 0 || index >= count) throw new IllegalArgumentException("Invalid crew position");
-        return forward + (count == 1 || index > 0 && index < count - 1 ? 180 : index == 0 ? -90 : 90);
-    }
+    /** Throw along the completed road, away from work, regardless of lane or crew membership. */
+    public static float trashYaw(float forward) { return forward + 180; }
 
     public static int count(Container inventory, Predicate<ItemStack> accepts) {
         int n = 0;
@@ -74,10 +71,40 @@ public final class CrewInventory extends dev.monocle.coordinator.ResourceLedger 
 
     public static boolean unresolvedReceipt(JsonObject receipt) {
         return receipt != null && receipt.has("issued") && receipt.get("issued").getAsBoolean()
-            && !java.util.Set.of("complete", "cancelled", "sent").contains(receipt.get("stage").getAsString());
+            && !java.util.Set.of("complete", "cancelled").contains(receipt.get("stage").getAsString());
+    }
+
+    /** Operator approval is bounded to receipts already present when inspection was confirmed. */
+    public static void inspectTransferReceipt(java.nio.file.Path path, long before) {
+        if (before <= 0 || before > System.currentTimeMillis()) throw new IllegalArgumentException("Invalid transfer inspection cutoff");
+        JsonObject receipt = dev.monocle.coordinator.TaskFiles.read(path);
+        if (!unresolvedReceipt(receipt)) return;
+        try {
+            if (java.nio.file.Files.getLastModifiedTime(path).toMillis() > before)
+                throw new IllegalStateException("Transfer receipt changed after inspection; inspect it again");
+        } catch (java.io.IOException e) { throw new IllegalStateException("Cannot inspect transfer receipt", e); }
+        var archive = path.resolveSibling(path.getFileName() + ".inspected-" + dev.monocle.coordinator.TaskFiles.hash(receipt.toString()) + ".json");
+        dev.monocle.coordinator.TaskFiles.write(archive, receipt); // Preserve the original before retiring the hold.
+        receipt.addProperty("previousStage", receipt.get("stage").getAsString());
+        receipt.addProperty("stage", "cancelled");
+        receipt.addProperty("inspectedBefore", before);
+        receipt.addProperty("inspectedAt", System.currentTimeMillis());
+        dev.monocle.coordinator.TaskFiles.write(path, receipt);
     }
     public static boolean mayDrop(boolean issued, boolean matches, int available, int reserve, int amount) {
         return !issued && matches && amount > 0 && amount <= 99 && available >= reserve && amount <= available - reserve;
+    }
+    public static boolean mayDrop(boolean issued, boolean matches, int available, int reserve, int count, int units) {
+        return !issued && matches && count > 0 && count <= 99 && units >= count && units <= available - reserve;
+    }
+
+    /** Follow the real stack; without a visible drop, sweep one block toward the donor and back. */
+    static net.minecraft.core.BlockPos pickupTarget(net.minecraft.core.BlockPos meeting, int dx, int dz,
+                                                    net.minecraft.world.phys.Vec3 drop, int elapsed) {
+        if (drop != null && Double.isFinite(drop.lengthSqr()) && Math.abs(drop.y - meeting.getY()) < 1
+            && net.minecraft.world.phys.Vec3.atBottomCenterOf(meeting).distanceToSqr(drop) <= 36)
+            return net.minecraft.core.BlockPos.containing(drop.x, meeting.getY(), drop.z);
+        return elapsed >= 20 && elapsed / 40 % 2 == 0 ? meeting.offset(dx, 0, dz) : meeting;
     }
 
     /** A compact manifest for inspection, not an executable item/slot description. */

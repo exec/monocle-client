@@ -14,6 +14,12 @@ import java.util.List;
 /** Profile validation must reject malformed settings before touching any live module. */
 public final class BotProfilesTest {
     public static void run() throws Exception {
+        String launcherSettings = """
+            {"groups":[{"name":"General","settings":[{"name":"vanilla-speed","value":5d},{"name":"existing","value":["a]b"]},{"name":"mode","value":"Vanilla"}]}]}
+            """;
+        assert BotProfiles.validate(profile(launcherSettings)).equals(profile(launcherSettings)) : "Launcher merges use the same worker SNBT validation";
+        var launcherTag=TagParser.parseCompoundFully(launcherSettings);
+        assert launcherTag.getListOrEmpty("groups").size()==1;
         for (String valid : List.of("{}", "{groups:[]}", "{groups:[{name:'General',settings:[{name:'speed',value:2.5}]}]}")) {
             JsonObject profile = profile(valid);
             assert BotProfiles.validate(profile).equals(profile);
@@ -29,6 +35,12 @@ public final class BotProfilesTest {
         JsonObject nativeExecutor = new JsonObject(); nativeExecutor.add("highway-builder", profile("{}").get("elytra-fly").deepCopy());
         nativeExecutor.getAsJsonObject("highway-builder").addProperty("active", true);
         try { BotProfiles.validate(nativeExecutor); throw new AssertionError("Profiles must not start native jobs"); } catch (IllegalArgumentException expected) {}
+        var original = TagParser.parseCompoundFully(launcherSettings);
+        var merged = BotProfiles.mergeSettings(original, TagParser.parseCompoundFully("{groups:[{name:'General',settings:[{name:'vanilla-speed',value:6d}]}]}"));
+        assert original.equals(TagParser.parseCompoundFully(launcherSettings)) : "Live patches must not mutate the checkpoint";
+        assert merged.toString().contains("6.0d") && merged.toString().contains("Vanilla") && merged.toString().contains("a]b") : "Unspecified settings survive live updates";
+        try { BotProfiles.mergeSettings(original, TagParser.parseCompoundFully("{groups:[{name:'General',settings:[{name:'typo',value:1}]}]}")); throw new AssertionError("Unknown live setting accepted"); }
+        catch (IllegalArgumentException expected) {}
         var same = TagParser.parseCompoundFully("{groups:[{name:'General',settings:[{name:'speed',value:2.5}]}]}");
         assert !BotProfiles.settingsChanged(same, same.copy()) : "Same settings must not cycle ElytraFly or other active modules";
         assert BotProfiles.settingsChanged(same, new CompoundTag());
@@ -44,13 +56,14 @@ public final class BotProfilesTest {
         } finally { Files.deleteIfExists(file); }
         try (var bytes = BotProfiles.class.getResourceAsStream("BotProfiles.class")) {
             var code = ClassFile.of().parse(bytes.readAllBytes());
-            for (String method : List.of("apply", "begin", "applyStates", "persistentTag")) {
-                var calls = code.methods().stream().filter(m -> m.methodName().equalsString(method)).findFirst().orElseThrow().code().orElseThrow().elementList().stream()
+            for (String method : List.of("apply", "begin", "applyStates", "persistentTag", "fullSettings")) {
+                var calls = code.methods().stream().filter(m -> m.methodName().equalsString(method) && (!method.equals("apply") || m.methodTypeSymbol().parameterCount() == 2)).findFirst().orElseThrow().code().orElseThrow().elementList().stream()
                     .filter(InvokeInstruction.class::isInstance).map(InvokeInstruction.class::cast).map(call -> call.name().stringValue()).toList();
                 if (method.equals("apply") || method.equals("begin")) assert calls.contains("requireIdle");
                 if (method.equals("apply")) assert calls.stream().filter("applyStates"::equals).count() == 2 && calls.contains("addSuppressed") : "Failure rolls back prior in-memory settings and preserves recovery errors";
                 if (method.equals("applyStates")) assert calls.containsAll(List.of("contains", "disable", "fromTag", "enable"));
                 if (method.equals("persistentTag")) assert calls.containsAll(List.of("put", "putBoolean")) : "Native persistence still substitutes the original lease";
+                if (method.equals("fullSettings")) assert !calls.contains("wasChanged") && calls.stream().filter("toTag"::equals).count() == 2 : "Live configuration must serialize every setting, including defaults";
             }
         }
         try (var bytes = BotProfiles.class.getResourceAsStream("/dev/monocle/client/systems/modules/Modules.class")) {

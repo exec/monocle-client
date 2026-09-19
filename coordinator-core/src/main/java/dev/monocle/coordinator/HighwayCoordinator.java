@@ -8,6 +8,93 @@ import dev.monocle.client.systems.modules.misc.swarm.SwarmConnection;
 
 /** Shared host state machine. P and the hooks isolate game observations/actions from coordination. */
 public abstract class HighwayCoordinator<P> {
+    private CrewTelemetry telemetry;
+    private String windowDecision = "not evaluated";
+    private long windowDecisionAt;
+    private final Map<UUID, JsonObject> diagnosticPermits = new LinkedHashMap<>();
+    private final Deque<JsonObject> diagnosticCommands = new ArrayDeque<>();
+    private String telemetryCaptureError = "";
+    private long telemetryErrorAt, diagnosticCommandSequence;
+
+    public Path telemetryPath() { return journal().resolveSibling(journal().getFileName() + ".telemetry.jsonl"); }
+    public String telemetryError() { return !telemetryCaptureError.isEmpty() ? telemetryCaptureError : telemetry == null ? "" : telemetry.error(); }
+    public long telemetryDropped() { return telemetry == null ? 0 : telemetry.dropped(); }
+
+    /** Both host adapters log the same decision inputs. Logging failure cannot stop coordination. */
+    protected void recordTelemetry() {
+        if (!isHost() || telemetry == null && !assigned()) return;
+        try {
+            if (telemetry == null) telemetry = new CrewTelemetry(telemetryPath());
+            long now = System.nanoTime(); if (!telemetry.due(now)) return;
+            JsonObject d = new JsonObject(); d.addProperty("execution", job); d.addProperty("generation", generation);
+            d.addProperty("phase", phase); d.addProperty("stopped", stopped); d.addProperty("begun", begun);
+            d.addProperty("regrouping", regrouping); d.addProperty("releasing", releasing); d.addProperty("granted", granted);
+            d.addProperty("supplyOwner", supplyOwner == null ? "" : supplyOwner.toString());
+            d.addProperty("lock", lock); d.add("acknowledgments", JSON.toJsonTree(acknowledgments));
+            d.addProperty("joining", String.valueOf(joiningWorker)); d.addProperty("detaching", String.valueOf(detachingWorker));
+            d.addProperty("rejoining", String.valueOf(rejoiningWorker));
+            d.addProperty("regroupTicks", regrouping ? ticks - regroupStarted : 0);
+            d.addProperty("supplyRetryTicks", supplyRetryAfter - ticks);
+            d.addProperty("windowDecision", windowDecision);
+            d.addProperty("windowDecisionAgeMs", windowDecisionAt == 0 ? -1 : (now - windowDecisionAt) / 1_000_000);
+            d.add("commandAttempts", JSON.toJsonTree(diagnosticCommands));
+            if (assigned()) {
+                d.addProperty("catalogId", str(assignment, "catalogId"));
+                d.addProperty("scope", str(assignment, "scope")); d.addProperty("progress", safeProgress());
+                d.addProperty("length", num(assignment, "length")); d.addProperty("hostAuthority", hostAuthority());
+                d.add("activeMembers", JSON.toJsonTree(activeMembers())); d.add("suppliers", suppliers(assignment).deepCopy());
+                if (resourceExchange.hostOffer != null) {
+                    JsonObject exchange = new JsonObject();
+                    for (String key : List.of("id", "phase", "sequence", "resource", "remaining", "donor", "recipient", "x", "y", "z"))
+                        if (resourceExchange.hostOffer.has(key)) exchange.add(key, resourceExchange.hostOffer.get(key).deepCopy());
+                    d.add("exchange", exchange);
+                }
+            }
+            JsonArray workers = new JsonArray();
+            for (UUID id : participants.keySet()) {
+                JsonObject w = new JsonObject(), report = reports.get(id); w.addProperty("id", id.toString());
+                if (assigned() && detachedMembers(assignment).contains(id)) w.addProperty("returnGate", serviceReturnGate(id));
+                w.addProperty("fresh", currentReport(id) != null);
+                w.addProperty("reportAgeMs", reportTimes.containsKey(id) ? (now - reportTimes.get(id)) / 1_000_000 : -1);
+                if (report != null) for (String key : List.of("name", "job", "generation", "scope", "phase", "status", "currentRow", "verifiedBase", "verifiedMask", "currentResolved",
+                    "serviceReturning", "serviceReady", "serviceRevisions", "renderedCrew", "begun", "regroupReady", "recoveryReady", "initialStockReady", "ack", "x", "y", "z", "diagnostics")) if (report.has(key)) w.add(key, report.get(key).deepCopy());
+                if (report != null && report.has("inventory")) {
+                    JsonObject inventory = new JsonObject(), source = report.getAsJsonObject("inventory");
+                    for (String key : List.of("loose", "shulkers", "echest", "reserve", "target", "busy", "idle")) if (source.has(key)) inventory.add(key, source.get(key).deepCopy());
+                    w.add("inventory", inventory);
+                }
+                if (report != null && report.has("exchange")) {
+                    JsonObject exchange = new JsonObject(), source = report.getAsJsonObject("exchange");
+                    for (String key : List.of("id", "sequence", "need", "stage", "stageTicks", "issued", "received", "detail"))
+                        if (source.has(key)) exchange.add(key, source.get(key).deepCopy());
+                    w.add("exchange", exchange);
+                }
+                JsonObject permit = diagnosticPermits.get(id);
+                if (permit != null && job.equals(str(permit, "job"))) w.add("lastPermitSent", permit.deepCopy());
+                if (requested.containsKey(id)) {
+                    JsonObject request = new JsonObject();
+                    for (String key : List.of("type", "job", "generation", "detach", "resource", "x", "y", "z"))
+                        if (requested.get(id).has(key)) request.add(key, requested.get(id).get(key).deepCopy());
+                    w.add("supplyRequest", request);
+                }
+                workers.add(w);
+            }
+            d.add("workers", workers); telemetry.sample(d, now); telemetryCaptureError = "";
+        } catch (RuntimeException e) {
+            // Diagnostics must never propagate into a bot controller's fail-closed gameplay path.
+            telemetryCaptureError = "Snapshot failed: " + e.getClass().getSimpleName();
+            long now = System.nanoTime();
+            if (telemetryErrorAt == 0 || now - telemetryErrorAt > 60_000_000_000L) { telemetryErrorAt = now; System.err.println(telemetryCaptureError); }
+        }
+    }
+
+    private void traceCommand(String recipient, JsonObject message) {
+        if (!isHost() || Set.of("nudge", "window", "heartbeat").contains(str(message, "type"))) return;
+        JsonObject event = new JsonObject(); event.addProperty("seq", ++diagnosticCommandSequence);
+        event.addProperty("at", System.currentTimeMillis()); event.addProperty("recipient", recipient);
+        for (String key : List.of("type", "job", "generation", "worker", "revision", "lock")) if (message.has(key)) event.add(key, message.get(key).deepCopy());
+        if (diagnosticCommands.size() == 16) diagnosticCommands.removeFirst(); diagnosticCommands.addLast(event);
+    }
     protected JsonArray cachedRoster;
     protected List<UUID> cachedMembers=List.of();
     protected static final Gson JSON = new Gson();
@@ -51,6 +138,7 @@ public abstract class HighwayCoordinator<P> {
     protected int forecastHintAfter;
 
     protected boolean regrouping, regroupReady, regroupWasPaused, releasing;
+    private int initialStockDeadline;
 
     protected JsonObject availabilityChange;
 
@@ -90,6 +178,10 @@ public abstract class HighwayCoordinator<P> {
 
     protected final Map<UUID, Long> reportTimes = new HashMap<>();
 
+    // Observations protect physical containers; they never reserve movement or work for the crew.
+    protected JsonObject supplyContainers = new JsonObject();
+    private final Map<UUID, Integer> pendingRejoins = new HashMap<>();
+
     protected final Map<String, Set<UUID>> pendingEnds = new LinkedHashMap<>();
 
     public static WorkSharing workSharing(JsonObject layout) {
@@ -105,6 +197,8 @@ public abstract class HighwayCoordinator<P> {
     public boolean localAssigned() { return assigned() && localParticipant; }
 
     public boolean detachedSupply() { return localAssigned() && detachedMembers(assignment).contains(me()); }
+
+    public boolean independentSupplies() { return assigned() && TaskWire.flag(assignment, "independentSupplies"); }
 
     public boolean isReleasing() { return releasing; }
 
@@ -133,7 +227,7 @@ public abstract class HighwayCoordinator<P> {
         return result;
     }
 
-    protected boolean sharedSupplyHold() { return supplyOwner != null && !detachedMembers(assignment).contains(supplyOwner); }
+    protected boolean sharedSupplyHold() { return !independentSupplies() && supplyOwner != null && !detachedMembers(assignment).contains(supplyOwner); }
 
     public static boolean sharedSupplyHold(UUID owner, UUID detached) { return owner != null && !owner.equals(detached); }
 
@@ -206,12 +300,28 @@ public abstract class HighwayCoordinator<P> {
 
     public static int leadLimit(int length, int slowest) { return Math.min(length, slowest + WORK_WINDOW); }
 
+    public static int serviceFrontRow(int progress, int length) {
+        return Math.max(1, Math.min(progress, length - 1));
+    }
+
+    public static int leadLimit(int length, int slowest, WorkSharing sharing, int renderDistance) {
+        // A short physical leash keeps lane workers side-by-side. Long render-distance
+        // windows were faster on paper but made restock/rejoin state unstable.
+        return sharing == WorkSharing.BreakOrder ? Math.min(length, slowest + 1)
+            : leadLimit(length, slowest);
+    }
+
     public static int leadLimit(int length, int slowest, WorkSharing sharing) {
-        return sharing == WorkSharing.BreakOrder ? Math.min(length, slowest + 1) : leadLimit(length, slowest);
+        return leadLimit(length, slowest, sharing, 0);
     }
 
     public static boolean verifiedRow(int base, int mask, int row) {
         return RowVerification.verifiedRow(base, mask, row);
+    }
+
+    /** A crew may enter a row only after its full, server-resolved pattern is observed. */
+    public static boolean canAdvance(int row, int limit, int base, int mask) {
+        return row <= limit && verifiedRow(base, mask, row);
     }
 
     public static int resolvedMask(int base, int limit, java.util.function.IntPredicate resolved) {
@@ -231,7 +341,11 @@ public abstract class HighwayCoordinator<P> {
     protected JsonObject jobMessage(String type) { var m = message(type); m.addProperty("job", job); m.addProperty("generation", generation); return m; }
 
     public static boolean matchesGeneration(String job, int generation, JsonObject message) {
-        return job.equals(str(message, "job")) && (message.has("generation") ? num(message, "generation") : 0) == generation;
+        // A missing generation is tolerated only for the initial, pre-reconfiguration
+        // execution. Once a job has advanced, accepting it would let stale packets
+        // mutate the current lane/supply state.
+        return message != null && job != null && job.equals(str(message, "job"))
+            && (message.has("generation") ? num(message, "generation") : generation == 0 ? 0 : Integer.MIN_VALUE) == generation;
     }
 
     public static boolean reconfigurationReady(JsonObject current, int generation, JsonObject next, boolean settled, boolean supplyReserved) {
@@ -244,12 +358,14 @@ public abstract class HighwayCoordinator<P> {
     protected static int num(JsonObject m, String key) { return m.get(key).getAsInt(); }
 
     protected void broadcast(JsonObject m) {
+        traceCommand("crew", m);
         for (var c : participants.values()) if (c != null) c.send(JSON.toJson(m));
         apply(m);
     }
 
     protected void coordinate(boolean workChanged) {
         if (isHost() && assigned() && !stopped && !phase.equals("paused")) {
+            if (independentSupplies() && ticks % 10 == 0) coordinateSupplyContainers();
             if (regrouping) {
                 try { if (!releasing && availabilityChange == null && detachingWorker == null && !rejoiningSupply && borrowingWorkers.isEmpty()) eligibleJoin(joiningWorker); }
                 catch (IllegalStateException e) {
@@ -296,13 +412,12 @@ public abstract class HighwayCoordinator<P> {
                 JsonObject r = currentReport(id);
                 if (r != null && needsBeginRetry(r)) sendMember(id, jobMessage("begin"));
             }
-            if (begun && !sharedSupplyHold() && workUpdateDue(ticks, true, workChanged)) coordinateWindow();
-            if (detachedMember() != null) {
+            if (begun && !initialStocking() && !sharedSupplyHold() && workUpdateDue(ticks, true, workChanged)) coordinateWindow();
+            if (detachedMember() != null || !pendingRejoins.isEmpty()) {
                 coordinateServiceReturn();
                 if (regrouping) return;
             }
-            // Handoff is independent of the one physical container lock: a second hungry
-            // builder can leave while the first runner is opening/recovering its shulker.
+            // A second hungry builder can leave while the first recovers its shulker.
             if (begun && ticks >= regroupRetryAfter) for (var entry : requested.entrySet()) {
                 if (entry.getValue().has("detach") && entry.getValue().get("detach").getAsBoolean() && canDetach(entry.getKey())
                     && serviceRequestCurrent(assignment, entry.getKey(), entry.getValue())) {
@@ -327,6 +442,7 @@ public abstract class HighwayCoordinator<P> {
             }
             // A returning runner no longer owns the supply lock. Other workers must still be
             // able to request shared restocking while that runner is catching up.
+            if (independentSupplies()) return; // Detached workers admit their own local supply work.
             if (supplyOwner != null && !granted && supplyBarrierReady()) broadcast(reservation("grant"));
             if (supplyOwner != null && reservationRetryDue(granted, ticks - reservationStarted)) {
                 // No grant was issued, so the owner cannot have started using a container.
@@ -349,6 +465,56 @@ public abstract class HighwayCoordinator<P> {
         }
     }
 
+    /** Fresh storage knowledge and roughly equal carried paving stock precede road permits. */
+    private boolean initialStocking() {
+        if (TaskWire.flag(assignment, "initialStocked")) return false;
+        if (ticks >= initialStockDeadline) {
+            assignment.addProperty("initialStockScanned", true); assignment.addProperty("initialStocked", true);
+            broadcast(jobMessage("stock-scan-complete")); broadcast(jobMessage("stock-complete")); persist();
+            warning("Initial stocking timed out; continuing with ordinary detached-restock fallbacks.");
+            return false;
+        }
+        List<UUID> active = activeMembers();
+        if (active.isEmpty() || !active.stream().allMatch(id -> {
+            JsonObject report = currentReport(id);
+            return report != null && TaskWire.flag(report, "initialStockReady");
+        })) return true;
+        if (!TaskWire.flag(assignment, "initialStockScanned")) {
+            assignment.addProperty("initialStockScanned", true); broadcast(jobMessage("stock-scan-complete")); persist();
+            info("Initial ender-chest scan complete; recovering the shared pair before balancing.");
+            return true;
+        }
+        if (active.stream().anyMatch(id -> workerInventory(currentReport(id)) == null)) {
+            assignment.addProperty("initialStocked", true); persist(); return false; // Protocol test/legacy host actor without an inventory ledger.
+        }
+        if (active.stream().anyMatch(id -> {
+            JsonObject inventory = workerInventory(currentReport(id));
+            return TaskWire.flag(inventory, "busy") || !TaskWire.flag(inventory, "idle");
+        })) return true;
+        UUID lowest = null; int min = Integer.MAX_VALUE, max = 0;
+        for (UUID id : active) {
+            int available = ResourceLedger.available(workerInventory(currentReport(id)), ResourceLedger.MATERIALS);
+            if (available < min) { min = available; lowest = id; }
+            max = Math.max(max, available);
+        }
+        if (max - min > 1728 && resourceExchange.hostOffer == null) {
+            JsonObject report = currentReport(lowest);
+            if (ResourceLedger.integer(report.getAsJsonObject("exchange"), "need") < 0) {
+                JsonObject balance = jobMessage("resource-balance"); balance.addProperty("resource", ResourceLedger.MATERIALS);
+                balance.addProperty("target", 1536); sendMember(lowest, balance);
+            }
+            return true;
+        }
+        if (resourceExchange.hostOffer != null) return true;
+        assignment.addProperty("initialStocked", true); broadcast(jobMessage("stock-complete")); persist();
+        info("Initial storage scan complete; carried paving stock is balanced within one shulker.");
+        return false;
+    }
+
+    private JsonObject workerInventory(JsonObject report) {
+        return report != null && report.has("inventory") ? report.getAsJsonObject("inventory") : null;
+    }
+
     public static boolean needsBeginRetry(JsonObject report) {
         return str(report, "phase").equals("ready") && (!report.has("begun") || !report.get("begun").getAsBoolean());
     }
@@ -357,31 +523,40 @@ public abstract class HighwayCoordinator<P> {
 
     public static boolean rejoinArmed(boolean armed, boolean nearby) { return armed || !nearby; }
 
+    private boolean workflowReady(UUID id) {
+        return !assignment.has("workflowMembers") || !assignment.getAsJsonArray("workflowMembers").contains(JSON.toJsonTree(id.toString()))
+            || nativeReady(id);
+    }
+
     protected boolean coordinateAvailability() {
+        if (!assigned() || stopped || releasing || phase.equals("paused")) return false;
         P front = returnRendezvous();
         boolean resuming = false;
         for (UUID id : participants.keySet()) {
+            if (participants.get(id) != null && !participants.get(id).connected()) continue;
             JsonObject r = currentReport(id);
             if (r == null || !r.has("x") || !str(assignment, "scope").equals(str(r, "scope"))) continue;
             boolean off = r.has("moduleOff") && r.get("moduleOff").getAsBoolean();
+            if (str(r,"phase").equals("failed")) continue;
             if (!off) { offRangeArmed.remove(id); continue; }
-            boolean nearby = hostNearby(front, point(num(r, "x"), num(r, "y"), num(r, "z")));
+            boolean nearby = validRenderedReturn(assignment, id, r) || hostNearby(front, point(num(r, "x"), num(r, "y"), num(r, "z")));
             boolean armed = rejoinArmed(offRangeArmed.getOrDefault(id, false), nearby);
             offRangeArmed.put(id, armed);
-            if (nearby && armed && !awayMembers(assignment).has(id.toString())) { sendMember(id, jobMessage("resume-builder")); resuming = true; }
+            if (nearby && armed) { sendMember(id, jobMessage("resume-builder")); resuming = true; }
         }
         if (resuming) return false; // Wait for fresh telemetry instead of withdrawing a just-resumed worker.
-        boolean liveRunner = detachedMembers(assignment).stream().anyMatch(id -> {
-            JsonObject runner = currentReport(id);
-            return runner == null || !runner.has("moduleOff") || !runner.get("moduleOff").getAsBoolean();
-        });
-        if (regrouping || supplyOwner != null || liveRunner
-            || ticks < regroupRetryAfter || safeProgress() >= num(assignment, "length")) return false;
+        if (regrouping || ticks < regroupRetryAfter || safeProgress() >= num(assignment, "length")) return false;
         JsonObject old = awayMembers(assignment), next = old.deepCopy();
         for (UUID id : participants.keySet()) {
+            if (detachedMembers(assignment).contains(id) || id.equals(supplyOwner)) continue; // Keep physical supply ownership intact.
             JsonObject report = currentReport(id);
-            if (report == null || !report.has("x") || !str(assignment, "scope").equals(str(report, "scope"))) continue;
-            boolean nearby = hostNearby(front, point(num(report, "x"), num(report, "y"), num(report, "z")));
+            if (participants.get(id) != null && !participants.get(id).connected()
+                || report == null || !report.has("x") || !str(assignment, "scope").equals(str(report, "scope"))
+                || independentSupplies() && !workflowReady(id)) {
+                next.addProperty(id.toString(), true);
+                continue;
+            }
+            boolean nearby = validRenderedReturn(assignment, id, report) || hostNearby(front, point(num(report, "x"), num(report, "y"), num(report, "z")));
             boolean off = report.has("moduleOff") && report.get("moduleOff").getAsBoolean();
             if (!old.has(id.toString())) {
                 if (off) next.addProperty(id.toString(), offRangeArmed.getOrDefault(id, !nearby));
@@ -396,13 +571,20 @@ public abstract class HighwayCoordinator<P> {
             return false;
         }
         Set<UUID> remaining = new LinkedHashSet<>(participants.keySet()); remaining.removeIf(id -> next.has(id.toString()));
-        if (remaining.isEmpty()) return false; // Real work always needs an on-site worker.
-        try { applyWorkflowDuties(assignment.deepCopy(), remaining); }
+        if (remaining.isEmpty() && !independentSupplies()) return false;
+        try { if (!remaining.isEmpty()) applyWorkflowDuties(assignment.deepCopy(), remaining); }
         catch (IllegalArgumentException e) { return false; }
-        var request = jobMessage("regroup"); request.add("awayMembers", next);
-        broadcast(request);
-        info("Updating off-duty workers; %d builders will cover the highway. Return detection arms after leaving the crew's range.", remaining.size());
-        return true;
+        // Restore returners before withdrawing workers, so a simultaneous swap never has an empty active roster.
+        for (boolean withdrawing : List.of(false, true)) for (UUID id : participants.keySet()) {
+            if (Objects.equals(old.get(id.toString()), next.get(id.toString()))) continue;
+            if (next.has(id.toString()) != withdrawing) continue;
+            JsonObject update = serviceChange(next.has(id.toString()) ? "service-away" : "service-back", id,
+                Math.incrementExact(serviceRevision(assignment, id)));
+            if (next.has(id.toString())) update.add("armed", next.get(id.toString()).deepCopy());
+            broadcast(update);
+        }
+        info("Updating off-duty workers in place; %d builders cover the highway without a crew-wide stop.", activeMembers().size());
+        return false;
     }
 
     protected void finishAvailability() {
@@ -430,7 +612,45 @@ public abstract class HighwayCoordinator<P> {
         return next;
     }
 
+    private void coordinateSupplyContainers() {
+        JsonObject next = supplyContainers.deepCopy();
+        next.keySet().retainAll(participants.keySet().stream().map(UUID::toString).toList());
+        for (UUID member : participants.keySet()) {
+            JsonObject report = currentReport(member);
+            if (report == null || !str(assignment, "scope").equals(str(report, "scope")) || !report.has("supplyContainers")) continue;
+            JsonArray locations = checkedSupplyContainers(assignment, report.get("supplyContainers"));
+            if (locations.isEmpty()) next.remove(member.toString()); else next.add(member.toString(), locations);
+        }
+        if (!next.equals(supplyContainers) || ticks % 20 == 0) {
+            JsonObject update = jobMessage("supply-containers"); update.add("containers", next); broadcast(update);
+        }
+    }
+
+    public static JsonArray checkedSupplyContainers(JsonObject assignment, JsonElement value) {
+        JsonArray result = new JsonArray();
+        if (value == null || !value.isJsonArray() || value.getAsJsonArray().size() > 2) return result;
+        JsonObject layout = assignment.getAsJsonObject("layout");
+        try {
+            for (JsonElement entry : value.getAsJsonArray()) {
+                JsonObject site = entry.getAsJsonObject(), checked = new JsonObject();
+                for (String axis : List.of("x", "y", "z")) {
+                    if (!site.getAsJsonPrimitive(axis).isNumber()) return new JsonArray();
+                    checked.addProperty(axis, site.get(axis).getAsBigDecimal().intValueExact());
+                }
+                long x = (long) num(checked, "x") - num(assignment, "x"), z = (long) num(checked, "z") - num(assignment, "z");
+                long row = x * num(layout, "dx") + z * num(layout, "dz"), side = x * num(layout, "dz") - z * num(layout, "dx");
+                if (row < -128 || row > (long) num(assignment, "length") + 12 || Math.abs(side) > num(layout, "width") + 12
+                    || Math.abs((long) num(checked, "y") - num(assignment, "y")) > 10) return new JsonArray();
+                result.add(checked);
+            }
+        } catch (RuntimeException malformed) { return new JsonArray(); }
+        return result;
+    }
+
     protected boolean supplyBarrierReady() {
+        // Detached actors own their local placement/clearance checks. A distant worker
+        // must never veto recovery by withholding a crew-wide acknowledgement.
+        if (supplyOwner != null && detachedMembers(assignment).contains(supplyOwner)) return true;
         Set<UUID> nearby = new HashSet<>(participants.keySet());
         if (compactReservation()) {
             for (UUID member : participants.keySet()) {
@@ -462,17 +682,50 @@ public abstract class HighwayCoordinator<P> {
     }
 
     protected boolean canDetach(UUID member) {
-        return ticks >= regroupRetryAfter && activeMembers().contains(member) && safeProgress() < num(assignment, "length");
+        // The verified checkpoint is the front while nobody is building; requiring a
+        // live anchor here deadlocks the final active worker when it needs supplies.
+        return ticks >= regroupRetryAfter && detachAllowed(activeMembers(), member) && safeProgress() < num(assignment, "length");
     }
 
+    public static boolean detachAllowed(Collection<UUID> active, UUID member) { return active.contains(member); }
+
     protected void departSupply(UUID supplier) {
-        // Assign the same rear service site as before; only the departing builder drains
-        // its outstanding actions, in crewTravelSupply. Everyone else's native job stays live.
-        JsonObject planned = supplyAssignment(assignment, supplier, true, safeProgress());
+        int progress = safeProgress();
+        JsonObject planned = laneRestocking(assignment)
+            ? laneSupplyAssignment(assignment, supplier, progress) : supplyAssignment(assignment, supplier, true, progress);
         JsonObject departure = serviceChange("service-detach", supplier, Math.incrementExact(serviceRevision(assignment, supplier)));
         departure.add("site", suppliers(planned).get(supplier.toString()).deepCopy());
         broadcast(departure);
-        info("%s is leaving for supplies; remaining builders keep working and share the road.", memberName(supplier));
+        info("%s is resupplying independently; remaining builders share the road.", memberName(supplier));
+    }
+
+    public static boolean laneRestocking(JsonObject current) {
+        JsonObject layout = current.getAsJsonObject("layout");
+        return num(layout, "width") == 5 && (num(layout, "dx") == 0 || num(layout, "dz") == 0);
+    }
+
+    public static boolean laneSite(JsonObject site) { return site != null && site.has("lane") && site.get("lane").getAsBoolean(); }
+
+    public static JsonObject laneSupplyAssignment(JsonObject current, UUID worker, int progress) {
+        JsonObject next = supplyAssignment(current, worker, true, progress);
+        List<UUID> roster = preferredMembers(current);
+        int index = roster.indexOf(worker);
+        if (!laneRestocking(current) || index < 0) throw new IllegalArgumentException("Invalid lane supply worker");
+        JsonObject layout = current.getAsJsonObject("layout"), site = suppliers(next).getAsJsonObject(worker.toString());
+        int offset = 2 - (2 * index + 1) * 5 / (2 * roster.size());
+        site.addProperty("x", num(current, "x") + num(layout, "dx") * progress + num(layout, "dz") * offset);
+        site.addProperty("z", num(current, "z") + num(layout, "dz") * progress - num(layout, "dx") * offset);
+        site.addProperty("lane", true);
+        return next;
+    }
+
+    public static boolean validSupplySite(JsonObject current, JsonObject site) {
+        JsonObject layout = current.getAsJsonObject("layout");
+        long x = (long) num(site, "x") - num(current, "x"), z = (long) num(site, "z") - num(current, "z");
+        long row = x * num(layout, "dx") + z * num(layout, "dz"), lateral = x * num(layout, "dz") - z * num(layout, "dx");
+        return num(site, "y") == num(current, "y") && (laneSite(site)
+            ? laneRestocking(current) && Math.abs(lateral) <= 2 && row >= 0 && row < num(current, "length")
+            : lateral == 0 && row >= -90 && row <= num(current, "length") - (compactSite(site) ? SUPPLY_SPACING : 10));
     }
 
     protected void finishServiceRegroup() {
@@ -528,39 +781,80 @@ public abstract class HighwayCoordinator<P> {
     }
 
     protected void coordinateServiceReturn() {
+        for (UUID member : List.copyOf(pendingRejoins.keySet())) {
+            JsonObject report = currentReport(member);
+            if (report != null && serviceRevision(report, member) == serviceRevision(assignment, member)
+                && !detachedMembers(report).contains(member)) pendingRejoins.remove(member);
+            else if (ticks - pendingRejoins.get(member) >= 20) {
+                pendingRejoins.remove(member);
+                if (activeMembers().contains(member) && safeProgress() < num(assignment, "length")) {
+                    departSupply(member);
+                    warning("%s has not accepted its work assignment; keeping it detached while other builders continue.", memberName(member));
+                }
+            }
+        }
         for (UUID supplier : detachedMembers(assignment)) {
             coordinateServiceReturn(supplier);
             if (regrouping) return;
         }
     }
 
-    protected void coordinateServiceReturn(UUID supplier) {
-        if (!begun) return; // Finish an outbound/initial positioning handoff before merging into its running lanes.
-        if (resourceTransfer(supplier)) return;
+    protected String serviceReturnBlocker(UUID supplier) {
+        if (!begun) return "waiting for job to begin";
+        if (resourceTransfer(supplier)) return "inventory exchange active";
         JsonObject report = currentReport(supplier);
-        if (report != null && report.has("exchange") && num(report.getAsJsonObject("exchange"), "need") >= 0) return;
-        if (report == null || supplier.equals(supplyOwner) || !report.has("serviceReturning") || !report.get("serviceReturning").getAsBoolean()) return;
-        if (serviceRevision(report, supplier) != serviceRevision(assignment, supplier)) return;
-        P front = rowCenter(Math.max(startRow(), checkpointRow - 2));
-        boolean rendered = validRenderedReturn(assignment, supplier, report);
+        if (report == null) return "waiting for fresh worker report";
+        if (report.has("exchange") && num(report.getAsJsonObject("exchange"), "need") >= 0) return "worker requests resources";
+        if (!independentSupplies() && supplier.equals(supplyOwner)) return "worker holds supply reservation";
+        if (!TaskWire.flag(report, "serviceReturning")) return "worker has not finished supplies";
+        if (serviceRevision(report, supplier) != serviceRevision(assignment, supplier))
+            return "service revision mismatch: worker=" + serviceRevision(report, supplier) + ", host=" + serviceRevision(assignment, supplier);
+        return "";
+    }
+
+    protected String serviceReturnGate(UUID supplier) {
+        if (stopped || phase.equals("paused")) return "host paused/disconnected";
+        if (regrouping || releasing) return "host changing/ending assignment";
+        String blocker = serviceReturnBlocker(supplier);
+        if (!blocker.isEmpty()) return blocker;
+        P front = rowCenter(serviceFrontRow(safeProgress(), num(assignment, "length")));
+        if (!hostReturnReady(assignment, supplier, currentReport(supplier), front)) return "waiting for worker landing/cleanup readiness";
+        return ticks < regroupRetryAfter ? "waiting for handoff retry" : "ready to restore duties";
+    }
+
+    protected void coordinateServiceReturn(UUID supplier) {
+        JsonObject report = currentReport(supplier);
+        P front = rowCenter(serviceFrontRow(safeProgress(), num(assignment, "length")));
+        if (checkpointRow == num(assignment, "length")
+            && activeMembers().stream().allMatch(id -> currentReport(id) != null && "complete".equals(str(currentReport(id), "phase")))) {
+            sendMember(supplier, jobMessage("service-complete"));
+            return;
+        }
+        boolean currentReturn = report != null && TaskWire.flag(report, "serviceReturning")
+            && serviceRevision(report, supplier) == serviceRevision(assignment, supplier);
+        boolean rendered = currentReturn && validRenderedReturn(assignment, supplier, report);
         // Outside entity-tracking range (or with every worker resupplying), keep a
-        // coarse approach point fresh. A visible crew is followed locally every tick.
-        if (!rendered && ticks % 20 == 0) {
+        // coarse approach point fresh. Navigation cannot wait on inventory exchange;
+        // only restoring the worker's lane remains gated below.
+        if (currentReturn && needsServiceFront(rendered, !activeMembers().isEmpty()) && ticks % 20 == 0) {
             JsonObject update = jobMessage("service-front"); update.addProperty("x", x(front)); update.addProperty("y", y(front)); update.addProperty("z", z(front));
+            update.addProperty("serviceRevision", serviceRevision(assignment, supplier));
             sendMember(supplier, update);
         }
+        if (!serviceReturnBlocker(supplier).isEmpty()) return;
         // Readiness refers to the worker's live entity destination, not an old host
         // checkpoint. The worker has landed and settled recovery before setting it.
         if (!hostReturnReady(assignment, supplier, report, front)) return;
-        if (checkpointRow == num(assignment, "length")) {
-            if (activeMembers().stream().allMatch(id -> currentReport(id) != null && "complete".equals(str(currentReport(id), "phase"))))
-                sendMember(supplier, jobMessage("service-complete"));
-            return;
-        }
+        if (checkpointRow == num(assignment, "length")) return;
         if (ticks < regroupRetryAfter) return;
         JsonObject join = serviceChange("service-join", supplier, Math.incrementExact(serviceRevision(assignment, supplier)));
         broadcast(join);
+        if (independentSupplies() && !detachedMembers(assignment).contains(supplier)) pendingRejoins.put(supplier, ticks);
         info("%s is merging into the moving crew; existing builders keep working.", memberName(supplier));
+    }
+
+    public static boolean needsServiceFront(boolean renderedCrew, boolean hasActiveBuilder) {
+        return !renderedCrew || !hasActiveBuilder;
     }
 
     public static JsonObject joinedSupplyAssignment(JsonObject current, UUID supplier) {
@@ -581,7 +875,9 @@ public abstract class HighwayCoordinator<P> {
                 if (!participants.containsKey(supplier)) continue; // A borrowed worker belongs to another execution for now.
                 if (serviceRevision(report, supplier) >= entry.getValue().getAsInt()) continue;
                 boolean detached = detachedMembers(assignment).contains(supplier);
-                JsonObject update = serviceChange(detached ? "service-detach" : "service-join", supplier, entry.getValue().getAsInt());
+                boolean away = awayMembers(assignment).has(supplier.toString());
+                JsonObject update = serviceChange(away ? "service-away" : detached ? "service-detach" : "service-back", supplier, entry.getValue().getAsInt());
+                if (away) update.add("armed", awayMembers(assignment).get(supplier.toString()).deepCopy());
                 if (detached) update.add("site", suppliers(assignment).get(supplier.toString()).deepCopy());
                 sendMember(member, update);
             }
@@ -617,13 +913,18 @@ public abstract class HighwayCoordinator<P> {
         if (str(update, "type").equals("service-detach")) {
             if (awayMembers(current).has(supplier.toString())) throw new IllegalArgumentException("Off-duty worker cannot depart for supplies");
             JsonObject site = update.getAsJsonObject("site"), layout = current.getAsJsonObject("layout");
-            long x = (long) num(site, "x") - num(current, "x"), z = (long) num(site, "z") - num(current, "z");
-            long row = x * num(layout, "dx") + z * num(layout, "dz");
-            if (num(site, "y") != num(current, "y") || x * num(layout, "dz") - z * num(layout, "dx") != 0
-                || row < -90 || row > num(current, "length") - (compactSite(site) ? SUPPLY_SPACING : 10))
+            if (!validSupplySite(current, site))
                 throw new IllegalArgumentException("Invalid rear supply site");
             runners.add(supplier.toString(), site.deepCopy());
         } else if (str(update, "type").equals("service-join")) runners.remove(supplier.toString());
+        else if (str(update, "type").equals("service-away")) {
+            if (runners.has(supplier.toString())) throw new IllegalArgumentException("Recover supplies before going off duty");
+            if (!update.has("armed") || !update.getAsJsonPrimitive("armed").isBoolean()) throw new IllegalArgumentException("Invalid return detection state");
+            JsonObject away = awayMembers(next).deepCopy(); away.add(supplier.toString(), update.get("armed").deepCopy()); next.add("awayMembers", away);
+        } else if (str(update, "type").equals("service-back")) {
+            JsonObject away = awayMembers(next).deepCopy(); away.remove(supplier.toString()); next.add("awayMembers", away);
+            runners.remove(supplier.toString()); // Reconciles a lost supply-return update too.
+        }
         else throw new IllegalArgumentException("Invalid supply update type");
         next.add("suppliers", runners); next.remove("detachedMember");
         next.add("activeMembers", JSON.toJsonTree(roster.stream().filter(id -> !runners.has(id.toString()) && !awayMembers(next).has(id.toString())).map(UUID::toString).toList()));
@@ -633,6 +934,7 @@ public abstract class HighwayCoordinator<P> {
     }
 
     protected void sendMember(UUID member, JsonObject message) {
+        traceCommand(member.toString(), message);
         SwarmConnection connection = participants.get(member);
         if (connection == null) apply(message); else connection.send(JSON.toJson(message));
     }
@@ -695,6 +997,7 @@ public abstract class HighwayCoordinator<P> {
             case "request" -> {
                 if (regrouping) return;
                 if (!serviceRequestCurrent(assignment, sender, m)) return;
+                if (independentSupplies() && !TaskWire.flag(m, "detach")) return;
                 if (supplyOwner != null && supplyOwner.equals(sender) && !(m.has("detach") && m.get("detach").getAsBoolean() && activeMembers().contains(sender))) return;
                 if (m.has("detach") && m.get("detach").getAsBoolean()) requested.put(sender, m.deepCopy());
                 else requested.putIfAbsent(sender, m.deepCopy());
@@ -752,7 +1055,8 @@ public abstract class HighwayCoordinator<P> {
         }
         Set<UUID> detached = detachedMembers(record);
         for (UUID supplier : detached) if (!expected.remove(supplier)) throw new IllegalArgumentException("Invalid detached supply membership");
-        if (expected.isEmpty() && detached.isEmpty() || !expected.equals(new LinkedHashSet<>(activeMembers(record)))) throw new IllegalArgumentException("Missing or overlapping active worker duties");
+        if (expected.isEmpty() && detached.isEmpty() && !TaskWire.flag(record, "independentSupplies")
+            || !expected.equals(new LinkedHashSet<>(activeMembers(record)))) throw new IllegalArgumentException("Missing or overlapping active worker duties");
     }
 
     public static void normalizeWorkflows(JsonObject record, Set<UUID> roster) {
@@ -769,20 +1073,33 @@ public abstract class HighwayCoordinator<P> {
     }
 
     protected boolean coordinateWindow() {
+        windowDecisionAt = System.nanoTime(); windowDecision = "evaluating reports";
         int length = num(assignment, "length");
-        if (activeMembers().isEmpty()) return true; // Everyone is supplying; retain the checkpoint until the first return.
+        if (activeMembers().isEmpty()) { windowDecision = "no active builders; all detached or away"; return true; }
         Map<UUID, JsonObject> current = new LinkedHashMap<>();
         for (UUID id : activeMembers()) {
             JsonObject report = currentReport(id);
+            if (independentSupplies() && pendingRejoins.containsKey(id)
+                && (report == null || serviceRevision(report, id) != serviceRevision(assignment, id) || detachedMembers(report).contains(id))) continue;
             // Missing telemetry expires outstanding permits; it is not treated as a worker at row zero.
-            if (report == null || !report.has("currentRow") || str(assignment, "scope").isEmpty() || !str(assignment, "scope").equals(str(report, "scope"))) return false;
+            if (report == null || !report.has("currentRow") || str(assignment, "scope").isEmpty() || !str(assignment, "scope").equals(str(report, "scope"))) {
+                windowDecision = "missing/stale/wrong-scope report: " + id; return false;
+            }
             int row = num(report, "currentRow");
             if (row < startRow() || row > length) throw new IllegalStateException("Worker reported progress outside the assigned job");
             current.put(id, report);
         }
+        if (current.isEmpty()) { windowDecision = "waiting for a returning builder's assignment receipt"; return true; }
         int minimum = slowestRow(length, current.values().stream().mapToInt(r -> num(r, "currentRow")).toArray());
-        boolean shared = workSharing(assignment.getAsJsonObject("layout")) == WorkSharing.BreakOrder;
-        int limit = leadLimit(length, minimum, workSharing(assignment.getAsJsonObject("layout")));
+        UUID trailAuditor = current.entrySet().stream().min(Comparator.comparingInt(entry -> num(entry.getValue(), "currentRow"))).orElseThrow().getKey();
+        WorkSharing sharing = workSharing(assignment.getAsJsonObject("layout"));
+        boolean shared = sharing == WorkSharing.BreakOrder;
+        int renderDistance = shared ? 0 : current.values().stream()
+            .filter(report -> report.has("renderDistance"))
+            .mapToInt(report -> num(report, "renderDistance"))
+            .filter(distance -> distance >= 2 && distance <= 64)
+            .min().orElse(0);
+        int limit = leadLimit(length, minimum, sharing, renderDistance);
         JsonObject sharedMining = new JsonObject();
         if (shared) {
             Map<UUID, List<P>> targets = new LinkedHashMap<>();
@@ -796,7 +1113,9 @@ public abstract class HighwayCoordinator<P> {
         // Only active builders bound the window. A stalled supply return must not freeze
         // the crew that already took over all of its duties.
         boolean hostAuthority = hostAuthority();
-        if (hostAuthority && (!localParticipant || !worldAvailable() || !scope().equals(str(assignment, "scope")))) return false;
+        if (hostAuthority && (!localParticipant || !worldAvailable() || !scope().equals(str(assignment, "scope")))) {
+            windowDecision = "participating host world unavailable"; return false;
+        }
         // All world reads stay on the client thread. Shared results bound host verification to five
         // forward rows plus the slowest member's current row, irrespective of the crew size.
         Map<Integer, Boolean> hostResolved = new HashMap<>();
@@ -808,17 +1127,21 @@ public abstract class HighwayCoordinator<P> {
         Map<UUID, RowVerification.Progress> progress = new LinkedHashMap<>();
         current.forEach((id, report) -> progress.put(id, RowVerification.Progress.fromReport(report)));
         checkpointRow = RowVerification.checkpoint(hostAuthority, startRow(), checkpointRow, minimum, worldRows, progress.values());
+        windowDecision = "sending verification windows";
         for (var member : current.entrySet()) {
             JsonObject report = member.getValue();
             // A reconnect may still be applying a lane update. Keep its existing permit
             // until the roster receipt arrives; never send unknown Break Order owners.
-            if (report.has("suppliers") && !report.getAsJsonObject("suppliers").keySet().equals(suppliers(assignment).keySet())) continue;
-            if (report.has("serviceRevisions") && !serviceRevisions(report).equals(serviceRevisions(assignment))) continue;
+            if (report.has("suppliers") && !report.getAsJsonObject("suppliers").keySet().equals(suppliers(assignment).keySet())) { windowDecision = "awaiting supplier roster ACK: " + member.getKey(); continue; }
+            if (report.has("serviceRevisions") && !serviceRevisions(report).equals(serviceRevisions(assignment))) { windowDecision = "awaiting service revision ACK: " + member.getKey(); continue; }
             int base = num(report, "currentRow") + 1;
             int mask = RowVerification.mask(hostAuthority, base, limit, worldRows, progress.get(member.getKey()));
             JsonObject permit = jobMessage("window");
             permit.addProperty("base", base); permit.addProperty("mask", mask); permit.addProperty("limit", limit);
             permit.addProperty("checkpoint", checkpointRow);
+            permit.addProperty("trailAuditor", member.getKey().equals(trailAuditor));
+            JsonObject diagnosticPermit = permit.deepCopy(); diagnosticPermit.addProperty("sentAt", System.currentTimeMillis());
+            diagnosticPermits.keySet().retainAll(participants.keySet()); diagnosticPermits.put(member.getKey(), diagnosticPermit);
             if (shared) permit.add("mining", sharedMining);
             SwarmConnection connection = participants.get(member.getKey());
             if (connection == null) apply(permit); else connection.send(JSON.toJson(permit));
@@ -828,6 +1151,13 @@ public abstract class HighwayCoordinator<P> {
     public static void applyWorkflowDuties(JsonObject value, Set<UUID> roster) {
         JsonObject main = BotWorkflows.checkedPlan(value.getAsJsonObject("workflow"));
         String required = main.get("duty").getAsString(); BotWorkflows.operation(main);
+        // An independent crew may temporarily have everyone away or resupplying.
+        // Validate that absence, rather than rejecting the restore needed to rejoin.
+        if (roster.isEmpty() && TaskWire.flag(value, "independentSupplies") && activeMembers(value).isEmpty()) {
+            Set<UUID> members = new LinkedHashSet<>();
+            value.getAsJsonArray("members").forEach(id -> members.add(UUID.fromString(id.getAsString())));
+            if (!members.isEmpty()) { validateActiveMembers(value, members); return; }
+        }
         JsonObject plans = value.has("memberWorkflows") ? value.getAsJsonObject("memberWorkflows") : new JsonObject(), duties = new JsonObject();
         boolean excavates = false, paves = false;
         for (UUID member : roster) {
@@ -895,7 +1225,7 @@ public abstract class HighwayCoordinator<P> {
     }
     private boolean hostReturnReady(JsonObject a,UUID supplier,JsonObject r,P fallback) {
         if(!r.has("serviceReady") || !r.get("serviceReady").getAsBoolean()) return false;
-        return validRenderedReturn(a,supplier,r) || activeMembers(a).isEmpty() && r.has("x") && r.has("y") && r.has("z") && num(r,"y")==y(fallback) && distance(fallback,point(num(r,"x"),num(r,"y"),num(r,"z")))<=4;
+        return validRenderedReturn(a,supplier,r) || r.has("x") && r.has("y") && r.has("z") && num(r,"y")==y(fallback) && distance(fallback,point(num(r,"x"),num(r,"y"),num(r,"z")))<=4;
     }
 
     protected final ResourceExchange resourceExchange = new ResourceExchange();
@@ -910,6 +1240,7 @@ public abstract class HighwayCoordinator<P> {
     protected final class ResourceExchange {
         public JsonObject hostOffer;
         private int hostSince, nextRequest;
+        private final Map<UUID, Integer> unavailableUntil = new HashMap<>();
         public boolean inTransfer(UUID member) {
             return hostOffer != null && (str(hostOffer, "donor").equals(member.toString()) || str(hostOffer, "recipient").equals(member.toString()));
         }
@@ -919,6 +1250,7 @@ public abstract class HighwayCoordinator<P> {
                 if (r == null || !r.has("exchange") || !r.has("inventory")) return null;
                 JsonObject inventory = r.getAsJsonObject("inventory"), exchange = r.getAsJsonObject("exchange");
                 if (ResourceLedger.integer(inventory, "version") != 1 || !inventory.getAsJsonPrimitive("busy").isBoolean()
+                    || inventory.has("echestKnown") && !inventory.getAsJsonPrimitive("echestKnown").isBoolean()
                     || !inventory.getAsJsonPrimitive("idle").isBoolean() || num(exchange, "need") < -1 || num(exchange, "need") >= ResourceLedger.RESOURCES) return null;
                 for (String tier : List.of("loose", "shulkers", "echest", "reserve", "target"))
                     for (int resource = 0; resource < ResourceLedger.RESOURCES; resource++) ResourceLedger.value(inventory, tier, resource);
@@ -938,51 +1270,95 @@ public abstract class HighwayCoordinator<P> {
                 if (ticks < nextRequest) return;
                 for (UUID recipient : participants.keySet()) {
                     JsonObject r = worker(recipient);
-                    if (r == null || awayMembers(assignment).has(recipient.toString()) || recipient.equals(supplyOwner)) continue;
+                    if (r == null || !r.has("sharedSupplyProtocol") || num(r,"sharedSupplyProtocol") != 1
+                        || awayMembers(assignment).has(recipient.toString()) || recipient.equals(supplyOwner)) continue;
                     int resource = ResourceLedger.integer(r.getAsJsonObject("exchange"), "need");
                     if (resource < 0 || resource >= ResourceLedger.RESOURCES || !detachedMembers(assignment).contains(recipient)) continue;
-                    UUID donor = null; int most = 0;
+                    UUID donor = null; int most = 0; boolean possible = false;
                     for (UUID candidate : participants.keySet()) {
                         JsonObject d = worker(candidate);
-                        if (candidate.equals(recipient) || d == null || candidate.equals(supplyOwner) || awayMembers(assignment).has(candidate.toString())
+                        JsonObject observation=currentReport(candidate);
+                        if(observation!=null&&str(observation,"phase").equals("failed"))continue;
+                        if (!candidate.equals(recipient) && !awayMembers(assignment).has(candidate.toString())) {
+                            if (d == null && participants.get(candidate) != null && participants.get(candidate).connected()) possible = true;
+                            else if (d != null && num(d.getAsJsonObject("exchange"),"need") != resource && ResourceLedger.possibleDonor(d.getAsJsonObject("inventory"),resource)) possible = true;
+                        }
+                        if (candidate.equals(recipient) || d == null || !d.has("sharedSupplyProtocol") || num(d,"sharedSupplyProtocol") != 1
+                            || candidate.equals(supplyOwner) || awayMembers(assignment).has(candidate.toString())
+                            || ticks < unavailableUntil.getOrDefault(candidate, 0)
                             || !canDetach(candidate) && !detachedMembers(assignment).contains(candidate)
                             || !Set.of("building", "resupplying", "returning from supplies").contains(str(d, "phase"))
                             || !Set.of("idle", "complete", "cancelled").contains(str(d.getAsJsonObject("exchange"), "stage"))
                             || num(d.getAsJsonObject("exchange"), "need") == resource
                             || d.getAsJsonObject("inventory").get("busy").getAsBoolean()
                             || !d.getAsJsonObject("inventory").get("idle").getAsBoolean()) continue;
-                        int surplus = ResourceLedger.surplus(d.getAsJsonObject("inventory"), resource);
+                        int surplus = Math.max(0, ResourceLedger.available(d.getAsJsonObject("inventory"), resource) - ResourceLedger.value(d.getAsJsonObject("inventory"), "target", resource));
+                        if (surplus == 0 && ResourceLedger.possibleDonor(d.getAsJsonObject("inventory"),resource)) surplus = ResourceLedger.exchangeTarget(r.getAsJsonObject("inventory"),resource);
                         if (surplus > most) { most = surplus; donor = candidate; }
                     }
-                    if (donor == null) continue;
+                    if (donor == null) {
+                        if (!possible && r.has("resourceExhaustionProtocol") && num(r,"resourceExhaustionProtocol")==1) {
+                            if(!onResourceExhausted(recipient,resource)){JsonObject failure=jobMessage("resource-exhausted");failure.addProperty("resource",resource);sendMember(recipient,failure);}
+                        }
+                        continue;
+                    }
                     JsonObject ledger = r.getAsJsonObject("inventory");
-                    int amount = Math.min(most, Math.max(1, ResourceLedger.value(ledger, "target", resource) - ResourceLedger.value(ledger, "loose", resource)));
+                    int amount = Math.min(most, Math.max(1, ResourceLedger.exchangeTarget(ledger, resource) - ResourceLedger.value(ledger, "loose", resource)));
                     hostOffer = new JsonObject(); hostOffer.addProperty("id", UUID.randomUUID().toString());
+                    boolean startup = !TaskWire.flag(assignment, "initialStocked");
+                    hostOffer.addProperty("mode", startup ? "drop" : "shared");
                     hostOffer.addProperty("resource", resource); hostOffer.addProperty("donor", donor.toString()); hostOffer.addProperty("recipient", recipient.toString());
-                    hostOffer.addProperty("remaining", amount); hostOffer.addProperty("sequence", 0); hostOffer.addProperty("phase", "gather");
+                    hostOffer.addProperty("remaining", startup ? Math.max(1728, amount) : amount); hostOffer.addProperty("sequence", 0); hostOffer.addProperty("phase", startup ? "gather" : "shared");
                     JsonObject meeting = suppliers(assignment).getAsJsonObject(recipient.toString());
                     // Two actors use the already-verified rear highway, never the active excavation face.
                     hostOffer.addProperty("x", num(meeting,"x")); hostOffer.addProperty("y", num(meeting,"y")); hostOffer.addProperty("z", num(meeting,"z"));
                     hostSince = ticks; saveHost(); dispatch();
                     if (activeMembers().contains(donor)) departSupply(donor);
-                    info("Crew supplies: %s will give %s up to %d %s. Other builders continue.", memberName(donor), memberName(recipient), amount, ResourceLedger.name(resource));
+                    info("Crew supplies: %s is opening supplies for %s (%s).", memberName(donor), memberName(recipient), ResourceLedger.name(resource));
                     break;
                 }
                 return;
             }
             UUID donor = UUID.fromString(str(hostOffer, "donor")), recipient = UUID.fromString(str(hostOffer, "recipient"));
             JsonObject d = exchangeReport(donor), r = exchangeReport(recipient);
+            if (str(hostOffer, "phase").equals("shared")) {
+                if (r != null && str(r, "stage").equals("complete")) { finish("complete"); return; }
+                if (ticks - hostSince >= 600 || d != null && str(d, "stage").equals("failed")
+                    || r != null && str(r, "stage").equals("failed")) { finish("cancelled"); return; }
+                if (d != null && d.has("container")) {
+                    JsonObject site = d.getAsJsonObject("container");
+                    // The donor advertises only its currently placed shulker. Bound it to
+                    // the donor's observed position before forwarding it to the requester.
+                    JsonObject observation = currentReport(donor);
+                    if (observation != null && Math.abs((long) num(site,"x") - num(observation,"x")) <= 12
+                        && Math.abs((long) num(site,"z") - num(observation,"z")) <= 12
+                        && num(site,"y") == num(assignment,"y")) hostOffer.add("container", site.deepCopy());
+                } else hostOffer.remove("container");
+                dispatch(); return;
+            }
+            // A worker cannot acknowledge cancellation as safe after its drop was issued.
+            // Agree on the preserved uncertain outcome so terminal delivery can finish.
+            if (str(hostOffer, "phase").equals("cancelled")
+                && (d != null && str(d, "stage").equals("uncertain") || r != null && str(r, "stage").equals("uncertain"))) {
+                finish("uncertain"); return;
+            }
             boolean terminal = Set.of("complete", "cancelled", "uncertain").contains(str(hostOffer, "phase"));
             if (!terminal && (d != null && Set.of("failed", "uncertain").contains(str(d, "stage")) || r != null && Set.of("failed", "uncertain").contains(str(r, "stage")))) {
                 finish("uncertain".equals(d == null ? "" : str(d, "stage")) || "uncertain".equals(r == null ? "" : str(r, "stage")) ? "uncertain" : "cancelled"); return;
             }
-            if (!terminal && ticks - hostSince > 1200) { finish(str(hostOffer, "phase").equals("drop") ? "uncertain" : "cancelled"); return; }
+            if (!terminal && ticks - hostSince > 1200) {
+                if (!str(hostOffer, "phase").equals("drop")) { finish("cancelled"); return; }
+                // Re-deliver the SAME intent. Workers retry pickup/server sync; an issued drop is never replayed.
+                hostSince = ticks;
+                info("Crew transfer is retrying pickup/confirmation of the existing drop at %s, %s, %s.", str(hostOffer, "x"), str(hostOffer, "y"), str(hostOffer, "z"));
+            }
             switch (str(hostOffer, "phase")) {
                 case "gather" -> {
                     if (d != null && d.has("proposal") && r != null && str(r, "stage").equals("meeting")) {
                         JsonObject proposal = d.getAsJsonObject("proposal");
                         int count = ResourceLedger.integer(proposal, "count");
-                        if (count < 1 || count > Math.min(99, num(hostOffer, "remaining")) || proposal.toString().length() > 32768) { finish("cancelled"); return; }
+                        int units = proposal.has("units") ? ResourceLedger.integer(proposal, "units") : count;
+                        if (count < 1 || count > 99 || units < count || units > num(hostOffer, "remaining") || proposal.toString().length() > 32768) { finish("cancelled"); return; }
                         hostOffer.add("proposal", proposal.deepCopy()); hostOffer.addProperty("phase", "prepare"); hostSince = ticks; saveHost();
                     }
                 }
@@ -993,7 +1369,8 @@ public abstract class HighwayCoordinator<P> {
                 }
                 case "drop" -> {
                     if (d != null && r != null && ResourceLedger.transferConfirmed(str(d, "stage"), str(r, "stage"))) {
-                        int remaining = num(hostOffer, "remaining") - num(hostOffer.getAsJsonObject("proposal"), "count");
+                        JsonObject proposal = hostOffer.getAsJsonObject("proposal");
+                        int remaining = num(hostOffer, "remaining") - (proposal.has("units") ? num(proposal, "units") : num(proposal, "count"));
                         if (remaining <= 0) { finish("complete"); return; }
                         hostOffer.addProperty("remaining", remaining); hostOffer.addProperty("sequence", num(hostOffer, "sequence") + 1);
                         hostOffer.remove("proposal"); hostOffer.addProperty("phase", "gather"); hostSince = ticks; saveHost();
@@ -1002,7 +1379,9 @@ public abstract class HighwayCoordinator<P> {
                 case "complete", "cancelled", "uncertain" -> {
                     boolean done = d != null && str(d, "stage").equals(str(hostOffer, "phase")) && r != null && str(r, "stage").equals(str(hostOffer, "phase"));
                     // Keep replaying the terminal instruction until both parties acknowledge it, including reconnects.
-                    if (done) { hostOffer = null; assignment.remove("resourceExchange"); persist(); nextRequest = ticks + 100; return; }
+                    if (done || str(hostOffer,"mode").equals("shared") && ticks - hostSince >= 40) {
+                        hostOffer = null; assignment.remove("resourceExchange"); persist(); nextRequest = ticks + 20; return;
+                    }
                 }
             }
             dispatch();
@@ -1014,9 +1393,14 @@ public abstract class HighwayCoordinator<P> {
         }
         public void finish(String phase) {
             hostOffer.addProperty("phase", phase); hostSince = ticks; saveHost(); dispatch();
-            if (!phase.equals("complete")) warning("Crew transfer %s at %s, %s, %s. Any unconfirmed drop is not repeated; inspect the participants in Bots.", phase, str(hostOffer, "x"), str(hostOffer, "y"), str(hostOffer, "z"));
+            if (!phase.equals("complete") && str(hostOffer,"mode").equals("shared")) {
+                unavailableUntil.put(UUID.fromString(str(hostOffer,"donor")), ticks + 100);
+                info("Shared supply attempt ended; checking other currently available sources.");
+            } else if (!phase.equals("complete")) warning("Crew transfer %s at %s, %s, %s. Any unconfirmed drop is not repeated; inspect the participants in Workers.", phase, str(hostOffer, "x"), str(hostOffer, "y"), str(hostOffer, "z"));
         }
     }
+    /** External hosts may replace terminal exhaustion with a higher-priority stash workflow. */
+    protected boolean onResourceExhausted(UUID worker,int resource){return false;}
     public SwarmConnection connectionForWorker(UUID id) { return peers.entrySet().stream().filter(e -> e.getKey().connected() && id.toString().equals(str(e.getValue(), "id"))).map(Map.Entry::getKey).findFirst().orElse(null); }
 
     protected boolean allMembersConnected() {
@@ -1169,7 +1553,7 @@ public abstract class HighwayCoordinator<P> {
     }
 
     public void endJob() {
-        if (!isHost()) throw new IllegalStateException("Only the host can End a crew job. Use the host's Bots tab.");
+        if (!isHost()) throw new IllegalStateException("Only the host can End a crew job. Use the host's Workers tab.");
         JsonObject record = assigned() ? assignment : recoveryRecord();
         if (record == null && Files.exists(journal())) throw new IllegalStateException(recoveryError + ". The host cannot identify the other members; inspect the recovery file before clearing it manually.");
         checkpointJobs(); // Persist the final verified checkpoint before issuing irreversible execution cancellation.
@@ -1253,6 +1637,7 @@ public abstract class HighwayCoordinator<P> {
     public boolean tryResume() {
         if (!isHost() || !assigned() || releasing || phase.equals("complete") || !reconnectReady()) return false;
         for (var member : participants.entrySet()) if (member.getValue() != null) {
+            if (!resumeMemberRequired(independentSupplies(), activeMembers().contains(member.getKey()), member.getValue().connected())) continue;
             JsonObject report = currentReport(member.getKey());
             if (report == null || !str(assignment, "scope").equals(str(report, "scope")) || !TaskWire.flag(report, "reconnectReady")) return false;
         }
@@ -1260,9 +1645,13 @@ public abstract class HighwayCoordinator<P> {
         return true;
     }
 
+    public static boolean resumeMemberRequired(boolean independent, boolean active, boolean connected) {
+        return !independent || active && connected;
+    }
+
     protected boolean reconnectReady() {
         return assigned() && live() && scope().equals(str(assignment, "scope"))
-            && (!localParticipant || localReconnectReady()) && (!isHost() || allMembersConnected());
+            && (!localParticipant || localReconnectReady()) && (!isHost() || independentSupplies() || allMembersConnected());
     }
 
     public static boolean handoffExpired(int now, int started) { return now - started >= 600; }
@@ -1274,19 +1663,32 @@ public abstract class HighwayCoordinator<P> {
         if (hasPendingEnds(selected.keySet()))
             throw new IllegalStateException("A selected worker must acknowledge its previous job ending before joining this one");
         definition = definition.deepCopy();
+        for (var entry : selected.entrySet()) {
+            if (entry.getValue() == null) continue;
+            JsonObject hello = peers.get(entry.getValue());
+            if (hello == null || !hello.has("supplyProtocol") || num(hello, "supplyProtocol") != 2)
+                throw new IllegalStateException("Update all highway workers to Monocle 0.7.36 or newer for independent restocking");
+            if (!hello.has("initialStockProtocol") || num(hello, "initialStockProtocol") != 1)
+                throw new IllegalStateException("Update all highway workers for initial ender-chest stocking");
+        }
         normalizeWorkflows(definition, selected.keySet());
         String id = UUID.randomUUID().toString();
         int progress = definition.has("progress") ? num(definition,"progress") : 0;
         int sectionLength = num(definition,"length"); String name = str(definition,"name"); JsonObject layout = definition.getAsJsonObject("layout");
         localParticipant = includeHost;
-        participants.clear(); participants.putAll(selected); reports.clear();
+        participants.clear(); participants.putAll(selected); reports.clear(); supplyContainers = new JsonObject(); pendingRejoins.clear();
         generation = 0;
+        List<UUID> stockOwners = new ArrayList<>(participants.keySet());
+        UUID initialStockOwner = stockOwners.get(java.util.concurrent.ThreadLocalRandom.current().nextInt(stockOwners.size()));
         int index = 0;
         for (var member : participants.entrySet()) {
             var m = message("prepare");
             m.addProperty("job", id); m.addProperty("name", name); m.addProperty("scope", scope());
+            m.addProperty("independentSupplies", true);
+            m.add("workflowMembers", JSON.toJsonTree(participants.keySet().stream().filter(this::nativeReady).map(UUID::toString).toList()));
             m.addProperty("catalogId", str(definition, "id")); m.addProperty("generation", generation); m.addProperty("startRow", progress);
             m.addProperty("host", hostIdentity().toString()); m.addProperty("hostMember", includeHost ? me().toString() : "");
+            m.addProperty("initialStockOwner", initialStockOwner.toString());
             m.addProperty("x", x(origin));
             m.addProperty("y", y(origin));
             m.addProperty("z", z(origin));
@@ -1324,10 +1726,14 @@ public abstract class HighwayCoordinator<P> {
         if (!assigned() || !matchesGeneration(job, generation, m)) return;
         String type = str(m, "type");
         switch (type) {
-            case "service-detach", "service-join" -> {
+            case "supply-containers" -> {
+                JsonObject next = m.getAsJsonObject("containers");
+                if (!next.equals(supplyContainers)) { supplyContainers = next.deepCopy(); persist(); }
+            }
+            case "service-detach", "service-join", "service-away", "service-back" -> {
                 if (stopped || releasing || regrouping || phase.equals("paused")) return;
                 UUID supplier = UUID.fromString(str(m, "supplier"));
-                if (type.equals("service-join") && supplier.equals(supplyOwner)) return;
+                if ((type.equals("service-join") || type.equals("service-back") || type.equals("service-away")) && supplier.equals(supplyOwner)) return;
                 JsonObject next = serviceUpdateAssignment(assignment, m);
                 if (next == assignment) return;
                 assignment = next; requested.remove(supplier); workChanged(); persist();
@@ -1335,6 +1741,8 @@ public abstract class HighwayCoordinator<P> {
             case "begin" -> {
                 if (releasing || begun || stopped || ticks < nextStartAttempt) return;
                 begun = true; phase = assignment.has("keepPaused") && assignment.get("keepPaused").getAsBoolean() ? "paused" : "building";
+                // Startup storage is an optimization, never a reason to hold a highway crew.
+                initialStockDeadline = ticks + 80;
             }
             case "regroup" -> {
                 if (releasing && !TaskWire.flag(m, "releasing")) return;
@@ -1412,7 +1820,19 @@ public abstract class HighwayCoordinator<P> {
     protected void hostConnectionMaintenance() {
         if (!isHost() || !assigned()) return;
         if (ticks % 20 == 0) restoreWorkers();
-        if (!stopped) for (var c : participants.values()) if (c != null && !c.connected()) { broadcast(jobMessage("lost")); break; }
+        if (!stopped && begun) coordinateAvailability();
+        if (!stopped && !independentSupplies()) for (UUID id : activeMembers()) {
+            var c = participants.get(id);
+            if (c != null && !c.connected()) { broadcast(jobMessage("lost")); break; }
+        }
+        if (independentSupplies() && !stopped && begun && !phase.equals("paused") && !releasing && ticks % 10 == 0) {
+            for (UUID id : participants.keySet()) {
+                JsonObject report = currentReport(id);
+                if (report != null && str(assignment, "scope").equals(str(report, "scope"))
+                    && TaskWire.flag(report, "connectionStopped") && TaskWire.flag(report, "reconnectReady")
+                    && !TaskWire.flag(report, "pausedBeforeDisconnect") && workflowReady(id)) sendMember(id, jobMessage("resume"));
+            }
+        }
         if (stopped && !pausedBeforeDisconnect && ticks % 10 == 0 && reconnectReady()
             && participants.keySet().stream().allMatch(id -> {
                 JsonObject r = currentReport(id);
@@ -1425,13 +1845,15 @@ public abstract class HighwayCoordinator<P> {
             for (UUID id : participants.keySet()) if (currentReport(id) != null) sendMember(id, jobMessage("nudge"));
     }
     protected void hostCoordinate(boolean changed) {
-        if (isHost() && assigned() && !stopped && regrouping && !releasing && !phase.equals("paused") && handoffExpired(ticks, regroupStarted)) {
-            broadcast(jobMessage("regroupCancel")); joiningWorker = detachingWorker = null; rejoiningSupply = false; borrowingWorkers.clear();
-            regroupRetryAfter = ticks + 400;
-            warning("Lane handoff timed out; keeping existing duties and supply ownership. Work continues before another handoff attempt.");
-        }
-        coordinate(changed);
-        if (isHost() && assigned() && !stopped && !regrouping && !releasing && !phase.equals("paused") && begun) resourceExchange.coordinate();
+        try {
+            if (isHost() && assigned() && !stopped && regrouping && !releasing && !phase.equals("paused") && handoffExpired(ticks, regroupStarted)) {
+                broadcast(jobMessage("regroupCancel")); joiningWorker = detachingWorker = null; rejoiningSupply = false; borrowingWorkers.clear();
+                regroupRetryAfter = ticks + 400;
+                warning("Lane handoff timed out; keeping existing duties and supply ownership. Work continues before another handoff attempt.");
+            }
+            coordinate(changed);
+            if (isHost() && assigned() && !stopped && !regrouping && !releasing && !phase.equals("paused") && begun) resourceExchange.coordinate();
+        } finally { recordTelemetry(); }
     }
 
     protected boolean endingsLoaded;

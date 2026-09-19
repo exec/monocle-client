@@ -108,13 +108,13 @@ public final class QueuePolicy {
         if (!tpa.has("acknowledgedAt") || flag(tpa, "recovered") || flag(tpa, "accepted")) return false;
         long acknowledged = tpa.get("acknowledgedAt").getAsLong();
         if (now < acknowledged) return false;
-        var value = tpa.getAsJsonPrimitive("warmup");
-        if (value == null || !value.isNumber()) throw new IllegalArgumentException("Missing integer: warmup");
-        int warmup;
-        try { warmup = value.getAsBigDecimal().intValueExact(); }
-        catch (ArithmeticException e) { throw new IllegalArgumentException("Invalid integer: warmup", e); }
-        if (warmup < 0 || warmup > 72_000) throw new IllegalArgumentException("Out of range: warmup");
-        return now - acknowledged >= warmup * 50L;
+        var value = tpa.getAsJsonPrimitive("acceptDelay");
+        if (value == null || !value.isNumber()) throw new IllegalArgumentException("Missing integer: acceptDelay");
+        int delay;
+        try { delay = value.getAsBigDecimal().intValueExact(); }
+        catch (ArithmeticException e) { throw new IllegalArgumentException("Invalid integer: acceptDelay", e); }
+        if (delay < 0 || delay > 200) throw new IllegalArgumentException("Out of range: acceptDelay");
+        return now - acknowledged >= delay * 50L;
     }
     private static JsonObject run(JsonObject task, UUID worker) { return task.getAsJsonObject("runs").getAsJsonObject(worker.toString()); }
     private static boolean flag(JsonObject value, String key) { return value.has(key) && value.get(key).getAsBoolean(); }

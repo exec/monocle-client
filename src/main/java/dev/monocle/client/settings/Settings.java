@@ -76,6 +76,10 @@ public class Settings implements ISerializable<Settings>, Iterable<SettingGroup>
             if (sg.name.equals(name)) return sg;
         }
 
+        // Preserve settings written before the Bots UI was renamed to Workers.
+        if (name.equals("Bots")) return getGroup("Workers");
+        if (name.startsWith("Bots · ")) return getGroup("Workers · " + name.substring(7));
+
         return null;
     }
 

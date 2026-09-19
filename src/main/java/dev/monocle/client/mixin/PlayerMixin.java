@@ -14,6 +14,7 @@ import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.movement.Flight;
 import dev.monocle.client.systems.modules.movement.NoSlow;
 import dev.monocle.client.systems.modules.movement.Sprint;
+import dev.monocle.client.systems.modules.player.AirMine;
 import dev.monocle.client.systems.modules.player.Reach;
 import dev.monocle.client.systems.modules.player.SpeedMine;
 import dev.monocle.client.utils.world.BlockUtils;
@@ -75,8 +76,10 @@ public abstract class PlayerMixin extends LivingEntity {
         if (!level().isClientSide()) return breakSpeed;
 
         SpeedMine speedMine = Modules.get().get(SpeedMine.class);
-        if (!speedMine.isActive() || speedMine.mode.get() != SpeedMine.Mode.Normal || !speedMine.filter(state.getBlock()))
-            return breakSpeed;
+        AirMine airMine = Modules.get().get(AirMine.class);
+        if (airMine.isActive() && airMine.liftsAirPenalty() && (Player) (Object) this == mc.player) breakSpeed *= 5.0f;
+
+        if (!speedMine.isActive() || speedMine.mode.get() != SpeedMine.Mode.Normal || !speedMine.filter(state.getBlock())) return breakSpeed;
 
         float breakSpeedMod = (float) (breakSpeed * speedMine.modifier.get());
 

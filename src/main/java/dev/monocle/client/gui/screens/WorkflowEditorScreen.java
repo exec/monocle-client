@@ -108,7 +108,7 @@ public final class WorkflowEditorScreen extends WindowScreen {
                 remove.action = () -> perform(() -> { writable(); bots.workflows().delete(id); discardRequested = true; }, "Custom workflow deleted.");
             }
         }
-        add(theme.button("Back to Bots")).expandX().widget().action = this::onClose;
+        add(theme.button("Back to Workers")).expandX().widget().action = this::onClose;
     }
 
     private void programEditor() {

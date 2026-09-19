@@ -88,6 +88,15 @@ public final class BotScheduler {
     public boolean hasWork() { if (bots.mode.get() == Bots.Mode.Worker) return runtime.hasWork(); load(); return !returns.isEmpty() || tasks.values().stream().anyMatch(t -> !terminal(text(t, "status"))); }
     public boolean usesCrew(String crew) { load(); return tasks.entrySet().stream().anyMatch(e -> !deletable(e.getKey(), e.getValue()) && crew.equals(text(e.getValue(), "crew"))) || returns.values().stream().anyMatch(r -> crew.equals(text(r, "crew"))); }
     public boolean workerBusy() { return runtime.ownsControls(); }
+    public JsonArray stashDiagnostics(UUID taskId) {
+        JsonArray result=new JsonArray();if(bots.mode.get()!=Bots.Mode.Host)return result;load();JsonObject t=tasks.get(taskId);if(t==null)return result;
+        for(var entry:t.getAsJsonObject("runs").entrySet()){
+            JsonObject r=entry.getValue().getAsJsonObject();if(!r.has("stashScan"))continue;
+            JsonObject d=r.getAsJsonObject("stashScan").deepCopy();d.addProperty("worker",entry.getKey());d.addProperty("status",text(r,"status"));d.addProperty("detail",text(r,"detail"));
+            if(r.has("stashEvents"))d.add("events",r.get("stashEvents").deepCopy());result.add(d);
+        }
+        return result;
+    }
     public boolean allowsNative() { return runtime.allowsNative(); }
     public boolean reserves(UUID worker) { load(); return teleportPinned(worker) || returns.containsKey(worker) || tasks.values().stream().anyMatch(t -> t.getAsJsonObject("runs").has(worker.toString()) && (!terminal(text(t, "status")) || !terminal(text(run(t, worker), "status")))); }
     public List<TaskView> list() {
@@ -99,6 +108,7 @@ public final class BotScheduler {
         return new TaskView(id, text(t, "name"), text(t, "workflowName"), text(t, "crew"), workers(t), text(t, "status"), text(t, "detail"), t.get("priority").getAsInt(), Map.copyOf(overrides), terminal(text(t, "status")));
     }
     public UUID create(String name, String workflowId, String crewId, Set<UUID> targets, JsonObject args, int priority, Map<UUID, Integer> overrides) {
+        if (workflowId.startsWith("package:")) return createPackage(name, workflowId.substring(8), crewId, targets, args, priority, overrides);
         hostOnly(); load();
         if (!bots.isHost() || !Utils.canUpdate()) throw new IllegalStateException("Start the host in a world before queuing work");
         if (targets.isEmpty() || targets.size() > 16 || targets.contains(mc.player.getUUID()) || !targets.containsAll(overrides.keySet())) throw new IllegalArgumentException("Choose 1–16 remote workers in this crew (native highways still allow at most 5)");
@@ -112,7 +122,7 @@ public final class BotScheduler {
             packaged.getAsJsonObject("profiles").add(profile, BotProfiles.capture(profile)); packaged = checkedPackage(packaged);
         }
         if (!workflow.script().isEmpty() && workflowId.startsWith("task-")) {
-            String type = switch (workflowId) { case "task-stash-hunt" -> "StashHunt"; case "task-travel" -> "Travel"; case "task-drop" -> "DropItems"; case "task-tpa" -> "Tpa"; case "task-wait" -> "Wait"; case "task-modules" -> "Modules"; case "task-profile" -> "SetProfile"; default -> ""; };
+            String type = switch (workflowId) { case "task-stash-scan" -> "StashScan"; case "task-stash-hunt" -> "StashHunt"; case "task-travel" -> "Travel"; case "task-drop" -> "DropItems"; case "task-tpa" -> "Tpa"; case "task-wait" -> "Wait"; case "task-modules" -> "Modules"; case "task-profile" -> "SetProfile"; default -> ""; };
             if (!type.isEmpty()) { JsonObject action = args.deepCopy(); action.addProperty("type", type); BotActions.validate(action); }
         }
         if (!packaged.getAsJsonObject("highways").isEmpty()) {
@@ -124,6 +134,19 @@ public final class BotScheduler {
         UUID id = createCaptured(name, workflowId, workflow.name(), crewId, targets, args, priority, overrides, packaged, scope());
         bots.info("Queued %s for %d worker%s at priority %d.", name, targets.size(), targets.size() == 1 ? "" : "s", priority); return id;
     }
+    /** Old highway forms are native workflow jobs too; no worker starts before its full configuration arrives. */
+    private UUID createPackage(String name, String id, String crewId, Set<UUID> targets, JsonObject args, int priority, Map<UUID,Integer> overrides) {
+        hostOnly();load();
+        if (!bots.isHost() || !Utils.canUpdate()) throw new IllegalStateException("Start the host in a world before queuing work");
+        if(targets.isEmpty() || targets.size()>16 || targets.contains(mc.player.getUUID()) || !targets.containsAll(overrides.keySet()))throw new IllegalArgumentException("Choose 1–16 remote workers");
+        for(UUID worker:targets)if(!crewId.equals(bots.workerCrew(worker)))throw new IllegalArgumentException("Every target must be connected to this crew");
+        checkedPriority(priority);overrides.values().forEach(BotScheduler::checkedPriority);
+        if(args==null || args.toString().length()>BotLua.MAX_STATE)throw new IllegalArgumentException("Arguments too large");
+        JsonObject record=bots.operations().get(id),packet=checkedPackage(record.getAsJsonObject("package"));
+        if(!packet.getAsJsonObject("highways").isEmpty() && (!text(packet.getAsJsonObject("geometry"),"scope").equals(scope()) || targets.size()>5))throw new IllegalArgumentException("Captured highway geometry must match this world, with at most 5 workers");
+        return createCaptured(name,text(packet,"entry"),text(record,"name"),crewId,targets,args,priority,overrides,packet,scope());
+    }
+
     /** Old highway forms are native workflow jobs too; no worker starts before its full configuration arrives. */
     UUID queueHighway(JsonObject definition, String crew, Set<UUID> workers, boolean includeHost) {
         hostOnly(); load();
@@ -154,7 +177,9 @@ public final class BotScheduler {
         String[] world = jobScope.split("\n", -1);
         if (world.length != 2 || world[0].isBlank() || world[1].isBlank() || jobScope.length() > 1024) throw new IllegalArgumentException("Choose a server and dimension for this task");
         if (tasks.size() >= 64) {
-            UUID retiredId = tasks.entrySet().stream().filter(e -> deletable(e.getKey(), e.getValue())).map(Map.Entry::getKey).findFirst().orElseThrow(() -> new IllegalStateException("Keep at most 64 active tasks; finish or cancel one first"));
+            UUID retiredId = tasks.entrySet().stream().filter(e -> deletable(e.getKey(), e.getValue()))
+                .min(Comparator.comparingLong(e -> BotHistory.finishedAt(e.getValue())))
+                .map(Map.Entry::getKey).orElseThrow(() -> new IllegalStateException("Keep at most 64 active tasks; finish or cancel one first"));
             bots.deleteTaskHistory(retiredId);
         }
         UUID id = UUID.randomUUID(); JsonObject t = new JsonObject(), runs = new JsonObject(), priorities = new JsonObject();
@@ -169,6 +194,11 @@ public final class BotScheduler {
     }
     private JsonObject task(UUID id) { load(); JsonObject t = tasks.get(id); if (t == null) throw new IllegalArgumentException("Unknown task"); return t; }
     public void pause(UUID id) { hostOnly(); if (QueuePolicy.pause(task(id))) save(); }
+    public void configure(UUID id, UUID worker, JsonObject modules) {
+        hostOnly(); JsonObject t = task(id), previous = t.deepCopy();
+        TaskWire.configure(t, worker, modules);
+        try { save(); } catch (RuntimeException e) { tasks.put(id, previous); throw e; }
+    }
     public void resume(UUID id) {
         hostOnly(); JsonObject t = task(id); QueuePolicy.resume(t);
         if (t.has("highway")) t.addProperty("nativeResumeRequested", true);
@@ -251,9 +281,24 @@ public final class BotScheduler {
                     JsonArray states = m.getAsJsonArray("runs"); if (states.size() > 64) throw new IllegalArgumentException("Too many worker states");
                     for (JsonElement value : states) updateStatus(worker, value.getAsJsonObject(), false);
                     reconcileWorker(worker, states, connection);
+                    if(m.has("stashCatalogProtocol")&&integer(m,"stashCatalogProtocol",1,1)==1)sendStashCatalog(connection,bots.workerCrew(worker));
                 }
                 case "task-status" -> updateStatus(worker, m, true);
                 case "task-survey-findings" -> receiveSurvey(worker, m);
+                case "task-stash-findings" -> {
+                    JsonObject task=tasks.get(UUID.fromString(text(m,"task")));
+                    if(task==null||!task.getAsJsonObject("runs").has(worker.toString()))throw new IllegalArgumentException("Unknown stash task");
+                    JsonObject ack=dev.monocle.coordinator.StashCatalog.accept(MonocleClient.FOLDER.toPath(),task,run(task,worker),worker.toString(),bots.workerCrew(worker),m);
+                    if(ack!=null){dirty=true;save();connection.send(ack.toString());}
+                }
+                case "task-stash-definition" -> {
+                    String scope=text(m,"scope");if(scope.length()>384||!scope.contains("\n"))throw new IllegalArgumentException("Invalid stash scope");
+                    dev.monocle.coordinator.StashCatalog.define(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,m.getAsJsonObject("stash"),worker.toString());sendStashCatalog(connection,bots.workerCrew(worker));
+                }
+                case "task-stash-import" -> {
+                    String scope=text(m,"scope");if(scope.length()>384||!scope.contains("\n"))throw new IllegalArgumentException("Invalid stash scope");
+                    dev.monocle.coordinator.StashCatalog.save(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,m.getAsJsonObject("stash"),m.getAsJsonObject("observation"));
+                }
                 default -> throw new IllegalArgumentException("Worker cannot send task commands: " + type);
             }
             return true;
@@ -275,23 +320,31 @@ public final class BotScheduler {
                 if (packaged != null) { UUID id = incoming.run; JsonObject metadata = packaged.remove("dispatch").getAsJsonObject(); runtime.install(id, metadata, packaged, owner); }
             }
             case "task-control" -> runtime.control(UUID.fromString(text(m, "run")), text(m, "command"), owner);
+            case "task-configure" -> runtime.configure(UUID.fromString(text(m, "run")), m.getAsJsonObject("modules"), integer(m, "revision", 1, Integer.MAX_VALUE), owner);
             case "task-survey-ack" -> runtime.acknowledgeSurvey(UUID.fromString(text(m, "run")), text(m, "token"), integer(m, "delivery", 1, 1_048_576), owner);
+            case "task-stash-ack" -> runtime.acknowledgeStash(UUID.fromString(text(m,"run")),text(m,"token"),integer(m,"delivery",1,4096),owner);
+            case "task-stash-catalog" -> dev.monocle.coordinator.StashCatalog.cacheRemote(MonocleClient.FOLDER.toPath(),m.getAsJsonArray("stashes"));
             case "task-result" -> runtime.external(UUID.fromString(text(m, "run")), text(m, "token"), flag(m, "success"), text(m, "detail"), m.has("result") ? m.getAsJsonObject("result") : new JsonObject());
             case "task-tpa-send" -> runtime.teleport(UUID.fromString(text(m, "run")), text(m, "token"), text(m, "name"), UUID.fromString(text(m, "target")), text(m, "dimension"));
             case "task-tpa-accept" -> acceptTeleport(m);
+            case "task-discard-stale-recovery" -> runtime.discardStaleRecovery();
             default -> throw new IllegalArgumentException("Unknown task command: " + type);
         }
         return true;
     }
+    private void sendStashCatalog(SwarmConnection connection,String crew){JsonObject m=TaskWire.message("stash-catalog");JsonArray list=new JsonArray();for(JsonElement value:dev.monocle.coordinator.StashCatalog.list(MonocleClient.FOLDER.toPath())){JsonObject s=value.getAsJsonObject();if(text(s,"crew").equals(crew))list.add(s.deepCopy());if(list.size()==64)break;}m.add("stashes",list);connection.send(m.toString());}
     private void updateStatus(UUID worker, JsonObject message, boolean full) {
         String id = text(message, "run"), state = text(message, "status"); UUID.fromString(id);
         if (!Set.of("Ready", "Running", "Suspending", "Suspended", "Inspection required", "Complete", "Failed", "Cancelled").contains(state)) throw new IllegalArgumentException("Invalid task execution state");
         for (JsonObject t : tasks.values()) if (t.getAsJsonObject("runs").has(worker.toString())) {
             JsonObject r = run(t, worker); if (!text(r, "id").equals(id)) continue;
+            if(full&&message.has("stashWithdrawal")&&!text(r,"stashWithdrawalToken").equals(text(message,"token"))){JsonObject receipt=message.getAsJsonObject("stashWithdrawal");dev.monocle.coordinator.StashCatalog.invalidateWithdrawn(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),text(receipt,"stash"),receipt.getAsJsonArray("withdrawn"));r.addProperty("stashWithdrawalToken",text(message,"token"));}
             if (!text(t, "crew").equals(bots.workerCrew(worker))) { if (terminal(text(r, "status"))) return; throw new IllegalArgumentException("Task status arrived through another crew"); }
             JsonObject checked = message.deepCopy();
             if (full && checked.has("action")) checked.add("action", BotActions.validate(checked.getAsJsonObject("action")));
-            if (!TaskWire.applyStatus(t, r, checked, full)) return;
+            SwarmCrew highway = bots.coordinator(text(t, "crew"));
+            boolean isolateInspection = t.has("nativeDefinition") && highway.assigned() && highway.independentSupplies();
+            if (!TaskWire.applyStatus(t, r, checked, full, isolateInspection)) return;
             if (Set.of("Running", "Suspending").contains(state)) workerCurrent.put(worker, id);
             else if (id.equals(workerCurrent.get(worker))) workerCurrent.put(worker, "");
             dirty = true; return;
@@ -372,6 +425,10 @@ public final class BotScheduler {
     private void schedule(UUID worker) {
         if (!fresh(worker) || !workerCurrent.containsKey(worker)) return;
         JsonObject active = activeTask(worker), next = choose(tasks.values(), worker);
+        if (active != null && !flag(active, "cancelled") && !flag(active, "paused")) {
+            JsonObject config = TaskWire.configurationToSend(run(active, worker), System.currentTimeMillis());
+            if (config != null) send(worker, config);
+        }
         if (source(worker) == null && !returns.containsKey(worker) && !teleportPinned(worker)) {
             QueuePolicy.Dispatch dispatch = QueuePolicy.dispatch(active, next, worker);
             if (dispatch.task() == null) return;
@@ -405,7 +462,10 @@ public final class BotScheduler {
                         return; // A transport interruption is not a request to borrow this worker's lane.
                     }
                     if (cleanup && active.has("highway") && ownsHighway(active, source) && Set.of("Failed", "Complete", "Cancelled").contains(text(r, "requestedStatus"))) {
-                        active.addProperty("failedNative", !text(r, "requestedStatus").equals("Complete")); releaseHighway(active); return;
+                        if (!source.independentSupplies()) {
+                            active.addProperty("failedNative", !text(r, "requestedStatus").equals("Complete")); releaseHighway(active); return;
+                        }
+                        return; // Only this failed worker is off duty; ending the job later releases its cleanup.
                     }
                     if ((pause || cancel) && active.has("highway") && allTargeted(source, active)) {
                         if (cancel) releaseHighway(active); else if (!source.inspect().phase().equals("paused")) source.pause();
@@ -455,7 +515,9 @@ public final class BotScheduler {
     private void transfer(JsonObject t, UUID worker, JsonObject r) {
         SwarmConnection c = connection(worker); if (c == null || !c.connected()) return;
         Transfer existing = transfers.get(worker); if (existing != null && existing.connection == c || transferred.get(runId(r)) == c) return;
-        JsonObject envelope = TaskWire.envelope(t, worker), metadata = envelope.getAsJsonObject("dispatch"); String data = BotTaskData.encode(envelope);
+        JsonObject envelope = TaskWire.envelope(t, worker), metadata = envelope.getAsJsonObject("dispatch"),args=metadata.getAsJsonObject("args");
+        if(args.has("needs")&&args.has("primary"))metadata.add("args",dev.monocle.coordinator.StashCatalog.refillAction(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),args,worker.toString()));else if(args.has("name")&&args.has("minX"))metadata.add("args",dev.monocle.coordinator.StashCatalog.route(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),args,worker.toString()));
+        String data = BotTaskData.encode(envelope);
         Transfer transfer = new Transfer(runId(r), data, hash(data), metadata, c, 0); transfers.put(worker, transfer);
         JsonObject begin = TaskWire.begin(transfer.run, data);
         r.addProperty("status", "Sending"); r.addProperty("detail", "Sending immutable workflow and profiles"); save();
@@ -635,10 +697,10 @@ public final class BotScheduler {
         }
         if (!task.has("highway")) return;
         if (c.assigned() && !ownsHighway(task, c)) return;
-        if (flag(task, "failedNative")) releaseHighway(task);
+        if (flag(task, "failedNative") && !c.independentSupplies()) releaseHighway(task);
         if (flag(task, "paused") && !flag(task, "cancelled")) { if (c.assigned() && !c.inspect().phase().equals("paused")) c.pause(); return; }
         if (flag(task, "nativeResumeRequested") && !flag(task, "failedNative") && c.assigned()
-            && workers(task).stream().allMatch(w -> nativeReady(w) && activeTask(w) == task) && c.tryResume()) {
+            && (c.independentSupplies() || workers(task).stream().allMatch(w -> nativeReady(w) && activeTask(w) == task)) && c.tryResume()) {
             task.remove("nativeResumeRequested"); save();
         }
         if (c.assigned() && c.roadComplete()) { if (!flag(task, "highwayCompleted")) { task.addProperty("highwayCompleted", true); save(); } releaseHighway(task); }
@@ -692,7 +754,8 @@ public final class BotScheduler {
         if (report == null) { reservation.addProperty("detail", "Waiting for a fresh returning worker observation"); return; }
         args.addProperty("teleport", !sourceScope.equals(report.scope()));
         JsonObject packaged = packageFor(bots.workflows(), "task-travel"); JsonObject p = new JsonObject(); p.addProperty("name", "Return to highway");
-        p.addProperty("script", "return function(ctx)\n if ctx.args.teleport and not ctx.state.teleported then ctx.state.teleported=true; return bot.tpa({target=ctx.args.target, warmupTicks=60, timeoutTicks=1200}) end\n if not ctx.state.walked then ctx.state.walked=true; return bot.travel(ctx.args) end\n return bot.done()\nend");
+        args.addProperty("warmupTicks",bots.teleportWarmupSeconds.get()*20);args.addProperty("acceptDelayTicks",Math.max(0,(bots.teleportAcceptDelayMs.get()+49)/50));
+        p.addProperty("script", "return function(ctx)\n if ctx.args.teleport and not ctx.state.teleported then ctx.state.teleported=true; return bot.tpa({target=ctx.args.target, warmupTicks=ctx.args.warmupTicks, acceptDelayTicks=ctx.args.acceptDelayTicks, timeoutTicks=1200}) end\n if not ctx.state.walked then ctx.state.walked=true; return bot.travel(ctx.args) end\n return bot.done()\nend");
         packaged.getAsJsonObject("programs").add("task-return", p); packaged.addProperty("entry", "task-return");
         UUID id = createCaptured("Return to highway", "task-return", "Return to highway", text(reservation, "crew"), Set.of(worker), args, 0, Map.of(), packaged, sourceScope);
         reservation.addProperty("task", id.toString()); save();
@@ -728,6 +791,7 @@ public final class BotScheduler {
         tpa.addProperty("name", targetName); tpa.addProperty("dimension", targetScope.substring(targetScope.indexOf('\n') + 1));
         tpa.addProperty("requester", requesterName); tpa.addProperty("requesterScope", requester.scope()); tpa.addProperty("targetScope", targetScope);
         tpa.addProperty("warmup", integer(action, "warmupTicks", 0, 72_000));
+        tpa.addProperty("acceptDelay",integer(action,"acceptDelayTicks",0,200));
         tpa.addProperty("deadline", System.currentTimeMillis() + integer(action, "timeoutTicks", 1, 1_728_000) * 50L);
         tpa.addProperty("sendIntent", true); r.add("tpa", tpa);
         save(); // Intent first: a crash between the checkpoint and packet is safe, not replayable.
@@ -778,7 +842,7 @@ public final class BotScheduler {
         accepted.put(token, expires);
         JsonObject journal = new JsonObject(); accepted.forEach(journal::addProperty);
         write(acceptanceFile, journal); // A target restart cannot turn the same acceptance into a second command.
-        mc.getConnection().sendCommand("tpaccept " + name);
+        mc.getConnection().sendCommand("tpy " + name);
     }
     private void loadAcceptances() {
         if (acceptedLoaded) return;

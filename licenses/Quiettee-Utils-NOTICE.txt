@@ -1,0 +1,4 @@
+Monocle's Air Mine module is derived from AirMiner in Quiettee Utils.
+Source: https://github.com/FragmentZero6b6t/quiettee-utils
+Copyright (c) FragmentZero6b6t.
+Licensed under the GNU General Public License, version 3. See the repository-root LICENSE.

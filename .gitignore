@@ -8,6 +8,7 @@ out
 run
 bin
 logs
+*.telemetry.jsonl*
 .github/builds/node_modules
 .github/moderation/node_modules
 *.iws

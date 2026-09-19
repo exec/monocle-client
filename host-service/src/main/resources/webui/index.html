@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Monocle · Control Room</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <section id="login" class="login-shell">
+    <div class="login-card">
+      <div class="brand-mark" aria-hidden="true">M</div>
+      <p class="eyebrow">MONOCLE / OPERATOR CONSOLE</p>
+      <h1>Your crew.<br>Your control room.</h1>
+      <p class="muted">One place to keep the work moving. Workers, workflows, and every little thing that gets in their way.</p>
+      <form id="login-form">
+        <label for="token">Host API token</label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false" required minlength="32" maxlength="128" placeholder="Paste your host's API token">
+        <p class="hint">Full operator access. Use the API token from host-config.json, not a worker's crew key. Kept in this tab only.</p>
+        <button class="primary" type="submit">Enter control room <span aria-hidden="true">↗</span></button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+      <button id="demo" class="text-button">Explore a read-only demo →</button>
+      <div class="login-footer"><span class="status-dot"></span> BUNDLED HOST UI <span>0.7.54</span></div>
+    </div>
+  </section>
+  <div id="app" class="app-shell" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/ui/" aria-label="Monocle control room"><span class="brand-mark small" aria-hidden="true">M</span><span>monocle<small>CONTROL ROOM</small></span></a>
+      <p class="nav-caption">OPERATIONS</p>
+      <nav aria-label="Main navigation">
+        <button data-page="overview" class="nav-button active"><span aria-hidden="true">◈</span> Overview</button>
+        <button data-page="crews" class="nav-button"><span aria-hidden="true">◇</span> Crews <span id="crew-count" class="nav-count">0</span></button>
+        <button data-page="workers" class="nav-button"><span aria-hidden="true">⊙</span> Workers <span id="worker-count" class="nav-count">0</span></button>
+        <button data-page="jobs" class="nav-button"><span aria-hidden="true">≡</span> Jobs <span id="job-count" class="nav-count">0</span></button>
+        <button data-page="stashes" class="nav-button"><span aria-hidden="true">▦</span> Stashes</button>
+        <button data-page="history" class="nav-button"><span aria-hidden="true">↶</span> History</button>
+      </nav>
+      <div class="sidebar-bottom"><p>Keep the train moving.</p><span>OPERATOR DESK · 0.7.54</span><button id="logout" class="text-button">Disconnect console ↗</button></div>
+    </aside>
+    <main>
+      <header class="topbar"><div><span class="eyebrow">MONOCLE /</span> <span id="breadcrumb">Overview</span></div><div class="top-actions"><span id="connection" class="pill">Connecting</span><button id="refresh" class="icon-button" aria-label="Refresh host status">↻</button><button id="new-job" class="primary">+ New job</button></div></header>
+      <div id="demo-banner" class="banner" hidden>READ-ONLY DEMO · Sample workers and jobs. No connection to your host.</div>
+      <div id="notice" class="banner" role="status" hidden></div>
+      <div class="page-heading"><div><p class="eyebrow" id="page-kicker">THE BIG PICTURE</p><h1 id="page-title">Operations overview</h1><p id="page-subtitle" class="muted">A live pulse on your workers and the work ahead.</p></div><span id="updated" class="muted small-text">Waiting for host</span></div>
+      <section id="metrics" class="metrics" aria-label="Host metrics"></section>
+      <section id="content" aria-label="Operations content"></section>
+      <footer class="page-footer"><span>Monocle · a transparent Meteor fork</span><span>Full host control · token held in memory only</span></footer>
+    </main>
+  </div>
+  <dialog id="inspect-dialog" class="inspect-dialog">
+    <div class="dialog-heading"><div><p class="eyebrow">MANAGEMENT DESK</p><h2 id="inspect-title">Job details</h2></div><button class="icon-button close-dialog" aria-label="Close inspection">×</button></div>
+    <div id="inspect-content"></div>
+  </dialog>
+  <dialog id="job-dialog">
+    <div class="dialog-heading"><div><p class="eyebrow">DISPATCH</p><h2>Assign the next job</h2></div><button class="icon-button close-dialog" aria-label="Close new job">×</button></div>
+    <form id="job-form">
+      <fieldset id="job-fields">
+        <div class="form-grid"><div><label for="job-name">Job name</label><input id="job-name" required maxlength="48" value="Highway job"></div><div><label for="job-crew">Crew</label><select id="job-crew" required></select></div></div>
+        <label for="job-kind">Workflow source</label><select id="job-kind"><option value="highway">6b6t Highway Builder</option><option value="package">Exported workflow package</option><option value="stash">Inspect stash · Experimental</option><option value="wait">Wait (connection test)</option><option value="lua">Custom Lua workflow</option></select>
+        <div id="highway-field">
+          <div class="form-grid"><div><label for="highway-direction">Direction</label><select id="highway-direction"><option>North</option><option>East</option><option>South</option><option>West</option></select></div><div><label for="highway-length">Length</label><input id="highway-length" type="number" min="16" max="100000" step="1" required value="10000"></div></div>
+          <div class="form-grid"><div><label for="highway-x">Start X</label><input id="highway-x" type="number" min="-29900000" max="29900000" step="1" required></div><div><label for="highway-y">Start Y</label><input id="highway-y" type="number" min="-2048" max="2048" step="1" required></div><div><label for="highway-z">Start Z</label><input id="highway-z" type="number" min="-29900000" max="29900000" step="1" required></div></div>
+          <button id="highway-worker-position" type="button">Use first selected worker’s position</button><p class="hint">Uses the immutable 6b6t profile: 5 × 3 obsidian highway, railings, managed inventory, Auto Eat, Speed 5.5 and the current tuned excavation/paving settings.</p>
+        </div>
+        <div id="package-field"><label for="package-file">Workflow package (.json)</label><input id="package-file" type="file" accept=".json,application/json"><p class="hint">Export in-game with .bot export-workflow &lt;id&gt;. Includes captured profiles and highway geometry; review before assigning.</p><p id="package-summary" class="muted"></p></div>
+        <div id="lua-field" hidden><label for="job-script">Lua workflow</label><textarea id="job-script" rows="6" spellcheck="false"></textarea></div>
+        <label>Target workers</label><div id="job-workers" class="worker-picker"></div>
+        <div class="form-grid"><div><label for="job-server">Minecraft server</label><input id="job-server" required placeholder="play.example.com"></div><div><label for="job-dimension">Dimension</label><input id="job-dimension" required value="minecraft:the_nether"></div></div>
+        <div class="form-grid"><div><label for="job-priority">Priority</label><input id="job-priority" type="number" min="-1000" max="1000" step="1" required value="0"></div><div id="args-field"><label for="job-args">Workflow arguments (JSON)</label><textarea id="job-args" rows="3" spellcheck="false">{}</textarea></div></div>
+        <p class="hint">Higher priority can interrupt existing work after native cleanup. Highway length may be 16–100,000 blocks.</p>
+      </fieldset>
+      <p id="job-error" class="error" role="alert"></p><div class="dialog-actions"><button id="job-submit" class="primary" type="submit">Dispatch job ↗</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

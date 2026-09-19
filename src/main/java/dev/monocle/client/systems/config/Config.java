@@ -31,7 +31,7 @@ public class Config extends System<Config> {
     private final SettingGroup sgChat = settings.createGroup("Chat");
     private final SettingGroup sgMisc = settings.createGroup("Misc");
     private final SettingGroup sgNotifications = settings.createGroup("Notification Feed");
-    private final SettingGroup sgBots = settings.createGroup("Bots");
+    private final SettingGroup sgBots = settings.createGroup("Workers");
 
     public final Setting<Boolean> banterMode = sgBots.add(new BoolSetting.Builder()
         .name("banter-mode")
@@ -39,7 +39,7 @@ public class Config extends System<Config> {
         .defaultValue(false).build());
 
     public final Setting<Integer> botJobHistoryDays = sgBots.add(new IntSetting.Builder()
-        .name("job-history-retention-days").description("Delete finished Bots job history after this many days. Zero disables history retention. Active jobs and recovery records are never expired.")
+        .name("job-history-retention-days").description("Delete finished worker job history after this many days. Zero disables history retention. Active jobs and recovery records are never expired.")
         .defaultValue(30).range(0, 3650).sliderMax(90).build());
 
     public final Setting<Boolean> notificationFeed = sgNotifications.add(new BoolSetting.Builder()

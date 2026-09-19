@@ -86,7 +86,7 @@ public class AutoEat extends Module {
         .defaultValue(9).range(1, 9).sliderRange(1, 9).visible(searchInventory::get).build()
     );
 
-    private final Setting<Boolean> protectNamed = sgGeneral.add(new BoolSetting.Builder()
+    public final Setting<Boolean> protectNamed = sgGeneral.add(new BoolSetting.Builder()
         .name("protect-named-food").description("Do not automatically eat food with a custom name, in addition to the blacklist.")
         .defaultValue(true).build()
     );

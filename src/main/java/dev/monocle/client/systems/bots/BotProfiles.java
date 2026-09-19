@@ -106,14 +106,24 @@ public final class BotProfiles {
         originals = capture("Current"); return originals.deepCopy();
     }
     public static void apply(JsonObject snapshot) {
+        apply(snapshot, false);
+    }
+    public static void applyLive(JsonObject snapshot) {
+        apply(dev.monocle.coordinator.TaskWire.checkedConfiguration(snapshot), true);
+    }
+    private static void apply(JsonObject snapshot, boolean live) {
         JsonObject checked = validate(snapshot);
-        requireIdle();
+        if (!live) requireIdle();
+        else if (!dev.monocle.client.MonocleClient.mc.isSameThread()) throw new IllegalStateException("Apply live configuration on the client thread");
         Map<Module, CompoundTag> desired = new LinkedHashMap<>(), previous = new LinkedHashMap<>();
         Map<Module, Boolean> enabled = new LinkedHashMap<>(), oldEnabled = new LinkedHashMap<>();
         for (String name : checked.keySet()) {
             Module module = Modules.get().get(name);
             if (module == null || !gameplay(module)) throw new IllegalArgumentException("Worker cannot apply gameplay module: " + name);
-            desired.put(module, parse(checked.getAsJsonObject(name).get("settings").getAsString()));
+            CompoundTag patch = parse(checked.getAsJsonObject(name).get("settings").getAsString());
+            // Workflow profiles are overlays: built-ins intentionally specify only their
+            // job policy, while workers retain unrelated local module settings.
+            desired.put(module, mergeSettings(fullSettings(module.settings), patch));
             enabled.put(module, checked.getAsJsonObject(name).get("active").getAsBoolean());
             previous.put(module, module.settings.toTag().copy()); oldEnabled.put(module, module.isActive());
         }
@@ -124,6 +134,32 @@ public final class BotProfiles {
             try { applyStates(previous, oldEnabled, true); } catch (RuntimeException rollback) { failure.addSuppressed(rollback); }
             throw failure;
         }
+    }
+    static CompoundTag fullSettings(dev.monocle.client.settings.Settings settings) {
+        CompoundTag tag = new CompoundTag(); net.minecraft.nbt.ListTag groups = new net.minecraft.nbt.ListTag();
+        for (var group : settings) {
+            CompoundTag g = group.toTag(); net.minecraft.nbt.ListTag values = new net.minecraft.nbt.ListTag();
+            for (var setting : group) values.add(setting.toTag());
+            g.put("settings", values); groups.add(g);
+        }
+        tag.put("groups", groups); return tag;
+    }
+    static CompoundTag mergeSettings(CompoundTag current, CompoundTag patch) {
+        validateSettings(patch);
+        CompoundTag merged = current.copy();
+        for (Tag t : patch.getListOrEmpty("groups")) {
+            CompoundTag group = (CompoundTag) t;
+            CompoundTag target = null;
+            for (Tag g : merged.getListOrEmpty("groups")) if (((CompoundTag) g).getStringOr("name", "").equals(group.getStringOr("name", ""))) target = (CompoundTag) g;
+            if (target == null) throw new IllegalArgumentException("Unknown settings group: " + group.getStringOr("name", ""));
+            for (Tag s : group.getListOrEmpty("settings")) {
+                CompoundTag setting = (CompoundTag) s; CompoundTag destination = null;
+                for (Tag old : target.getListOrEmpty("settings")) if (((CompoundTag) old).getStringOr("name", "").equals(setting.getStringOr("name", ""))) destination = (CompoundTag) old;
+                if (destination == null) throw new IllegalArgumentException("Unknown setting: " + setting.getStringOr("name", ""));
+                destination.merge(setting);
+            }
+        }
+        return merged;
     }
     private static void requireIdle() {
         if (!dev.monocle.client.MonocleClient.mc.isSameThread()) throw new IllegalStateException("Apply task profiles on the client thread.");

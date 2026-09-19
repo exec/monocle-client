@@ -17,6 +17,7 @@ final class HighwayHost extends HighwayCoordinator<HighwayHost.Position> {
     private JsonObject saved;
     private String startingScope = "";
     private final Deque<JsonObject> events = new ArrayDeque<>();
+    private final Deque<JsonObject> stashRequests=new ArrayDeque<>();
     HighwayHost(Path directory, String crew, Predicate<UUID> ready, Consumer<JsonObject> checkpoint) {
         file = directory.resolve("highway-" + UUID.nameUUIDFromBytes(crew.getBytes(java.nio.charset.StandardCharsets.UTF_8)) + ".json");
         identity = UUID.nameUUIDFromBytes(file.toAbsolutePath().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -78,6 +79,11 @@ final class HighwayHost extends HighwayCoordinator<HighwayHost.Position> {
         if(assigned() && ticks%20==0) { persist(); checkpointJobs(); }
         if(ticks%20==0) for(var p:peers.entrySet()) if(p.getKey().connected()) for(String ending:pendingEnds.keySet()) sendPendingEnd(p.getKey(),UUID.fromString(str(p.getValue(),"id")),ending);
     }
+    JsonObject pollStashRequest(){return stashRequests.pollFirst();}
+    void clearStashRequests(Collection<String> workers){stashRequests.removeIf(r->workers.contains(str(r,"worker")));}
+    JsonObject workerReport(UUID worker){return currentReport(worker);}
+    void failStashRequest(JsonObject request){UUID worker=UUID.fromString(str(request,"worker"));JsonObject failure=jobMessage("resource-exhausted");failure.addProperty("resource",num(request,"resource"));sendMember(worker,failure);}
+    @Override protected boolean onResourceExhausted(UUID worker,int resource){if(stashRequests.stream().anyMatch(r->str(r,"worker").equals(worker.toString())))return true;JsonObject r=new JsonObject();r.addProperty("worker",worker.toString());r.addProperty("resource",resource);r.addProperty("scope",scope());stashRequests.add(r);info("Worker requested stash resupply for resource %d; other builders continue.",resource);return true;}
     int pendingEndCount() { return pendingEnds.values().stream().mapToInt(Set::size).sum(); }
     boolean paused() { return phase.equals("paused"); }
     JsonObject snapshot() {
@@ -85,6 +91,7 @@ final class HighwayHost extends HighwayCoordinator<HighwayHost.Position> {
         if(r!=null && assigned()) {
             r.addProperty("progress",safeProgress()); r.addProperty("phase",phase);
             r.addProperty("supplyOwner",supplyOwner==null?"":supplyOwner.toString());
+            r.add("supplyContainers", supplyContainers.deepCopy());
             if(supplyCenter!=null)r.addProperty("supplyPosition",x(supplyCenter)+", "+y(supplyCenter)+", "+z(supplyCenter));
             if(pickupCenter!=null)r.addProperty("pickupPosition",x(pickupCenter)+", "+y(pickupCenter)+", "+z(pickupCenter));
         }
@@ -92,15 +99,25 @@ final class HighwayHost extends HighwayCoordinator<HighwayHost.Position> {
     }
     JsonObject status() {
         JsonObject r=new JsonObject(); r.addProperty("phase",assigned()?phase:saved!=null?"Inspection required":"idle");
+        r.addProperty("telemetryPath",telemetryPath().toString()); r.addProperty("telemetryError",telemetryError()); r.addProperty("telemetryDropped",telemetryDropped());
         r.addProperty("pendingEnds",pendingEndCount()); r.addProperty("execution",assigned()?job:saved==null?"":str(saved,"job"));
+        r.add("supplyContainers", supplyContainers.deepCopy());
         if(assigned()) {
             r.addProperty("progress",safeProgress()); r.addProperty("length",num(assignment,"length"));
             r.addProperty("generation",generation); r.addProperty("supplyOwner",supplyOwner==null?"":supplyOwner.toString());
             r.add("suppliers",suppliers(assignment).deepCopy()); r.add("activeMembers",JSON.toJsonTree(activeMembers()));
-            JsonArray workers=new JsonArray();
+            JsonArray workers=new JsonArray(); int[] crewCounts=new int[3]; boolean chestKnown=true; int countedWorkers=0;
             for(UUID id:participants.keySet()) { JsonObject w=new JsonObject(); w.addProperty("id",id.toString()); JsonObject report=currentReport(id);
-                w.addProperty("fresh",report!=null); if(report!=null) for(String key:List.of("name","phase","status","currentRow","verifiedBase","verifiedMask","currentResolved","serviceReturning","serviceReady","regroupReady","ack","x","y","z","exchange","inventory","diagnostics")) if(report.has(key)) w.add(key,report.get(key).deepCopy()); workers.add(w); }
+                if(detachedMembers(assignment).contains(id)) w.addProperty("returnGate",serviceReturnGate(id));
+                w.addProperty("fresh",report!=null); if(report!=null) { for(String key:List.of("name","phase","status","currentRow","verifiedBase","verifiedMask","currentResolved","serviceReturning","serviceReady","regroupReady","ack","x","y","z","exchange","inventory","diagnostics")) if(report.has(key)) w.add(key,report.get(key).deepCopy());
+                    if(report.has("roadPrediction"))try {w.add("roadPrediction",RoadForecast.checked(report.getAsJsonObject("roadPrediction")));}catch(RuntimeException ignored) {}
+                    if(report.has("inventory")) try { JsonObject counts=ResourceLedger.resourceCounts(report.getAsJsonObject("inventory")); w.add("resourceCounts",counts);JsonObject total=counts.getAsJsonObject("total");
+                        crewCounts[0]+=total.get("obsidian").getAsInt();crewCounts[1]+=total.get("pickaxes").getAsInt();crewCounts[2]+=total.get("food").getAsInt();chestKnown&=counts.get("enderChestKnown").getAsBoolean();countedWorkers++;
+                    } catch(RuntimeException ignored) {} }
+                workers.add(w); }
             r.add("workers",workers);
+            JsonObject prediction=RoadForecast.crew(workers);if(prediction!=null)r.add("roadPrediction",prediction);
+            JsonObject resources=new JsonObject(),total=new JsonObject();total.addProperty("obsidian",crewCounts[0]);total.addProperty("pickaxes",crewCounts[1]);total.addProperty("food",crewCounts[2]);resources.add("total",total);resources.addProperty("workers",countedWorkers);resources.addProperty("enderChestKnown",countedWorkers>0&&chestKnown);r.add("resourceCounts",resources);
             if(resourceExchange.hostOffer!=null) r.add("resourceExchange",resourceExchange.hostOffer.deepCopy());
         }
         r.add("events",JSON.toJsonTree(events)); return r;
@@ -130,13 +147,13 @@ final class HighwayHost extends HighwayCoordinator<HighwayHost.Position> {
     }
     @Override protected void clearLocal() {
         JsonObject r=snapshot();
-        if(r!=null && (!str(r,"supplyOwner").isEmpty() || r.has("resourceExchange"))) TaskFiles.write(file.resolveSibling("ended-"+UUID.fromString(str(r,"job"))+"-supplies.json"),r);
+        if(r!=null && (!str(r,"supplyOwner").isEmpty() || r.has("resourceExchange") || r.has("supplyContainers") && !r.getAsJsonObject("supplyContainers").isEmpty())) TaskFiles.write(file.resolveSibling("ended-"+UUID.fromString(str(r,"job"))+"-supplies.json"),r);
         try { Files.deleteIfExists(file); } catch(java.io.IOException e) { throw new IllegalStateException("Cannot clear highway journal",e); }
         assignment=saved=null;job="";phase="idle";stopped=begun=granted=backstepped=regrouping=regroupReady=regroupWasPaused=releasing=serviceReturning=serviceFinished=rejoiningSupply=false;
         joiningWorker=detachingWorker=rejoiningWorker=supplyOwner=null;serviceFront=supplyCenter=pickupCenter=null;generation=0;lock=acknowledged="";
         releaseStarted=0;retryingSupply=supplyHandoff=false;supplyRetryAfter=0;availabilityChange=null;
         cachedRoster=null;cachedMembers=List.of();offRangeArmed.clear();participants.clear();reports.clear();requested.clear();acknowledgments.clear();borrowingWorkers.clear();
-        resourceExchange.hostOffer=null;resetWindow(0);
+        resourceExchange.hostOffer=null;supplyContainers=new JsonObject();resetWindow(0);
     }
     @Override public void disconnected() { if(!assigned())return;if(!stopped)pausedBeforeDisconnect=phase.equals("paused");stopped=true;lastPermit=0;phase="connection lost / inspect job"; }
     @Override protected void apply(JsonObject m) { applyController(m); }

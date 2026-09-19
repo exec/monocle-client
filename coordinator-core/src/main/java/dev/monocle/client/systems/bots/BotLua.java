@@ -78,7 +78,7 @@ public final class BotLua {
         bot.set("array", new OneArgFunction() { @Override public LuaValue call(LuaValue items) {
             LuaTable value = items.isnil() ? new LuaTable() : items.checktable(); arrays.put(value, true); return value;
         } });
-        Map<String, String> actions = Map.of("travel", "Travel", "stash_hunt", "StashHunt", "drop", "DropItems", "modules", "Modules", "tpa", "Tpa", "highway", "Highway", "recover", "RecoverSupplies");
+        Map<String, String> actions = Map.ofEntries(Map.entry("travel","Travel"),Map.entry("stash_hunt","StashHunt"),Map.entry("stash_scan","StashScan"),Map.entry("stash_resupply","StashResupply"),Map.entry("drop","DropItems"),Map.entry("modules","Modules"),Map.entry("tpa","Tpa"),Map.entry("highway","Highway"),Map.entry("recover","RecoverSupplies"));
         actions.forEach((name, type) -> bot.set(name, new OneArgFunction() {
             @Override public LuaValue call(LuaValue argument) {
                 LuaTable value = argument.checktable(); value.set("type", type); return value;

@@ -6,6 +6,7 @@
 package dev.monocle.client.systems.bots;
 
 import com.google.gson.JsonObject;
+import dev.monocle.coordinator.HighwayJobs;
 import dev.monocle.client.MonocleClient;
 import dev.monocle.client.systems.Systems;
 import dev.monocle.client.systems.modules.misc.swarm.*;
@@ -31,7 +32,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public final Settings settings = new Settings();
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     public final Setting<String> crewKey = sgGeneral.add(new StringSetting.Builder().name("crew-key")
-        .description("Shared private Bots key, 24+ characters. Paste the same key on trusted workers. LAN traffic is authenticated, not encrypted.")
+        .description("Shared private Workers key, 24+ characters. Paste the same key on trusted workers. TCP LAN traffic is not encrypted; wss:// encrypts all traffic.")
         .defaultValue("").build());
     public final Setting<String> bindAddress = sgGeneral.add(new StringSetting.Builder().name("bind-address")
         .description("Host listener: loopback by default; use this computer's specific LAN IP for other machines.")
@@ -42,7 +43,9 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public SwarmCrew crew = new SwarmCrew(this);
     public final Setting<Integer> sectionLength = sgGeneral.add(new IntSetting.Builder().name("crew-road-length")
         .description("Total shared road length. Players divide the width and advance together. Cardinal directions only.")
-        .defaultValue(128).range(16, 4096).sliderRange(16, 512).build());
+        .defaultValue(128).range(16, HighwayJobs.MAX_LENGTH).sliderRange(16, 512).build());
+    public final Setting<Integer> teleportWarmupSeconds=sgGeneral.add(new IntSetting.Builder().name("crew-teleport-warmup").description("Server delay after /tpy before a returning stash or supply worker is expected to arrive.").defaultValue(15).range(0,60).sliderRange(0,30).build());
+    public final Setting<Integer> teleportAcceptDelayMs=sgGeneral.add(new IntSetting.Builder().name("crew-teleport-accept-delay").description("Delay between a worker's /tpa and the active builder's /tpy. 500 ms preserves server command order.").defaultValue(500).range(0,5000).sliderRange(0,2000).build());
 
     public final Setting<Mode> mode = sgGeneral.add(new EnumSetting.Builder<Mode>()
         .name("mode")
@@ -53,7 +56,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     public final Setting<String> ipAddress = sgGeneral.add(new StringSetting.Builder()
         .name("ip")
-        .description("The IP address of the host server.")
+        .description("LAN host address, or wss://HOST[:PORT]/v1/workers. A web URL includes its own port; the TCP port setting is ignored.")
         .defaultValue("localhost")
         .visible(() -> mode.get() == Mode.Worker)
         .build()
@@ -70,7 +73,12 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     public SwarmHost host;
     public SwarmWorker worker;
-    private record ConnectionConfig(Mode mode, String ip, int port, String key, String bind) {}
+    private final dev.monocle.coordinator.BotChat chat = new dev.monocle.coordinator.BotChat();
+    public com.google.gson.JsonArray chatFeed() { return chat.json(); }
+    public final Setting<Integer> webPort = sgGeneral.add(new IntSetting.Builder().name("web-port")
+        .description("Optional host WebSocket ingress on 127.0.0.1 only. 0 disables it. Use an HTTPS reverse proxy for remote workers.")
+        .defaultValue(0).range(0, 65535).noSlider().visible(() -> mode.get() == Mode.Host).build());
+    private record ConnectionConfig(Mode mode, String ip, int port, String key, String bind, int webPort) {}
     private ConnectionConfig connectionConfig;
     private long retryAt, noticeAt;
     private int attempts;
@@ -89,6 +97,11 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     private final BotJobs catalog = new BotJobs(MonocleClient.FOLDER.toPath().resolve("bot-jobs.json"));
     private final BotWorkflows workflows = new BotWorkflows(MonocleClient.FOLDER.toPath().resolve("bot-workflows.json"));
     public BotWorkflows workflows() { return workflows; }
+    private dev.monocle.coordinator.OperationsLibrary operations;
+    public dev.monocle.coordinator.OperationsLibrary operations() {
+        if (operations == null) operations = new dev.monocle.coordinator.OperationsLibrary(MonocleClient.FOLDER.toPath().resolve("bot-operations.json"));
+        return operations;
+    }
     private final BotScheduler tasks = new BotScheduler(this);
     public BotScheduler tasks() { return tasks; }
     private int catalogTicks;
@@ -237,6 +250,20 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     }
     /** Authenticated host-only management message; never forwarded to other workers. */
     public boolean handleManagement(SwarmConnection connection, com.google.gson.JsonObject message, boolean hostSide) {
+        String type=dev.monocle.coordinator.TaskWire.text(message,"type");
+        if(type.equals("worker-chat")) {
+            if(!hostSide)throw new IllegalArgumentException("Chat reports must come from a worker");
+            for(String crewId:presets.keySet()) {var member=coordinator(crewId).members().stream().filter(m->coordinator(crewId).connectionForWorker(m.id())==connection).findFirst();
+                if(member.isPresent()) {chat.append(member.get().id(),crewId,member.get().name(),"",dev.monocle.coordinator.TaskWire.text(message,"direction"),dev.monocle.coordinator.TaskWire.text(message,"text"),message.has("parts")?message.getAsJsonArray("parts"):null);return true;} }
+            return true;
+        }
+        if(type.equals("manage-chat")) {
+            if(hostSide||connection!=worker||!connection.connected())throw new IllegalArgumentException("Chat commands must come from the connected host");
+            UUID id=UUID.fromString(dev.monocle.coordinator.TaskWire.text(message,"id"));String text=dev.monocle.coordinator.BotChat.command(dev.monocle.coordinator.TaskWire.text(message,"text"));
+            if(!chat.first(id))return true;
+            if(!Utils.canUpdate()||!worldScope().equals(dev.monocle.coordinator.TaskWire.text(message,"scope"))) { reportChat("error","Chat not sent: worker world changed");return true; }
+            dev.monocle.client.utils.player.ChatUtils.sendPlayerMsg(text,false);reportChat("sent",text);return true;
+        }
         if (tasks.handle(connection, message, hostSide)) return true;
         if (!message.has("type") || !message.get("type").getAsString().equals("assign-crew")) return false;
         if (hostSide) throw new IllegalArgumentException("Workers cannot reassign crews.");
@@ -253,6 +280,34 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         if (!isHost()) throw new IllegalStateException("Start the host first.");
         for (var connection : connectionsForCrew(selectedCrew)) connection.send(message);
     }
+    public void sendChat(String crewId, UUID target, String text) {
+        requireHostRole();text=dev.monocle.coordinator.BotChat.command(text);
+        for(var member:coordinator(crewId).members()) { if(target!=null&&!target.equals(member.id()))continue;
+            SwarmConnection c=coordinator(crewId).connectionForWorker(member.id());if(c==null||!c.connected())continue;
+            JsonObject m=new JsonObject();m.addProperty("type","manage-chat");m.addProperty("id",UUID.randomUUID().toString());m.addProperty("text",text);m.addProperty("scope",worldScope());c.send(m.toString()); }
+    }
+    private void reportChat(String direction,String text) {
+        if(!active||mode.get()!=Mode.Worker||worker==null||!worker.connected())return;
+        JsonObject m=new JsonObject();m.addProperty("type","worker-chat");m.addProperty("direction",direction);m.addProperty("text",text.substring(0,Math.min(text.length(),2048)));worker.send(m.toString());
+    }
+    @EventHandler
+    private void onChat(dev.monocle.client.events.game.ReceiveMessageEvent event) {
+        if(!active||mode.get()!=Mode.Worker||worker==null||!worker.connected())return;
+        String plain=event.getMessage().getString();
+        if(plain.length()>2048) {reportChat("received",plain);return;}
+        var parts=new com.google.gson.JsonArray();
+        event.getMessage().visit((style,text)-> {
+            if(!text.isEmpty()) {
+                JsonObject part=new JsonObject();part.addProperty("text",text);
+                if(style.getColor()!=null)part.addProperty("color",String.format("#%06x",style.getColor().getValue()&0xffffff));
+                parts.add(part);
+            }
+            return java.util.Optional.empty();
+        },net.minecraft.network.chat.Style.EMPTY);
+        JsonObject m=new JsonObject();m.addProperty("type","worker-chat");m.addProperty("direction","received");m.addProperty("text",plain);
+        if(parts.size()<=256)m.add("parts",parts);
+        worker.send(m.toString());
+    }
     public void savePreset(String name, int length, Set<UUID> workers) {
         CrewPreset preset = checkedPreset(name, length, workers);
         if (coordinators.containsKey(preset.name()) && coordinators.get(preset.name()).assigned()) throw new IllegalStateException("End the crew's current job before changing its roster.");
@@ -265,7 +320,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         name = name.trim();
         if (name.isEmpty() || name.length() > 48 || name.chars().anyMatch(Character::isISOControl))
             throw new IllegalArgumentException("Choose a crew name of 1–48 printable characters.");
-        if (length < 16 || length > 4096 || workers.size() > 5) throw new IllegalArgumentException("Crew length must be 16–4096, with at most 5 players total.");
+        if (length < 16 || length > HighwayJobs.MAX_LENGTH || workers.size() > 5) throw new IllegalArgumentException("Crew length must be 16–100,000, with at most 5 players total.");
         return new CrewPreset(name, length, workers);
     }
     public void removePreset(String name) {
@@ -588,8 +643,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         String message = String.format(Locale.ROOT, format, args);
         if (events.size() == 40) events.removeFirst();
         events.addLast(new Event(java.time.LocalTime.now().withNano(0).toString(), severity.name(), message));
-        MonocleClient.LOG.info("[Bots] {}", message);
-        Notifications.post("Bots", message, severity, message);
+        MonocleClient.LOG.info("[Workers] {}", message);
+        Notifications.post("Workers", message, severity, message);
     }
 
     @Override public CompoundTag toTag() {
@@ -611,7 +666,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     }
     @Override public Bots fromTag(CompoundTag tag) {
         if (settingsLoaded && (hasJobs() || hasPersistedCrewWork())) {
-            warning("Bots settings were not reloaded: release assigned/recovered jobs and wait for worker acknowledgments first so their keys and recovery controllers are retained.");
+            warning("Workers settings were not reloaded: release assigned/recovered jobs and wait for worker acknowledgments first so their keys and recovery controllers are retained.");
             return this;
         }
         disable();
@@ -641,7 +696,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
                     usedKeys.add(key);
                     crewKeys.put(preset.name(), key);
                 }
-            } catch (RuntimeException ignored) { MonocleClient.LOG.warn("Skipped malformed saved Bots crew"); }
+            } catch (RuntimeException ignored) { MonocleClient.LOG.warn("Skipped malformed saved Workers crew"); }
         }
         ensureDefaultCrew(); refreshCredentials();
         selectedCrew = tag.getStringOr("selectedCrew", "Default");
@@ -667,7 +722,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             CompoundTag old = legacySettings(NbtIo.read(legacy.toPath()));
             if (old == null) return;
             fromTag(old); save(folder);
-            info("Connection settings moved to Right Shift → Bots.");
+            info("Connection settings moved to Right Shift → Workers.");
         } catch (Exception e) { MonocleClient.LOG.warn("Could not migrate old bot connection settings", e); }
     }
     public static CompoundTag legacySettings(CompoundTag modules) {
@@ -686,7 +741,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public void close() {
         tasks.disconnected();
         if (mode.get() == Mode.Host) try { syncJobs(); if (catalogDirty) { catalog.save(); catalogDirty = false; } }
-        catch (RuntimeException e) { MonocleClient.LOG.error("Could not checkpoint Bots jobs while closing", e); }
+        catch (RuntimeException e) { MonocleClient.LOG.error("Could not checkpoint Workers jobs while closing", e); }
         crew.disconnected();
         for (SwarmCrew coordinator : coordinators.values()) if (coordinator != crew) coordinator.disconnected();
         try {
@@ -748,14 +803,14 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     private void tickCrew(SwarmCrew coordinator) {
         try { coordinator.tick(); }
         catch (RuntimeException e) {
-            MonocleClient.LOG.error("Bots crew controller failed", e);
+            MonocleClient.LOG.error("Workers crew controller failed", e);
             coordinator.controllerFailed();
             reportConnectionFailure("Crew controller stopped: " + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
         }
     }
 
     public void connectWorker(String ip, int port) {
-        if (port < 1 || port > 65535) throw new IllegalArgumentException("Invalid Bots port");
+        if (port < 1 || port > 65535) throw new IllegalArgumentException("Invalid Workers port");
         if (mode.get() != Mode.Worker && hasJobs()) throw new IllegalStateException("End host jobs before switching to Worker.");
         close();
         mode.set(Mode.Worker); ipAddress.set(ip); serverPort.set(port);
@@ -774,10 +829,11 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         refreshCredentials();
         host = new SwarmHost(serverPort.get());
         connectionDetail = host.listening() ? "Listening at " + bindAddress.get() + ":" + serverPort.get() : "Host failed to start — check the key, bind address and port";
-        if (host.listening()) info("Bots host listening at %s:%d", bindAddress.get(), serverPort.get());
+        if (host.listening()) info("Workers host listening at %s:%d", bindAddress.get(), serverPort.get());
     }
 
-    private ConnectionConfig currentConfig() { return new ConnectionConfig(mode.get(), ipAddress.get().trim(), serverPort.get(), crewKey.get(), bindAddress.get().trim()); }
+    private ConnectionConfig currentConfig() { return new ConnectionConfig(mode.get(), ipAddress.get().trim(), serverPort.get(), crewKey.get(), bindAddress.get().trim(), webPort.get()); }
+    private String workerEndpoint() { return ipAddress.get().contains("://") ? ipAddress.get() : ipAddress.get() + ":" + serverPort.get(); }
     public static int retrySeconds(int failedAttempts) { return Math.min(10, 1 << Math.clamp(failedAttempts - 1, 0, 4)); }
 
     private void tickConnection() {
@@ -805,7 +861,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             return;
         }
         if (worker != null && worker.connected()) {
-            if (!workerWasConnected) info("Connected to Bots host at %s:%d", config.ip(), config.port());
+            if (!workerWasConnected) info("Connected to Workers host at %s", workerEndpoint());
             workerWasConnected = true; attempts = 0;
             connectionDetail = crew.assigned()
                 ? crew.canResume() ? "Authenticated; crew assigned" : "Authenticated; interrupted crew job requires inspection"
@@ -822,26 +878,34 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         }
         if (now < retryAt) return;
         attempts = Math.min(100, attempts + 1);
-        worker = new SwarmWorker(config.ip(), config.port(), config.key());
+        try { worker = new SwarmWorker(config.ip(), config.port(), config.key()); }
+        catch (IllegalArgumentException e) {
+            connectionDetail = e.getMessage(); reportConnectionFailure(connectionDetail);
+            retryAt = now + retrySeconds(attempts) * 1_000_000_000L;
+        }
     }
 
     public void reportConnectionFailure(String reason) {
         long now = System.nanoTime();
         if (!reason.equals(lastNotice) || now >= noticeAt) {
-            warning("Bots: %s", reason);
+            warning("Workers: %s", reason);
             lastNotice = reason; noticeAt = now + 30_000_000_000L;
         }
     }
 
     public String connectionStatus() {
-        if (!isActive()) return "Bots disabled";
+        if (!isActive()) return "Workers disabled";
         if (mode.get() == Mode.Host) return isHost() ? "Host listening · " + host.getConnectionCount() + " authenticated worker(s)" : "Host stopped";
-        String endpoint = ipAddress.get() + ":" + serverPort.get();
+        String endpoint = workerEndpoint();
         if (isWorker()) return "Connected · " + endpoint;
         if (crewKey.get().length() < 24) return "Worker needs host key · " + endpoint;
         if (worker != null && worker.isAlive()) return "Connecting / authenticating · " + endpoint;
         long seconds = Math.max(0, (retryAt - System.nanoTime() + 999_999_999L) / 1_000_000_000L);
         return "Retrying " + endpoint + " in " + seconds + "s";
+    }
+
+    public boolean sendToHost(JsonObject message) {
+        return isWorker() && worker.send(message.toString());
     }
 
     @EventHandler

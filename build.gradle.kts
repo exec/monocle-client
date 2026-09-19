@@ -98,6 +98,7 @@ dependencies {
 
     // Libraries (JAR-in-JAR)
     jij("org.luaj:luaj-jse:3.0.1") { isTransitive = false }
+    jij("org.java-websocket:Java-WebSocket:1.6.0") { isTransitive = false }
     jij(libs.orbit)
     jij(libs.starscript)
     jij(libs.discord.ipc)
@@ -182,6 +183,17 @@ tasks {
         dependsOn(jar)
         doLast {
             ZipFile(jar.get().archiveFile.get().asFile).use { archive ->
+                listOf(
+                    "LICENSE_monocle",
+                    "META-INF/licenses/Java-WebSocket-MIT.txt",
+                    "META-INF/licenses/Quiettee-Utils-NOTICE.txt",
+                    "assets/monocle-client/licenses/luaj-LICENSE.txt",
+                    "assets/monocle-client/fonts/GlacialIndifference-OFL.txt",
+                    "assets/monocle-client/fonts/GlacialIndifference-NOTICE.txt"
+                ).forEach { path ->
+                    val entry = archive.getEntry(path)
+                    check(entry != null && entry.size > 0) { "Release JAR is missing required notice: $path" }
+                }
                 val metadata = archive.getInputStream(archive.getEntry("fabric.mod.json")).bufferedReader().use { it.readText() }
                 jij.resolvedConfiguration.resolvedArtifacts.forEach { artifact ->
                     val id = artifact.moduleVersion.id
@@ -190,6 +202,26 @@ tasks {
                         check(archive.getEntry(path) != null && metadata.contains("\"$path\"")) {
                             "Release JAR is missing a registered bundled library: $path"
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    val documentationCheck = register("documentationCheck") {
+        group = "verification"
+        description = "Checks local Markdown links in project documentation."
+        inputs.files(fileTree(projectDir) {
+            include("README.md", "CHANGELOG.md", "SECURITY.md", "docs/**/*.md", "host-service/README.md", "coordinator-core/README.md")
+        })
+        doLast {
+            val link = Regex("""!?\[[^]]*]\(([^)]+)\)""")
+            inputs.files.files.sorted().forEach { source ->
+                link.findAll(source.readText()).forEach { match ->
+                    val raw = match.groupValues[1].trim().substringBefore(" \"").removeSurrounding("<", ">")
+                    if (!raw.startsWith("#") && !raw.startsWith("http://") && !raw.startsWith("https://") && !raw.startsWith("mailto:")) {
+                        val target = source.parentFile.resolve(raw.substringBefore('#')).normalize()
+                        check(target.isFile) { "Broken documentation link in ${source.relativeTo(projectDir)}: $raw" }
                     }
                 }
             }
@@ -267,7 +299,8 @@ tasks {
         "printerHelperCheck" to "dev.monocle.client.systems.modules.world.PrinterHelperTest",
         "printerFlightCheck" to "dev.monocle.client.utils.world.PrinterFlightTest",
         "printerIntegrationCheck" to "dev.monocle.client.modintegration.PrinterIntegrationTest",
-        "printerRestockCheck" to "dev.monocle.client.systems.modules.world.PrinterRestockTest"
+        "printerRestockCheck" to "dev.monocle.client.systems.modules.world.PrinterRestockTest",
+        "playerProfileConcurrencyCheck" to "dev.monocle.client.mixin.PlayerProfileConcurrencyTest"
     ).map { (taskName, main) ->
         register<JavaExec>(taskName) {
             group = "verification"
@@ -307,10 +340,11 @@ tasks {
         exclude("**/LitematicExporterTest*.class", "**/SchematicSelectorTest*.class")
         exclude("**/HighwayMobTest*.class")
         exclude("**/Printer*Test*.class")
+        exclude("**/PlayerProfileConcurrencyTest*.class")
     }
 
     check {
-        dependsOn(bundledLibrariesCheck)
+        dependsOn(bundledLibrariesCheck, documentationCheck)
         dependsOn(":coordinator-core:check", ":host-service:check")
         dependsOn(highwayBuilderCheck, highwaySupplyCheck, monocleStyleCheck, monocleFontCheck)
         dependsOn(moduleChecks)
@@ -344,6 +378,8 @@ tasks {
 
     jar {
         inputs.property("archivesName", archivesBaseName)
+        from("licenses/Java-WebSocket-MIT.txt") { into("META-INF/licenses") }
+        from("licenses/Quiettee-Utils-NOTICE.txt") { into("META-INF/licenses") }
 
         from("LICENSE") {
             rename { "${it}_$archivesBaseName" }

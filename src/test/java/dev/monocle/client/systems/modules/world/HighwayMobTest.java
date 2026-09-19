@@ -151,7 +151,7 @@ public final class HighwayMobTest {
         MethodModel nativeHands = compiled(LivingEntity.class).methods().stream()
             .filter(candidate -> candidate.methodName().equalsString("isHolding") && call(candidate, "getOffhandItem") >= 0).findFirst().orElseThrow();
         assert call(nativeHands, "getMainHandItem") >= 0 : "Native crossbow detection includes either hand, not just main hand";
-        for (String required : List.of("job", "paused", "suspended", "jobWorld"))
+        for (String required : List.of("lifecycle", "jobWorld"))
             assert field(method(builder, "controlsPlayer"), required, Opcode.GETFIELD) >= 0 : "Attack callbacks must honor job ownership and lifecycle";
         MethodModel footing = method(builder, "walkingStandable");
         assert call(footing, "standable") >= 0 && call(footing, "withinMobArea") >= 0
@@ -248,7 +248,7 @@ public final class HighwayMobTest {
                 if (!(instructions.get(i) instanceof FieldInstruction write) || write.opcode() != Opcode.PUTFIELD || !write.name().equalsString("waitingForMob")) continue;
                 assert instructions.get(i - 1) instanceof ConstantInstruction : "Entity wait must be explicitly set or cleared";
                 Object value = ((ConstantInstruction) instructions.get(i - 1)).constantValue();
-                assert Integer.valueOf(candidate.methodName().equalsString("waitForMob") ? 1 : 0).equals(value)
+                assert Integer.valueOf(candidate.methodName().equalsString("waitForMob") || candidate.methodName().equalsString("clearBlockingBoat") ? 1 : 0).equals(value)
                     : "Only a physical obstruction may set the flag; normal ticks and lifecycle paths clear it";
             }
         }
@@ -344,10 +344,10 @@ public final class HighwayMobTest {
 
     private static void settingsGuards(ClassModel builder) throws IOException {
         Map<String, Object> defaults = Map.ofEntries(
-            Map.entry("clearPiglins", 0), Map.entry("mobTypes", "PIGLIN"), Map.entry("mobWeapons", "CrossbowOnly"),
+            Map.entry("clearPiglins", 1), Map.entry("mobTypes", "PIGLIN"), Map.entry("mobWeapons", "CrossbowOnly"),
             Map.entry("mobPursuit", "CrossbowOnly"), Map.entry("mobAge", "Both"), Map.entry("mobIgnoreNamed", 1),
             Map.entry("mobWaitTicks", 40), Map.entry("mobTimeout", 20), Map.entry("mobRotate", 1),
-            Map.entry("mobMinHealth", 12d), Map.entry("mobChaseRange", 6d));
+            Map.entry("mobMinHealth", 10d), Map.entry("mobChaseRange", 6d));
         MethodModel constructor = method(builder, "<init>"), ui = method(builder, "buildSettings");
         for (var entry : defaults.entrySet()) {
             List<CodeElement> setting = settingElements(constructor, entry.getKey());

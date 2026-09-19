@@ -16,6 +16,7 @@ import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFlightModes;
 import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFly;
 import dev.monocle.client.systems.modules.movement.elytrafly.modes.Bounce;
 import dev.monocle.client.systems.modules.player.NoStatusEffects;
+import dev.monocle.client.systems.modules.player.AirMine;
 import dev.monocle.client.systems.modules.render.HandView;
 import dev.monocle.client.systems.modules.render.NoRender;
 import net.minecraft.core.Holder;
@@ -79,6 +80,8 @@ public abstract class LivingEntityMixin extends Entity {
     @ModifyReturnValue(method = "isFallFlying", at = @At("RETURN"))
     private boolean isGlidingHook(boolean original) {
         if ((Object) this != mc.player) return original;
+
+        if (Modules.get().get(AirMine.class).preservesGlide()) return true;
 
         if (Modules.get().get(ElytraFly.class).canPacketEfly()) {
             return true;

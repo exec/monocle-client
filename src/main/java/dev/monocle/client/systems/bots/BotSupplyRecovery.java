@@ -39,6 +39,10 @@ public final class BotSupplyRecovery {
     private final Bots bots;
     private final int searchRadius, retryTicks;
     private final double flyBeyond;
+    private final Vec3 origin;
+    private final String execution;
+    private final long inspectTransfersBefore;
+    private boolean transferInspected;
     private BotActions travel;
     private Vec3 destination;
     private int ticks, unchanged, inventoryAt = -1;
@@ -50,9 +54,12 @@ public final class BotSupplyRecovery {
 
     BotSupplyRecovery(Bots bots, JsonObject policy) {
         this.bots = bots;
+        inspectTransfersBefore = policy.has("inspectTransfersBefore") ? policy.get("inspectTransfersBefore").getAsLong() : 0;
         searchRadius = policy.has("searchRadius") ? policy.get("searchRadius").getAsInt() : 16;
         retryTicks = policy.has("retryTicks") ? policy.get("retryTicks").getAsInt() : 100;
         flyBeyond = policy.has("flyBeyond") ? policy.get("flyBeyond").getAsDouble() : 8;
+        origin = policy.has("x") ? new Vec3(policy.get("x").getAsDouble(), policy.get("y").getAsDouble(), policy.get("z").getAsDouble()) : null;
+        execution = text(policy, "execution");
     }
     private static SupplyRecovery journal() {
         if (journal == null) journal = new SupplyRecovery(MonocleClient.FOLDER.toPath().resolve("workflow-supply-recovery.json"));
@@ -96,17 +103,41 @@ public final class BotSupplyRecovery {
     }
     /** Only the native restocker's already-confirmed pickup path may retire its obligation. */
     public static void recovered(BlockPos pos) { JsonObject r=at(pos); if(r!=null) journal().resolved(text(r,"id")); }
+    /** Highway policy explicitly permits retrying after a loaded site has no container or drop. */
+    public static void unavailable(BlockPos pos) {
+        JsonObject r = at(pos);
+        if (r == null) return;
+        MonocleClient.LOG.warn("Supply unavailable after observing loaded site: id={}, position={}, execution={}", text(r,"id"), pos, text(r,"execution"));
+        journal().resolved(text(r,"id"));
+    }
+    /** Explicit operator-authorized loss path for records that can no longer be recovered. */
+    static int discardCurrent() {
+        List<JsonObject> stale = records();
+        for (JsonObject record : stale) journal().resolved(text(record, "id"));
+        return stale.size();
+    }
 
     String detail() { return detail; }
+    static List<JsonObject> selectedRecords(List<JsonObject> pending, Vec3 origin, int radius, String execution) {
+        return pending.stream().filter(r -> (execution.isEmpty() || execution.equals(text(r, "execution")))
+            && Vec3.atBottomCenterOf(position(r)).distanceToSqr(origin) <= (double) radius * radius).toList();
+    }
+    private boolean inArea(Vec3 point) { return point != null && point.distanceToSqr(origin) <= (double) searchRadius * searchRadius; }
     boolean tick() {
+        if (origin == null) throw new IllegalStateException("Recovery requires a checkpointed search origin");
         ticks++;
+        if (!transferInspected && inspectTransfersBefore > 0) {
+            bots.crew.inspectPreviousTransfer(inspectTransfersBefore);
+            transferInspected = true;
+        }
         if (!listening) { MonocleClient.EVENT_BUS.subscribe(this); listening=true; }
         if (ticks % 20 == 1 && mc.player.containerMenu == mc.player.inventoryMenu) refresh();
-        List<JsonObject> pending=records();
+        List<JsonObject> all = records();
+        List<JsonObject> pending = selectedRecords(all, origin, searchRadius, execution);
         if(pending.isEmpty()) {
             String concern=bots.crew.workflowRecoveryConcern();
             if(!concern.isEmpty()) { detail=concern; return false; }
-            close(); return true;
+            close(); detail = "Supply area clear; " + all.size() + " other recorded obligations remain saved"; return true;
         }
         JsonObject r=pending.stream().min(Comparator.comparingDouble(v -> position(v).distToCenterSqr(mc.player.position()))).orElseThrow();
         if(!selected.equals(text(r,"id"))) { stopTravel(); selected=text(r,"id"); unchanged=0; }
@@ -122,7 +153,9 @@ public final class BotSupplyRecovery {
         mining=null;
         if (mc.player.isUsingItem() || Modules.get().get(AutoEat.class).eating || Modules.get().get(AutoGap.class).isEating() || TickRate.INSTANCE.getTimeSinceLastTick()>=1.5f) { stopTravel(); detail="Recovery yielding to food / server lag"; return false; }
         if (mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.inventoryMenu.getCarried().isEmpty()) { stopTravel(); detail="Recovery waiting for the current inventory transaction"; return false; }
-        if (++unchanged % retryTicks == 0) { stopTravel(); mc.gameMode.stopDestroyBlock(); refresh(); }
+        // Refresh inventory/mining evidence without restarting a flight that is still travelling.
+        // The Travel action owns movement retries; recreating it here repeats takeoff every five seconds.
+        if (++unchanged % retryTicks == 0) { mc.gameMode.stopDestroyBlock(); refresh(); }
         if (!loaded || pos.distToCenterSqr(mc.player.position())>16) {
             move(approach(pos),"Travelling to recorded supplies"); return false;
         }
@@ -143,7 +176,7 @@ public final class BotSupplyRecovery {
         }
         if(!drops.isEmpty()) {
             if(!hasRoom(expected)) { stopTravel(); detail="Recovery needs inventory room for the tracked drop"; return false; }
-            ItemEntity drop=drops.stream().filter(e -> !r.has("drop") || text(r,"drop").equals(e.getUUID().toString())).min(Comparator.comparingDouble(e -> e.distanceToSqr(mc.player))).orElse(null);
+            ItemEntity drop=drops.stream().filter(e -> inArea(e.position()) && (!r.has("drop") || text(r,"drop").equals(e.getUUID().toString()))).min(Comparator.comparingDouble(e -> e.distanceToSqr(mc.player))).orElse(null);
             // A name/color match without a witnessed identity is ambiguous when several candidates exist.
             if(drop!=null && (r.has("drop") || drops.size()==1)) {
                 if(!r.has("drop")) { r.addProperty("drop",drop.getUUID().toString()); journal().put(r); }
@@ -168,15 +201,16 @@ public final class BotSupplyRecovery {
         return best;
     }
     private Vec3 approach(BlockPos pos) {
-        for(var dir:net.minecraft.core.Direction.Plane.HORIZONTAL) { BlockPos feet=pos.relative(dir); if(mc.level.hasChunkAt(feet) && mc.level.getBlockState(feet).isAir() && mc.level.getBlockState(feet.above()).isAir() && mc.level.getBlockState(feet.below()).isFaceSturdy(mc.level,feet.below(),net.minecraft.core.Direction.UP)) return Vec3.atBottomCenterOf(feet); }
-        return Vec3.atBottomCenterOf(pos.offset(0,0,1));
+        for(var dir:net.minecraft.core.Direction.Plane.HORIZONTAL) { BlockPos feet=pos.relative(dir); if(inArea(Vec3.atBottomCenterOf(feet)) && mc.level.hasChunkAt(feet) && mc.level.getBlockState(feet).isAir() && mc.level.getBlockState(feet.above()).isAir() && mc.level.getBlockState(feet.below()).isFaceSturdy(mc.level,feet.below(),net.minecraft.core.Direction.UP)) return Vec3.atBottomCenterOf(feet); }
+        return null;
     }
     private void move(Vec3 target,String message) {
+        if (!inArea(target)) { stopTravel(); detail = "Waiting for a supported approach inside the selected supply area"; return; }
         if(destination==null || destination.distanceToSqr(target)>.25) {
             stopTravel(); destination=target; travel=new BotActions(bots);
             JsonObject a=new JsonObject(); a.addProperty("type","Travel"); a.addProperty("x",target.x); a.addProperty("y",target.y); a.addProperty("z",target.z); a.addProperty("radius",.6); a.addProperty("flyBeyond",flyBeyond); travel.start(a);
         }
-        JsonObject status=travel.tick(); detail=message+" · "+text(status,"detail");
+        JsonObject status=travel.tick(); detail=message+" at "+BlockPos.containing(target).toShortString()+" · "+text(status,"detail");
         if(!text(status,"state").equals("Running")) { stopTravel(); refresh(); }
     }
     private void stopTravel() { if(travel!=null) { travel.stop(); travel=null; } destination=null; }
@@ -201,6 +235,16 @@ public final class BotSupplyRecovery {
             || !Objects.equals(original.get(DataComponents.CUSTOM_NAME),box.getCustomName()))) return;
         if(container(original) && original.getItem() instanceof BlockItem bi && state.is(bi.getBlock())) BlockUtils.breakBlock(mining,true);
     }
-    boolean suspend() { return travel==null || travel.requestSuspend(); }
+    boolean suspend() {
+        mining = null;
+        if (travel == null) return true;
+        if (!travel.requestSuspend()) { travel.tick(); return false; }
+        stopTravel();
+        return true;
+    }
+    void disconnected() {
+        mining = null;
+        if (travel != null) travel.disconnected();
+    }
     void close() { mining=null; stopTravel(); if(listening) { MonocleClient.EVENT_BUS.unsubscribe(this); listening=false; } if(Utils.canUpdate()) mc.gameMode.stopDestroyBlock(); }
 }

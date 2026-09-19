@@ -1,4 +1,14 @@
-# Bots control room — 0.7.4
+# Workers control room
+
+The former **Bots** UI is now **Workers**. Use **Right Shift → Workers** or
+**`.worker`**; `.bot` remains a compatibility alias. Internal `bot-*` filenames
+and the workflow `bot.*` Lua namespace remain unchanged.
+
+## Resource exhaustion (0.7.59)
+
+After enabled local sources (loose inventory, carried shulkers, ender chest and nested shulkers) are searched, a worker asks the crew for supplies. Unknown donor ender-chest contents are searched rather than treated as empty. Busy or temporarily unavailable potential donors remain retryable; only a completed local search with no available crew source causes `Resource exhausted: <resource>`.
+
+Exhaustion disables Highway Builder and fails the worker's workflow action, releasing its local crew ownership. Other supplied workers continue; exhausted workers are not automatically toggled back on. Late-arriving usable supplies are rechecked before accepting a failure. Disconnect-on-toggle and external notifications are not enabled by this change. Update both the host and workers for crew-wide exhaustion decisions.
 
 ## Native highways on the standalone host (0.7.4)
 
@@ -40,9 +50,9 @@ The host chooses the eligible donor with the largest surplus of the requested re
 
 Donors retain at least 128 paving blocks (or the lower configured target), two usable picks, 16 food, up to 16 filler and two ender chests, with higher native reserves respected. Exchanges are serialized per crew. The recipient keeps an empty pickup slot and can reclaim expendable filler/trash for space. Each batch requires a server-confirmed sender inventory decrease and recipient inventory increase or pickup notification. The sender records intent before issuing a drop; reconnects reuse that receipt instead of sending the same batch again. Near-partner distance, clear passage and third-party pickup clearance are checked before throwing. Missing donors leave only the requester waiting; cancellation remains host-controlled.
 
-Automatic trash cleanup protects tools, armor, elytras, shulkers, paving blocks, filler and ender chests. It also protects food, totems, rockets, pearls, XP bottles, ammunition, potions, named items and other container items. Typical mining drops such as quartz, gold nuggets, flint, gravel, coal and sticks are trash. Working filler defaults include netherrack, cobblestone, cobbled deepslate, blackstone, basalt, stone, deepslate, dirt and end stone; paving always takes precedence. Routine cleanup retains the configured filler amount rounded up to whole stacks, and supply-space recovery may discard it when necessary. Left/right come from the active left-to-right lane roster facing highway progress; all interior workers throw backward. Detached workers use the preferred roster, and a solo worker throws backward.
+Automatic trash cleanup protects tools, armor, elytras, shulkers, paving blocks, filler and ender chests. It also protects food, totems, rockets, pearls, XP bottles, ammunition, potions, named items and other container items. Typical mining drops such as quartz, gold nuggets, flint, gravel, coal and sticks are trash. Working filler defaults include netherrack, cobblestone, cobbled deepslate, blackstone, basalt, stone, deepslate, dirt and end stone; paving always takes precedence. Routine cleanup retains the configured filler amount rounded up to whole stacks, and supply-space recovery may discard it when necessary. As of 0.7.45, every worker throws trash backward along the completed road, away from highway progress, including during detached restocking. Lane position no longer changes trash direction.
 
-**Test host and all workers on 0.7.0 together.** Start with a short, already-supported highway, one bot with tools but no paving stock, one well-stocked donor, and a third builder. Check local shulker use first, then the peer exchange, donor reserves, trash direction and return. Test full-inventory filler reclamation, paired-chest retrieval, disconnect/reconnect and cancellation separately. These flows have automated policy/accounting/compiled-path checks, not live server validation yet. Uncertain drops are deliberately not retried: inspect both inventories and the ground, then use **Bots → job inspection → Resolve item transfer**. This clears the transfer hold; it does not assert that lost items arrived. Native container recovery remains a separate prerequisite and cannot be bypassed by resolving an item exchange.
+**Test host and all workers on 0.7.0 together.** Start with a short, already-supported highway, one bot with tools but no paving stock, one well-stocked donor, and a third builder. Check local shulker use first, then the peer exchange, donor reserves, trash direction and return. Test full-inventory filler reclamation, paired-chest retrieval, disconnect/reconnect and cancellation separately. These flows have automated policy/accounting/compiled-path checks, not live server validation yet. Uncertain drops are deliberately not retried: inspect both inventories and the ground, then use **Workers → job inspection → Resolve item transfer**. This clears the transfer hold; it does not assert that lost items arrived. Native container recovery remains a separate prerequisite and cannot be bypassed by resolving an item exchange.
 
 ## Full meals and eating priority (0.6.13)
 
@@ -120,7 +130,7 @@ The shared corridor check for supply departure, takeoff, flight and final rendez
 
 ## Distributed stash hunting (0.6.0)
 
-Open **Bots → Jobs → Create stash hunt**, select a crew and its workers, and set the rectangular bounds, altitude, strip half-width, speed ceiling and acceleration. Bounds expand outward to whole chunks. The host coordinates remotely; survey execution targets workers, not the host account. Native highways retain their existing limits; workflow queues now accept up to 16 workers within the host's existing 16-connection capacity.
+Open **Workers → Jobs → Create stash hunt**, select a crew and its workers, and set the rectangular bounds, altitude, strip half-width, speed ceiling and acceleration. Bounds expand outward to whole chunks. The host coordinates remotely; survey execution targets workers, not the host account. Native highways retain their existing limits; workflow queues now accept up to 16 workers within the host's existing 16-connection capacity.
 
 Equip each worker with an elytra with more than 10 durability remaining. Set **ElytraFly → Vanilla** and a suitable **Horizontal Speed** on the host before queuing; task profiles capture those settings and Stash Finder's storage filters/thresholds. The survey ceiling is the lower of **Horizontal Speed × 20** and the job's blocks/sec ceiling (default 60, maximum 120). Acceleration defaults to 4 blocks/sec²; server position corrections and chunk stalls reduce the ramp. These are requested speeds at 20 client ticks/sec, not a promise of server acceptance or measured maximum throughput.
 
@@ -162,7 +172,7 @@ This is the first optimization pass: preserving mining across ownership handoffs
 
 ## Work sharing (0.5.11)
 
-Choose **Bots → Jobs → Create native highway job / edit an unassigned job → Work sharing**. The dropdown is saved with the job, shown in its details and sent by the host to every worker. Existing jobs without this field use **Lanes**. Assigned jobs remain read-only; change modes only on an unclaimed unfinished job, then assign a crew. No mid-mine ownership switch is attempted. Geometry recapture preserves the selected mode.
+Choose **Workers → Jobs → Create native highway job / edit an unassigned job → Work sharing**. The dropdown is saved with the job, shown in its details and sent by the host to every worker. Existing jobs without this field use **Lanes**. Assigned jobs remain read-only; change modes only on an unclaimed unfinished job, then assign a crew. No mid-mine ownership switch is attempted. Geometry recapture preserves the selected mode.
 
 - **Lanes:** existing per-column ownership and five-row movement window, unchanged.
 - **Break Order:** every excavation-capable worker can mine the full face. Roster positions select Left → Right, Right → Left, Top → Bottom, Bottom → Top, then Center → Edges. Nearer rows still take priority and active slow mines stay selected. Since 0.5.13, workers share the center lane; movement permits keep them at most one row apart while allowing the existing speculative reach ahead.
@@ -229,7 +239,7 @@ Cancellation is separate from successful physical cleanup: new work stops, clean
 
 Jobs shows unfinished work and anything still cleaning up. **History** is a separate, non-default page for finished workflow/native highway records. Linked records share an entry and deletion path; **Delete history** removes the linked finished records, and **Clear all job history** clears the finished collection. Deletion is permanent. Paused jobs, crew claims, pending cancellation acknowledgments, return handoffs, uncertain worker actions and profile restoration are not disposable history.
 
-**Config → Bots → Job history retention days** defaults to **30**; **0** disables retention. Expiry runs at most once a minute, including while Bots is disabled. Each installation also expires its safely finished worker checkpoints. Older records without a finish date get their migration date, persisted so reopening the client does not reset the clock. Host deletion does not remotely erase another installation's recovery/checkpoint files. Existing bounded task storage may retire older finished history earlier when it reaches capacity.
+**Config → Workers → Job history retention days** defaults to **30**; **0** disables retention. Expiry runs at most once a minute, including while Workers is disabled. Each installation also expires its safely finished worker checkpoints. Older records without a finish date get their migration date, persisted so reopening the client does not reset the clock. Host deletion does not remotely erase another installation's recovery/checkpoint files. Existing bounded task storage may retire older finished history earlier when it reaches capacity.
 
 ## Supply clearance (0.5.3)
 
@@ -243,7 +253,7 @@ The host retries starts rejected after a ready report. A transport reconnect can
 
 Transient walking/verification pauses can retry up to three times, five seconds apart, without resetting the supply state or accepting predicted blocks as confirmed. Confirmed block work replenishes that retry budget. Real hazards, missing supplies, uncertain pickups and manual pauses still need attention. Task details now expose the native phase, blocker, pending confirmation counts and travel target instead of a generic host-managed wait. Automated checks cover policies and transport; live multi-account testing remains necessary.
 
-Open **Right Shift → Bots**, next to Modules, or run **`.bot`**. Bots is a persistent system, not a module: opening its dashboard never stops connections or a job. Monocle remains a fork of Meteor; the old Swarm transport and highway integration have been substantially reworked here.
+Open **Right Shift → Workers**, next to Modules, or run **`.worker`**. Workers is a persistent system, not a module: opening its dashboard never stops connections or a job. Monocle remains a fork of Meteor; the old Swarm transport and highway integration have been substantially reworked here.
 
 ## Connect accounts
 
@@ -256,7 +266,7 @@ The roster shows authenticated workers, their current crew, availability, job ph
 
 ## Crews, Jobs and Workflows
 
-The Bots screen has three sections. **Crews** manages people and connections; **Jobs** manages saved work and progress; **Workflows** holds reusable work definitions. Highway geometry appears in a job's editor instead of the main crew controls.
+The Workers screen has three sections. **Crews** manages people and connections; **Jobs** manages saved work and progress; **Workflows** holds reusable work definitions. Highway geometry appears in a job's editor instead of the main crew controls.
 
 Jobs also contains programmable workflow queues. Select one worker or a whole crew, supply arguments, and set a default or per-worker priority. Higher-priority jobs interrupt at safe checkpoints; equal-priority work stays FIFO. The host distributes the captured Lua code, nested dependencies and temporary gameplay profiles. Lua is bundled inside Monocle: no external interpreter is needed. See the [workflow programming guide](bot-workflows.md) for the API, examples and recovery rules.
 

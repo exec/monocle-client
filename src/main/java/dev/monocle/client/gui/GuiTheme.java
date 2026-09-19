@@ -28,6 +28,7 @@ import dev.monocle.client.systems.accounts.Account;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.misc.InventoryTweaks;
 import dev.monocle.client.systems.modules.world.HighwayBuilder;
+import dev.monocle.client.systems.modules.world.StashManager;
 import dev.monocle.client.utils.misc.ISerializable;
 import dev.monocle.client.utils.misc.Keybind;
 import dev.monocle.client.utils.misc.Names;
@@ -265,6 +266,7 @@ public abstract class GuiTheme implements ISerializable<GuiTheme> {
 
     public WidgetScreen moduleScreen(Module module) {
         if (module instanceof HighwayBuilder builder) return new HighwayBuilderScreen(this, builder);
+        if (module instanceof StashManager stash) return new dev.monocle.client.gui.screens.StashManagerScreen(this, stash);
         if (module instanceof InventoryTweaks inventory) return new InventoryManagerScreen(this, inventory);
         return new ModuleScreen(this, module);
     }

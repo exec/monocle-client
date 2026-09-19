@@ -83,6 +83,17 @@ final class BotJobsTest {
                 JsonObject fractional = definition(); fractional.addProperty(key, 1.5); bad(() -> BotJobs.checked(fractional));
             }
 
+            JsonObject longRoad = next.deepCopy(); longRoad.addProperty("length", 100_000); longRoad.addProperty("progress", 90_000);
+            longRoad.addProperty("status", "Unassigned"); restored.put(longRoad);
+            BotJobs longReload = new BotJobs(path); longReload.load();
+            assert longReload.records.get(id).get("length").getAsInt() == 100_000;
+            assert longReload.records.get(id).get("progress").getAsInt() == 90_000 : "Long-road checkpoints survive reload";
+            for (int length : new int[] {15, 100_001}) {
+                JsonObject tooLong = longRoad.deepCopy(); tooLong.addProperty("length", length); bad(() -> BotJobs.checked(tooLong));
+            }
+            longRoad.addProperty("progress", 100_000); assert BotJobs.checked(longRoad).get("progress").getAsInt() == 100_000;
+            longRoad.addProperty("progress", 100_001); bad(() -> BotJobs.checked(longRoad));
+
             String saved = Files.readString(path);
             JsonObject invalid = definition(); invalid.addProperty("length", 0); bad(() -> restored.put(invalid));
             assert Files.readString(path).equals(saved) : "Invalid edits cannot overwrite persisted jobs";

@@ -45,6 +45,38 @@ public class ResourceLedger {
     public static int available(JsonObject ledger, int resource) {
         return value(ledger, "loose", resource) + value(ledger, "shulkers", resource) + value(ledger, "echest", resource);
     }
+    public static boolean possibleDonor(JsonObject ledger, int resource) {
+        return available(ledger, resource) > value(ledger,"target",resource)
+            || ledger.has("echestKnown") && !ledger.get("echestKnown").getAsBoolean() && available(ledger, ECHESTS) > 0;
+    }
+    /** Stable API view; inventory includes resources inside carried shulkers. */
+    public static JsonObject resourceCounts(JsonObject ledger) {
+        JsonObject inventory = counts(value(ledger, "loose", MATERIALS) + value(ledger, "shulkers", MATERIALS), value(ledger, "loose", PICKS) + value(ledger, "shulkers", PICKS), value(ledger, "loose", FOOD) + value(ledger, "shulkers", FOOD));
+        JsonObject chest = counts(value(ledger, "echest", MATERIALS), value(ledger, "echest", PICKS), value(ledger, "echest", FOOD));
+        JsonObject result = new JsonObject(); result.add("inventory", inventory); result.add("enderChest", chest);
+        result.add("total", counts(inventory.get("obsidian").getAsInt() + chest.get("obsidian").getAsInt(), inventory.get("pickaxes").getAsInt() + chest.get("pickaxes").getAsInt(), inventory.get("food").getAsInt() + chest.get("food").getAsInt()));
+        result.addProperty("enderChestKnown", ledger != null && ledger.has("echestKnown") && ledger.get("echestKnown").getAsBoolean()); return result;
+    }
+    private static JsonObject counts(int obsidian, int picks, int food) { JsonObject r = new JsonObject(); r.addProperty("obsidian", obsidian); r.addProperty("pickaxes", picks); r.addProperty("food", food); return r; }
     public static int surplus(JsonObject ledger, int resource) { return Math.max(0, available(ledger, resource) - value(ledger, "reserve", resource)); }
+    /** A shared handoff fills a second working loadout, rather than bouncing for one target-sized refill. */
+    public static int exchangeTarget(JsonObject ledger, int resource) {
+        return switch (resource) {
+            case MATERIALS -> 1536;
+            case PICKS, ECHESTS -> 9;
+            case FOOD, FILLERS -> 256;
+            default -> throw new IllegalArgumentException("Unknown resource");
+        };
+    }
+    /** Bound a donor's temporary carried load; it keeps its normal target after each batch. */
+    public static int exchangeBatch(int resource) {
+        return switch (resource) {
+            case MATERIALS -> 512;
+            case PICKS -> 3;
+            case FOOD, FILLERS -> 64;
+            case ECHESTS -> 2;
+            default -> throw new IllegalArgumentException("Unknown resource");
+        };
+    }
     public static boolean transferConfirmed(String donor, String receiver) { return donor.equals("sent") && receiver.equals("received"); }
 }

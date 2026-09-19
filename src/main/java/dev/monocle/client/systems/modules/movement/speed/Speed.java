@@ -35,7 +35,7 @@ public class Speed extends Module {
     public final Setting<Double> vanillaSpeed = sgGeneral.add(new DoubleSetting.Builder()
         .name("vanilla-speed")
         .description("The speed in blocks per second.")
-        .defaultValue(5.6)
+        .defaultValue(6)
         .min(0)
         .sliderMax(20)
         .visible(() -> speedMode.get() == SpeedModes.Vanilla)

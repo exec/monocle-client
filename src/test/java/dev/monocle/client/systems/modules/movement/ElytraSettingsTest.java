@@ -42,6 +42,8 @@ public final class ElytraSettingsTest {
         assert ElytraFly.regroupSettings(new CompoundTag(), "Flight", true, name -> true).getListOrEmpty("settings").isEmpty();
         groups.add(net.minecraft.nbt.StringTag.valueOf("ignore malformed entry"));
         ElytraFly.regroupSettings(saved, "Flight", true, name -> true);
-        System.out.println("Elytra settings checks passed: exact legacy values, routing, non-mutating migration, round-trip, expansion state and missing settings.");
+        assert ElytraFly.horizontalBps(3, 4, 0, 0) == 100;
+        assert ElytraFly.horizontalBps(-3, -4, 0, 0) == 100;
+        System.out.println("Elytra settings checks passed: exact legacy values, routing, non-mutating migration, HUD speed and missing settings.");
     }
 }

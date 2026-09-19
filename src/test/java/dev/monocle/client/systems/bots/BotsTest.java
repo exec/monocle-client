@@ -50,12 +50,12 @@ public final class BotsTest {
         assert preset.workers().equals(Set.of(first, second)) : "Saved membership must not follow live checkbox edits";
         try { preset.workers().clear(); throw new AssertionError("Preset membership must be immutable"); }
         catch (UnsupportedOperationException expected) { }
-        for (int length : new int[] {16, 128, 4096}) {
+        for (int length : new int[] {16, 128, 4096, 4097, 100_000}) {
             assert Bots.checkedPreset("x".repeat(48), length, Set.of()).length() == length;
         }
         for (String name : List.of("", "  ", "x".repeat(49), "crew\nname", "crew\u0000name", "crew\u007fname"))
             invalid(() -> Bots.checkedPreset(name, 128, Set.of()));
-        for (int length : new int[] {Integer.MIN_VALUE, -1, 0, 15, 4097, Integer.MAX_VALUE})
+        for (int length : new int[] {Integer.MIN_VALUE, -1, 0, 15, 100_001, Integer.MAX_VALUE})
             invalid(() -> Bots.checkedPreset("crew", length, Set.of()));
         Set<UUID> fullCrew = new HashSet<>();
         for (int i = 0; i < 5; i++) fullCrew.add(UUID.randomUUID());
@@ -99,10 +99,11 @@ public final class BotsTest {
         assert calls(method(compiled("commands/Commands"), "init")).contains("dev/monocle/client/commands/commands/BotCommand.<init>");
         assert calls(compiled("commands/Commands")).stream().noneMatch(call -> call.contains("/SwarmCommand."));
         var command = method(compiled("commands/commands/BotCommand"), "<init>");
-        assert constants(command).contains("bot") && !constants(command).contains("swarm") : "Use .bot as the public command";
+        assert constants(command).contains("worker") && constants(command).contains("bot") && !constants(command).contains("swarm")
+            : "Use .worker publicly and retain .bot as a compatibility alias";
         assert calls(method(compiled("gui/tabs/Tabs"), "init")).contains("dev/monocle/client/gui/tabs/builtin/BotsTab.<init>")
             : "The dashboard must be reachable from the top tab bar";
-        assert constants(method(compiled("gui/tabs/builtin/BotsTab"), "<init>")).contains("Bots");
+        assert constants(method(compiled("gui/tabs/builtin/BotsTab"), "<init>")).contains("Workers");
         var screenClose = calls(method(compiled("gui/tabs/builtin/BotsTab$BotsScreen"), "onClosed"));
         assert screenClose.contains("dev/monocle/client/systems/bots/Bots.save");
         assert screenClose.stream().noneMatch(call -> call.endsWith(".disable") || call.endsWith(".close") || call.endsWith(".pause"))

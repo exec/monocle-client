@@ -22,10 +22,21 @@ public final class SwarmCrewTest {
     public static void main(String[] args) throws Exception {
         boolean assertions = false; assert assertions = true;
         if (!assertions) throw new IllegalStateException("Enable assertions");
+        assert SwarmCrew.temporaryOffDuty(true, false, true) : "Eating workers must leave active lane ownership";
+        assert SwarmCrew.temporaryOffDuty(true, true, false) && !SwarmCrew.temporaryOffDuty(false, false, true);
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(VanillaRegistries.createLookup()).forEach(DataComponentInitializers.PendingComponents::apply);
         SwarmCrew standalone = new SwarmCrew(null);
         var arbitrary = new net.minecraft.core.BlockPos(123, 64, -456);
+        assert SwarmCrew.supplyReturnTarget(null, arbitrary, 60).equals(arbitrary);
+        assert SwarmCrew.supplyReturnTarget(null, arbitrary, 61) == null : "Stale host destinations cannot keep a worker running";
+        assert SwarmCrew.supplyReturnTarget(null, arbitrary, -1) == null : "A clock reset invalidates the old target";
+        assert SwarmCrew.supplyReturnTarget(null, null, 0) == null : "No observed crew/front means stop movement, never visit the old supply origin";
+        assert SwarmCrew.supplyReturnTarget(arbitrary, arbitrary.north(100), 61).equals(arbitrary) : "Live crewmates override stale host coordinates";
+        var ownSupply = com.google.gson.JsonParser.parseString("[{x:123,y:64,z:-456}]").getAsJsonArray();
+        assert SwarmCrew.containsSupplyPosition(ownSupply, arbitrary) && SwarmCrew.containsSupplyPosition(ownSupply, arbitrary.below());
+        assert !SwarmCrew.containsSupplyPosition(ownSupply, arbitrary.east()) : "A neighboring supplier's container is not ours";
+        supplyPlacementPrediction(arbitrary);
         assert !standalone.assigned() && !standalone.hold();
         assert standalone.allowsWork(arbitrary) && standalone.requestSupply(arbitrary) && standalone.clearance(arbitrary);
         assert !standalone.protectedPosition(arbitrary) : "No crew assignment means no change to standalone behavior";
@@ -35,6 +46,7 @@ public final class SwarmCrewTest {
         assert !SwarmCrew.validPickupCenter(arbitrary, arbitrary.offset(8, 0, 0));
         assert !SwarmCrew.validPickupCenter(arbitrary, arbitrary.offset(0, 11, 0));
         assert !SwarmCrew.validPickupCenter(null, arbitrary) : "Clearance requests cannot create an unreserved supply site";
+        assert SwarmCrew.crewPickupExclusion(2.24) && !SwarmCrew.crewPickupExclusion(2.25) : "Crew mates yield only the real pickup radius";
         compactSupplies();
         assert SwarmCrew.supplyRendezvousReady(arbitrary, arbitrary.offset(0, 0, 2));
         assert !SwarmCrew.supplyRendezvousReady(arbitrary, arbitrary.offset(0, 0, 3));
@@ -71,14 +83,11 @@ public final class SwarmCrewTest {
                 assert SwarmCrew.laneOwner(width, crew, width, row) == crew - 1;
             }
         }
-        assert SwarmCrew.laneOwner(5, 2, 2, 1) != SwarmCrew.laneOwner(5, 2, 2, 2) : "The middle alternates without players swapping sides";
+        assert SwarmCrew.laneOwner(5, 2, 2, 1) == SwarmCrew.laneOwner(5, 2, 2, 2) : "A contested lane has one stable owner";
         assert SwarmCrew.anchorColumn(5, 2, 0) == 1 && SwarmCrew.anchorColumn(5, 2, 1) == 3 : "Five-wide crews stand on blocks 2 and 4";
         assert SwarmCrew.anchorColumn(5, 3, 0) == 0 && SwarmCrew.anchorColumn(5, 3, 1) == 2 && SwarmCrew.anchorColumn(5, 3, 2) == 4 : "Three players stand on blocks 1, 3 and 5";
-        for (int contested : new int[] {1, 3}) {
-            int[] workload = new int[3];
-            for (int row = 0; row < 20; row++) for (int y = 0; y < 3; y++) workload[SwarmCrew.laneOwner(5, 3, contested, row + y)]++;
-            assert workload[contested / 2] == 30 && workload[contested / 2 + 1] == 30 : "Contested excavation is shared equally across rows and heights";
-        }
+        for (int contested : new int[] {1, 3}) for (int row = 0; row < 20; row++) for (int y = 0; y < 3; y++)
+            assert SwarmCrew.laneOwner(5, 3, contested, row + y) == contested / 2 : "Contested columns never checkerboard";
         var lane = new net.minecraft.world.phys.Vec3(10.5, 64, -10.5);
         assert SwarmCrew.laneReady(lane, lane, true);
         assert !SwarmCrew.laneReady(lane, lane, false);
@@ -137,6 +146,10 @@ public final class SwarmCrewTest {
                 assert !(first && second) : "Sections must not overlap";
                 assert (first || second) == (step >= 1 && step <= 32) : "No seam gaps, no speculative overshoot";
             }
+            BlockPos rear = new BlockPos(100 + 10 * dir[0], 116, -100 + 10 * dir[1]);
+            BlockPos front = rear.offset(dir[0] * 2, 0, dir[1] * 2);
+            assert SwarmCrew.fartherBack(dir[0], dir[1], rear, front);
+            assert !SwarmCrew.fartherBack(dir[0], dir[1], front, rear);
         }
         UUID a = UUID.randomUUID(), b = UUID.randomUUID(), c = UUID.randomUUID();
         Set<UUID> members = Set.of(a, b, c);
@@ -263,6 +276,12 @@ public final class SwarmCrewTest {
                 .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
             assert calls.contains("getPlayerByUUID") && calls.contains("position") && !calls.contains("currentReport")
                 : "Live flight destinations must come from local player entities, never host position telemetry";
+            var protection = compiled.methods().stream().filter(m -> m.methodName().equalsString("protectedPosition")).findFirst().orElseThrow();
+            var protectionCalls = protection.code().orElseThrow().elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
+            assert protectionCalls.indexOf("containsSupplyPosition") >= 0
+                && protectionCalls.indexOf("containsSupplyPosition") < protectionCalls.indexOf("observedSupplyAt")
+                : "Own recovery must take precedence over the overlapping neighbor-area fallback";
             for (String method : List.of("applyServiceChange", "coordinateServiceReturn", "departSupply")) {
                 var methods = compiled.methods().stream().filter(m -> m.methodName().equalsString(method)).toList();
                 for (var m : methods) {
@@ -357,6 +376,12 @@ public final class SwarmCrewTest {
         var next = current.deepCopy(); next.addProperty("generation", 3);
         assert SwarmCrew.matchesGeneration(current.get("job").getAsString(), 2, current);
         assert !SwarmCrew.matchesGeneration(current.get("job").getAsString(), 2, next);
+        var legacy = current.deepCopy(); legacy.remove("generation");
+        assert !SwarmCrew.matchesGeneration(current.get("job").getAsString(), 2, legacy)
+            : "A packet without a generation cannot cross a reconfiguration boundary";
+        var initial = current.deepCopy(); initial.remove("generation");
+        assert SwarmCrew.matchesGeneration(current.get("job").getAsString(), 0, initial)
+            : "Initial-generation legacy packets remain compatible";
         assert SwarmCrew.reconfigurationReady(current, 2, next, true, false);
         assert !SwarmCrew.reconfigurationReady(current, 2, next, false, false) : "Do not replace lanes while old placement packets are unsettled";
         assert !SwarmCrew.reconfigurationReady(current, 2, next, true, true) : "Never discard a live supply recovery";
@@ -522,14 +547,14 @@ public final class SwarmCrewTest {
         supplier.addProperty("z", 63);
         assert (boolean) barrier.invoke(remote) : "A working bot three rows forward does not block compact supply admission";
         supplier.addProperty("z", 57);
-        assert !(boolean) barrier.invoke(remote) : "An adjacent queued bot must clear pickup space before supply admission";
+        assert (boolean) barrier.invoke(remote) : "Detached supply admission cannot wait for adjacent crew members";
         var ackField = crewField("acknowledgments"); ackField.setAccessible(true);
         var receipts = (Set<UUID>) ackField.get(remote); receipts.add(host);
         assert (boolean) barrier.invoke(remote) : "The native yield receipt releases the compact barrier even before the next position report";
         receipts.clear(); supplier.addProperty("z", 55);
         assert (boolean) barrier.invoke(remote) : "A fresh clear position also releases the barrier if its receipt was delayed";
         supplier.remove("x");
-        assert !(boolean) barrier.invoke(remote) : "Compact spacing cannot waive missing telemetry";
+        assert (boolean) barrier.invoke(remote) : "Missing unrelated crew telemetry cannot veto local restocking";
         supplier.addProperty("x", 0); assignment.remove("suppliers"); set(remote, "pickupCenter", null);
         assert remote.supplyYieldDistance() == 5.5 : "Legacy supply records keep their existing yield margin";
         assignment.addProperty("x", 0); assignment.addProperty("y", 64); assignment.addProperty("z", 0);
@@ -552,7 +577,7 @@ public final class SwarmCrewTest {
         assert SwarmCrew.workSharing(layout) == SwarmCrew.WorkSharing.BreakOrder;
         for (int row = 0; row <= 512; row++) {
             assert SwarmCrew.leadLimit(512, row, SwarmCrew.WorkSharing.BreakOrder) == Math.min(512, row + 1);
-            assert SwarmCrew.leadLimit(512, row, SwarmCrew.WorkSharing.Lanes) == Math.min(512, row + 5);
+            assert SwarmCrew.leadLimit(512, row, SwarmCrew.WorkSharing.Lanes, 12) == Math.min(512, row + 5);
         }
         layout.addProperty("workSharing", "Unknown");
         try { SwarmCrew.workSharing(layout); throw new AssertionError("Unknown strategy accepted"); }
@@ -656,6 +681,37 @@ public final class SwarmCrewTest {
         }
     }
 
+    private static void supplyPlacementPrediction(BlockPos target) throws Exception {
+        // Reproduce useItemOn ordering: validate air, predict a box locally, run the
+        // outgoing packet guard, then record placementSent. Nearby suppliers overlap.
+        var owned = new com.google.gson.JsonArray();
+        var predicted = new java.util.HashSet<BlockPos>();
+        java.util.function.BiPredicate<BlockPos, BlockPos> protectedByPeer = (checked, inFlight) ->
+            !SwarmCrew.containsSupplyPosition(owned, checked, inFlight)
+                && (predicted.contains(checked) || predicted.contains(checked.above()));
+        assert !protectedByPeer.test(target, null) : "The air target passes the initial placement check";
+        predicted.add(target);
+        assert protectedByPeer.test(target, null) : "Reproduce the old guard rejecting its own predicted box";
+        for (BlockPos hit : List.of(target, target.below())) {
+            assert !protectedByPeer.test(hit, target) : "The validated in-flight placement must reach the server before placementSent is set";
+        }
+        BlockPos peer = target.east();
+        predicted.add(peer);
+        assert protectedByPeer.test(peer, target) && protectedByPeer.test(peer.below(), target)
+            : "The in-flight exception must not expose a neighboring worker's box or footing";
+        assert protectedByPeer.test(target, null) : "The exception ends immediately after the placement callback";
+        // Paired chests use the same callback and must protect the already-placed first chest.
+        JsonObject first = new JsonObject(); first.addProperty("x", target.getX()); first.addProperty("y", target.getY()); first.addProperty("z", target.getZ());
+        owned.add(first);
+        assert !protectedByPeer.test(target, peer) && !protectedByPeer.test(peer, peer);
+        try (var bytes = SwarmCrew.class.getResourceAsStream("SwarmCrew.class")) {
+            var compiled = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes());
+            var method = compiled.methods().stream().filter(m -> m.methodName().equalsString("protectedPosition")).findFirst().orElseThrow();
+            assert method.code().orElseThrow().elementList().stream().anyMatch(e -> e instanceof java.lang.classfile.instruction.InvokeInstruction call
+                && call.name().equalsString("crewPlacingSupply")) : "The live packet guard must use the in-flight target";
+        }
+    }
+
     private static void detachedSuppliesAndDuties() throws Exception {
         UUID first = UUID.randomUUID(), middle = UUID.randomUUID(), last = UUID.randomUUID();
         List<UUID> roster = List.of(first, middle, last);
@@ -694,7 +750,7 @@ public final class SwarmCrewTest {
         assert (boolean) canDetach.invoke(coordinator, middle) : "A required specialist can restock; unfinishable cells wait for its return";
         assert (boolean) canDetach.invoke(coordinator, first);
         record.add("activeMembers", new com.google.gson.Gson().toJsonTree(List.of(last.toString())));
-        assert (boolean) canDetach.invoke(coordinator, last) : "Even the last builder detaches; first return restarts the road";
+        assert (boolean) canDetach.invoke(coordinator, last) : "The verified host checkpoint anchors the front while every builder resupplies";
         multipleSupplyRuns(roster);
     }
 
@@ -706,6 +762,18 @@ public final class SwarmCrewTest {
     }
 
     private static void rollingDepartures(JsonObject original, List<UUID> roster) {
+        for (boolean active : List.of(false, true)) for (boolean off : List.of(false, true)) for (boolean away : List.of(false, true))
+            assert SwarmCrew.guardsManualActions(active, off, away) == (active && !off && !away);
+        UUID returning = roster.get(0);
+        JsonObject off = supplyUpdate("service-away", returning, 1, null); off.addProperty("armed", true);
+        JsonObject withdrawn = SwarmCrew.serviceUpdateAssignment(original, off);
+        assert !SwarmCrew.activeMembers(withdrawn).contains(returning);
+        assert SwarmCrew.serviceUpdateAssignment(withdrawn, off) == withdrawn;
+        JsonObject back = SwarmCrew.serviceUpdateAssignment(withdrawn, supplyUpdate("service-back", returning, 2, null));
+        assert SwarmCrew.activeMembers(back).equals(roster);
+        assert SwarmCrew.serviceUpdateAssignment(back, off) == back : "An old withdrawal cannot undo a return";
+        for (String key : List.of("job", "generation", "startRow", "layout", "length"))
+            assert java.util.Objects.equals(original.get(key), back.get(key)) : "Rolling return reset " + key;
         JsonObject current = original.deepCopy();
         current.addProperty("supplyOwner", "existing recovery"); current.addProperty("serviceLock", "preserved lock");
         JsonObject before = current.deepCopy();
@@ -989,7 +1057,7 @@ public final class SwarmCrewTest {
             var cancelled = new SwarmWorker("localhost", port, key);
             cancelled.disconnect();
             await(() -> !cancelled.isAlive());
-            assert !cancelled.connected() && cancelled.socket.isClosed();
+            assert !cancelled.connected() && cancelled.closed();
         }
     }
     private static void stalledHandoffs() throws Exception {
@@ -1046,9 +1114,9 @@ public final class SwarmCrewTest {
             var worker = new SwarmConnection(workerSocket, workerKey, false);
             try {
                 host.start(); worker.start();
-                await(() -> host.connected() && worker.connected() || host.socket.isClosed() || worker.socket.isClosed());
+                await(() -> host.connected() && worker.connected() || host.closed() || worker.closed());
                 if (!success) {
-                    await(() -> host.socket.isClosed() && worker.socket.isClosed());
+                    await(() -> host.closed() && worker.closed());
                     assert !host.connected() && !worker.connected(); return;
                 }
                 assert host.connected() && worker.connected();
@@ -1057,7 +1125,7 @@ public final class SwarmCrewTest {
                     assert next(worker).equals("assignment:" + i); assert next(host).equals("report:" + i);
                 }
                 assert !host.send("x".repeat(16001));
-                await(() -> worker.socket.isClosed());
+                await(worker::closed);
             } finally { host.disconnect(); worker.disconnect(); host.join(1000); worker.join(1000); }
         }
     }

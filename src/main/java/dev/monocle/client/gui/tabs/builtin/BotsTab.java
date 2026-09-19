@@ -1,6 +1,8 @@
 package dev.monocle.client.gui.tabs.builtin;
 
 import com.google.gson.JsonParser;
+import com.google.gson.JsonObject;
+import dev.monocle.coordinator.HighwayJobs;
 import dev.monocle.client.gui.GuiTheme;
 import dev.monocle.client.gui.WindowScreen;
 import dev.monocle.client.gui.renderer.GuiRenderer;
@@ -37,7 +39,7 @@ public class BotsTab extends Tab {
     private static final Color GREEN = new Color(115, 211, 181);
     private static final Color RED = new Color(230, 139, 147);
 
-    public BotsTab() { super("Bots"); }
+    public BotsTab() { super("Workers"); }
 
     @Override public TabScreen createScreen(GuiTheme theme) { return new BotsScreen(theme, this); }
     @Override public boolean isScreen(Screen screen) { return screen instanceof BotsScreen; }
@@ -76,7 +78,7 @@ public class BotsTab extends Tab {
             panelWidth = contentWidth - 16;
 
             Card hero = add(card()).expandX().minWidth(contentWidth).widget();
-            headline = hero.add(theme.label("BOT CONTROL", true, contentWidth - 24).color(GOLD)).expandX().widget();
+            headline = hero.add(theme.label("WORKER CONTROL", true, contentWidth - 24).color(GOLD)).expandX().widget();
             hero.add(theme.label("Crews are your people. Jobs are their work. Manage them independently.", contentWidth - 24)
                 .color(theme.textSecondaryColor())).expandX();
             feedback = hero.add(theme.label("Opening this tab does not pause your crew.", contentWidth - 24)).expandX().widget();
@@ -136,11 +138,12 @@ public class BotsTab extends Tab {
             }, "New crew key copied. Paste it into this crew's workers before reconnecting.");
 
             WSection endpoint = section.add(theme.section("Address & port", false)).expandX().widget();
-            endpoint.add(theme.label("Stop connections before editing. localhost is this computer; use the host's LAN IP for another computer.", panelWidth - 24)
+            endpoint.add(theme.label("LAN: host IP + TCP port. Web: wss://HOST[:PORT]/v1/workers (TCP port ignored). Stop connections before editing.", panelWidth - 24)
                 .color(theme.textSecondaryColor()));
             WTable fields = endpoint.add(theme.table()).expandX().widget();
             fields.add(theme.label("Host address"));
             WTextBox address = fields.add(theme.textBox(bots.ipAddress.get())).minWidth(150).expandX().widget();
+            address.tooltip = bots.ipAddress.description;
             fields.row();
             fields.add(theme.label("Listen on"));
             WTextBox bind = fields.add(theme.textBox(bots.bindAddress.get())).expandX().widget();
@@ -148,6 +151,10 @@ public class BotsTab extends Tab {
             fields.row();
             fields.add(theme.label("Port"));
             WIntEdit port = fields.add(theme.intEdit(bots.serverPort.get(), 1, 65535, true)).expandX().widget();
+            fields.row();
+            fields.add(theme.label("Host web port (0 = off)"));
+            WIntEdit webPort = fields.add(theme.intEdit(bots.webPort.get(), 0, 65535, true)).expandX().widget();
+            webPort.tooltip = "Host only. Loopback WebSocket ingress for a TLS reverse proxy; suggested port 6971.";
             button(endpoint, "Apply connection settings", () -> perform(() -> {
                 connectionEditable();
                 if (address.get().isBlank() || bind.get().isBlank()) throw new IllegalStateException("Both addresses are required.");
@@ -155,6 +162,7 @@ public class BotsTab extends Tab {
                 bots.ipAddress.set(address.get().trim());
                 bots.bindAddress.set(bind.get().trim());
                 bots.serverPort.set(port.get());
+                bots.webPort.set(webPort.get());
                 bots.save();
             }, "Connection settings saved. Start the host or enable the worker connection."));
         }
@@ -188,6 +196,22 @@ public class BotsTab extends Tab {
                     }, "Definition imported with a new identity. Review its code, calls and profiles before queuing it.");
                 }
                 workflowLibrary = pageBody.add(theme.verticalList()).expandX().widget();
+                if (bots.mode.get() == Bots.Mode.Host) {
+                    button(pageBody,"Import captured package from clipboard",()->perform(()->{
+                        String source=mc.keyboardHandler.getClipboard();if(source.length()>4*1024*1024)throw new IllegalArgumentException("Package exceeds 4 MiB");
+                        JsonObject packet=JsonParser.parseString(source).getAsJsonObject();String id=java.util.UUID.randomUUID().toString();
+                        String name=packet.getAsJsonObject("programs").getAsJsonObject(packet.get("entry").getAsString()).get("name").getAsString();
+                        bots.operations().save(id,name,"Imported",packet);buildPage();
+                    },"Portable package imported. Captured profiles travel to workers when queued."));
+                    for(var item:bots.operations().list()) {
+                        JsonObject record=item.getAsJsonObject();if(record.get("builtin").getAsBoolean())continue;
+                        String id=record.get("id").getAsString();
+                        WHorizontalList row=pageBody.add(theme.horizontalList()).expandX().widget();row.add(theme.label(record.get("folder").getAsString()+" / "+record.get("name").getAsString())).expandX();
+                        button(row,"Queue",()->mc.gui.setScreen(new BotTaskScreen(theme,bots,null,"package:"+id,bots.selectedCrew())));
+                        button(row,"Copy package",()->mc.keyboardHandler.setClipboard(bots.operations().get(id).get("package").toString()));
+                        var remove=row.add(theme.confirmedButton("Delete","Delete captured package?")).widget();remove.action=()->perform(()->{bots.operations().delete(id);buildPage();},"Package removed; queued jobs retain their snapshots.");
+                    }
+                }
                 workflowShape = "";
                 refreshWorkflows();
                 return;
@@ -241,6 +265,7 @@ public class BotsTab extends Tab {
             button(actions, "Assign crew", () -> mc.gui.setScreen(new AssignmentScreen(theme, bots, bots.selectedCrew(), null)));
             button(actions, "Queue workflow", () -> mc.gui.setScreen(new BotTaskScreen(theme, bots, null, null, bots.selectedCrew())));
             button(actions, "Inspect current job", () -> mc.gui.setScreen(new InspectionScreen(theme, bots, bots.controlCrew())));
+            button(actions, "Manage & chat", () -> mc.gui.setScreen(new ManagementScreen(theme,bots,bots.selectedCrew(),null)));
         }
 
         private void jobsPage() {
@@ -248,6 +273,7 @@ public class BotsTab extends Tab {
                 .color(theme.textSecondaryColor()));
             button(pageBody, "Queue workflow", () -> mc.gui.setScreen(new BotTaskScreen(theme, bots, null)));
             button(pageBody, "Create stash hunt", () -> mc.gui.setScreen(new BotTaskScreen(theme, bots, null, dev.monocle.client.systems.bots.BotStashHunt.WORKFLOW, bots.selectedCrew())));
+            button(pageBody, "Inspect stash · Experimental", () -> mc.gui.setScreen(new BotTaskScreen(theme,bots,null,dev.monocle.client.systems.bots.BotStashScan.WORKFLOW,bots.selectedCrew())));
             taskQueue = pageBody.add(theme.verticalList()).expandX().widget();
             refreshTasks();
             WSection nativeJobs = pageBody.add(theme.section("Native highway jobs · saved geometry & progress", false)).expandX().widget();
@@ -309,7 +335,7 @@ public class BotsTab extends Tab {
         }
 
         private void historyPage() {
-            pageBody.add(theme.label("Finished workflow and highway records, unified here. Retention is configured under Config → Bots (30 days by default). Active jobs and recovery records are protected.", panelWidth).color(theme.textSecondaryColor()));
+            pageBody.add(theme.label("Finished workflow and highway records, unified here. Retention is configured under Config → Workers (30 days by default). Active jobs and recovery records are protected.", panelWidth).color(theme.textSecondaryColor()));
             var clear = pageBody.add(theme.confirmedButton("Clear all job history", "Permanently delete all finished job history?")).expandX().widget();
             clear.action = () -> perform(bots::clearJobHistory, "Finished history deleted from both job lists. Active jobs and recovery records were kept.");
             catalog = pageBody.add(theme.verticalList()).expandX().widget();
@@ -421,7 +447,7 @@ public class BotsTab extends Tab {
                 ? new SwarmCrew.JobView("No crew", "idle", "Create a crew above, then assign it a saved job.", "", "", "", false, false, false)
                 : bots.controlCrew().inspect();
             var members = bots.allMembers();
-            headline.set("BOT CONTROL  ·  " + bots.mode.get() + "  ·  " + members.stream().filter(SwarmCrew.MemberView::connected).count() + " online");
+            headline.set("WORKER CONTROL  ·  " + bots.mode.get() + "  ·  " + members.stream().filter(SwarmCrew.MemberView::connected).count() + " online");
             connection.set(bots.connectionStatus());
             connection.color(bots.isHost() || bots.isWorker() ? GREEN : GOLD);
             connectionDetail.set(bots.connectionDetail());
@@ -477,6 +503,7 @@ public class BotsTab extends Tab {
                     WContainer statusParent = contentWidth >= 600 ? row : memberBox;
                     WLabel status = statusParent.add(theme.label("", contentWidth >= 600 ? contentWidth - 370 : contentWidth - 30)).expandX().widget();
                     memberStatus.put(member.id(), status);
+                    if(!self&&bots.mode.get()==Bots.Mode.Host)button(memberBox,"Manage & chat",()->mc.gui.setScreen(new ManagementScreen(theme,bots,bots.workerCrew(member.id()),member.id())));
                     button(memberBox, "Copy diagnostics", () -> {
                         var snapshot = bots.coordinator(bots.workerCrew(member.id())).workerDiagnostics(member.id());
                         mc.keyboardHandler.setClipboard(snapshot.toString());
@@ -648,7 +675,7 @@ public class BotsTab extends Tab {
                     assign.set("Assigned"); assign.action = null;
                 } catch (RuntimeException e) { feedback.set(e.getMessage() == null ? "Unable to assign this job." : e.getMessage()); feedback.color(RED); }
             };
-            add(theme.button("Back to Bots")).expandX().widget().action = this::onClose;
+            add(theme.button("Back to Workers")).expandX().widget().action = this::onClose;
         }
 
         private void refreshWorkerWorkflows(boolean includeHost, double width) {
@@ -698,7 +725,7 @@ public class BotsTab extends Tab {
             }
             catch (RuntimeException e) {
                 add(theme.label("Job unavailable: " + failure(e) + "\nSaved data has not been changed. Resolve the issue, then reopen this editor.", width).color(RED));
-                add(theme.button("Back to Bots")).expandX().widget().action = this::onClose;
+                add(theme.button("Back to Workers")).expandX().widget().action = this::onClose;
                 return;
             }
             WTable fields = add(theme.table()).expandX().widget();
@@ -708,7 +735,7 @@ public class BotsTab extends Tab {
             String selectedWorkflow = existing == null ? BotWorkflows.DEFAULT_ID : existing.workflowId();
             workflow = fields.add(theme.dropdown(workflows, Arrays.stream(workflows).filter(w -> w.id().equals(selectedWorkflow)).findFirst().orElse(workflows[0]))).expandX().widget(); fields.row();
             fields.add(theme.label("Road length"));
-            length = fields.add(theme.intEdit(existing == null ? bots.sectionLength.get() : existing.length(), 16, 4096, true)).expandX().widget();
+            length = fields.add(theme.intEdit(existing == null ? bots.sectionLength.get() : existing.length(), 16, HighwayJobs.MAX_LENGTH, true)).expandX().widget();
             fields.row(); fields.add(theme.label("Work sharing"));
             sharing = fields.add(theme.dropdown(SwarmCrew.WorkSharing.values(), existing == null ? SwarmCrew.WorkSharing.Lanes : SwarmCrew.workSharing(existing.layout()))).expandX().widget();
             sharing.tooltip = "Lanes: separate standing positions/columns and a five-row work window. Break Order: shared center lane, different mining orders and at most one row between builders. Paving keeps dedicated owners.";
@@ -743,7 +770,7 @@ public class BotsTab extends Tab {
             }, "Job workflow refreshed from its saved definition. The origin and highway geometry are unchanged.");
             add(theme.label("Workflows control excavating, paving and supply fallback; Highway Builder supplies geometry/materials. Origin, layout, workflow and length changes require zero progress. Names can be edited while unassigned. Existing progress is never silently discarded.", width).color(theme.textSecondaryColor()));
             actions = add(theme.verticalList()).expandX().widget();
-            add(theme.button("Back to Bots")).expandX().widget().action = this::onClose;
+            add(theme.button("Back to Workers")).expandX().widget().action = this::onClose;
             refresh();
         }
 
@@ -775,6 +802,32 @@ public class BotsTab extends Tab {
             refresh();
         }
         @Override public void tick() { super.tick(); if (actions != null && ++ticks % 5 == 0) refresh(); }
+    }
+
+    /** Same authenticated chat channel as the standalone dashboard; no launcher dependency. */
+    private static class ManagementScreen extends WindowScreen {
+        private final Bots bots;private final String crewId;private final UUID worker;private WLabel feed,feedback;private int ticks;
+        ManagementScreen(GuiTheme theme,Bots bots,String crewId,UUID worker) {super(theme,worker==null?"Manage crew":"Manage worker");this.bots=bots;this.crewId=crewId;this.worker=worker;}
+        @Override public void initWidgets() {
+            double width=Math.clamp(Utils.getWindowWidth()/theme.scale(1)-100,320,640);
+            add(theme.label(bots.crewLabel(crewId)+(worker==null?" · all workers":" · "+bots.allMembers().stream().filter(m->m.id().equals(worker)).map(SwarmCrew.MemberView::name).findFirst().orElse(worker.toString())),true,width)).expandX();
+            add(theme.label("Game chat · session-only · slash commands go to the server. Crew messages are sent from every connected worker.",width).color(theme.textSecondaryColor())).expandX();
+            feed=add(theme.label("Waiting for chat",width)).expandX().widget();
+            WHorizontalList compose=add(theme.horizontalList()).expandX().widget();WTextBox text=compose.add(theme.textBox("","Message or /server command")).expandX().widget();
+            var send=compose.add(theme.confirmedButton("Send",worker==null?"Send from whole crew?":"Send message?")).widget();
+            feedback=add(theme.label("",width)).expandX().widget();
+            send.action=()->{try {bots.sendChat(crewId,worker,text.get());text.set("");feedback.set("Sent to connected clients; not a server acknowledgement.");}catch(RuntimeException e){feedback.set(failure(e));}};
+            add(theme.button("Manage current job & recovery")).widget().action=()->mc.gui.setScreen(new InspectionScreen(theme,bots,bots.coordinator(crewId)));
+            add(theme.button("Queue workflow")).widget().action=()->mc.gui.setScreen(new BotTaskScreen(theme,bots,null,null,crewId));
+            add(theme.button("Back")).widget().action=this::onClose;refreshChat();
+        }
+        private void refreshChat() {
+            var raw=bots.chatFeed();
+            var rows=(worker==null?dev.monocle.coordinator.BotChat.grouped(raw):raw).asList().stream().map(com.google.gson.JsonElement::getAsJsonObject).filter(r->worker==null?r.get("crew").getAsString().equals(crewId):r.get("worker").getAsString().equals(worker.toString())).toList();
+            StringBuilder lines=new StringBuilder();for(var row:rows.subList(Math.max(0,rows.size()-40),rows.size()))lines.append('[').append(row.get("name").getAsString()).append(" · ").append(row.get("direction").getAsString()).append("] ").append(row.get("text").getAsString()).append('\n');
+            feed.set(lines.isEmpty()?"No chat captured yet.":lines.toString());
+        }
+        @Override public void tick() {super.tick();if(++ticks%20==0)refreshChat();}
     }
 
     private static class InspectionScreen extends WindowScreen {
@@ -824,7 +877,7 @@ public class BotsTab extends Tab {
                 }
             } else add(theme.label(catalogError.isEmpty() ? "Only the host can resume or end a crew job. Keep this worker connected so it can receive the host's recovery decision."
                 : catalogError + "\nRecovery details remain readable. Resolve the catalog issue and reopen this view before changing job state.", reportWidth).color(GOLD)).expandX();
-            var back = add(theme.button("Back to Bots")).expandX().widget();
+            var back = add(theme.button("Back to Workers")).expandX().widget();
             back.action = this::onClose;
             refresh();
         }

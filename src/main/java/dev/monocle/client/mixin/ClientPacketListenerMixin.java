@@ -39,6 +39,7 @@ import net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.CommonListenerCookie;
+import net.minecraft.client.multiplayer.PlayerInfo;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.game.*;
 import net.minecraft.world.entity.Entity;
@@ -46,6 +47,8 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.phys.Vec3;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -53,6 +56,15 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ClientPacketListener.class)
 public abstract class ClientPacketListenerMixin extends ClientCommonPacketListenerImpl {
+    @Shadow @Final @Mutable
+    private java.util.Map<java.util.UUID, PlayerInfo> playerInfoMap;
+
+    @Inject(method = "<init>", at = @At("TAIL"))
+    private void monocle$threadSafePlayerProfiles(Minecraft client, Connection connection, CommonListenerCookie cookie, CallbackInfo ci) {
+        // Vanilla resolves item profiles asynchronously while player-list packets update this map.
+        playerInfoMap = new java.util.concurrent.ConcurrentHashMap<>(playerInfoMap);
+    }
+
     @Shadow
     private ClientLevel level;
 

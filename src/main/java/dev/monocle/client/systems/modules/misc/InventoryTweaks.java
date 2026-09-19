@@ -40,6 +40,7 @@ import net.minecraft.nbt.*;
 import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
 import net.minecraft.network.protocol.game.ServerboundContainerClosePacket;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.Container;
 import net.minecraft.world.entity.decoration.ItemFrame;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.InventoryMenu;
@@ -61,6 +62,7 @@ import com.mojang.blaze3d.platform.InputConstants;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Predicate;
 
 public class InventoryTweaks extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -327,12 +329,36 @@ public class InventoryTweaks extends Module {
     private InventoryLoadout.Move confirmingMove;
     private ItemStack expectedFrom = ItemStack.EMPTY, expectedTo = ItemStack.EMPTY, expectedCursor = ItemStack.EMPTY;
     private int confirmingAmount;
+    private ClientLevel managedWorld;
+    private int managedTick, managedTrashSlot = -1;
+    private ItemStack managedTrashStack = ItemStack.EMPTY;
 
     private enum Operation { Refill, Deposit, Compact, Arrange, Steal, Dump, Cleanup }
     public enum OnOpen { Off, Refill, Deposit }
 
+    /** A transient workflow loadout. Workflows own their targets; Inventory Manager owns slot changes. */
+    public record ManagedSlot(int hotbarSlot, Predicate<ItemStack> accepts) {
+        public ManagedSlot {
+            if (hotbarSlot < 0 || hotbarSlot > 8 || accepts == null) throw new IllegalArgumentException("A managed slot needs a hotbar slot and item matcher.");
+        }
+    }
+
+    public record ManagedPolicy(List<ManagedSlot> hotbar, Predicate<ItemStack> filler, int fillerLimit,
+                                Predicate<ItemStack> trash, float trashYaw) {
+        public ManagedPolicy {
+            hotbar = List.copyOf(hotbar);
+            if (filler == null || trash == null || fillerLimit < 0) throw new IllegalArgumentException("A managed policy needs item matchers and a non-negative filler reserve.");
+        }
+    }
+
+    record ManagedAction(int drop, int from, int to) {
+        static final ManagedAction NONE = new ManagedAction(-1, -1, -1);
+        static ManagedAction drop(int slot) { return new ManagedAction(slot, -1, -1); }
+        static ManagedAction swap(int from, int to) { return new ManagedAction(-1, from, to); }
+    }
+
     public InventoryTweaks() {
-        super(Categories.Misc, "inventory-manager", "Saved loadouts, pinned hotbars and controlled supply transfers. Monocle rework of Meteor's Inventory Tweaks.", "inventory-tweaks");
+        super(Categories.Misc, "inventory-manager", "Saved and workflow loadouts, pinned hotbars and controlled supply transfers. Monocle rework of Meteor's Inventory Tweaks.", "inventory-tweaks");
     }
 
     @Override
@@ -371,6 +397,84 @@ public class InventoryTweaks extends Module {
     }
     public boolean hasLoadout() { return !getLoadout().isEmpty(); }
     public boolean showLegacyButtons() { return legacyButtons.get(); }
+
+    /** Plans one loss-aware workflow action without mutating the inventory. */
+    static ManagedAction managedAction(Container inventory, ManagedPolicy policy) {
+        int filler = 0;
+        for (int i = 0; i < Math.min(36, inventory.getContainerSize()); i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (policy.filler.test(stack)) {
+                boolean excess = filler >= policy.fillerLimit;
+                filler += stack.getCount();
+                if (!excess) continue;
+            } else if (!policy.trash.test(stack)) continue;
+            return ManagedAction.drop(i);
+        }
+        for (ManagedSlot role : policy.hotbar) {
+            if (role.accepts.test(inventory.getItem(role.hotbarSlot))) continue;
+            for (int i = 0; i < Math.min(36, inventory.getContainerSize()); i++) {
+                if (role.accepts.test(inventory.getItem(i))) return ManagedAction.swap(i, role.hotbarSlot);
+            }
+        }
+        return ManagedAction.NONE;
+    }
+
+    /** Executes at most one workflow-requested cleanup or hotbar action. Null means the policy is settled. */
+    public String maintain(ManagedPolicy policy) {
+        if (mc.player == null || mc.level == null || mc.player.containerMenu != mc.player.inventoryMenu
+            || !mc.player.containerMenu.getCarried().isEmpty()) return null;
+        if (managedWorld != mc.level) {
+            managedWorld = mc.level;
+            managedTick = 0;
+            managedTrashSlot = -1;
+            managedTrashStack = ItemStack.EMPTY;
+        }
+        if (operation != null) return "Managed inventory: waiting for Inventory Manager";
+        if (mc.player.tickCount < managedTick) return null;
+        managedTick = mc.player.tickCount + 5;
+        ManagedAction action = managedAction(mc.player.getInventory(), policy);
+        if (action.drop >= 0) {
+            ItemStack stack = mc.player.getInventory().getItem(action.drop);
+            mc.player.setYRot(policy.trashYaw);
+            mc.player.setXRot(-25);
+            if (managedTrashSlot == action.drop && ItemStack.matches(managedTrashStack, stack)) {
+                InvUtils.drop().slot(action.drop);
+                managedTrashSlot = -1;
+                managedTrashStack = ItemStack.EMPTY;
+            } else {
+                managedTrashSlot = action.drop;
+                managedTrashStack = stack.copy();
+            }
+            status = "Managed inventory: clearing trash";
+            return status;
+        }
+        managedTrashSlot = -1;
+        managedTrashStack = ItemStack.EMPTY;
+        if (action.from >= 0) {
+            InvUtils.quickSwap().fromId(action.to).to(action.from);
+            status = "Managed inventory: arranging hotbar";
+            return status;
+        }
+        return null;
+    }
+
+    /** Dedicated boxes contain only the requested resource; mixed kits are deliberately ignored. */
+    public static int dedicatedSupplyScore(ItemStack box, Predicate<ItemStack> wanted) {
+        if (!Utils.isShulker(box.getItem())) return 0;
+        ItemStack[] contents = new ItemStack[27];
+        Utils.getItemsInContainerItem(box, contents);
+        return dedicatedSupplyScore(contents, wanted);
+    }
+
+    public static int dedicatedSupplyScore(ItemStack[] contents, Predicate<ItemStack> wanted) {
+        int count = 0;
+        for (ItemStack stack : contents) {
+            if (stack.isEmpty()) continue;
+            if (!wanted.test(stack)) return 0;
+            count += stack.getCount();
+        }
+        return count;
+    }
 
     public List<InventoryLoadout.Rule> getLoadout() {
         if ((!loadoutLoaded || loadoutWorld != mc.level) && mc.player != null) {
@@ -515,6 +619,10 @@ public class InventoryTweaks extends Module {
         automaticMenu = null;
         loadoutLoaded = false;
         invOpened = false;
+        managedWorld = null;
+        managedTick = 0;
+        managedTrashSlot = -1;
+        managedTrashStack = ItemStack.EMPTY;
     }
 
     @EventHandler

@@ -13,6 +13,7 @@ java {
 dependencies {
     api("com.google.code.gson:gson:2.14.0")
     implementation("org.luaj:luaj-jse:3.0.1")
+    implementation("org.java-websocket:Java-WebSocket:1.6.0")
 }
 
 val coordinatorCoreCheck = tasks.register<JavaExec>("coordinatorCoreCheck") {
@@ -23,6 +24,9 @@ val coordinatorCoreCheck = tasks.register<JavaExec>("coordinatorCoreCheck") {
     mainClass.set("dev.monocle.coordinator.CoordinatorCoreTest")
     enableAssertions = true
 }
-tasks.test { exclude("**/CoordinatorCoreTest*.class") } // Assertion main above, not a test-framework test.
+tasks.test { exclude("**/CoordinatorCoreTest*.class", "**/CrewTelemetryTest*.class", "**/OperationsLibraryTest*.class") } // Assertion mains above, not test-framework tests.
 tasks.check { dependsOn(coordinatorCoreCheck) }
-tasks.withType<Jar>().configureEach { from(rootProject.file("LICENSE")) }
+tasks.withType<Jar>().configureEach {
+    from(rootProject.file("LICENSE"))
+    from(rootProject.file("licenses/Java-WebSocket-MIT.txt")) { into("META-INF/licenses") }
+}

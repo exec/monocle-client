@@ -96,12 +96,12 @@ public class HighwayBuilderScreen extends WindowScreen {
         actions.clear();
 
         if (Bots.get().crew.localAssigned()) {
-            WButton manage = actions.add(theme.button("Manage crew in Bots")).expandX().widget();
-            manage.action = () -> dev.monocle.client.gui.tabs.Tabs.get().stream().filter(tab -> tab.name.equals("Bots")).findFirst().ifPresent(tab -> tab.openScreen(theme));
-            manage.tooltip = "Crew lifecycle is controlled from the host's Bots tab. Emergency module disable remains available.";
+            WButton manage = actions.add(theme.button("Manage crew in Workers")).expandX().widget();
+            manage.action = () -> dev.monocle.client.gui.tabs.Tabs.get().stream().filter(tab -> tab.name.equals("Workers")).findFirst().ifPresent(tab -> tab.openScreen(theme));
+            manage.tooltip = "Crew lifecycle is controlled from the host's Workers tab. Emergency module disable remains available.";
             enterAction = manage.action;
             setup.clear();
-            setup.add(theme.label("This highway belongs to a bot crew.\nUse the host's Bots tab to inspect, pause, resume or end the job.", 310));
+            setup.add(theme.label("This highway belongs to a worker crew.\nUse the host's Workers tab to inspect, pause, resume or end the job.", 310));
             return;
         }
 
@@ -135,7 +135,7 @@ public class HighwayBuilderScreen extends WindowScreen {
     }
 
     private void refreshLabels() {
-        status.set(builder.getHudStatus() + " · " + builder.getPavingRate());
+        status.set(builder.getHudStatus() + " · " + builder.getPavingRate()+"\n"+builder.getRoadPrediction());
         status.color(builder.isHudHealthy() ? new Color(100, 220, 145) : theme.textColor());
         plan.set(builder.getPlanSummary());
         stats.set(StringUtil.stripColor(builder.getStatsText().getString()).replace("\n", " · "));
