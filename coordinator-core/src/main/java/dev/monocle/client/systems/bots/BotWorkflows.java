@@ -27,7 +27,7 @@ public final class BotWorkflows {
     private static Map<String, Workflow> builtins() {
         Map<String, Workflow> values = new LinkedHashMap<>();
         addBuiltin(values, "highway-supplies", "Carried supplies", List.of(new Step(Action.InventoryShulkers, ""),
-            new Step(Action.EnderChestContents, ""), new Step(Action.EnderChestFarm, "")));
+            new Step(Action.EnderChestContents, "")));
         addBuiltin(values, DEFAULT_ID, "6b6t Highway Builder", List.of(new Step(Action.Excavating, ""), new Step(Action.Paving, ""), new Step(Action.Call, "highway-supplies")));
         addBuiltin(values, "highway-excavate", "Excavation crew", List.of(new Step(Action.Excavating, ""), new Step(Action.Call, "highway-supplies")));
         addBuiltin(values, "highway-pave", "Paving crew", List.of(new Step(Action.Paving, ""), new Step(Action.Call, "highway-supplies")));

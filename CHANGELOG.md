@@ -2,7 +2,42 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
-## Unreleased — 0.7.128 development checkpoint
+## 0.7.139
+
+- Made crew cancellation stop Highway Builder unconditionally, preventing a cleared assignment flag from leaving the module running as an uncoordinated solo builder.
+
+## 0.7.138 — development checkpoint
+
+- Removed ender-chest farming from the built-in 6b6t highway workflow. Default jobs search carried shulkers and ender-chest contents but never consume ender chests as paving material.
+
+## 0.7.137 — development checkpoint
+
+- Made shared-supply donors discard stale rear service waypoints before opening a shulker, and let recipients follow the donor's verified container anywhere along the active highway corridor.
+
+## 0.7.136 — development checkpoint
+
+- Rebased stale detached-restock sites onto the worker's current completed road instead of sending it hundreds of blocks backward after an earlier failed attempt.
+- Made managed restocking reserve only the physical container-recovery slots and sacrifice expendable filler when necessary, rather than prematurely reporting that the inventory is full.
+
+- Added experimental **Roles** highway sharing. Dedicated excavators take centered front positions and remain 5–16 rows ahead; paving specialists retain separate rear lanes, while dual-duty workers are permitted between both fronts.
+- Made role-based column ownership match physical worker positions so a centered excavator owns the full excavation face without forcing paving and rail work onto an edge lane.
+
+- Rebuilt Crystal Aura around scored attack plans with proactive airplaced obsidian bases, ping-adaptive server confirmation, spawn-driven breaking, safer primary-target selection, friend protection, health reserves, and optional damage-simulated one- or two-block cover.
+- Updated Crystal Aura defaults for anarchy combat: movement prediction, confirmed base building, smart cover, and silent switching are enabled while fixed hurt-time throttling remains off.
+
+- Highway Builder now automatically retries transient movement, route, cursor, and server-verification stalls in solo and crew jobs while preserving pending work.
+- Supply recovery now abandons confirmed-missing or externally collected containers instead of permanently pausing, skips exhausted ender-chest sources, and retries around occupied supply sites.
+- Double ender-chest restocking now degrades to a single chest when the pair is blocked, changed, unsupported, or exposed as only 27 slots by the server.
+
+- Added an authenticated crew directory to connected workers, showing crew status, live job, and occupancy without disclosing crew keys.
+- Added per-job public joining controls to the in-game host and standalone WebUI. Eligible workers can switch crews through the existing encrypted key handoff and join a highway already in progress.
+- Host-driven worker moves now carry the destination's active job through reconnect, so moving an idle worker into a working crew no longer requires a second manual admission step.
+- Added host-owned Auto TPY for exact same-crew `/tpa` commands, with a 10-tick delay, fresh server/identity checks, authenticated delivery, and controls in both Workers host UIs.
+- Added last-line highway recovery through a healthy crewmate using the authenticated TPA/TPY path. A worker already awaiting teleport recovery cannot be its anchor.
+- Capped native highway crews at three workers across host, workflow, join, and assignment boundaries.
+- Kept worker connection controls visible while connected, added an explicit disconnect action, and allowed offline workers to change host address/port without discarding their saved assignment.
+
+## 0.7.128 — development checkpoint
 
 - Continued hardening of coordinated highway excavation, paving, verification, crew rejoining, supply recovery, and managed inventory.
 - Added the standalone Workers host, authenticated control API, bundled operator WebUI, telemetry, resource accounting, and live module configuration.

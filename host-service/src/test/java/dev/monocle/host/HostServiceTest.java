@@ -25,6 +25,7 @@ public final class HostServiceTest {
         }
         assert HostService.ACTIONS.contains("Tpa") : "Standalone workers must be able to use the trusted TPA action";
         operationsCheck();
+        autoTpyCheck();
         stashScanCheck();
         rollingHistoryCheck();
         checkpointReleaseCheck();
@@ -792,6 +793,27 @@ public final class HostServiceTest {
         System.out.println("Operations host checks passed: crew identity/credentials, immutable drafts, job assignment, protected moves, authenticated reconnect, offline roster and retention.");
     }
 
+    private static void autoTpyCheck() throws Exception {
+        Path directory=Files.createTempDirectory("monocle-auto-tpy-host-");
+        JsonObject config=new JsonObject();config.addProperty("historyDays",30);config.addProperty("autoTpy",true);config.add("crews",new Gson().toJsonTree(CREWS));TaskFiles.write(directory.resolve("host-config.json"),config);
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
+            Worker requester=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());
+            Worker target=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());
+            Worker outsider=new Worker(host.port(),OTHER_KEY,UUID.randomUUID(),new LinkedHashMap<>())) {
+            requester.name="Requester";target.name=outsider.name="Target";requester.announce();target.announce();outsider.announce();
+            await(()->connected(host)==3&&requester.autoTpy&&target.autoTpy&&outsider.autoTpy,requester,target,outsider);
+            long started=System.nanoTime();requester.requestTpa("Target");
+            await(()->target.tpaAccepts.size()==1,requester,target,outsider);
+            assert System.nanoTime()-started>=400_000_000L : "Auto TPY must preserve the requested ten-tick ordering delay";
+            assert outsider.tpaAccepts.isEmpty()&&text(target.tpaAccepts.getFirst(),"requester").equals("Requester") : "Auto TPY stays inside the authenticated crew";
+            JsonObject setting=op("host-settings");setting.addProperty("autoTpy",false);host.control(setting);
+            await(()->!requester.autoTpy&&!target.autoTpy,requester,target,outsider);
+            requester.requestTpa("Target");for(int i=0;i<80;i++){requester.pump();target.pump();outsider.pump();Thread.sleep(10);}
+            assert target.tpaAccepts.size()==1&&!TaskFiles.read(directory.resolve("host-config.json")).get("autoTpy").getAsBoolean() : "Disabled host policy persists and sends no acceptance";
+        }
+        System.out.println("Auto TPY checks passed: host-owned policy, ten-tick delay, exact same-crew routing and durable disable.");
+    }
+
     private static final class Worker implements AutoCloseable {
         final SwarmConnection c;
         final UUID id;
@@ -799,6 +821,7 @@ public final class HostServiceTest {
         String current = "", digest, transfer;
         final List<String> chunks = new ArrayList<>();
         final List<String> chatMessages = new ArrayList<>();
+        final List<JsonObject> tpaAccepts = new ArrayList<>();
         int count, installs, resumes;
         int stashAcks;
         long announceAt;
@@ -817,6 +840,7 @@ public final class HostServiceTest {
         int row;
         boolean begun, advance, detached, returning, ignoreEnd, nativePaused, moduleOff;
         boolean ignoreJoin;
+        boolean autoTpy;
         boolean delayLanding;
         int frontUpdates;
         int rejectedJoins;
@@ -881,7 +905,8 @@ public final class HostServiceTest {
                 JsonObject message = JsonParser.parseString(wire).getAsJsonObject();
                 switch (text(message, "type")) {
                     case "manage-chat" -> { assert text(message,"scope").equals(scope);chatMessages.add(BotChat.command(text(message,"text")));JsonObject report=new JsonObject();report.addProperty("type","worker-chat");report.addProperty("direction","sent");report.addProperty("text",text(message,"text"));c.send(report.toString()); }
-                    case "heartbeat" -> { }
+                    case "heartbeat" -> autoTpy=flag(message,"autoTpy");
+                    case "task-tpa-accept" -> tpaAccepts.add(message.deepCopy());
                     case "assign-crew" -> { assignedKey=c.openSecret(text(message,"sealedKey")); }
                     case "task-begin" -> { transfer = text(message, "run"); digest = text(message, "hash"); count = message.get("count").getAsInt(); chunks.clear(); }
                     case "task-chunk" -> {
@@ -971,6 +996,7 @@ public final class HostServiceTest {
             m.addProperty("x",0);m.addProperty("y",116);m.addProperty("z",97);m.addProperty("lock",supplyLock);c.send(m.toString());
         }
         void detach(){nativeSend("request",true);}
+        void requestTpa(String target){JsonObject request=new JsonObject();request.addProperty("type","worker-tpa-request");request.addProperty("request",UUID.randomUUID().toString());request.addProperty("target",target);request.addProperty("scope",scope);c.send(request.toString());}
         void reserve(){supplyLock="local-container";announce();}
         void release(){supplyLock="";returning=true;announce();}
         @Override public void close() { c.disconnect(); }

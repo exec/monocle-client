@@ -35,7 +35,7 @@ final class HighwayHost extends HighwayCoordinator<HighwayHost.Position> {
         if (assigned() || saved != null) throw new IllegalStateException("Finish or cancel this crew's previous highway first");
         JsonObject definition = HighwayJobs.checked(input);
         if (num(definition,"progress") >= num(definition,"length")) throw new IllegalArgumentException("Highway already complete");
-        if (workers.isEmpty() || workers.size() > num(definition.getAsJsonObject("layout"),"width")) throw new IllegalArgumentException("Crew must fit the highway width");
+        if (workers.isEmpty() || workers.size() > MAX_CREW_MEMBERS || workers.size() > num(definition.getAsJsonObject("layout"),"width")) throw new IllegalArgumentException("Crew must contain 1–3 workers and fit the highway width");
         Map<UUID,SwarmConnection> selected = new LinkedHashMap<>();
         for (UUID id : workers) {
             SwarmConnection c = connectionForWorker(id); JsonObject report = c == null ? null : peers.get(c);

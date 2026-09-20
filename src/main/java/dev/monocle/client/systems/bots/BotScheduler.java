@@ -34,6 +34,8 @@ public final class BotScheduler {
     private final Map<UUID, SwarmConnection> transferred = new HashMap<>();
     private final Map<UUID, Long> commands = new HashMap<>();
     private final Map<String, JsonObject> teleports = new HashMap<>();
+    private final Map<UUID, AutoTpy> autoTpy = new LinkedHashMap<>();
+    private final Set<String> autoTpyAccepting = new HashSet<>();
     private final Map<String, Long> accepted = new HashMap<>();
     private final Path acceptanceFile = MonocleClient.FOLDER.toPath().resolve("bot-tpa-accepts.json");
     private boolean acceptedLoaded;
@@ -44,6 +46,7 @@ public final class BotScheduler {
     private long savedAt;
     private boolean dirty;
     private record Transfer(UUID run, String data, String hash, JsonObject metadata, SwarmConnection connection, int next) { }
+    private record AutoTpy(UUID requester, UUID target, String requesterName, String crew, String requesterScope, long due, long expires) { }
     public BotScheduler(Bots bots) { this.bots = bots; runtime = new BotRuntime(bots); }
     public Path exportWorkflow(String id) {
         identifier(id);
@@ -111,7 +114,7 @@ public final class BotScheduler {
         if (workflowId.startsWith("package:")) return createPackage(name, workflowId.substring(8), crewId, targets, args, priority, overrides);
         hostOnly(); load();
         if (!bots.isHost() || !Utils.canUpdate()) throw new IllegalStateException("Start the host in a world before queuing work");
-        if (targets.isEmpty() || targets.size() > 16 || targets.contains(mc.player.getUUID()) || !targets.containsAll(overrides.keySet())) throw new IllegalArgumentException("Choose 1–16 remote workers in this crew (native highways still allow at most 5)");
+        if (targets.isEmpty() || targets.size() > 16 || targets.contains(mc.player.getUUID()) || !targets.containsAll(overrides.keySet())) throw new IllegalArgumentException("Choose 1–16 remote workers in this crew (native highways allow at most 3)");
         for (UUID worker : targets) if (!crewId.equals(bots.workerCrew(worker))) throw new IllegalArgumentException("Every target must be connected to the selected crew");
         if (args == null || args.toString().length() > BotLua.MAX_STATE) throw new IllegalArgumentException("Arguments must be a JSON object of at most 32 KiB");
         checkedPriority(priority); overrides.values().forEach(BotScheduler::checkedPriority);
@@ -126,7 +129,7 @@ public final class BotScheduler {
             if (!type.isEmpty()) { JsonObject action = args.deepCopy(); action.addProperty("type", type); BotActions.validate(action); }
         }
         if (!packaged.getAsJsonObject("highways").isEmpty()) {
-            if (targets.size() > 5) throw new IllegalArgumentException("Native highway workflows support at most 5 workers");
+            if (targets.size() > dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS) throw new IllegalArgumentException("Native highway workflows support at most 3 workers");
             JsonObject geometry = new JsonObject();
             geometry.addProperty("scope", scope()); geometry.addProperty("x", mc.player.getBlockX()); geometry.addProperty("y", mc.player.getBlockY()); geometry.addProperty("z", mc.player.getBlockZ());
             geometry.add("layout", Modules.get().get(HighwayBuilder.class).crewLayout()); packaged.add("geometry", geometry);
@@ -143,7 +146,7 @@ public final class BotScheduler {
         checkedPriority(priority);overrides.values().forEach(BotScheduler::checkedPriority);
         if(args==null || args.toString().length()>BotLua.MAX_STATE)throw new IllegalArgumentException("Arguments too large");
         JsonObject record=bots.operations().get(id),packet=checkedPackage(record.getAsJsonObject("package"));
-        if(!packet.getAsJsonObject("highways").isEmpty() && (!text(packet.getAsJsonObject("geometry"),"scope").equals(scope()) || targets.size()>5))throw new IllegalArgumentException("Captured highway geometry must match this world, with at most 5 workers");
+        if(!packet.getAsJsonObject("highways").isEmpty() && (!text(packet.getAsJsonObject("geometry"),"scope").equals(scope()) || targets.size()>dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS))throw new IllegalArgumentException("Captured highway geometry must match this world, with at most 3 workers");
         return createCaptured(name,text(packet,"entry"),text(record,"name"),crewId,targets,args,priority,overrides,packet,scope());
     }
 
@@ -351,7 +354,7 @@ public final class BotScheduler {
         }
     }
     public void disconnected() {
-        runtime.disconnected(); transfers.clear(); transferred.clear(); incoming = null;
+        runtime.disconnected(); transfers.clear(); transferred.clear(); autoTpy.clear(); autoTpyAccepting.clear(); incoming = null;
         reports.clear(); seen.clear(); workerSessions.clear(); workerCurrent.clear();
     }
     public void tick() {
@@ -376,7 +379,7 @@ public final class BotScheduler {
                 bots.reportConnectionFailure("Worker scheduling will retry: " + e.getMessage());
             }
         }
-        flushTransfers(); tickTeleports();
+        flushTransfers(); tickTeleports(); tickAutoTpy();
         if (ticks % 20 == 0) {
             for (JsonObject t : tasks.values()) summarize(t);
             if (dirty || System.nanoTime() - savedAt > 10_000_000_000L) save();
@@ -603,7 +606,8 @@ public final class BotScheduler {
         JsonObject snapshot = coordinator.jobSnapshot(); PlayerObservation report = observation(worker);
         JsonArray preferred = snapshot.getAsJsonArray(snapshot.has("preferredMembers") ? "preferredMembers" : "members");
         long pending = owner.getAsJsonObject("runs").entrySet().stream().filter(e -> pendingLateJoin(e.getValue().getAsJsonObject()) && preferred.asList().stream().noneMatch(v -> v.getAsString().equals(e.getKey()))).count();
-        if (preferred.size() + pending >= integer(snapshot.getAsJsonObject("layout"), "width", 1, 5) || workers(owner).size() >= 5)
+        if (preferred.size() + pending >= Math.min(dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS, integer(snapshot.getAsJsonObject("layout"), "width", 1, 5))
+            || workers(owner).size() >= dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS)
             throw new IllegalStateException("No spare highway lane; existing return and join reservations are retained.");
         BlockPos front = coordinator.returnRendezvous();
         if (report == null || !report.nearby(text(snapshot, "scope"), position(front), 16, true, System.nanoTime()))
@@ -621,7 +625,8 @@ public final class BotScheduler {
         JsonObject reference = workers(task).stream().filter(w -> sameHighwayAction(task, w, run(task, w))).map(w -> run(task, w)).findFirst()
             .orElseThrow(() -> new IllegalStateException("Wait for an existing worker's current Highway action report before adding another."));
         JsonObject joining = new JsonObject(); joining.addProperty("id", UUID.randomUUID().toString()); joining.addProperty("status", "Queued");
-        joining.addProperty("detail", "Preparing captured workflow/profile for late highway admission"); joining.addProperty("joinJob", text(task, "highway"));
+        String highway=task.has("highway")?text(task,"highway"):text(task.getAsJsonObject("nativeDefinition"),"id");
+        joining.addProperty("detail", "Preparing captured workflow/profile for late highway admission"); joining.addProperty("joinJob", highway);
         joining.add("joinAction", reference.getAsJsonObject("action").deepCopy());
         return joining;
     }
@@ -827,11 +832,73 @@ public final class BotScheduler {
             if (localTarget) acceptTeleport(accept); else send(target, accept);
         }
     }
+
+    public void requestAutoTpy(UUID requester, String crew, JsonObject message) {
+        if (!bots.autoTpy.get()) return;
+        UUID request = UUID.fromString(text(message, "request"));
+        if (autoTpy.containsKey(request)) return;
+        if (autoTpy.size() >= 64) throw new IllegalStateException("Too many pending Auto TPY requests");
+        PlayerObservation observation = observation(requester);
+        if (observation == null || !observation.scope().equals(text(message, "scope"))) return;
+        queueAutoTpy(request, observation, crew, text(message, "target"));
+    }
+
+    public void requestLocalAutoTpy(String target) {
+        PlayerObservation local = localObservation();
+        if (local == null) return;
+        for (String crew : bots.presets().stream().map(Bots.CrewPreset::name).toList()) if (bots.coordinator(crew).localAssigned()) {
+            queueAutoTpy(UUID.randomUUID(), local, crew, target); return;
+        }
+    }
+
+    private void queueAutoTpy(UUID request, PlayerObservation requester, String crew, String targetName) {
+        if (!targetName.matches("[A-Za-z0-9_]{1,16}")) throw new IllegalArgumentException("Invalid TPA target");
+        List<PlayerObservation> candidates = new ArrayList<>(observations(crew).values());
+        PlayerObservation local = localObservation();
+        if (local != null && bots.coordinator(crew).localAssigned()) candidates.add(local);
+        List<PlayerObservation> matches = candidates.stream().filter(p -> !p.id().equals(requester.id()) && p.name().equalsIgnoreCase(targetName)).toList();
+        if (matches.size() != 1 || !sameTeleportServer(requester.scope(), matches.getFirst().scope())) return;
+        long now = System.currentTimeMillis();
+        autoTpy.put(request, new AutoTpy(requester.id(), matches.getFirst().id(), requester.name(), crew, requester.scope(), now + 500, now + 10_000));
+    }
+
+    private void tickAutoTpy() {
+        long now = System.currentTimeMillis();
+        for (var entry : List.copyOf(autoTpy.entrySet())) {
+            AutoTpy request = entry.getValue();
+            if (!bots.autoTpy.get() || now >= request.expires()) { autoTpy.remove(entry.getKey()); continue; }
+            if (now < request.due()) continue;
+            PlayerObservation requester = request.requester().equals(mc.player.getUUID()) ? localObservation() : observation(request.requester());
+            boolean localTarget = request.target().equals(mc.player.getUUID());
+            PlayerObservation target = localTarget ? localObservation() : observation(request.target());
+            boolean targetInCrew = localTarget ? bots.coordinator(request.crew()).localAssigned() : request.crew().equals(bots.workerCrew(request.target()));
+            if (requester == null || target == null || !targetInCrew
+                || !request.requesterName().equals(requester.name()) || !request.requesterScope().equals(requester.scope()) || !sameTeleportServer(requester.scope(), target.scope())) {
+                autoTpy.remove(entry.getKey()); continue;
+            }
+            JsonObject accept = message("tpa-accept"); accept.addProperty("token", entry.getKey().toString()); accept.addProperty("requester", requester.name());
+            accept.addProperty("requesterId", requester.id().toString()); accept.addProperty("target", target.id().toString());
+            accept.addProperty("requesterScope", requester.scope()); accept.addProperty("targetScope", target.scope()); accept.addProperty("expires", request.expires());
+            boolean sent;
+            if (localTarget) {
+                acceptCrewTeleport(accept); sent = true;
+            } else {
+                SwarmConnection connection = connection(request.target()); sent = connection != null && connection.connected() && connection.send(accept.toString());
+            }
+            if (sent) { autoTpy.remove(entry.getKey()); bots.info("Auto TPY accepted %s's request to %s.", requester.name(), target.name()); }
+        }
+    }
+    public void acceptCrewTeleport(JsonObject message) {
+        String token = text(message, "token"); UUID.fromString(token);
+        autoTpyAccepting.add(token);
+        try { acceptTeleport(message); }
+        finally { autoTpyAccepting.remove(token); }
+    }
     private void acceptTeleport(JsonObject m) {
         if (!Utils.canUpdate() || !text(m, "target").equals(mc.player.getUUID().toString())) return;
         String token = text(m, "token"), name = text(m, "requester"); UUID.fromString(token); UUID.fromString(text(m, "requesterId"));
         if (bots.mode.get() == Bots.Mode.Worker && (!bots.isWorker() || !bots.acceptCrew.get())) return;
-        if (bots.mode.get() == Bots.Mode.Host && (!teleports.containsKey(token) || !flag(teleports.get(token), "accepted"))) return;
+        if (bots.mode.get() == Bots.Mode.Host && !autoTpyAccepting.contains(token) && (!teleports.containsKey(token) || !flag(teleports.get(token), "accepted"))) return;
         long now = System.currentTimeMillis(), expires = m.get("expires").getAsBigDecimal().longValueExact();
         if (!name.matches("[A-Za-z0-9_]{1,16}") || !validTeleportTtl(now, expires)
             || !scope().equals(text(m, "targetScope")) || !sameTeleportServer(scope(), text(m, "requesterScope"))) return;

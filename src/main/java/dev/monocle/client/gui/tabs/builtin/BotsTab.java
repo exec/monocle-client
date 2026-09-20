@@ -53,7 +53,7 @@ public class BotsTab extends Tab {
         private final Map<UUID, WLabel> memberStatus = new HashMap<>();
         private final Map<UUID, WCheckbox> memberChecks = new HashMap<>();
         private WLabel headline, connection, connectionDetail, keyStatus, feedback, crewDetail, rosterSummary, activity;
-        private WVerticalList connectionControls, pageBody, roster, crewControls, catalog;
+        private WVerticalList connectionControls, pageBody, roster, crewControls, catalog, discovery;
         private WVerticalList workflowLibrary;
         private WVerticalList taskQueue;
         private final Map<UUID, WLabel> taskLabels = new LinkedHashMap<>();
@@ -64,7 +64,7 @@ public class BotsTab extends Tab {
         private final Map<UUID, WLabel> jobLabels = new LinkedHashMap<>();
         private Page page = Page.Crews;
         private Bots.Mode shownRole;
-        private String rosterShape = "", selectedCrew = "", crewShape = "", catalogShape = "", workflowShape = "", workflowFolder = "", taskShape = "";
+        private String rosterShape = "", selectedCrew = "", crewShape = "", catalogShape = "", workflowShape = "", workflowFolder = "", taskShape = "", discoveryShape = "";
         private boolean shownListening, shownEnabled, selectionEdited;
         private double contentWidth, panelWidth;
         private int ticks;
@@ -96,7 +96,7 @@ public class BotsTab extends Tab {
         }
 
         private void connectionPanel(WVerticalList parent) {
-            WSection section = parent.add(theme.section("Connection & private crew key", !bots.isHost() && !bots.isWorker())).expandX().minWidth(panelWidth).widget();
+            WSection section = parent.add(theme.section("Connection & private crew key", true)).expandX().minWidth(panelWidth).widget();
             connection = section.add(theme.label("", true, panelWidth - 16)).expandX().widget();
             connectionDetail = section.add(theme.label("", panelWidth - 16).color(theme.textSecondaryColor())).expandX().widget();
 
@@ -156,7 +156,7 @@ public class BotsTab extends Tab {
             WIntEdit webPort = fields.add(theme.intEdit(bots.webPort.get(), 0, 65535, true)).expandX().widget();
             webPort.tooltip = "Host only. Loopback WebSocket ingress for a TLS reverse proxy; suggested port 6971.";
             button(endpoint, "Apply connection settings", () -> perform(() -> {
-                connectionEditable();
+                endpointEditable();
                 if (address.get().isBlank() || bind.get().isBlank()) throw new IllegalStateException("Both addresses are required.");
                 if (port.get() < 1 || port.get() > 65535) throw new IllegalStateException("Port must be between 1 and 65535.");
                 bots.ipAddress.set(address.get().trim());
@@ -169,8 +169,8 @@ public class BotsTab extends Tab {
 
         private void buildPage() {
             navigation.clear(); pageBody.clear(); memberStatus.clear(); memberChecks.clear(); jobLabels.clear(); taskLabels.clear();
-            rosterShape = crewShape = catalogShape = taskShape = "";
-            roster = null; crewSelector = null; crewName = null; crewDetail = null; catalog = null; workflowLibrary = null; taskQueue = null;
+            rosterShape = crewShape = catalogShape = taskShape = discoveryShape = "";
+            roster = null; crewSelector = null; crewName = null; crewDetail = null; catalog = null; workflowLibrary = null; taskQueue = null; discovery = null;
             for (Page destination : Page.values()) if (destination != Page.History || bots.mode.get() == Bots.Mode.Host) button(navigation, destination == page ? "[ " + destination + " ]" : destination.toString(), () -> {
                 page = destination; buildPage(); refresh();
             });
@@ -220,6 +220,7 @@ public class BotsTab extends Tab {
                 pageBody.add(theme.label("This worker is managed by its host. Keep automatic connection enabled; job and crew controls are host-only.", panelWidth));
                 crewDetail = pageBody.add(theme.label("", panelWidth)).expandX().widget();
                 button(pageBody, "Inspect assignment", () -> mc.gui.setScreen(new InspectionScreen(theme, bots, bots.crew)));
+                if(page==Page.Crews){pageBody.add(theme.label("Crews advertised by this authenticated host. Open jobs can be joined without asking the host operator to move this worker.",panelWidth).color(theme.textSecondaryColor()));discovery=pageBody.add(theme.verticalList()).expandX().widget();refreshDiscovery();}
                 if (page == Page.Jobs) { taskQueue = pageBody.add(theme.verticalList()).expandX().widget(); refreshTasks(); }
                 return;
             }
@@ -314,7 +315,7 @@ public class BotsTab extends Tab {
                 }
                 return;
             }
-            String shape = jobs.stream().map(j -> j.id() + ":" + j.crewId() + ":" + j.unfinished()).toList().toString();
+            String shape = jobs.stream().map(j -> j.id() + ":" + j.crewId() + ":" + j.unfinished()+":"+j.publicJoin()).toList().toString();
             if (!shape.equals(catalogShape) || catalog.cells.isEmpty()) {
                 catalogShape = shape; catalog.clear(); jobLabels.clear();
                 if (jobs.isEmpty()) catalog.add(theme.label("No saved jobs yet. Create one here, then assign any available crew to it.", panelWidth));
@@ -325,6 +326,7 @@ public class BotsTab extends Tab {
                     button(actions, "Details / edit", () -> mc.gui.setScreen(new JobEditorScreen(theme, bots, job.id())));
                     if (job.unclaimed() && job.unfinished()) button(actions, "Assign crew", () -> mc.gui.setScreen(new AssignmentScreen(theme, bots, null, job.id())));
                     if (!job.unclaimed()) {
+                        button(actions, job.publicJoin()?"Close joining":"Open joining", () -> perform(() -> bots.setJobPublic(job.id(),!job.publicJoin()), job.publicJoin()?"Public joining closed.":"Connected workers can now discover and join this job."));
                         button(actions, "Pause", () -> perform(() -> bots.pauseJob(job.id()), "Job pause requested."));
                         button(actions, "Resume", () -> perform(() -> bots.resumeJob(job.id()), "Job resume requested."));
                         button(actions, "Inspect", () -> mc.gui.setScreen(new InspectionScreen(theme, bots, bots.coordinator(job.crewId()))));
@@ -332,6 +334,15 @@ public class BotsTab extends Tab {
                 }
             }
             for (var job : jobs) jobLabels.get(job.id()).set(jobSummary(bots, job));
+        }
+
+        private void refreshDiscovery(){
+            if(discovery==null)return;var rows=bots.discoveries();String shape=rows.toString();if(shape.equals(discoveryShape))return;discoveryShape=shape;discovery.clear();
+            if(rows.isEmpty()){discovery.add(theme.label("No crew directory received yet.",panelWidth).color(theme.textSecondaryColor()));return;}
+            for(var row:rows){Card card=discovery.add(card()).expandX().widget();card.add(theme.label(row.name()+" · "+row.workers()+"/"+row.capacity()+" workers",panelWidth-20).color(row.publicJoin()?GREEN:theme.textColor()));
+                card.add(theme.label((row.jobName().isBlank()?"No active job":row.jobName())+" · "+row.status(),panelWidth-20));
+                if(row.publicJoin()&&!row.job().isBlank()&&row.workers()<row.capacity())button(card,"Join crew job",()->perform(()->bots.requestPublicJoin(row.id(),row.job()),"Join requested. If this is another crew, the worker will reconnect with its assigned key."));
+            }
         }
 
         private void historyPage() {
@@ -408,6 +419,11 @@ public class BotsTab extends Tab {
             role.set(shownRole);
             if (roleChanged) buildPage();
             if (shownRole == Bots.Mode.Host) {
+                WHorizontalList tpy = connectionControls.add(theme.horizontalList()).expandX().widget();
+                WCheckbox autoTpy = tpy.add(theme.checkbox(bots.autoTpy.get())).widget();
+                tpy.add(theme.label("Auto TPY same-crew requests"));
+                autoTpy.tooltip = "Accept an observed /tpa from a worker in this crew after 10 ticks. Workers cannot enable this policy.";
+                autoTpy.action = () -> { bots.autoTpy.set(autoTpy.checked); bots.save(); };
                 if (shownListening) {
                     var stop = connectionControls.add(theme.confirmedButton("Stop host", "Stop connections?")).expandX().widget();
                     stop.action = () -> perform(() -> { noJob(); bots.close(); }, "Host stopped. Workers will keep retrying until you start it again.");
@@ -423,6 +439,11 @@ public class BotsTab extends Tab {
                         bots.save();
                     } finally { enabled.checked = bots.isActive(); }
                 }, "Worker connection preference saved.");
+                if (shownEnabled) {
+                    var disconnect = connectionControls.add(theme.confirmedButton("Disconnect from host", "Disconnect this worker?")).expandX().widget();
+                    disconnect.tooltip = "Disconnect now and stop automatic reconnect. Any host-owned assignment is preserved for a later reconnect.";
+                    disconnect.action = () -> perform(() -> { bots.disable(); bots.save(); }, "Worker disconnected. Address and port can now be changed below.");
+                }
                 WHorizontalList jobs = connectionControls.add(theme.horizontalList()).expandX().widget();
                 WCheckbox accept = jobs.add(theme.checkbox(bots.acceptCrew.get())).widget();
                 jobs.add(theme.label("Accept crew assignments"));
@@ -462,6 +483,7 @@ public class BotsTab extends Tab {
                         ? "participating host confirms the paving" : bots.controlCrew().detachedSupply() ? "worker reports while the host resupplies" : "worker reports; host coordinates remotely") : ""));
                 refreshRoster(members, job);
             } else if (page == Page.Jobs && bots.mode.get() == Bots.Mode.Host) { refreshTasks(); refreshCatalog(); }
+            else if(page==Page.Crews&&bots.mode.get()==Bots.Mode.Worker)refreshDiscovery();
             else if (page == Page.History && bots.mode.get() == Bots.Mode.Host) refreshJobHistory();
             else if (page == Page.Workflows) refreshWorkflows();
             else if (crewDetail != null) {
@@ -553,6 +575,14 @@ public class BotsTab extends Tab {
             noJob();
             if (bots.isHost() || bots.mode.get() == Bots.Mode.Worker && bots.isActive())
                 throw new IllegalStateException("Stop the host or turn off automatic worker connection before changing the role, key or address.");
+        }
+
+        private void endpointEditable() {
+            if (bots.mode.get() == Bots.Mode.Worker) {
+                if (bots.isActive()) throw new IllegalStateException("Disconnect this worker before changing its host address or port.");
+                return; // A disconnected assignment may reconnect to the same host at its new endpoint.
+            }
+            connectionEditable();
         }
 
         private void perform(Runnable action, String success) {
@@ -738,7 +768,7 @@ public class BotsTab extends Tab {
             length = fields.add(theme.intEdit(existing == null ? bots.sectionLength.get() : existing.length(), 16, HighwayJobs.MAX_LENGTH, true)).expandX().widget();
             fields.row(); fields.add(theme.label("Work sharing"));
             sharing = fields.add(theme.dropdown(SwarmCrew.WorkSharing.values(), existing == null ? SwarmCrew.WorkSharing.Lanes : SwarmCrew.workSharing(existing.layout()))).expandX().widget();
-            sharing.tooltip = "Lanes: separate standing positions/columns and a five-row work window. Break Order: shared center lane, different mining orders and at most one row between builders. Paving keeps dedicated owners.";
+            sharing.tooltip = "Lanes: separate columns and a five-row work window. Roles: dedicated excavators lead 5–16 rows from the center while pavers form lanes behind them. Break Order: shared center lane, different mining orders and at most one row between builders.";
             details = add(theme.label("", width)).expandX().widget();
             details.tooltip = "Click to copy the saved job details, including its origin.";
             details.action = () -> perform(() -> {

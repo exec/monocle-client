@@ -20,6 +20,10 @@ final class BotJobsTest {
             try { BotJobs.checked(badMode); throw new AssertionError("Unknown sharing mode accepted"); }
             catch (IllegalArgumentException expected) { }
             jobs.put(original);
+            assert !jobs.records.get(id).get("publicJoin").getAsBoolean() : "Joining is invite-only by default";
+            JsonObject discoverable=jobs.records.get(id).deepCopy();discoverable.addProperty("publicJoin",true);jobs.put(discoverable);
+            assert jobs.records.get(id).get("publicJoin").getAsBoolean() : "Public joining survives catalog validation";
+            JsonObject invalidPublic=definition();invalidPublic.addProperty("publicJoin","yes");bad(()->BotJobs.checked(invalidPublic));
             original.addProperty("name", "Caller changed its copy");
             assert jobs.records.get(id).get("name").getAsString().equals("North road");
             assert BotJobs.unfinished(jobs.records.get(id));

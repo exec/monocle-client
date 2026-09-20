@@ -13,6 +13,26 @@ import java.util.UUID;
 public final class CoordinatorCoreTest {
     private static final UUID WORKER = UUID.fromString("00000000-0000-0000-0000-000000000001");
     private static final UUID OTHER = UUID.fromString("00000000-0000-0000-0000-000000000002");
+    private static final UUID THIRD = UUID.fromString("00000000-0000-0000-0000-000000000003");
+
+    private static void teleportRecovery() {
+        JsonObject requester = recoveryReport("Requester", "requested", 500, 20);
+        JsonObject healthy = recoveryReport("Healthy", "", 2, 12);
+        JsonObject waiting = recoveryReport("Waiting", "waiting", 0, 10);
+        Map<UUID, JsonObject> reports = Map.of(WORKER, requester, OTHER, healthy, THIRD, waiting);
+        assert HighwayCoordinator.recoveryTeleportTarget(WORKER, List.of(WORKER, OTHER, THIRD), reports).equals(OTHER)
+            : "TPA recovery must choose a healthy crewmate, never one awaiting its own teleport";
+        healthy.getAsJsonObject("diagnostics").addProperty("idleTicks", 400);
+        assert HighwayCoordinator.recoveryTeleportTarget(WORKER, List.of(WORKER, OTHER, THIRD), reports) == null
+            : "A stuck crewmate is not a recovery anchor";
+    }
+
+    private static JsonObject recoveryReport(String name, String recovery, int idleTicks, int row) {
+        JsonObject report = new JsonObject(), diagnostics = new JsonObject();
+        report.addProperty("name", name); report.addProperty("phase", "building"); report.addProperty("tpaRecovery", recovery);
+        report.addProperty("currentRow", row); diagnostics.addProperty("idleTicks", idleTicks); report.add("diagnostics", diagnostics);
+        return report;
+    }
 
     private static void supplyRecovery() throws Exception {
         var path = java.nio.file.Files.createTempDirectory("monocle-supply-recovery-check-").resolve("records.json");
@@ -75,6 +95,7 @@ public final class CoordinatorCoreTest {
         liveConfiguration();
         stashScan();
         supplyRecovery();
+        teleportRecovery();
         highwayStartup();
         independentSupplies();
         OperationsLibraryTest.run();
@@ -197,6 +218,10 @@ public final class CoordinatorCoreTest {
         JsonObject assignment = JsonParser.parseString("{x:0,y:116,z:100,length:512,layout:{dx:0,dz:1,width:5}}").getAsJsonObject();
         var locations = JsonParser.parseString("[{x:1,y:116,z:137},{x:2,y:116,z:137}]");
         assert HighwayCoordinator.checkedSupplyContainers(assignment, locations).size() == 2;
+        assert HighwayCoordinator.validSharedContainer(assignment, JsonParser.parseString("{x:2,y:116,z:-28}").getAsJsonObject())
+            : "A recipient may fly back through rendered highway to the donor's real shulker";
+        for (String invalid : List.of("{}", "{x:6,y:116,z:137}", "{x:0,y:117,z:137}", "{x:0,y:116,z:-29}", "{x:0,y:116,z:613}"))
+            assert !HighwayCoordinator.validSharedContainer(assignment, JsonParser.parseString(invalid).getAsJsonObject()) : invalid;
         assert HighwayCoordinator.checkedSupplyContainers(assignment, null).isEmpty();
         for (String invalid : List.of("null", "{}", "[{}]", "[null]", "[{x:1,y:116,z:137.5}]",
             "[{x:'1',y:116,z:137}]", "[{x:2147483648,y:116,z:137}]", "[{x:18,y:116,z:137}]",

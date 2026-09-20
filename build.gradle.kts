@@ -283,6 +283,7 @@ tasks {
         "scaffoldCheck" to "dev.monocle.client.systems.modules.movement.ScaffoldTest",
         "moduleHandoffCheck" to "dev.monocle.client.systems.modules.ModuleHandoffTest",
         "surroundCheck" to "dev.monocle.client.systems.modules.combat.SurroundTest",
+        "crystalAuraCheck" to "dev.monocle.client.systems.modules.combat.CrystalAuraTest",
         "autoToolCheck" to "dev.monocle.client.systems.modules.player.AutoToolTest",
         "autoArmorCheck" to "dev.monocle.client.systems.modules.combat.AutoArmorTest",
         "autoMendCheck" to "dev.monocle.client.systems.modules.player.AutoMendTest",
@@ -328,6 +329,7 @@ tasks {
         exclude("**/ScaffoldTest*.class")
         exclude("**/ModuleHandoffTest*.class")
         exclude("**/SurroundTest*.class")
+        exclude("**/CrystalAuraTest*.class")
         exclude("**/AutoToolTest*.class")
         exclude("**/AutoArmorTest*.class")
         exclude("**/AutoMendTest*.class")

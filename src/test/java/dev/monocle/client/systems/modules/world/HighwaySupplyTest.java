@@ -60,6 +60,16 @@ public final class HighwaySupplyTest {
         assert HighwayBuilder.crewRepairRows(20, 0, 2).equals(List.of(20, 19, 18));
         assert HighwayBuilder.supplyReservationChanged(new net.minecraft.core.BlockPos(0, 116, 10), new net.minecraft.core.BlockPos(0, 116, 11));
         assert !HighwayBuilder.supplyReservationChanged(new net.minecraft.core.BlockPos(0, 116, 10), new net.minecraft.core.BlockPos(0, 116, 10));
+        assert HighwayBuilder.staleSupplySite(new net.minecraft.core.BlockPos(0, 116, 10), new net.minecraft.core.BlockPos(0, 116, 43), 0, 1);
+        assert !HighwayBuilder.staleSupplySite(new net.minecraft.core.BlockPos(0, 116, 10), new net.minecraft.core.BlockPos(0, 116, 42), 0, 1);
+        assert !HighwayBuilder.staleSupplySite(new net.minecraft.core.BlockPos(0, 116, 43), new net.minecraft.core.BlockPos(0, 116, 10), 0, 1)
+            : "Only obsolete rear sites are replaced; a site ahead remains authoritative";
+        assert HighwayBuilder.restockSlots(2, 3, 2, false, true) == 0
+            : "Managed inventory reserves only the two physical container recoveries";
+        assert HighwayBuilder.restockSlots(5, 3, 2, false, false) == 0
+            : "Ordinary inventory still honors the configured empty-slot reserve";
+        assert HighwayBuilder.restockSlots(1, 3, 1, true, true) == 1
+            : "Placing the last supply container frees its own recovery slot";
         assert HighwayBuilder.crewVerificationRepairRow(21, 0, 18, false) == 18
             : "An overshooting returner must reclaim its unfinished row 19, not wait forever at row 21";
         assert HighwayBuilder.crewVerificationRepairRow(21, 0, 18, true) == 21
@@ -453,6 +463,8 @@ public final class HighwaySupplyTest {
             assert methodCalls(compiled, "crewPrepareRejoin").containsAll(List.of("onGround", "isFallFlying", "recoverCursor", "crewRestockIdle", "crewReconfigureReady"));
             assert methodCalls(compiled, "crewTravelSupply").contains("crewReconfigureReady")
                 && methodCalls(compiled, "crewTravelRejoin").contains("crewRestockIdle") : "Travel cannot take ownership from unfinished native work";
+            assert methodCalls(compiled, "crewTravelSupply").containsAll(List.of("staleSupplySite", "standable"))
+                : "An obsolete local or host supply waypoint must rebase before the donor opens a shulker";
             assert methodCalls(compiled, "crewCancelTravel").containsAll(List.of("stop", "stopCrewFlight", "brakeCrewFlight"));
             assert methodCalls(compiled, "crewBeginSupply").contains("crewCancelTravel") : "Rejected admission must revoke the previous return destination";
             assert methodCalls(compiled, "crewCloseSharedSupply").contains("crewCancelTravel") : "A withdrawn shared shulker must clear its travel target";

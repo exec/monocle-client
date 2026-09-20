@@ -137,6 +137,12 @@ function render() {
   $('new-job').disabled = !writable();
   const focused = $('content').contains(document.activeElement) ? document.activeElement.dataset.key : null;
   $('content').replaceChildren();
+  if (page === 'overview') {
+    section('Host policies', 'Applied by this coordinator; workers cannot enable them');
+    const policy=el('article','card');const label=el('label','worker-option');const toggle=document.createElement('input');toggle.type='checkbox';toggle.checked=!!snapshot.autoTpy;toggle.disabled=!writable();
+    toggle.addEventListener('change',()=>control({op:'host-settings',autoTpy:toggle.checked}));
+    label.append(toggle,el('span','','Auto TPY · accept an observed same-crew /tpa after 10 ticks'));policy.append(label,el('p','hint','Only exact online crew identities on the same server qualify. The policy is advertised by the host and cannot be enabled from a worker.'));$('content').append(policy);
+  }
   if (page === 'overview' || page === 'crews') {
     section(page === 'crews' ? 'Configured crews' : 'Crew activity', 'Work is isolated by crew key');
     const cards = el('div', 'cards'); snapshot.crews.forEach(crew => cards.append(crewCard(crew))); $('content').append(cards);
@@ -257,13 +263,14 @@ function jobActions(task) {
   if (!dead) {
     const paused = !!task.paused || /paused|inspection|suspended/i.test(task.status);
     actions.append(button(paused ? 'Resume' : 'Pause', () => control({ op: paused ? 'resume' : 'pause', id: task.id }), !writable(), '', task.id + '-pause'));
+    if(task.nativeDefinition)actions.append(button(task.publicJoin?'Close joining':'Open joining',()=>control({op:'public-join',id:task.id,enabled:!task.publicJoin}),!writable(),'','public-'+task.id));
     actions.append(button('Cancel job', () => control({ op: 'cancel', id: task.id }, 'Cancel “' + task.name + '”? Offline workers reconcile this decision when they reconnect. Outstanding resource recovery stays recorded.'), !writable(), 'danger', task.id + '-cancel'));
   } else actions.append(button('Delete history', () => control({ op: 'delete', id: task.id }, 'Delete this finished history record?'), !writable() || task.cleanupPending, 'danger', task.id + '-delete'));
   actions.append(button('Inspect', () => inspect('job', task.id), false, '', task.id + '-inspect')); return actions;
 }
 function jobCard(task) {
   const card = el('article', 'card job-card'); const header = el('div', 'card-header'); header.append(el('h3', '', task.name), badge(task.status, tone(task.status))); card.append(header);
-  const meta = el('div', 'job-meta'); [task.crew, task.workflowName || 'Workflow', 'Priority ' + task.priority, Object.keys(task.runs || {}).length + ' workers'].forEach(t => meta.append(el('span', '', t))); card.append(meta);
+  const meta = el('div', 'job-meta'); [task.crew, task.workflowName || 'Workflow', 'Priority ' + task.priority, Object.keys(task.runs || {}).length + ' workers',task.publicJoin?'Public joining':'Invite only'].forEach(t => meta.append(el('span', '', t))); card.append(meta);
   const total = task.nativeDefinition?.length; if (total) progress(card, task.highwayProgress || 0, total);
   card.append(el('p', 'job-detail', task.detail || 'Awaiting dispatch'), jobActions(task));
   if (task.cleanupPending) card.append(el('p', 'hint', 'Decision is final; delivery/recovery acknowledgements remain outstanding. History deletion is protected.'));

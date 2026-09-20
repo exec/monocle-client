@@ -47,6 +47,7 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.function.BiFunction;
+import java.util.List;
 
 import static dev.monocle.client.MonocleClient.mc;
 
@@ -106,6 +107,10 @@ public class DamageUtils {
         return overridingExplosionDamage(target, crystal, 12f, predictMovement, obsidianPos, Blocks.OBSIDIAN.defaultBlockState());
     }
 
+    public static float crystalDamage(LivingEntity target, Vec3 crystal, boolean predictMovement, BlockPos obsidianPos, List<BlockPos> additionalObsidian) {
+        return explosionDamage(target, crystal, 12f, predictMovement, getOverridingHitFactory(obsidianPos, Blocks.OBSIDIAN.defaultBlockState(), additionalObsidian));
+    }
+
     public static float crystalDamage(LivingEntity target, Vec3 crystal) {
         return explosionDamage(target, crystal, 12f, false);
     }
@@ -140,9 +145,14 @@ public class DamageUtils {
     }
 
     public static RaycastFactory getOverridingHitFactory(BlockPos overridePos, BlockState overrideState) {
+        return getOverridingHitFactory(overridePos, overrideState, List.of());
+    }
+
+    public static RaycastFactory getOverridingHitFactory(BlockPos overridePos, BlockState overrideState, List<BlockPos> additionalObsidian) {
         return (context, blockPos) -> {
             BlockState blockState;
             if (blockPos.equals(overridePos)) blockState = overrideState;
+            else if (additionalObsidian.contains(blockPos)) blockState = Blocks.OBSIDIAN.defaultBlockState();
             else {
                 blockState = mc.level.getBlockState(blockPos);
                 if (blockState.getBlock().getExplosionResistance() < 600) return null;

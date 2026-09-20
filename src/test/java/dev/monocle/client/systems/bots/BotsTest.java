@@ -39,6 +39,10 @@ public final class BotsTest {
         BotStashHuntTest.run();
         BotTaskDataTest.run();
         BotSchedulerTest.run();
+        assert Bots.tpaTarget("tpa Worker_1").equals("Worker_1");
+        assert Bots.tpaTarget("TPA Worker_1").equals("Worker_1");
+        assert Bots.tpaTarget("tpy Worker_1") == null;
+        assert Bots.tpaTarget("tpa bad-name") == null;
         sharedCoordinator();
         dev.monocle.client.gui.screens.WorkflowCodeBoxTest.run();
 
@@ -58,8 +62,8 @@ public final class BotsTest {
         for (int length : new int[] {Integer.MIN_VALUE, -1, 0, 15, 100_001, Integer.MAX_VALUE})
             invalid(() -> Bots.checkedPreset("crew", length, Set.of()));
         Set<UUID> fullCrew = new HashSet<>();
-        for (int i = 0; i < 5; i++) fullCrew.add(UUID.randomUUID());
-        assert Bots.checkedPreset("Five remote workers", 128, fullCrew).workers().size() == 5;
+        for (int i = 0; i < 3; i++) fullCrew.add(UUID.randomUUID());
+        assert Bots.checkedPreset("Three remote workers", 128, fullCrew).workers().size() == 3;
         fullCrew.add(UUID.randomUUID());
         invalid(() -> Bots.checkedPreset("Too many", 128, fullCrew));
 
@@ -108,6 +112,13 @@ public final class BotsTest {
         assert screenClose.contains("dev/monocle/client/systems/bots/Bots.save");
         assert screenClose.stream().noneMatch(call -> call.endsWith(".disable") || call.endsWith(".close") || call.endsWith(".pause"))
             : "Closing the dashboard must not alter worker connections or jobs";
+        assert constants(method(compiled("gui/tabs/builtin/BotsTab$BotsScreen"), "refreshConnectionControls"))
+            .contains("Disconnect from host")
+            : "A connected worker must have an explicit disconnect control";
+        assert constants(method(compiled("gui/tabs/builtin/BotsTab$BotsScreen"), "refreshDiscovery")).contains("Join crew job")
+            : "Authenticated workers must be able to join a discoverable live crew from the client";
+        assert constants(method(bots,"handleManagement")).containsAll(List.of("crew-join-request","assign-crew","crew-join-result"))
+            : "Crew discovery admission must reuse authenticated reassignment and acknowledge late joining";
         var inspection = method(compiled("gui/tabs/builtin/BotsTab$InspectionScreen"), "initWidgets");
         assert inspection.code().orElseThrow().elementList().stream().filter(element -> element instanceof FieldInstruction field
             && field.owner().asInternalName().equals("dev/monocle/client/systems/bots/Bots$Mode") && field.name().equalsString("Host")).count() >= 2
@@ -144,7 +155,8 @@ public final class BotsTest {
         assert constants(load).containsAll(List.of("crews", "workers", "name", "length", 32)) : "Bound restored presets and preserve their membership";
         assert constants(method(bots, "toTag")).containsAll(List.of("active", "settings", "crews", "workers", "name", "length"));
         assert calls(method(bots, "load")).contains("dev/monocle/client/systems/bots/Bots.legacySettings");
-        assert calls(method(bots, "reassignWorker")).contains("dev/monocle/client/systems/modules/misc/swarm/SwarmConnection.sealSecret");
+        assert calls(bots.methods().stream().filter(method -> method.methodName().equalsString("reassignWorker")
+            && method.methodTypeSymbol().parameterCount() == 3).findFirst().orElseThrow()).contains("dev/monocle/client/systems/modules/misc/swarm/SwarmConnection.sealSecret");
         var lateJoin = calls(method(bots, "addWorker"));
         assert lateJoin.contains("dev/monocle/client/systems/bots/BotScheduler.joinHighway")
             && lateJoin.indexOf("dev/monocle/client/systems/bots/BotScheduler.joinHighway") < lateJoin.indexOf("dev/monocle/client/systems/modules/misc/swarm/SwarmCrew.addWorker")

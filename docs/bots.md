@@ -4,6 +4,20 @@ The former **Bots** UI is now **Workers**. Use **Right Shift → Workers** or
 **`.worker`**; `.bot` remains a compatibility alias. Internal `bot-*` filenames
 and the workflow `bot.*` Lua namespace remain unchanged.
 
+## Crew discovery and live joining (0.7.132)
+
+An authenticated worker's **Workers → Crews** page lists every crew on that host with its current status, job, and connected count. A host can mark a live native highway job **Open joining** from either the in-game Jobs page or standalone WebUI. The worker can then join it directly; cross-crew admission uses the existing encrypted crew-key reassignment, reconnects automatically, installs the captured workflow/profile, and joins the moving highway without stopping its existing builders.
+
+Host operators can also use **Move here** or the WebUI worker management panel. If the destination crew already has a live highway, its job is carried through the reconnect and admission is retried until the worker is eligible and near the work. Public discovery exposes labels and status only, never private crew keys. It is off by default and remains limited to workers already authenticated to this host. A worker with active source work must still be released cleanly before reassignment so jobs and supply recovery cannot be orphaned.
+
+## Host-owned Auto TPY (0.7.129)
+
+Enable **Auto TPY same-crew requests** from the client-host Workers connection panel or the standalone host WebUI Overview. When a connected worker sends an exact `/tpa <username>` command, the host accepts it only if that username uniquely identifies another fresh, online member of the same authenticated crew on the same Minecraft server. The recipient sends `/tpy <requester>` after 10 ticks. Workflow TPA keeps its existing durable handshake and is not accepted twice.
+
+Workers receive this as host policy and cannot enable it themselves. The policy defaults off, expires unfulfilled observations after 10 seconds, and clears pending observations on disconnect. It does not parse arbitrary incoming chat or accept requests from players outside the crew.
+
+As a last-line native-highway recovery, a worker that still makes no progress after the normal route reset may ask the host to TPA it to a healthy active crewmate. A worker already awaiting TPA recovery, outside the building phase, or itself stalled cannot be selected as the anchor. The host reuses the authenticated acceptance and replay journal above; supply recovery and ordinary travel never invoke this fallback. Native highway crews are capped at three workers.
+
 ## Resource exhaustion (0.7.59)
 
 After enabled local sources (loose inventory, carried shulkers, ender chest and nested shulkers) are searched, a worker asks the crew for supplies. Unknown donor ender-chest contents are searched rather than treated as empty. Busy or temporarily unavailable potential donors remain retryable; only a completed local search with no available crew source causes `Resource exhausted: <resource>`.
@@ -14,9 +28,9 @@ Exhaustion disables Highway Builder and fails the worker's workflow action, rele
 
 The client and service now inherit the same Minecraft-free `HighwayCoordinator`: preparation payloads, verification windows, lane/supply handoffs, inventory-exchange decisions, membership redistribution, completion and durable END receipts. Native workflow definitions and resource policy/accounting are also shared. Local world observations, movement, block actions and inventory clicks remain in the worker/client adapter. A participating client host still verifies rows itself; the standalone service uses active workers' server-resolved reports.
 
-`.bot export-workflow highway-default` now includes the current world's position/geometry and captured gameplay profiles. Submit that package to the service with worker UUIDs and `args.length`; inspect `status.highways` for progress, worker states, supply ownership and a bounded recent-event feed. Both Lanes and Break Order use the shared engine. Real target-server testing is still required.
+`.bot export-workflow highway-default` now includes the current world's position/geometry and captured gameplay profiles. Submit that package to the service with worker UUIDs and `args.length`; inspect `status.highways` for progress, worker states, supply ownership and a bounded recent-event feed. Lanes, Roles and Break Order use the shared engine. Roles requires dedicated excavation and paving duties: excavators occupy the centered front row 5–16 blocks ahead, pavers retain distinct lanes behind it, and dual-duty workers run between both fronts. Real target-server testing is still required.
 
-Finish/cancel existing client-hosted jobs before changing hosts. Native host restarts remain inspection-only: cancel the interrupted execution and use its saved verified progress to prepare remaining work; do not delete recovery journals. The service's current task adapter pauses the native crew during a worker's higher-priority task and resumes it when all targeted workers return to their Highway steps; automatic individual borrowing/return travel remains available only in client hosting. TPA, stash-hunt hosting, live cross-crew reassignment and launcher UI are still later stages. [Setup and native test instructions](../host-service/README.md).
+Finish/cancel existing client-hosted jobs before changing hosts. Native host restarts remain inspection-only: cancel the interrupted execution and use its saved verified progress to prepare remaining work; do not delete recovery journals. The service's current task adapter pauses the native crew during a worker's higher-priority task and resumes it when all targeted workers return to their Highway steps; automatic individual borrowing/return travel remains available only in client hosting. Launcher account management remains a later stage. [Setup and native test instructions](../host-service/README.md).
 
 ## Standalone host service (0.7.3)
 

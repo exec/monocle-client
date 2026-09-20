@@ -5,7 +5,6 @@
 
 package dev.monocle.client.systems.modules.combat;
 
-import com.google.common.util.concurrent.AtomicDouble;
 import it.unimi.dsi.fastutil.ints.*;
 import dev.monocle.client.events.entity.EntityAddedEvent;
 import dev.monocle.client.events.entity.EntityRemovedEvent;
@@ -60,10 +59,7 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class CrystalAura extends Module {
@@ -89,7 +85,7 @@ public class CrystalAura extends Module {
     private final Setting<Boolean> predictMovement = sgGeneral.add(new BoolSetting.Builder()
         .name("predict-movement")
         .description("Predicts target movement.")
-        .defaultValue(false)
+        .defaultValue(true)
         .build()
     );
 
@@ -104,7 +100,7 @@ public class CrystalAura extends Module {
     private final Setting<Double> maxDamage = sgGeneral.add(new DoubleSetting.Builder()
         .name("max-damage")
         .description("Maximum damage crystals can deal to yourself.")
-        .defaultValue(6)
+        .defaultValue(8)
         .range(0, 36)
         .sliderMax(36)
         .build()
@@ -114,6 +110,32 @@ public class CrystalAura extends Module {
         .name("anti-suicide")
         .description("Will not place and break crystals if they will kill you.")
         .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Double> healthReserve = sgGeneral.add(new DoubleSetting.Builder()
+        .name("health-reserve")
+        .description("Minimum health and absorption left after self damage.")
+        .defaultValue(6)
+        .range(0, 36)
+        .sliderMax(20)
+        .build()
+    );
+
+    private final Setting<Boolean> protectFriends = sgGeneral.add(new BoolSetting.Builder()
+        .name("protect-friends")
+        .description("Rejects explosions that would seriously hurt a friend.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Double> maxFriendDamage = sgGeneral.add(new DoubleSetting.Builder()
+        .name("max-friend-damage")
+        .description("Maximum damage an explosion may deal to a friend.")
+        .defaultValue(4)
+        .range(0, 36)
+        .sliderMax(20)
+        .visible(protectFriends::get)
         .build()
     );
 
@@ -161,7 +183,7 @@ public class CrystalAura extends Module {
     private final Setting<AutoSwitchMode> autoSwitch = sgSwitch.add(new EnumSetting.Builder<AutoSwitchMode>()
         .name("auto-switch")
         .description("Switches to crystals in your hotbar once a target is found.")
-        .defaultValue(AutoSwitchMode.Normal)
+        .defaultValue(AutoSwitchMode.Silent)
         .build()
     );
 
@@ -239,18 +261,25 @@ public class CrystalAura extends Module {
     );
 
     private final Setting<SupportMode> support = sgPlace.add(new EnumSetting.Builder<SupportMode>()
-        .name("support")
-        .description("Places a support block in air if no other position have been found.")
-        .defaultValue(SupportMode.Disabled)
+        .name("base-builder")
+        .description("Actively airplaces obsidian bases when they produce the best crystal attack.")
+        .defaultValue(SupportMode.Confirmed)
         .build()
     );
 
     private final Setting<Integer> supportDelay = sgPlace.add(new IntSetting.Builder()
-        .name("support-delay")
-        .description("Delay in ticks after placing support block.")
-        .defaultValue(1)
+        .name("base-confirm-delay")
+        .description("Additional delay after the server confirms an obsidian placement.")
+        .defaultValue(0)
         .min(0)
         .visible(() -> support.get() != SupportMode.Disabled)
+        .build()
+    );
+
+    private final Setting<Boolean> smartCover = sgPlace.add(new BoolSetting.Builder()
+        .name("smart-cover")
+        .description("Places up to two damage-simulated obsidian cover blocks when they make an otherwise unsafe attack safe.")
+        .defaultValue(true)
         .build()
     );
 
@@ -581,6 +610,15 @@ public class CrystalAura extends Module {
     private final Int2IntMap waitingToExplode = new Int2IntOpenHashMap();
     private int attacks;
 
+    private PlacementPlan activePlan;
+    private BlockPos pendingBlock;
+    private BlockPos sendingBlock;
+    private int pendingBlockSequence = -1;
+    private int pendingBlockTicks;
+    private boolean pendingBlockAcknowledged;
+    private boolean pendingBlockSpeculative;
+    private final Map<BlockPos, Integer> inhibitedBases = new HashMap<>();
+
     private double serverYaw;
 
     private LivingEntity bestTarget;
@@ -618,6 +656,9 @@ public class CrystalAura extends Module {
 
         attacks = 0;
 
+        clearPlan();
+        inhibitedBases.clear();
+
         serverYaw = mc.player.getYRot();
 
         bestTargetDamage = 0;
@@ -637,6 +678,8 @@ public class CrystalAura extends Module {
 
         attemptedBreaks.clear();
         waitingToExplode.clear();
+        clearPlan();
+        inhibitedBases.clear();
 
         removed.clear();
 
@@ -688,13 +731,14 @@ public class CrystalAura extends Module {
             int id = it.nextInt();
             int ticks = waitingToExplode.get(id);
 
-            if (ticks > 3) {
+            if (ticks >= confirmationTicks()) {
                 it.remove();
                 removed.remove(id);
             } else {
                 waitingToExplode.put(id, ticks + 1);
             }
         }
+        inhibitedBases.entrySet().removeIf(entry -> entry.getValue() <= mc.player.tickCount);
 
         // Set player eye pos
         ((IVec3) playerEyePos).monocle$set(mc.player.position().x, mc.player.position().y + mc.player.getEyeHeight(mc.player.getPose()), mc.player.position().z);
@@ -728,7 +772,7 @@ public class CrystalAura extends Module {
 
         if (fastBreak.get() && !didRotateThisTick && attacks < attackFrequency.get()) {
             float damage = getBreakDamage(event.entity, true);
-            if (damage > minDamage.get()) doBreak(event.entity);
+            if (damage > 0) doBreak(event.entity);
         }
     }
 
@@ -787,7 +831,7 @@ public class CrystalAura extends Module {
         if (removed.contains(entity.getId())) return 0;
 
         // Check attempted breaks
-        if (attemptedBreaks.get(entity.getId()) > breakAttempts.get()) return 0;
+        if (attemptedBreaks.get(entity.getId()) >= breakAttempts.get()) return 0;
 
         // Check crystal age
         if (checkCrystalAge && entity.tickCount < ticksExisted.get()) return 0;
@@ -798,15 +842,21 @@ public class CrystalAura extends Module {
         // Check damage to self and anti suicide
         blockPos.set(entity.blockPosition()).move(0, -1, 0);
         float selfDamage = DamageUtils.crystalDamage(mc.player, entity.position(), predictMovement.get(), blockPos);
-        if (selfDamage > maxDamage.get() || (antiSuicide.get() && selfDamage >= EntityUtils.getTotalHealth(mc.player)))
-            return 0;
+        if (!isSelfDamageSafe(selfDamage) || !isFriendDamageSafe(entity.position(), blockPos, List.of())) return 0;
 
-        // Check damage to targets and face place
-        float damage = getDamageToTargets(entity.position(), blockPos, true, false);
-        boolean shouldFacePlace = shouldFacePlace();
-        double minimumDamage = shouldFacePlace ? Math.min(minDamage.get(), 1.5d) : minDamage.get();
-
-        if (damage < minimumDamage) return 0f;
+        float damage = 0;
+        for (LivingEntity target : targets) {
+            if (smartDelay.get() && target.hurtTime > 0) continue;
+            float candidate = DamageUtils.crystalDamage(target, entity.position(), predictMovement.get(), blockPos);
+            if (candidate < minimumDamage(target)) continue;
+            if (candidate > damage) {
+                damage = candidate;
+                bestTarget = target;
+                bestTargetDamage = candidate;
+                bestTargetTimer = 10;
+            }
+        }
+        if (damage == 0) return 0;
 
         return damage;
     }
@@ -885,6 +935,9 @@ public class CrystalAura extends Module {
         if (event.packet instanceof ServerboundSetCarriedItemPacket) {
             switchTimer = switchDelay.get();
         }
+        if (sendingBlock != null && event.packet instanceof ServerboundUseItemOnPacket packet) {
+            pendingBlockSequence = packet.getSequence();
+        }
     }
 
     // Place
@@ -892,6 +945,12 @@ public class CrystalAura extends Module {
     private void doPlace() {
         if (!doPlace.get() || placeTimer > 0) return;
         if (shouldPause(PauseMode.Place)) return;
+
+        if (activePlan != null) {
+            advancePlan();
+            return;
+        }
+        if (placing) return;
 
         // Return if there are no crystals in hotbar or offhand
         if (!InvUtils.testInHotbar(Items.END_CRYSTAL)) return;
@@ -912,16 +971,15 @@ public class CrystalAura extends Module {
             if (getBreakDamage(entity, false) > 0) return;
         }
 
-        // Setup variables
-        AtomicDouble bestDamage = new AtomicDouble(0);
-        AtomicReference<BlockPos.MutableBlockPos> bestBlockPos = new AtomicReference<>(new BlockPos.MutableBlockPos());
-        AtomicBoolean isSupport = new AtomicBoolean(support.get() != SupportMode.Disabled);
+        AtomicReference<PlacementPlan> best = new AtomicReference<>();
+        boolean hasObsidian = InvUtils.findInHotbar(Items.OBSIDIAN).found();
 
         // Find best position to place the crystal on
         BlockIterator.register((int) Math.ceil(placeRange.get()), (int) Math.ceil(placeRange.get()), (bp, blockState) -> {
-            // Check if its bedrock or obsidian and return if isSupport is false
             boolean hasBlock = blockState.is(Blocks.BEDROCK) || blockState.is(Blocks.OBSIDIAN);
-            if (!hasBlock && (!isSupport.get() || !blockState.canBeReplaced())) return;
+            boolean needsSupport = !hasBlock;
+            if (needsSupport && (support.get() == SupportMode.Disabled || !hasObsidian || !blockState.canBeReplaced()
+                || inhibitedBases.containsKey(bp) || !BlockUtils.canPlaceBlock(bp, true, Blocks.OBSIDIAN))) return;
 
             // Check if there is air on top
             blockPos.set(bp.getX(), bp.getY() + 1, bp.getZ());
@@ -937,19 +995,6 @@ public class CrystalAura extends Module {
             blockPos.set(bp).move(0, 1, 0);
             if (isOutOfRange(vec3d, blockPos, true)) return;
 
-            // Check damage to self and anti suicide
-            float selfDamage = DamageUtils.crystalDamage(mc.player, vec3d, predictMovement.get(), bp);
-            if (selfDamage > maxDamage.get() || (antiSuicide.get() && selfDamage >= EntityUtils.getTotalHealth(mc.player)))
-                return;
-
-            // Check damage to targets and face place
-            float damage = getDamageToTargets(vec3d, bp, false, !hasBlock && support.get() == SupportMode.Fast);
-
-            boolean shouldFacePlace = shouldFacePlace();
-            double minimumDamage = Math.min(minDamage.get(), shouldFacePlace ? 1.5 : minDamage.get());
-
-            if (damage < minimumDamage) return;
-
             // Check if it can be placed
             double x = bp.getX();
             double y = bp.getY() + 1;
@@ -958,42 +1003,219 @@ public class CrystalAura extends Module {
 
             if (intersectsWithEntities(box)) return;
 
-            // Compare damage
-            if (damage > bestDamage.get() || (isSupport.get() && hasBlock)) {
-                bestDamage.set(damage);
-                bestBlockPos.get().set(bp);
-            }
-
-            if (hasBlock) isSupport.set(false);
+            PlacementPlan candidate = evaluatePlacement(bp.immutable(), needsSupport);
+            if (candidate != null && betterPlan(candidate, best.get())) best.set(candidate);
         });
 
-        // Place the crystal
         BlockIterator.after(() -> {
-            if (bestDamage.get() == 0) return;
-
-            BlockHitResult result = getPlaceInfo(bestBlockPos.get());
-
-            ((IVec3) vec3d).monocle$set(
-                result.getBlockPos().getX() + 0.5 + result.getDirection().getUnitVec3i().getX() * 1.0 / 2.0,
-                result.getBlockPos().getY() + 0.5 + result.getDirection().getUnitVec3i().getY() * 1.0 / 2.0,
-                result.getBlockPos().getZ() + 0.5 + result.getDirection().getUnitVec3i().getZ() * 1.0 / 2.0
-            );
-
-            if (rotate.get()) {
-                double yaw = Rotations.getYaw(vec3d);
-                double pitch = Rotations.getPitch(vec3d);
-
-                if (yawStepMode.get() == YawStepMode.Break || doYawSteps(yaw, pitch)) {
-                    setRotation(true, vec3d, 0, 0);
-                    Rotations.rotate(yaw, pitch, 50, () -> placeCrystal(result, bestDamage.get(), isSupport.get() ? bestBlockPos.get() : null));
-
-                    placeTimer += placeDelay.get();
-                }
-            } else {
-                placeCrystal(result, bestDamage.get(), isSupport.get() ? bestBlockPos.get() : null);
-                placeTimer += placeDelay.get();
-            }
+            if (best.get() == null || activePlan != null) return;
+            activePlan = best.get();
+            advancePlan();
         });
+    }
+
+    private PlacementPlan evaluatePlacement(BlockPos base, boolean needsSupport) {
+        Vec3 explosion = new Vec3(base.getX() + 0.5, base.getY() + 1, base.getZ() + 0.5);
+        PlacementPlan best = null;
+
+        for (LivingEntity target : targets) {
+            if (smartDelay.get() && target.hurtTime > 0) continue;
+
+            double targetDamage = DamageUtils.crystalDamage(target, explosion, predictMovement.get(), base);
+            if (targetDamage < minimumDamage(target)) continue;
+
+            double selfDamage = DamageUtils.crystalDamage(mc.player, explosion, predictMovement.get(), base);
+            List<BlockPos> cover = List.of();
+
+            if (!isSelfDamageSafe(selfDamage) || !isFriendDamageSafe(explosion, base, cover)) {
+                CoverResult result = smartCover.get() && InvUtils.findInHotbar(Items.OBSIDIAN).found()
+                    ? findCover(base, explosion, target) : null;
+                if (result == null) continue;
+                targetDamage = result.targetDamage();
+                selfDamage = result.selfDamage();
+                cover = result.blocks();
+            }
+
+            int placements = (needsSupport ? 1 : 0) + cover.size();
+            boolean lethal = targetDamage >= EntityUtils.getTotalHealth(target);
+            double score = planScore(targetDamage, selfDamage, placements, lethal);
+            PlacementPlan candidate = new PlacementPlan(base, target, targetDamage, selfDamage, needsSupport, cover, score);
+            if (betterPlan(candidate, best)) best = candidate;
+        }
+
+        if (best != null && best.targetDamage() > bestTargetDamage) {
+            bestTarget = best.target();
+            bestTargetDamage = best.targetDamage();
+            bestTargetTimer = 10;
+        }
+        return best;
+    }
+
+    private CoverResult findCover(BlockPos base, Vec3 explosion, LivingEntity target) {
+        CoverResult best = null;
+        for (List<BlockPos> layout : coverLayouts(mc.player.blockPosition(), explosion)) {
+            boolean placeable = true;
+            for (BlockPos pos : layout) {
+                if (pos.equals(base) || pos.equals(base.above()) || !BlockUtils.canPlaceBlock(pos, true, Blocks.OBSIDIAN)
+                    || isOutOfRange(Vec3.atCenterOf(pos), pos, true)) {
+                    placeable = false;
+                    break;
+                }
+            }
+            if (!placeable) continue;
+
+            double selfDamage = DamageUtils.crystalDamage(mc.player, explosion, predictMovement.get(), base, layout);
+            if (!isSelfDamageSafe(selfDamage) || !isFriendDamageSafe(explosion, base, layout)) continue;
+
+            double targetDamage = DamageUtils.crystalDamage(target, explosion, predictMovement.get(), base, layout);
+            if (targetDamage < minimumDamage(target)) continue;
+
+            CoverResult candidate = new CoverResult(List.copyOf(layout), targetDamage, selfDamage);
+            if (best == null || planScore(targetDamage, selfDamage, layout.size(), targetDamage >= EntityUtils.getTotalHealth(target))
+                > planScore(best.targetDamage(), best.selfDamage(), best.blocks().size(), best.targetDamage() >= EntityUtils.getTotalHealth(target))) best = candidate;
+        }
+        return best;
+    }
+
+    static List<List<BlockPos>> coverLayouts(BlockPos feet, Vec3 explosion) {
+        int x = Double.compare(explosion.x, feet.getX() + 0.5);
+        int z = Double.compare(explosion.z, feet.getZ() + 0.5);
+        if (x == 0 && z == 0) return List.of();
+
+        boolean xFirst = Math.abs(explosion.x - feet.getX() - 0.5) >= Math.abs(explosion.z - feet.getZ() - 0.5);
+        BlockPos primary = feet.offset(xFirst ? x : 0, 0, xFirst ? 0 : z);
+        List<List<BlockPos>> layouts = new ArrayList<>();
+        layouts.add(List.of(primary));
+        layouts.add(List.of(primary, primary.above()));
+
+        if (x != 0 && z != 0) {
+            BlockPos secondary = feet.offset(xFirst ? 0 : x, 0, xFirst ? z : 0);
+            layouts.add(List.of(secondary));
+            layouts.add(List.of(secondary, secondary.above()));
+            layouts.add(List.of(primary, secondary));
+        }
+        return layouts;
+    }
+
+    private boolean advancePlan() {
+        if (activePlan == null) return false;
+
+        if (pendingBlock != null) {
+            boolean present = mc.level.getBlockState(pendingBlock).is(Blocks.OBSIDIAN) || mc.level.getBlockState(pendingBlock).is(Blocks.BEDROCK);
+            if (present && (pendingBlockAcknowledged || pendingBlockSpeculative)) {
+                clearPendingBlock();
+                placeTimer = Math.max(placeTimer, supportDelay.get());
+            } else if (++pendingBlockTicks >= confirmationTicks()) {
+                inhibitAndClearPlan();
+            }
+            return true;
+        }
+
+        if (!activePlan.target().isAlive() || activePlan.target().distanceToSqr(mc.player) > targetRange.get() * targetRange.get()) {
+            clearPlan();
+            return false;
+        }
+
+        for (BlockPos cover : activePlan.cover()) {
+            if (!mc.level.getBlockState(cover).is(Blocks.OBSIDIAN) && !mc.level.getBlockState(cover).is(Blocks.BEDROCK)) {
+                if (!BlockUtils.canPlaceBlock(cover, true, Blocks.OBSIDIAN)) {
+                    inhibitAndClearPlan();
+                    return true;
+                }
+                return placePlanBlock(cover, false);
+            }
+        }
+
+        if (activePlan.needsSupport() && !mc.level.getBlockState(activePlan.base()).is(Blocks.OBSIDIAN)
+            && !mc.level.getBlockState(activePlan.base()).is(Blocks.BEDROCK)) {
+            if (!BlockUtils.canPlaceBlock(activePlan.base(), true, Blocks.OBSIDIAN)) {
+                inhibitAndClearPlan();
+                return true;
+            }
+            return placePlanBlock(activePlan.base(), support.get() == SupportMode.Speculative);
+        }
+
+        placePlannedCrystal(activePlan);
+        return true;
+    }
+
+    private boolean placePlanBlock(BlockPos pos, boolean speculative) {
+        FindItemResult obsidian = InvUtils.findInHotbar(Items.OBSIDIAN);
+        if (!obsidian.found()) {
+            inhibitAndClearPlan();
+            return true;
+        }
+
+        pendingBlock = pos.immutable();
+        pendingBlockSequence = Integer.MAX_VALUE;
+        pendingBlockTicks = 0;
+        pendingBlockAcknowledged = false;
+        pendingBlockSpeculative = speculative;
+        Runnable place = () -> {
+            if (activePlan == null || !pos.equals(pendingBlock)) return;
+            sendingBlock = pos;
+            try {
+                if (!BlockUtils.place(pos, obsidian, false, 50, swingMode.get().client(), true, true)) inhibitAndClearPlan();
+            } finally {
+                sendingBlock = null;
+            }
+        };
+
+        if (rotate.get()) {
+            Vec3 center = Vec3.atCenterOf(pos);
+            double yaw = Rotations.getYaw(center);
+            double pitch = Rotations.getPitch(center);
+            if (yawStepMode.get() != YawStepMode.Break && !doYawSteps(yaw, pitch)) {
+                clearPendingBlock();
+                return true;
+            }
+            setRotation(true, center, 0, 0);
+            Rotations.rotate(yaw, pitch, 50, place);
+        } else place.run();
+        return true;
+    }
+
+    private void placePlannedCrystal(PlacementPlan plan) {
+        Vec3 explosion = new Vec3(plan.base().getX() + 0.5, plan.base().getY() + 1, plan.base().getZ() + 0.5);
+        double targetDamage = DamageUtils.crystalDamage(plan.target(), explosion, predictMovement.get(), plan.base());
+        double selfDamage = DamageUtils.crystalDamage(mc.player, explosion, predictMovement.get(), plan.base());
+        if (targetDamage < minimumDamage(plan.target()) || !isSelfDamageSafe(selfDamage)
+            || !isFriendDamageSafe(explosion, plan.base(), List.of()) || isOutOfRange(explosion, plan.base().above(), true)) {
+            clearPlan();
+            return;
+        }
+
+        double x = plan.base().getX();
+        double y = plan.base().getY() + 1;
+        double z = plan.base().getZ();
+        ((IAABB) box).monocle$set(x, y, z, x + 1, y + (placement112.get() ? 1 : 2), z + 1);
+        if (!mc.level.getBlockState(plan.base().above()).isAir()
+            || placement112.get() && !mc.level.getBlockState(plan.base().above(2)).isAir()
+            || intersectsWithEntities(box)) {
+            clearPlan();
+            return;
+        }
+
+        BlockHitResult result = getPlaceInfo(plan.base());
+        ((IVec3) vec3d).monocle$set(
+            result.getBlockPos().getX() + 0.5 + result.getDirection().getUnitVec3i().getX() * 0.5,
+            result.getBlockPos().getY() + 0.5 + result.getDirection().getUnitVec3i().getY() * 0.5,
+            result.getBlockPos().getZ() + 0.5 + result.getDirection().getUnitVec3i().getZ() * 0.5
+        );
+
+        Runnable place = () -> placeCrystal(result, targetDamage);
+        if (rotate.get()) {
+            double yaw = Rotations.getYaw(vec3d);
+            double pitch = Rotations.getPitch(vec3d);
+            if (yawStepMode.get() != YawStepMode.Break && !doYawSteps(yaw, pitch)) return;
+            setRotation(true, vec3d, 0, 0);
+            activePlan = null;
+            Rotations.rotate(yaw, pitch, 50, place);
+        } else {
+            activePlan = null;
+            place.run();
+        }
+        placeTimer += placeDelay.get();
     }
 
     private BlockHitResult getPlaceInfo(BlockPos blockPos) {
@@ -1018,11 +1240,8 @@ public class CrystalAura extends Module {
         return new BlockHitResult(vec3d, side, blockPos, false);
     }
 
-    private void placeCrystal(BlockHitResult result, double damage, BlockPos supportBlock) {
-        // Switch
-        Item targetItem = supportBlock == null ? Items.END_CRYSTAL : Items.OBSIDIAN;
-
-        FindItemResult item = InvUtils.findInHotbar(targetItem);
+    private void placeCrystal(BlockHitResult result, double damage) {
+        FindItemResult item = InvUtils.findInHotbar(Items.END_CRYSTAL);
         if (!item.found()) return;
 
         int prevSlot = mc.player.getInventory().getSelectedSlot();
@@ -1032,45 +1251,104 @@ public class CrystalAura extends Module {
         InteractionHand hand = item.getHand();
         if (hand == null) return;
 
-        // Place
-        if (supportBlock == null) {
-            // Place crystal
-            mc.gameMode.startPrediction(mc.level, sequence -> new ServerboundUseItemOnPacket(hand, result, sequence));
+        mc.gameMode.startPrediction(mc.level, sequence -> new ServerboundUseItemOnPacket(hand, result, sequence));
 
-            if (swingMode.get().client()) mc.player.swing(hand);
-            if (swingMode.get().packet()) mc.getConnection().send(new ServerboundSwingPacket(hand));
+        if (swingMode.get().client()) mc.player.swing(hand);
+        if (swingMode.get().packet()) mc.getConnection().send(new ServerboundSwingPacket(hand));
 
-            placing = true;
-            placingTimer = 4;
-            kaTimer = 8;
-            placingCrystalBlockPos.set(result.getBlockPos()).move(0, 1, 0);
+        placing = true;
+        placingTimer = confirmationTicks();
+        kaTimer = 8;
+        placingCrystalBlockPos.set(result.getBlockPos()).move(0, 1, 0);
 
-            placeRenderPos.set(result.getBlockPos());
-            renderDamage = damage;
+        placeRenderPos.set(result.getBlockPos());
+        renderDamage = damage;
 
-            if (renderMode.get() == RenderMode.Normal) {
-                placeRenderTimer = placeRenderTime.get();
-            } else {
-                placeRenderTimer = renderTime.get();
-                if (renderMode.get() == RenderMode.Fading) {
-                    RenderUtils.renderTickingBlock(
-                        placeRenderPos, sideColor.get(),
-                        lineColor.get(), shapeMode.get(),
-                        0, renderTime.get(), true,
-                        false
-                    );
-                }
-            }
+        if (renderMode.get() == RenderMode.Normal) {
+            placeRenderTimer = placeRenderTime.get();
         } else {
-            // Place support block
-            BlockUtils.place(supportBlock, item, false, 0, swingMode.get().client(), true, false);
-            placeTimer += supportDelay.get();
-
-            if (supportDelay.get() == 0) placeCrystal(result, damage, null);
+            placeRenderTimer = renderTime.get();
+            if (renderMode.get() == RenderMode.Fading) {
+                RenderUtils.renderTickingBlock(
+                    placeRenderPos, sideColor.get(),
+                    lineColor.get(), shapeMode.get(),
+                    0, renderTime.get(), true,
+                    false
+                );
+            }
         }
 
         // Switch back
         if (autoSwitch.get() == AutoSwitchMode.Silent) InvUtils.swap(prevSlot, false);
+    }
+
+    public void onServerBlockAck(int sequence) {
+        if (!isActive() || pendingBlock == null || pendingBlockSequence == Integer.MAX_VALUE) return;
+        if (sequence >= pendingBlockSequence) pendingBlockAcknowledged = true;
+    }
+
+    public void onServerBlockUpdate(BlockPos pos, net.minecraft.world.level.block.state.BlockState state) {
+        if (!isActive() || pendingBlock == null || !pendingBlock.equals(pos)) return;
+        if (state.is(Blocks.OBSIDIAN) || state.is(Blocks.BEDROCK)) pendingBlockAcknowledged = true;
+    }
+
+    private boolean isSelfDamageSafe(double damage) {
+        double health = EntityUtils.getTotalHealth(mc.player);
+        return damage <= maxDamage.get() && health - damage >= healthReserve.get() && (!antiSuicide.get() || damage < health);
+    }
+
+    private boolean isFriendDamageSafe(Vec3 explosion, BlockPos base, List<BlockPos> cover) {
+        if (!protectFriends.get()) return true;
+        for (Player friend : mc.level.players()) {
+            if (friend == mc.player || Friends.get().shouldAttack(friend)) continue;
+            double damage = DamageUtils.crystalDamage(friend, explosion, predictMovement.get(), base, cover);
+            if (damage > maxFriendDamage.get() || damage >= EntityUtils.getTotalHealth(friend)) return false;
+        }
+        return true;
+    }
+
+    private double minimumDamage(LivingEntity target) {
+        return shouldFacePlace(target) ? Math.min(minDamage.get(), 1.5) : minDamage.get();
+    }
+
+    static double planScore(double targetDamage, double selfDamage, int blockPlacements, boolean lethal) {
+        return targetDamage - selfDamage * 0.35 - blockPlacements * 0.65 + (lethal ? 20 : 0);
+    }
+
+    private static boolean betterPlan(PlacementPlan candidate, PlacementPlan current) {
+        if (current == null) return true;
+        if (Math.abs(candidate.targetDamage() - current.targetDamage()) <= 1) {
+            if (candidate.selfDamage() != current.selfDamage()) return candidate.selfDamage() < current.selfDamage();
+            if (candidate.blockPlacements() != current.blockPlacements()) return candidate.blockPlacements() < current.blockPlacements();
+        }
+        return candidate.score() > current.score();
+    }
+
+    static int confirmationTicksForPing(int ping) {
+        return Mth.clamp((int) Math.ceil(Math.max(0, ping) / 50.0) + 3, 4, 12);
+    }
+
+    private int confirmationTicks() {
+        return confirmationTicksForPing(PlayerUtils.getPing());
+    }
+
+    private void inhibitAndClearPlan() {
+        if (activePlan != null) inhibitedBases.put(activePlan.base(), mc.player.tickCount + confirmationTicks() * 2);
+        clearPlan();
+    }
+
+    private void clearPlan() {
+        activePlan = null;
+        clearPendingBlock();
+    }
+
+    private void clearPendingBlock() {
+        pendingBlock = null;
+        sendingBlock = null;
+        pendingBlockSequence = -1;
+        pendingBlockTicks = 0;
+        pendingBlockAcknowledged = false;
+        pendingBlockSpeculative = false;
     }
 
     // Yaw steps
@@ -1111,27 +1389,17 @@ public class CrystalAura extends Module {
 
     // Face place
 
-    private boolean shouldFacePlace() {
+    private boolean shouldFacePlace(LivingEntity target) {
         if (!facePlace.get()) return false;
+        if (forceFacePlace.get().isPressed() || EntityUtils.getTotalHealth(target) <= facePlaceHealth.get()) return true;
 
-        if (forceFacePlace.get().isPressed()) return true;
-
-        // Checks if the provided crystal position should face place to any target
-        for (LivingEntity target : targets) {
-            if (EntityUtils.getTotalHealth(target) <= facePlaceHealth.get()) return true;
-
-            for (EquipmentSlot slot : EquipmentSlotGroup.ARMOR) {
-                ItemStack itemStack = target.getItemBySlot(slot);
-
-                if (itemStack == null || itemStack.isEmpty()) {
-                    if (facePlaceArmor.get()) return true;
-                } else {
-                    if ((double) (itemStack.getMaxDamage() - itemStack.getDamageValue()) / itemStack.getMaxDamage() * 100 <= facePlaceDurability.get())
-                        return true;
-                }
-            }
+        for (EquipmentSlot slot : EquipmentSlotGroup.ARMOR) {
+            ItemStack itemStack = target.getItemBySlot(slot);
+            if (itemStack == null || itemStack.isEmpty()) {
+                if (facePlaceArmor.get()) return true;
+            } else if (itemStack.isDamageableItem()
+                && (double) (itemStack.getMaxDamage() - itemStack.getDamageValue()) / itemStack.getMaxDamage() * 100 <= facePlaceDurability.get()) return true;
         }
-
         return false;
     }
 
@@ -1156,49 +1424,6 @@ public class CrystalAura extends Module {
         if (result == null || !result.getBlockPos().equals(blockPos)) // Is behind wall
             return !PlayerUtils.isWithin(vec3d, (place ? placeWallsRange : breakWallsRange).get());
         return !PlayerUtils.isWithin(vec3d, (place ? placeRange : breakRange).get());
-    }
-
-    private LivingEntity getNearestTarget() {
-        LivingEntity nearestTarget = null;
-        double nearestDistance = Double.MAX_VALUE;
-
-        for (LivingEntity target : targets) {
-            double distance = PlayerUtils.squaredDistanceTo(target);
-
-            if (distance < nearestDistance) {
-                nearestTarget = target;
-                nearestDistance = distance;
-            }
-        }
-
-        return nearestTarget;
-    }
-
-    private float getDamageToTargets(Vec3 vec3d, BlockPos obsidianPos, boolean breaking, boolean fast) {
-        float damage = 0;
-
-        if (fast) {
-            LivingEntity target = getNearestTarget();
-            if (!(smartDelay.get() && breaking && target.hurtTime > 0))
-                damage = DamageUtils.crystalDamage(target, vec3d, predictMovement.get(), obsidianPos);
-        } else {
-            for (LivingEntity target : targets) {
-                if (smartDelay.get() && breaking && target.hurtTime > 0) continue;
-
-                float dmg = DamageUtils.crystalDamage(target, vec3d, predictMovement.get(), obsidianPos);
-
-                // Update best target
-                if (dmg > bestTargetDamage) {
-                    bestTarget = target;
-                    bestTargetDamage = dmg;
-                    bestTargetTimer = 10;
-                }
-
-                damage += dmg;
-            }
-        }
-
-        return damage;
     }
 
     @Override
@@ -1338,6 +1563,15 @@ public class CrystalAura extends Module {
         }
     }
 
+    private record PlacementPlan(BlockPos base, LivingEntity target, double targetDamage, double selfDamage,
+                                 boolean needsSupport, List<BlockPos> cover, double score) {
+        int blockPlacements() {
+            return (needsSupport ? 1 : 0) + cover.size();
+        }
+    }
+
+    private record CoverResult(List<BlockPos> blocks, double targetDamage, double selfDamage) {}
+
     public enum YawStepMode {
         Break,
         All,
@@ -1351,8 +1585,8 @@ public class CrystalAura extends Module {
 
     public enum SupportMode {
         Disabled,
-        Accurate,
-        Fast
+        Confirmed,
+        Speculative
     }
 
     public enum PauseMode {

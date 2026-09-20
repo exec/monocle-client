@@ -46,13 +46,15 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         .defaultValue(128).range(16, HighwayJobs.MAX_LENGTH).sliderRange(16, 512).build());
     public final Setting<Integer> teleportWarmupSeconds=sgGeneral.add(new IntSetting.Builder().name("crew-teleport-warmup").description("Server delay after /tpy before a returning stash or supply worker is expected to arrive.").defaultValue(15).range(0,60).sliderRange(0,30).build());
     public final Setting<Integer> teleportAcceptDelayMs=sgGeneral.add(new IntSetting.Builder().name("crew-teleport-accept-delay").description("Delay between a worker's /tpa and the active builder's /tpy. 500 ms preserves server command order.").defaultValue(500).range(0,5000).sliderRange(0,2000).build());
-
     public final Setting<Mode> mode = sgGeneral.add(new EnumSetting.Builder<Mode>()
         .name("mode")
         .description("What type of client to run.")
         .defaultValue(Mode.Host)
         .build()
     );
+    public final Setting<Boolean> autoTpy=sgGeneral.add(new BoolSetting.Builder().name("auto-tpy")
+        .description("Host only: automatically accept a same-crew worker's observed /tpa after 10 ticks.")
+        .defaultValue(false).visible(() -> mode.get() == Mode.Host).build());
 
     public final Setting<String> ipAddress = sgGeneral.add(new StringSetting.Builder()
         .name("ip")
@@ -108,16 +110,23 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     private long catalogSavedAt;
     private boolean catalogDirty;
     private boolean settingsLoaded;
+    private boolean hostAutoTpy;
+    private boolean workflowTpa;
+    private final List<CrewDiscovery> discoveries = new ArrayList<>();
+    private String pendingJoinCrew = "", pendingJoinJob = "";
+    private long pendingJoinAt;
 
     public record CrewPreset(String name, int length, Set<UUID> workers) {
         public CrewPreset { workers = Set.copyOf(workers); }
     }
     public record Event(String time, String level, String message) {}
     public record JobView(UUID id, String name, String type, String crewId, String status, int progress, int length,
-                          BlockPos origin, String scope, JsonObject layout, String detail, boolean includeHost, String workflowId, String workflowName) {
+                          BlockPos origin, String scope, JsonObject layout, String detail, boolean includeHost, String workflowId, String workflowName,
+                          boolean publicJoin) {
         public boolean unfinished() { return !Set.of("Complete", "Cancelled").contains(status) && progress < length; }
         public boolean unclaimed() { return crewId.isEmpty(); }
     }
+    public record CrewDiscovery(String id, String name, String job, String jobName, String status, int workers, int capacity, boolean publicJoin) {}
 
     public Bots() { super("bots"); ensureDefaultCrew(); }
     public boolean isActive() { return active; }
@@ -128,6 +137,33 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public void disable() { close(); active = false; connectionDetail = "Offline"; }
     public void setEnabled(boolean enabled) { if (enabled) enable(); else disable(); save(); }
     public String connectionDetail() { return connectionDetail; }
+
+    public void hostAutoTpy(boolean enabled) { hostAutoTpy = mode.get() == Mode.Worker && enabled; }
+
+    public void sendWorkflowTpa(String name) {
+        workflowTpa = true;
+        try { mc.getConnection().sendCommand("tpa " + name); }
+        finally { workflowTpa = false; }
+    }
+
+    public void onCommandSent(String command) {
+        String target = tpaTarget(command);
+        if (workflowTpa || target == null || !Utils.canUpdate()) return;
+        if (mode.get() == Mode.Host) {
+            if (autoTpy.get() && isHost()) tasks.requestLocalAutoTpy(target);
+            return;
+        }
+        if (!hostAutoTpy || !isWorker()) return;
+        JsonObject request = new JsonObject(); request.addProperty("type", "worker-tpa-request");
+        request.addProperty("request", UUID.randomUUID().toString()); request.addProperty("target", target); request.addProperty("scope", worldScope());
+        worker.send(request.toString());
+    }
+
+    static String tpaTarget(String command) {
+        if (command == null) return null;
+        var match = java.util.regex.Pattern.compile("(?i)^tpa ([a-z0-9_]{1,16})$").matcher(command.trim());
+        return match.matches() ? match.group(1) : null;
+    }
 
     public void generateKey() {
         if (isHost() || worker != null && worker.isAlive()) throw new IllegalStateException("Stop connections before changing the key.");
@@ -231,7 +267,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         }
         return "Offline";
     }
-    public void reassignWorker(UUID id, String target) {
+    public void reassignWorker(UUID id, String target) { reassignWorker(id, target, activeJob(target)); }
+    private void reassignWorker(UUID id, String target, UUID joinJob) {
         if (!isHost() || !presets.containsKey(target)) throw new IllegalStateException("Start the host and choose a destination crew.");
         String source = workerCrew(id);
         if (source.equals(target)) return;
@@ -245,12 +282,42 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         SwarmConnection connection = old.connectionForWorker(id);
         if (connection == null || !connection.connected()) throw new IllegalStateException("Worker disconnected before reassignment.");
         message.addProperty("type", "assign-crew"); message.addProperty("crew", crewLabel(target)); message.addProperty("sealedKey", connection.sealSecret(crewKey(target)));
+        message.addProperty("crewId", target);
+        if (joinJob != null) message.addProperty("joinJob", joinJob.toString());
         if (connection == null || !connection.send(message.toString())) throw new IllegalStateException("Worker disconnected before reassignment.");
         info("Moving %s to %s; waiting for its authenticated reconnect.", member.name(), crewLabel(target));
     }
     /** Authenticated host-only management message; never forwarded to other workers. */
     public boolean handleManagement(SwarmConnection connection, com.google.gson.JsonObject message, boolean hostSide) {
         String type=dev.monocle.coordinator.TaskWire.text(message,"type");
+        if (type.equals("crew-join-request")) {
+            if (!hostSide) throw new IllegalArgumentException("Crew join requests must come from a worker");
+            try {
+                UUID workerId = workerFor(connection), jobId = UUID.fromString(dev.monocle.coordinator.TaskWire.text(message,"job"));
+                String target = dev.monocle.coordinator.TaskWire.text(message,"crew"), source = workerCrew(workerId);
+                JsonObject job = requireJob(jobId);
+                if (!target.equals(BotJobs.text(job,"crew")) || !BotJobs.unfinished(job)) throw new IllegalArgumentException("That crew job is no longer joinable");
+                if (!source.equals(target)) {
+                    if (!job.get("publicJoin").getAsBoolean()) throw new IllegalStateException("That job is not open for joining");
+                    reassignWorker(workerId,target,jobId); return true;
+                } else addWorker(target,workerId);
+                joinResult(connection,jobId,true,false,"Joining the live crew job");return true;
+            } catch(RuntimeException e){String detail=e.getMessage()==null?"Join is not currently available":e.getMessage();joinResult(connection,null,false,detail.startsWith("Bring the worker")||detail.startsWith("Wait for"),detail);return true;}
+        }
+        if (type.equals("crew-join-result")) {
+            if (hostSide || connection != worker) throw new IllegalArgumentException("Invalid crew join result");
+            boolean accepted=message.has("accepted")&&message.get("accepted").getAsBoolean(),retry=message.has("retry")&&message.get("retry").getAsBoolean();
+            connectionDetail=(accepted?"Join accepted":retry?"Join pending":"Join refused")+(message.has("detail")?" · "+message.get("detail").getAsString():"");
+            if(accepted||!retry){pendingJoinCrew="";pendingJoinJob="";save();}
+            return true;
+        }
+        if(type.equals("worker-tpa-request")) {
+            if(!hostSide)throw new IllegalArgumentException("TPA observations must come from a worker");
+            for(String crewId:presets.keySet()) for(var member:coordinator(crewId).members()) if(coordinator(crewId).connectionForWorker(member.id())==connection) {
+                tasks.requestAutoTpy(member.id(),crewId,message);return true;
+            }
+            throw new IllegalArgumentException("Worker must announce its identity first");
+        }
         if(type.equals("worker-chat")) {
             if(!hostSide)throw new IllegalArgumentException("Chat reports must come from a worker");
             for(String crewId:presets.keySet()) {var member=coordinator(crewId).members().stream().filter(m->coordinator(crewId).connectionForWorker(m.id())==connection).findFirst();
@@ -272,9 +339,62 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             throw new IllegalStateException("End the existing worker job before reassignment.");
         String key = connection.openSecret(message.get("sealedKey").getAsString()), name = message.get("crew").getAsString();
         if (key.length() < 24 || key.length() > 128 || name.isBlank() || name.length() > 48 || name.chars().anyMatch(Character::isISOControl)) throw new IllegalArgumentException("Invalid crew assignment credentials");
-        crewKey.set(key); workerCrewName = name; save();
+        crewKey.set(key); workerCrewName = name;
+        pendingJoinCrew = message.has("crewId") ? message.get("crewId").getAsString() : "";
+        pendingJoinJob = message.has("joinJob") ? UUID.fromString(message.get("joinJob").getAsString()).toString() : "";
+        save();
         info("Host assigned this worker to %s. Reconnecting with its crew key.", name);
         return true;
+    }
+    private static void joinResult(SwarmConnection connection,UUID job,boolean accepted,boolean retry,String detail){JsonObject result=new JsonObject();result.addProperty("type","crew-join-result");result.addProperty("job",job==null?"":job.toString());result.addProperty("accepted",accepted);result.addProperty("retry",retry);result.addProperty("detail",detail);connection.send(result.toString());}
+    private UUID workerFor(SwarmConnection connection) {
+        for (String crewId : presets.keySet()) for (var member : coordinator(crewId).members())
+            if (coordinator(crewId).connectionForWorker(member.id()) == connection) return member.id();
+        throw new IllegalArgumentException("Worker must announce its identity first");
+    }
+    private UUID activeJob(String crewId) {
+        syncJobs();
+        return catalog.records.values().stream().filter(j -> crewId.equals(BotJobs.text(j,"crew")) && BotJobs.unfinished(j))
+            .map(j -> UUID.fromString(BotJobs.text(j,"id"))).findFirst().orElse(null);
+    }
+    public void setJobPublic(UUID id, boolean enabled) {
+        requireHostRole(); JsonObject job=requireJob(id).deepCopy();
+        if (!BotJobs.unfinished(job) || BotJobs.text(job,"crew").isEmpty()) throw new IllegalStateException("Assign an unfinished job before opening it for joining.");
+        job.addProperty("publicJoin",enabled);catalog.put(job);
+    }
+    public List<CrewDiscovery> discoveries() { return List.copyOf(discoveries); }
+    public void updateCrewDiscovery(com.google.gson.JsonArray values) {
+        if (mode.get()!=Mode.Worker) return;
+        List<CrewDiscovery> next=new ArrayList<>();
+        if(values!=null) for(var value:values) {
+            if(next.size()==32)break;JsonObject row=value.getAsJsonObject();
+            String id=BotJobs.text(row,"id"),name=BotJobs.text(row,"name"),job=BotJobs.text(row,"job"),jobName=BotJobs.text(row,"jobName"),status=BotJobs.text(row,"status");
+            if(id.length()>64||name.length()>48||jobName.length()>64||status.length()>96)continue;
+            if(!job.isEmpty())try{UUID.fromString(job);}catch(IllegalArgumentException ignored){continue;}
+            int workers=Math.clamp(row.get("workers").getAsInt(),0,3),capacity=Math.clamp(row.get("capacity").getAsInt(),1,3);
+            next.add(new CrewDiscovery(id,name,job,jobName,status,workers,capacity,row.has("publicJoin")&&row.get("publicJoin").getAsBoolean()));
+        }
+        discoveries.clear();discoveries.addAll(next);
+    }
+    public com.google.gson.JsonArray crewDiscovery() {
+        syncJobs();com.google.gson.JsonArray result=new com.google.gson.JsonArray();
+        for(String id:presets.keySet()) {
+            JsonObject row=new JsonObject();row.addProperty("id",id);row.addProperty("name",crewLabel(id));
+            JsonObject job=catalog.records.values().stream().filter(j->id.equals(BotJobs.text(j,"crew"))&&BotJobs.unfinished(j)).findFirst().orElse(null);
+            var state=coordinator(id).inspect();int count=(int)coordinator(id).members().stream().filter(SwarmCrew.MemberView::connected).count();
+            row.addProperty("workers",count);row.addProperty("capacity",dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS);row.addProperty("status",state.phase());
+            row.addProperty("job",job==null?"":BotJobs.text(job,"id"));row.addProperty("jobName",job==null?"":BotJobs.text(job,"name"));row.addProperty("publicJoin",job!=null&&job.get("publicJoin").getAsBoolean());result.add(row);
+        }
+        return result;
+    }
+    public void requestPublicJoin(String crewId,String job) {
+        if(!isWorker())throw new IllegalStateException("Connect this worker to the host first.");
+        UUID.fromString(job);pendingJoinCrew=crewId;pendingJoinJob=job;pendingJoinAt=0;save();sendPendingJoin();
+    }
+    private void sendPendingJoin() {
+        if(!isWorker()||pendingJoinJob.isBlank()||System.nanoTime()<pendingJoinAt)return;
+        JsonObject request=new JsonObject();request.addProperty("type","crew-join-request");request.addProperty("crew",pendingJoinCrew);request.addProperty("job",pendingJoinJob);
+        worker.send(request.toString());pendingJoinAt=System.nanoTime()+1_000_000_000L;
     }
     public void sendMessage(String message) {
         if (!isHost()) throw new IllegalStateException("Start the host first.");
@@ -320,7 +440,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         name = name.trim();
         if (name.isEmpty() || name.length() > 48 || name.chars().anyMatch(Character::isISOControl))
             throw new IllegalArgumentException("Choose a crew name of 1–48 printable characters.");
-        if (length < 16 || length > HighwayJobs.MAX_LENGTH || workers.size() > 5) throw new IllegalArgumentException("Crew length must be 16–100,000, with at most 5 players total.");
+        if (length < 16 || length > HighwayJobs.MAX_LENGTH || workers.size() > dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS)
+            throw new IllegalArgumentException("Crew length must be 16–100,000, with at most 3 players total.");
         return new CrewPreset(name, length, workers);
     }
     public void removePreset(String name) {
@@ -360,7 +481,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         return new JobView(UUID.fromString(BotJobs.text(value, "id")), BotJobs.text(value, "name"), "Highway", owner, BotJobs.text(value, "status"),
             value.get("progress").getAsInt(), value.get("length").getAsInt(), new BlockPos(value.get("x").getAsInt(), value.get("y").getAsInt(), value.get("z").getAsInt()),
             BotJobs.text(value, "scope"), value.getAsJsonObject("layout").deepCopy(), detail, value.get("includeHost").getAsBoolean(),
-            BotJobs.text(value.getAsJsonObject("workflow"), "id"), BotJobs.text(value.getAsJsonObject("workflow"), "name"));
+            BotJobs.text(value.getAsJsonObject("workflow"), "id"), BotJobs.text(value.getAsJsonObject("workflow"), "name"), value.get("publicJoin").getAsBoolean());
     }
     public UUID createHighwayJob(String name, int length) {
         return createHighwayJob(name, length, BotWorkflows.DEFAULT_ID);
@@ -652,6 +773,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         tag.put("settings", settings.toTag()); tag.putBoolean("active", active);
         tag.putString("selectedCrew", selectedCrew);
         tag.putString("workerCrew", workerCrewName);
+        tag.putString("pendingJoinCrew",pendingJoinCrew);tag.putString("pendingJoinJob",pendingJoinJob);
         ListTag crews = new ListTag();
         for (CrewPreset preset : presets.values()) {
             CompoundTag value = new CompoundTag();
@@ -675,6 +797,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         crewRole = mode.get();
         workerCrewName = tag.getStringOr("workerCrew", "");
         if (workerCrewName.length() > 48) workerCrewName = "";
+        pendingJoinCrew=tag.getStringOr("pendingJoinCrew","");pendingJoinJob=tag.getStringOr("pendingJoinJob","");
+        try { if(!pendingJoinJob.isEmpty())UUID.fromString(pendingJoinJob); } catch(IllegalArgumentException e){pendingJoinCrew="";pendingJoinJob="";}
         presets.clear();
         crewKeys.clear(); crewLabels.clear(); coordinators.clear();
         Set<String> usedKeys = new HashSet<>();
@@ -739,6 +863,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     }
 
     public void close() {
+        hostAutoTpy = false;
         tasks.disconnected();
         if (mode.get() == Mode.Host) try { syncJobs(); if (catalogDirty) { catalog.save(); catalogDirty = false; } }
         catch (RuntimeException e) { MonocleClient.LOG.error("Could not checkpoint Workers jobs while closing", e); }
@@ -866,6 +991,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             connectionDetail = crew.assigned()
                 ? crew.canResume() ? "Authenticated; crew assigned" : "Authenticated; interrupted crew job requires inspection"
                 : "Authenticated" + (workerCrewName.isBlank() ? "" : " · " + workerCrewName) + "; " + (acceptCrew.get() ? "waiting for a crew assignment" : "highway assignments disabled");
+            sendPendingJoin();
             return;
         }
         if (worker != null && worker.isAlive()) return; // One DNS/connect/handshake attempt at a time.

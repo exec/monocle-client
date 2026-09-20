@@ -132,6 +132,10 @@ public final class SwarmCrewTest {
         assert SwarmCrew.leadLimit(128, SwarmCrew.slowestRow(128, 5, 1, 5)) == 6 : "The forward window slides as soon as the slowest worker moves";
         assert SwarmCrew.slowestRow(128) == 0;
         assert SwarmCrew.leadLimit(16, 14) == 16 : "Do not exceed the common road length";
+        assert SwarmCrew.roleLeadLimit(100, 0, "Excavate", 0, 0) == 16;
+        assert SwarmCrew.roleLeadLimit(100, 0, "Pave", 5, 0) == 0 && SwarmCrew.roleLeadLimit(100, 0, "Pave", 6, 0) == 1
+            : "Pavers remain at least five rows behind the excavation front";
+        assert SwarmCrew.roleLeadLimit(100, 0, "Build", 8, 0) == 6 : "Dual-duty workers stay between specialist rows";
         int mask = SwarmCrew.resolvedMask(11, 15, row -> row != 14);
         assert SwarmCrew.verifiedRow(11, mask, 11) && SwarmCrew.verifiedRow(11, mask, 12) && SwarmCrew.verifiedRow(11, mask, 13);
         assert !SwarmCrew.verifiedRow(11, mask, 14) && SwarmCrew.verifiedRow(11, mask, 15) : "A missing distant row must not impose an all-five-rows barrier";
@@ -665,6 +669,7 @@ public final class SwarmCrewTest {
                 .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
             assert calls.indexOf("archiveInterruptedSupplies") >= 0 && calls.indexOf("archiveInterruptedSupplies") < calls.indexOf("stopJob")
                 && calls.indexOf("archiveInterruptedSupplies") < calls.indexOf("deleteIfExists") : "Preserve interrupted supply locations before clearing native state or the active journal";
+            assert !calls.contains("crewAssigned") : "Crew cleanup must stop a stale builder even after its assignment flag was cleared";
             var sharedCode = java.lang.classfile.ClassFile.of().parse(shared.readAllBytes());
             var release = sharedCode.methods().stream().filter(m -> m.methodName().equalsString("releaseJob")).findFirst().orElseThrow();
             var releaseCalls = release.code().orElseThrow().elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
@@ -726,6 +731,10 @@ public final class SwarmCrewTest {
         assert SwarmCrew.dutyAllows("Build", true) && SwarmCrew.dutyAllows("Build", false);
         assert SwarmCrew.dutyAllows("Excavate", true) && !SwarmCrew.dutyAllows("Excavate", false);
         assert !SwarmCrew.dutyAllows("Pave", true) && SwarmCrew.dutyAllows("Pave", false);
+        assert Arrays.equals(SwarmCrew.roleAnchors(5, List.of("Excavate", "Pave", "Pave")), new int[] {2, 1, 3})
+            : "One excavator uses the center while two pavers receive distinct rear lanes";
+        assert Arrays.equals(SwarmCrew.roleAnchors(5, List.of("Pave", "Excavate", "Pave")), new int[] {1, 2, 3})
+            : "Role placement must not depend on roster order";
         for (int row = 0; row < 20; row++) for (int column = 0; column < 5; column++) {
             assert SwarmCrew.capableOwner(5, 3, column, row, index -> index == 1) == 1 : "A dedicated excavator owns all excavation, even outside its walking column";
             int paver = SwarmCrew.capableOwner(5, 3, column, row, index -> index != 1);

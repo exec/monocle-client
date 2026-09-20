@@ -76,6 +76,9 @@ public final class HighwayJobs {
         if (text(layout, "blocks").isBlank() || text(layout, "blocks").length() > 2048) throw new IllegalArgumentException("Invalid highway materials");
         if (layout.toString().length() > 6000) throw new IllegalArgumentException("Highway settings are too large");
         if (text(job, "crew").length() > 48) throw new IllegalArgumentException("Invalid crew ID");
+        if (job.has("publicJoin") && (!job.get("publicJoin").isJsonPrimitive() || !job.getAsJsonPrimitive("publicJoin").isBoolean()))
+            throw new IllegalArgumentException("Invalid public joining option");
+        if (!job.has("publicJoin")) job.addProperty("publicJoin", false);
         if (job.has("execution") && !text(job, "execution").isEmpty()) UUID.fromString(text(job, "execution"));
         if (job.has("type") && !text(job, "type").equals("Highway")) throw new IllegalArgumentException("Unsupported job type");
         String status = job.has("status") ? text(job, "status") : "Unassigned";

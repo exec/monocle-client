@@ -12,9 +12,11 @@ The token stays in memory in the open tab. Reloading or disconnecting requires e
 
 - Overview and Crews show connection health, native highway progress, supply recovery and exchange state.
 - Click a worker name or Manage to open its management desk: resources, live game chat, new work, assigned job actions, worker priority and live module configuration. Click a crew name or Manage for combined resources, crew chat, all assigned jobs, renaming/deletion and membership management. Job pause/resume/cancel still affects the whole selected job, not just the worker whose panel is open.
-- Crews can be created directly. Moving workers uses the existing host admission checks; active jobs and unfinished cleanup cannot be orphaned.
+- Crews can be created directly. Moving an idle worker into a crew with a running highway carries that job through its authenticated reconnect and late admission. Active source jobs and unfinished cleanup still cannot be orphaned.
+- Live native highway jobs can be opened or closed for joining. Connected workers discover open crews in their in-game Workers tab; discovery never exposes crew keys.
 - Jobs support pause, resume, cancellation and global or worker-specific priorities. Terminal jobs live separately in History; deletion respects outstanding recovery/cleanup obligations.
 - New Job accepts an exported `.bot export-workflow <workflow-id>` JSON package, a simple wait workflow, or custom Lua plus JSON arguments. Select workers in one crew and matching server/dimension. Review uploaded gameplay profiles before dispatching.
+- Overview exposes the host-owned **Auto TPY** policy. It accepts only an observed exact `/tpa <username>` whose unique recipient is a fresh, online member of the same authenticated crew and server, after a 10-tick delay. Workers cannot enable it.
 
 Status polls once per second, slowing to five seconds in a hidden tab. Stale snapshots disable writes. If a submission response is lost, **Retry same submission** reuses the identical payload and UUID; it never blindly creates a second job. Cancellation goes through the existing durable host controls, not a browser-only state change.
 

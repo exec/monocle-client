@@ -64,6 +64,9 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     private String lastScreenFreeDetail = "Not sampled yet";
     private JsonObject savedRecovery;
     private boolean recoveryLoaded, legacyRecovery;
+    private String tpaRecovery = "";
+    private UUID tpaRecoveryTarget;
+    private int tpaRecoverySince;
     // Only unacknowledged cancellations persist; a reconnect must not resurrect an ended job.
     private final ResourcePool resourcePool = new ResourcePool();
 
@@ -137,12 +140,14 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
             if (width < 1 || width > 5) throw new IllegalArgumentException("Invalid ownership width");
             members = activeMembers(record);
             owners = new int[2][width];
+            int[] anchors = roleFormation(record) ? roleAnchors(width, members.stream().map(id -> duty(record, id)).toList()) : null;
             for (int kind = 0; kind < 2; kind++) {
                 boolean excavation = kind == 0;
                 boolean[] capable = new boolean[members.size()];
                 for (int i = 0; i < capable.length; i++) capable[i] = dutyAllows(duty(record, members.get(i)), excavation);
                 for (int column = 0; column < width; column++)
-                    owners[kind][column] = capableOwner(width, members.size(), column, 0, i -> capable[i]);
+                    owners[kind][column] = anchors == null ? capableOwner(width, members.size(), column, 0, i -> capable[i])
+                        : capableOwner(column, anchors, i -> capable[i]);
             }
         }
         boolean matches(JsonObject record) {
@@ -162,6 +167,29 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         List<UUID> active = activeMembers();
         return active.contains(me()) && active.contains(player);
     }
+    public boolean requestTpaRecovery() {
+        if (!localAssigned() || !begun || activeMembers().size() < 2 || away() || detachedSupply() || regrouping || releasing || builder().crewNeedsCleanup()) return false;
+        if (tpaRecovery.isEmpty()) { tpaRecovery = "requested"; tpaRecoverySince = ticks; tpaRecoveryTarget = null; workChanged(); }
+        return !tpaRecovery.equals("failed");
+    }
+    public void resetTpaRecovery() { tpaRecovery = ""; tpaRecoveryTarget = null; tpaRecoverySince = 0; workChanged(); }
+
+    private void tickTpaRecovery() {
+        if (!localAssigned() || tpaRecovery.isEmpty() || tpaRecovery.equals("failed")) return;
+        int warmup = swarm.teleportWarmupSeconds.get() * 20;
+        if (tpaRecovery.equals("waiting") && ticks - tpaRecoverySince >= warmup && tpaRecoveryTarget != null) {
+            var target = mc.level.getPlayerByUUID(tpaRecoveryTarget);
+            if (target != null && target.isAlive() && target.distanceToSqr(mc.player) <= 144 && mc.player.onGround()
+                && builder().crewTeleportRecovered(num(assignment, "length") - startRow())) {
+                resetTpaRecovery(); swarm.info("Crew TPA recovery rejoined the moving highway."); return;
+            }
+        }
+        int timeout = tpaRecovery.equals("requested") ? 100 : warmup + 200;
+        if (ticks - tpaRecoverySince > timeout) {
+            tpaRecovery = "failed"; workChanged();
+            builder().crewTeleportRecoveryFailed("Crew TPA recovery timed out; using the normal recoverable pause.");
+        }
+    }
     public boolean ownsSealing(BlockPos pos) {
         if (!localAssigned()) return true;
         // One owner for each liquid plug, even when excavation and paving have different owners.
@@ -176,6 +204,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     }
     private String laneLabel() { return away() ? "Off duty · automatic return" : detachedSupply() ? "Detached supply task"
         : breakOrder() ? "Break Order · " + breakOrderName(activeMembers().indexOf(me()))
+        : roleFormation(assignment) ? "Role · " + duty(me())
         : "Lane " + (activeMembers().indexOf(me()) + 1) + "/" + activeMembers().size(); }
     public boolean canResume() { return assigned() && !stopped && live(); }
     public boolean isPausedByHost() { return phase.equals("paused") || regrouping && regroupWasPaused; }
@@ -351,15 +380,35 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     }
     public BlockPos origin() { return new BlockPos(num(assignment, "x"), num(assignment, "y"), num(assignment, "z")); }
     public BlockPos lanePosition(BlockPos center) {
-        var layout = assignment.getAsJsonObject("layout");
-        List<UUID> active = activeMembers();
-        int index = active.indexOf(me());
-        if (index < 0) return center; // Detached supply travel uses its explicitly reserved service site.
-        return workPosition(center, num(layout, "dx"), num(layout, "dz"), num(layout, "width"), active.size(), index, workSharing(layout));
+        return workPosition(assignment, activeMembers(), me(), center);
+    }
+    static BlockPos workPosition(JsonObject record, List<UUID> members, UUID member, BlockPos center) {
+        var layout = record.getAsJsonObject("layout"); int index = members.indexOf(member);
+        if (index < 0) return center;
+        int anchor = roleFormation(record, members) ? roleAnchors(num(layout, "width"), members.stream().map(id -> duty(record, id)).toList())[index]
+            : workSharing(layout) == WorkSharing.BreakOrder ? num(layout, "width") / 2 : anchorColumn(num(layout, "width"), members.size(), index);
+        int offset = num(layout, "width") / 2 - anchor;
+        return center.offset(num(layout, "dz") * offset, 0, -num(layout, "dx") * offset);
     }
     static BlockPos workPosition(BlockPos center, int dx, int dz, int width, int members, int index, WorkSharing sharing) {
         int offset = sharing == WorkSharing.BreakOrder ? 0 : width / 2 - anchorColumn(width, members, index);
         return center.offset(dz * offset, 0, -dx * offset);
+    }
+    static int[] roleAnchors(int width, List<String> duties) {
+        int[] result = new int[duties.size()]; Arrays.fill(result, -1);
+        boolean[] used = new boolean[width];
+        for (String duty : List.of("Excavate", "Pave", "Build")) {
+            List<Integer> group = new ArrayList<>();
+            for (int i = 0; i < duties.size(); i++) if (duties.get(i).equals(duty)) group.add(i);
+            for (int rank = 0; rank < group.size(); rank++) {
+                int desired = anchorColumn(width, group.size(), rank), chosen = -1, distance = Integer.MAX_VALUE;
+                for (int column = 0; column < width; column++) if (!used[column] && Math.abs(column - desired) < distance) {
+                    chosen = column; distance = Math.abs(column - desired);
+                }
+                result[group.get(rank)] = chosen; used[chosen] = true;
+            }
+        }
+        return result;
     }
     public boolean owns(BlockPos pos) {
         return ownsExcavation(pos) || ownsPaving(pos);
@@ -437,6 +486,14 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         int owner = -1, distance = Integer.MAX_VALUE;
         for (int index = 0; index < count; index++) if (capable.test(index)) {
             int candidate = Math.abs(column - anchorColumn(width, count, index));
+            if (candidate < distance) { owner = index; distance = candidate; }
+        }
+        return owner;
+    }
+    static int capableOwner(int column, int[] anchors, java.util.function.IntPredicate capable) {
+        int owner = -1, distance = Integer.MAX_VALUE;
+        for (int index = 0; index < anchors.length; index++) if (capable.test(index)) {
+            int candidate = Math.abs(column - anchors[index]);
             if (candidate < distance) { owner = index; distance = candidate; }
         }
         return owner;
@@ -677,8 +734,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         List<UUID> active = activeMembers(assignment);
         List<UUID> returning = assignment.getAsJsonArray("members").asList().stream().map(id -> UUID.fromString(id.getAsString()))
             .filter(id -> active.contains(id) || id.equals(supplier)).toList();
-        var layout = assignment.getAsJsonObject("layout");
-        return workPosition(center, num(layout, "dx"), num(layout, "dz"), num(layout, "width"), returning.size(), returning.indexOf(supplier), workSharing(layout));
+        return workPosition(assignment, returning, supplier, center);
     }
 
     static BlockPos renderedReturnTarget(BlockPos origin, int dx, int dz, int width, int length, Vec3 model) {
@@ -725,7 +781,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         archiveInterruptedSupplies();
         releasePositioning();
         if (localParticipant) {
-            if (builder().crewAssigned()) builder().stopJob();
+            builder().stopJob();
             builder().endCrew();
         }
         // Do not report successful cleanup or acknowledge the host while the disk still retains this job.
@@ -745,6 +801,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         borrowingWorkers.clear();
         borrowed = ItemStack.EMPTY; borrowedDrop = returnOwner = null; returnAuthorized = thrown = false;
         pendingReturn = null; facingTicks = 0;
+        tpaRecovery = ""; tpaRecoveryTarget = null; tpaRecoverySince = 0;
         resetWindow(0);
         savedRecovery = null; recoveryLoaded = true; recoveryError = ""; legacyRecovery = false;
         localParticipant = crewName.isEmpty();
@@ -868,6 +925,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
             } else if (begun && !phase.equals("paused")) phase = workPhase(builder().hasJob(), builder().isJobPaused(), builder().getStatus());
             if (!phase.equals("paused")) tickReturn();
             if (hold() && (!builder().hasJob() || builder().isJobPaused())) holdStep(builder());
+            tickTpaRecovery();
         }
         List<BlockPos> mining = breakOrder() && !detachedSupply() && !away() && Utils.canUpdate()
             ? builder().crewMiningTargets() : List.of();
@@ -997,6 +1055,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         hello.addProperty("assignmentLoaded", assigned());
         hello.addProperty("recoveryReady", swarm.tasks().allowsNative());
         hello.addProperty("job", assigned() ? job : recovered == null ? "" : str(recovered, "job")); hello.addProperty("phase", phase); hello.addProperty("ack", acknowledged);
+        hello.addProperty("tpaRecovery", localAssigned() ? tpaRecovery : "");
         hello.addProperty("lane", assigned() ? laneLabel() : "—");
         hello.addProperty("currentRow", actualRow);
         if (breakOrder() && !detachedSupply() && !away() && Utils.canUpdate())
@@ -1047,7 +1106,8 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         if (swarm.isWorker()) swarm.worker.send(JSON.toJson(hello));
         if (swarm.isHost()) {
             if (localParticipant) reports.put(me(), hello);
-            for (var c : connections()) c.send(JSON.toJson(message("heartbeat")));
+            JsonObject heartbeat = new JsonObject(); heartbeat.addProperty("type", "heartbeat"); heartbeat.addProperty("autoTpy", swarm.autoTpy.get());heartbeat.add("crews",swarm.crewDiscovery());
+            for (var c : connections()) c.send(JSON.toJson(heartbeat));
         }
     }
 
@@ -1157,7 +1217,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     protected void apply(JsonObject m) {
         if (swarm != null && swarm.isHost() && !localParticipant) { applyController(m); return; }
         String type = str(m, "type");
-        if (type.equals("heartbeat")) return;
+        if (type.equals("heartbeat")) { swarm.hostAutoTpy(m.has("autoTpy") && m.get("autoTpy").getAsBoolean());swarm.updateCrewDiscovery(m.has("crews")?m.getAsJsonArray("crews"):null); return; }
         if (type.equals("withdraw")) {
             withdraw(m); return;
         }
@@ -1194,6 +1254,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
             if (Math.abs((long) num(m, "x")) > 29_900_000 || Math.abs((long) num(m, "z")) > 29_900_000 || Math.abs((long) num(m, "y")) > 2048 || num(m, "length") < 16 || num(m, "length") > HighwayJobs.MAX_LENGTH
                 || num(m, "startRow") < 0 || num(m, "startRow") >= num(m, "length") || num(m, "generation") < 0) throw new IllegalArgumentException("Invalid section bounds");
             builder().validateCrewLayout(m.getAsJsonObject("layout"));
+            if (num(m, "count") < 1 || num(m, "count") > MAX_CREW_MEMBERS) throw new IllegalArgumentException("Highway crews support 1–3 workers");
             anchorColumn(num(m.getAsJsonObject("layout"), "width"), num(m, "count"), num(m, "index"));
             if (m.getAsJsonArray("members").size() != num(m, "count") || !m.getAsJsonArray("members").get(num(m, "index")).getAsString().equals(me().toString())) throw new IllegalArgumentException("Invalid lane membership");
             Set<UUID> uniqueMembers = new HashSet<>();
@@ -1253,6 +1314,18 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
             case "stock-scan-complete" -> { assignment.addProperty("initialStockScanned", true); persist(); }
             case "service-join", "service-detach", "service-away", "service-back" -> applyServiceChange(m);
             case "anticipate-supply" -> { if (localParticipant && !stopped && !regrouping && !isPausedByHost() && !releasing) builder().crewAnticipateSupply(); }
+            case "tpa-recovery" -> {
+                UUID.fromString(str(m, "token")); UUID target = UUID.fromString(str(m, "target")); String name = str(m, "name");
+                if (localParticipant && tpaRecovery.equals("requested") && activeMembers().contains(target) && !target.equals(me()) && name.matches("[A-Za-z0-9_]{1,16}")) {
+                    tpaRecovery = "waiting"; tpaRecoveryTarget = target; tpaRecoverySince = ticks; workChanged(); swarm.sendWorkflowTpa(name);
+                }
+            }
+            case "tpa-recovery-accept" -> { if (localParticipant) swarm.tasks().acceptCrewTeleport(m); }
+            case "tpa-recovery-cancel" -> {
+                if (localParticipant && Set.of("requested", "waiting").contains(tpaRecovery)) {
+                    tpaRecovery = "requested"; tpaRecoveryTarget = null; tpaRecoverySince = ticks; workChanged();
+                }
+            }
             case "nudge" -> { if (localParticipant && !isPausedByHost()) builder().crewNudge(); }
             case "resume-builder" -> {
                 if (localParticipant && !isPausedByHost() && !releasing) {
@@ -1435,7 +1508,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     protected void installAssignment(JsonObject m) {
         resourceFailureReason="";
         if (!localParticipant) { installRemoteAssignment(m); return; }
-        serviceReadyUntil = 0;
+        serviceReadyUntil = 0; tpaRecovery = ""; tpaRecoveryTarget = null; tpaRecoverySince = 0;
         boolean keepSupply = supplyHandoff && m.has("supplyHandoff") && m.get("supplyHandoff").getAsBoolean();
         boolean keepRunner = keepSupply && localParticipant && detachedSupply() && detachedMembers(m).contains(me());
         assignment = m.deepCopy(); job = str(m, "job"); generation = num(m, "generation"); phase = "positioning";
@@ -1506,7 +1579,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
             .findFirst().orElseGet(JsonObject::new);
     }
 
-    public boolean hold() { return localAssigned() && (stopped || !live()
+    public boolean hold() { return localAssigned() && (Set.of("requested", "waiting").contains(tpaRecovery) || stopped || !live()
         || away()
         || detachedSupply() && serviceReturning && builder().crewRestockIdle()
         || regrouping && !(supplyHandoff && detachedSupply() && !me().equals(rejoiningWorker)) && !me().equals(supplyOwner) && !builder().crewNeedsCleanup()
@@ -1516,6 +1589,10 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     }
     public void holdStep(HighwayBuilder b) {
         boolean settled = b.crewQuiesce();
+        if (Set.of("requested", "waiting").contains(tpaRecovery)) {
+            b.crewInventoryStatus(tpaRecovery.equals("requested") ? "Requesting a healthy crewmate for TPA recovery" : "Waiting for crew TPA recovery");
+            return;
+        }
         // Clear pickup space even while old road ACKs drain. Grant still requires both conditions.
         if (!stopped && live() && supplyCenter != null && (returnAuthorized || b.crewYield(pickupCenter == null ? supplyCenter : pickupCenter)) && settled) acknowledgeHold();
     }

@@ -457,7 +457,7 @@ final class BotRuntime {
         JsonObject action = top().getAsJsonObject("action"); action.addProperty("target", targetId.toString()); action.addProperty("dimension", dimension);
         actions.stop(); actions.start(action); actionLoaded = token;
         top().addProperty("commandSent", true); actions.markTpaSent(); top().add("native", actions.snapshot()); save();
-        mc.getConnection().sendCommand("tpa " + targetName); checkpointAction();
+        bots.sendWorkflowTpa(targetName); checkpointAction();
     }
     void configure(UUID id, JsonObject modules, int revision, String owner) {
         load(); JsonObject run = runs.get(id);

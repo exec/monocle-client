@@ -23,6 +23,7 @@ public final class HostService implements AutoCloseable {
     private final Deque<JsonObject> activity = new ArrayDeque<>();
     private final BotChat chat = new BotChat();
     private final Map<UUID, Long> chatAt = new HashMap<>();
+    private final Map<UUID, AutoTpy> autoTpyRequests = new LinkedHashMap<>();
     private final CrewTelemetry events;
     private final FileChannel lockChannel;
     private final FileLock lock;
@@ -42,6 +43,8 @@ public final class HostService implements AutoCloseable {
     private long historyAt;
     private long rosterAt;
     private int historyDays;
+    private boolean autoTpy;
+    private record AutoTpy(UUID requester, UUID target, String requesterName, String crew, String scope, long due, long expires) { }
     private static final class Peer {
         boolean chatSupported;
         boolean stashCatalogSupported;
@@ -83,6 +86,7 @@ public final class HostService implements AutoCloseable {
             if (lock == null) throw new IllegalStateException("Another host owns this data directory");
             library = new OperationsLibrary(directory.resolve("bot-operations.json"));
             JsonObject config = TaskFiles.read(directory.resolve("host-config.json"));
+            autoTpy = config.has("autoTpy") && config.get("autoTpy").isJsonPrimitive() && config.getAsJsonPrimitive("autoTpy").isBoolean() && config.get("autoTpy").getAsBoolean();
             if (config.has("crewLabels")) config.getAsJsonObject("crewLabels").entrySet().forEach(e -> {
                 if (this.crews.containsKey(e.getKey())) crewLabels.put(e.getKey(), WorkflowPackages.label(e.getValue().getAsString()));
             });
@@ -143,9 +147,11 @@ public final class HostService implements AutoCloseable {
                 checkpointRoster();rosterAt=now;
             }
             if (now - heartbeatAt >= 1_000_000_000L) {
-                for (SwarmConnection c : listener.connections()) if (c != null && c.connected()) c.send("{\"type\":\"heartbeat\"}");
+                JsonObject heartbeat=new JsonObject();heartbeat.addProperty("type","heartbeat");heartbeat.addProperty("autoTpy",autoTpy);heartbeat.add("crews",crewDiscovery());
+                for (SwarmConnection c : listener.connections()) if (c != null && c.connected()) c.send(heartbeat.toString());
                 heartbeatAt = now;
             }
+            tickAutoTpy();
             for (var entry : List.copyOf(peers.entrySet())) {
                 SwarmConnection c = entry.getKey(); Peer peer = entry.getValue();
                 if (!c.connected() || !peer.reconciled || now - peer.seen >= 5_000_000_000L) continue;
@@ -246,7 +252,84 @@ public final class HostService implements AutoCloseable {
             JsonObject saved=StashCatalog.save(directory,peer.crew,scope,message.getAsJsonObject("stash"),message.getAsJsonObject("observation"));persist();
             logEvent("stash-container-imported",peer.id.toString(),"",text(saved,"name"));
         }
+        else if(type.equals("worker-tpa-request")) requestAutoTpy(peer,message);
+        else if(type.equals("crew-join-request")) {
+            try{requestCrewJoin(c,peer,message);}
+            catch(RuntimeException e){String detail=e.getMessage()==null?"Join is not currently available":e.getMessage();joinResult(c,null,false,detail.startsWith("Bring the worker")||detail.startsWith("Wait for"),detail);}
+        }
         else highways.get(peer.crew).receive(c,message);
+    }
+
+    private JsonArray crewDiscovery() {
+        JsonArray result=new JsonArray();
+        for(String crew:crews.keySet()) {
+            JsonObject row=new JsonObject(),task=activeHighwayTask(crew,null);HighwayHost highway=highways.get(crew);JsonObject state=highway.status();
+            long connected=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().crew.equals(crew)).count();
+            row.addProperty("id",crew);row.addProperty("name",crewLabels.getOrDefault(crew,crew));row.addProperty("workers",connected);
+            row.addProperty("capacity",HighwayCoordinator.MAX_CREW_MEMBERS);row.addProperty("status",text(state,"phase").isEmpty()?"idle":text(state,"phase"));
+            row.addProperty("job",task==null?"":text(task,"id"));row.addProperty("jobName",task==null?"":text(task,"name"));row.addProperty("publicJoin",task!=null&&flag(task,"publicJoin"));result.add(row);
+        }
+        return result;
+    }
+
+    private JsonObject activeHighwayTask(String crew,UUID job) {
+        return tasks.values().stream().filter(t->text(t,"crew").equals(crew)&&t.has("nativeDefinition")&&!flag(t,"cancelled")&&!QueuePolicy.terminal(text(t,"status"))
+            &&(job==null||text(t,"id").equals(job.toString()))).findFirst().orElse(null);
+    }
+
+    private void requestCrewJoin(SwarmConnection connection,Peer peer,JsonObject message) {
+        String target=text(message,"crew");UUID job=UUID.fromString(text(message,"job"));JsonObject task=activeHighwayTask(target,job);
+        if(task==null)throw new IllegalArgumentException("That crew job is no longer joinable");
+        if(!peer.crew.equals(target)) {
+            if(!flag(task,"publicJoin"))throw new IllegalStateException("That job is not open for joining");
+            moveWorker(connection,peer,target,job);return;
+        }
+        HighwayHost highway=highways.get(target);JsonObject runs=task.getAsJsonObject("runs");
+        if(runs.has(peer.id.toString())) { if(pendingLateJoin(run(task,peer.id)))return;throw new IllegalStateException("This worker already belongs to the job"); }
+        if(runs.size()>=Math.min(HighwayCoordinator.MAX_CREW_MEMBERS,task.getAsJsonObject("nativeDefinition").getAsJsonObject("layout").get("width").getAsInt()))throw new IllegalStateException("No spare highway lane");
+        if(!peer.reconciled||!peer.current.isEmpty()||tasks.values().stream().anyMatch(t->workerJobPending(t,peer.id)))throw new IllegalStateException("Finish this worker's current task before joining");
+        JsonObject joining=lateJoinRun(task);runs.add(peer.id.toString(),joining);persist();
+        joinResult(connection,job,true,false,"Joining the live crew job");
+        logEvent("worker-joining-job",peer.id.toString(),job.toString(),target);
+    }
+    private static void joinResult(SwarmConnection connection,UUID job,boolean accepted,boolean retry,String detail){JsonObject result=message("crew-join-result");result.addProperty("job",job==null?"":job.toString());result.addProperty("accepted",accepted);result.addProperty("retry",retry);result.addProperty("detail",detail);connection.send(result.toString());}
+    private static boolean pendingLateJoin(JsonObject run){return run.has("joinJob")&&!flag(run,"joinAdmitted")&&!QueuePolicy.terminal(text(run,"status"));}
+    private static JsonObject lateJoinRun(JsonObject task) {
+        JsonObject reference=task.getAsJsonObject("runs").asMap().values().stream().map(JsonElement::getAsJsonObject).filter(HostService::highwayAction).findFirst()
+            .orElseThrow(()->new IllegalStateException("Wait for an existing worker's current Highway action report before adding another"));
+        JsonObject run=new JsonObject();run.addProperty("id",UUID.randomUUID().toString());run.addProperty("status","Queued");run.addProperty("detail","Preparing captured workflow/profile for late highway admission");
+        run.addProperty("joinJob",text(task.getAsJsonObject("nativeDefinition"),"id"));run.add("joinAction",reference.getAsJsonObject("action").deepCopy());return run;
+    }
+
+    private void requestAutoTpy(Peer requester,JsonObject message) {
+        if(!autoTpy)return;
+        UUID request=UUID.fromString(text(message,"request"));if(autoTpyRequests.containsKey(request))return;
+        if(autoTpyRequests.size()>=64)throw new IllegalStateException("Too many pending Auto TPY requests");
+        String targetName=text(message,"target"),scope=text(message,"scope");
+        if(!targetName.matches("[A-Za-z0-9_]{1,16}"))throw new IllegalArgumentException("Invalid TPA target");
+        if(requester.observation==null||!requester.observation.scope().equals(scope))return;
+        long fresh=System.nanoTime();List<Peer> matches=peers.entrySet().stream().filter(e->e.getKey().connected()).map(Map.Entry::getValue)
+            .filter(p->p.observation!=null&&p.observation.fresh(fresh)&&p.crew.equals(requester.crew)&&!p.id.equals(requester.id)&&p.observation.name().equalsIgnoreCase(targetName)).toList();
+        if(matches.size()!=1||!sameServer(scope,matches.getFirst().observation.scope()))return;
+        long now=System.currentTimeMillis();autoTpyRequests.put(request,new AutoTpy(requester.id,matches.getFirst().id,requester.observation.name(),requester.crew,scope,now+500,now+10_000));
+    }
+
+    private void tickAutoTpy() {
+        long now=System.currentTimeMillis(),fresh=System.nanoTime();
+        for(var entry:List.copyOf(autoTpyRequests.entrySet())) {
+            AutoTpy request=entry.getValue();if(!autoTpy||now>=request.expires()){autoTpyRequests.remove(entry.getKey());continue;}if(now<request.due())continue;
+            var requester=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().id.equals(request.requester())).findFirst().orElse(null);
+            var target=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().id.equals(request.target())).findFirst().orElse(null);
+            if(requester==null||target==null||requester.getValue().observation==null||target.getValue().observation==null
+                ||!requester.getValue().observation.fresh(fresh)||!target.getValue().observation.fresh(fresh)||!request.crew().equals(requester.getValue().crew)||!request.crew().equals(target.getValue().crew)
+                ||!request.requesterName().equals(requester.getValue().observation.name())||!request.scope().equals(requester.getValue().observation.scope())||!sameServer(request.scope(),target.getValue().observation.scope())) {
+                autoTpyRequests.remove(entry.getKey());continue;
+            }
+            JsonObject accept=message("tpa-accept");accept.addProperty("token",entry.getKey().toString());accept.addProperty("requester",request.requesterName());
+            accept.addProperty("requesterId",request.requester().toString());accept.addProperty("target",request.target().toString());accept.addProperty("requesterScope",request.scope());
+            accept.addProperty("targetScope",target.getValue().observation.scope());accept.addProperty("expires",request.expires());
+            if(target.getKey().send(accept.toString())){autoTpyRequests.remove(entry.getKey());logEvent("worker-auto-tpy",request.target().toString(),"",request.requesterName());}
+        }
     }
     private void sendStashCatalog(SwarmConnection c,Peer peer){if(!peer.stashCatalogSupported)return;JsonObject m=TaskWire.message("stash-catalog");JsonArray list=new JsonArray();for(JsonElement value:StashCatalog.list(directory)){JsonObject s=value.getAsJsonObject();if(text(s,"crew").equals(peer.crew))list.add(s.deepCopy());if(list.size()==64)break;}m.add("stashes",list);c.send(m.toString());}
     private void update(Peer peer, JsonObject message, boolean full) {
@@ -405,10 +488,18 @@ public final class HostService implements AutoCloseable {
                 boolean failed=workers.stream().anyMatch(id -> text(run(task,id),"status").equals("Failed")
                     || Set.of("Failed", "Cancelled").contains(text(run(task,id),"requestedStatus")));
                 if(ownsHighway(task,highway)) {
+                    for(UUID id:workers) {
+                        JsonObject joining=run(task,id);if(!pendingLateJoin(joining)||!nativeReady(crew,id))continue;
+                        try {
+                            JsonObject tokens=task.getAsJsonObject("highwayTokens");if(!tokens.has(id.toString())){tokens.addProperty(id.toString(),text(joining,"token"));persist();}
+                            if(!highway.isParticipant(id))highway.addWorker(id);
+                            if(highway.isParticipant(id)){joining.addProperty("joinAdmitted",true);persist();}
+                        } catch(IllegalStateException e){task.addProperty("detail","Late join waiting: "+e.getMessage());}
+                    }
                     if(flag(task,"cancelled")) highway.endJob();
                     else if(failed && !highway.independentSupplies()) { if(highway.assigned()) highway.releaseJob(); else highway.endJob(); }
                     else if(highway.assigned()) {
-                        boolean ready=workers.stream().allMatch(id -> nativeReady(crew,id) && peer(crew,id).current.equals(text(run(task,id),"id")));
+                        boolean ready=workers.stream().filter(id->!pendingLateJoin(run(task,id))).allMatch(id -> nativeReady(crew,id) && peer(crew,id).current.equals(text(run(task,id),"id")));
                         if(flag(task,"paused") || !ready && !highway.independentSupplies()) { if(!highway.paused() && !highway.isReleasing()) highway.pause(); }
                         else if(!highway.isReleasing() && (highway.paused() || flag(task,"nativeResumeRequested"))) {
                             if (highway.tryResume()) { task.remove("nativeResumeRequested"); persist(); }
@@ -513,9 +604,13 @@ public final class HostService implements AutoCloseable {
             JsonObject result=new JsonObject();result.add("delivered",delivered);result.addProperty("status","Sent to connected clients; not a server acknowledgement");return result;
         }
         if (op.equals("host-settings")) {
-            int days=integer(request,"historyDays",-1,3650);JsonObject config=TaskFiles.read(directory.resolve("host-config.json"));
+            if(!request.has("historyDays")&&!request.has("autoTpy"))throw new IllegalArgumentException("Specify a host setting");
+            int days=request.has("historyDays")?integer(request,"historyDays",-1,3650):historyDays;
+            boolean nextAutoTpy=autoTpy;
+            if(request.has("autoTpy")){if(!request.get("autoTpy").isJsonPrimitive()||!request.getAsJsonPrimitive("autoTpy").isBoolean())throw new IllegalArgumentException("autoTpy must be true or false");nextAutoTpy=request.get("autoTpy").getAsBoolean();}
+            JsonObject config=TaskFiles.read(directory.resolve("host-config.json"));
             if(config.isEmpty())throw new IllegalStateException("This host has no persistent configuration");
-            config.addProperty("historyDays",days);TaskFiles.write(directory.resolve("host-config.json"),config);historyDays=days;return status();
+            config.addProperty("historyDays",days);config.addProperty("autoTpy",nextAutoTpy);TaskFiles.write(directory.resolve("host-config.json"),config);historyDays=days;autoTpy=nextAutoTpy;return status();
         }
         if (op.equals("worker-forget")) {
             UUID worker=UUID.fromString(text(request,"worker"));
@@ -561,6 +656,11 @@ public final class HostService implements AutoCloseable {
         JsonObject previous = task.deepCopy();
         try {
             switch (op) {
+                case "public-join" -> {
+                    if(!task.has("nativeDefinition")||QueuePolicy.terminal(text(task,"status"))||flag(task,"cancelled"))throw new IllegalStateException("Only a live native highway job can accept public joins");
+                    if(!request.has("enabled")||!request.get("enabled").isJsonPrimitive()||!request.getAsJsonPrimitive("enabled").isBoolean())throw new IllegalArgumentException("enabled must be true or false");
+                    task.addProperty("publicJoin",request.get("enabled").getAsBoolean());
+                }
                 case "configure" -> TaskWire.configure(task, request.has("worker") ? UUID.fromString(text(request, "worker")) : null, request.getAsJsonObject("modules"));
                 case "pause" -> QueuePolicy.pause(task);
                 case "resume" -> {
@@ -625,15 +725,18 @@ public final class HostService implements AutoCloseable {
         if(op.equals("crew-move")) {
             UUID worker=UUID.fromString(text(request,"worker"));
             var source=peers.entrySet().stream().filter(e->e.getKey().connected() && e.getValue().id.equals(worker)).findFirst().orElseThrow(()->new IllegalArgumentException("Worker is offline"));
-            Peer peer=source.getValue();HighwayHost highway=highways.get(peer.crew);
-            if(!peer.reconciled || !peer.current.isEmpty() || highway.isParticipant(worker) || highway.recoveryRecord()!=null || highway.hasPendingEnds(Set.of(worker)) || !highway.recoveryReady(worker)
-                || tasks.values().stream().anyMatch(t->workerJobPending(t,worker)))
-                throw new IllegalStateException("Cancel or finish the worker's jobs and wait for cleanup before moving crews");
-            if(peer.crew.equals(id))return status();
-            JsonObject message=new JsonObject();message.addProperty("type","assign-crew");message.addProperty("crew",crewLabels.getOrDefault(id,id));message.addProperty("sealedKey",source.getKey().sealSecret(crews.get(id)));
-            if(!source.getKey().send(message.toString()))throw new IllegalStateException("Worker disconnected before reassignment");return status();
+            if(source.getValue().crew.equals(id))return status();
+            JsonObject destination=activeHighwayTask(id,null);moveWorker(source.getKey(),source.getValue(),id,destination==null?null:UUID.fromString(text(destination,"id")));return status();
         }
         throw new IllegalArgumentException("Unknown crew operation");
+    }
+    private void moveWorker(SwarmConnection connection,Peer peer,String target,UUID joinJob) {
+        HighwayHost highway=highways.get(peer.crew);
+        if(!peer.reconciled||!peer.current.isEmpty()||highway.isParticipant(peer.id)||highway.recoveryRecord()!=null||highway.hasPendingEnds(Set.of(peer.id))||!highway.recoveryReady(peer.id)
+            ||tasks.values().stream().anyMatch(t->workerJobPending(t,peer.id)))throw new IllegalStateException("Cancel or finish the worker's jobs and wait for cleanup before moving crews");
+        JsonObject message=new JsonObject();message.addProperty("type","assign-crew");message.addProperty("crew",crewLabels.getOrDefault(target,target));message.addProperty("crewId",target);
+        message.addProperty("sealedKey",connection.sealSecret(crews.get(target)));if(joinJob!=null)message.addProperty("joinJob",joinJob.toString());
+        if(!connection.send(message.toString()))throw new IllegalStateException("Worker disconnected before reassignment");
     }
     private String uniqueCrewLabel(String name,String except) {
         name=WorkflowPackages.label(name);for(String id:crews.keySet())if(!id.equals(except) && crewLabels.getOrDefault(id,id).equalsIgnoreCase(name))throw new IllegalArgumentException("A crew already uses that name");return name;
@@ -665,7 +768,7 @@ public final class HostService implements AutoCloseable {
             case "West" -> { dx=-1;heading="West"; }
             default -> throw new IllegalArgumentException("Choose North, East, South or West");
         }
-        JsonArray workers=request.getAsJsonArray("workers");if(workers!=null&&workers.size()>5)throw new IllegalArgumentException("Native highway jobs support at most 5 workers");
+        JsonArray workers=request.getAsJsonArray("workers");if(workers!=null&&workers.size()>HighwayCoordinator.MAX_CREW_MEMBERS)throw new IllegalArgumentException("Native highway jobs support at most 3 workers");
         JsonObject prepared=request.deepCopy(),packaged=library.get(dev.monocle.client.systems.bots.BotWorkflows.DEFAULT_ID).getAsJsonObject("package");
         JsonObject geometry=packaged.getAsJsonObject("geometry"),layout=geometry.getAsJsonObject("layout"),args=new JsonObject();
         geometry.addProperty("scope",text(request,"server")+"\n"+text(request,"dimension"));geometry.addProperty("x",x);geometry.addProperty("y",y);geometry.addProperty("z",z);
@@ -711,6 +814,7 @@ public final class HostService implements AutoCloseable {
         }
         task.addProperty("id", id.toString()); task.addProperty("requestHash", digest); task.addProperty("name", name); task.addProperty("workflowName", name); task.addProperty("crew", crew);
         task.addProperty("server", server); task.addProperty("dimension", dimension); task.addProperty("priority", priority); task.addProperty("status", "Queued");
+        task.addProperty("publicJoin",false);
         task.add("runs", runs); task.add("overrides", new JsonObject()); task.add("args", args); task.add("package", packaged); task.add("supportedActions", new Gson().toJsonTree(ACTIONS));
         validateTask(id, task);
         for (String worker : runs.keySet()) TaskFiles.jsonBytes(TaskWire.envelope(task, UUID.fromString(worker)), TaskFiles.MAX_PACKAGE);
@@ -730,7 +834,7 @@ public final class HostService implements AutoCloseable {
         JsonObject result = new JsonObject(); result.addProperty("status", failure.isEmpty() ? closed ? "Stopped" : "Running" : failure);
         result.addProperty("lastConnectionError", lastConnectionError);
         result.addProperty("telemetryError", events.error()); result.addProperty("telemetryDropped", events.dropped());
-        result.addProperty("operationsVersion",1);result.addProperty("historyDays",historyDays);
+        result.addProperty("operationsVersion",1);result.addProperty("historyDays",historyDays);result.addProperty("autoTpy",autoTpy);
         result.addProperty("rosterError",rosterError);
         result.add("crewLabels",new Gson().toJsonTree(crewLabels));result.add("workflows",library.list());result.add("drafts",library.drafts());
         result.add("activity",new Gson().toJsonTree(activity));
@@ -779,6 +883,8 @@ public final class HostService implements AutoCloseable {
             throw new IllegalArgumentException("Invalid saved task scope/arguments");
         if (!Set.of("Queued", "Paused", "Cancelling", "Running", "Suspended", "Inspection required", "Complete", "Failed", "Cancelled").contains(text(task, "status"))) throw new IllegalArgumentException("Invalid saved task state");
         for (String key : List.of("paused", "cancelled")) if (task.has(key) && (!task.get(key).isJsonPrimitive() || !task.getAsJsonPrimitive(key).isBoolean())) throw new IllegalArgumentException("Invalid saved control flag");
+        if(task.has("publicJoin")&&(!task.get("publicJoin").isJsonPrimitive()||!task.getAsJsonPrimitive("publicJoin").isBoolean()))throw new IllegalArgumentException("Invalid public joining option");
+        if(!task.has("publicJoin"))task.addProperty("publicJoin",false);
         JsonObject runs = task.getAsJsonObject("runs"); if (runs == null || runs.isEmpty() || runs.size() > 16) throw new IllegalArgumentException("Invalid saved targets");
         Set<UUID> executions = new HashSet<>();
         for (var entry : runs.entrySet()) {

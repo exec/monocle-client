@@ -26,6 +26,7 @@ import dev.monocle.client.mixininterface.IClientboundExplodePacket;
 import dev.monocle.client.pathing.BaritoneUtils;
 import dev.monocle.client.systems.config.Config;
 import dev.monocle.client.systems.modules.Modules;
+import dev.monocle.client.systems.modules.combat.CrystalAura;
 import dev.monocle.client.systems.modules.combat.Surround;
 import dev.monocle.client.systems.modules.movement.Scaffold;
 import dev.monocle.client.systems.modules.movement.Velocity;
@@ -127,6 +128,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
         // Vanilla has resolved block predictions on the client thread before this callback.
         Modules.get().get(HighwayBuilder.class).onServerBlockAck(packet.sequence());
         Modules.get().get(PrinterHelper.class).onServerBlockAck(packet.sequence());
+        Modules.get().get(CrystalAura.class).onServerBlockAck(packet.sequence());
         Modules.get().get(Surround.class).onServerBlockAck(packet.sequence());
         Modules.get().get(Scaffold.class).onServerBlockAck(packet.sequence());
     }
@@ -135,6 +137,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
     private void onHandleBlockUpdate(ClientboundBlockUpdatePacket packet, CallbackInfo ci) {
         Modules.get().get(HighwayBuilder.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(PrinterHelper.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
+        Modules.get().get(CrystalAura.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(Surround.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(Scaffold.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
     }
@@ -144,6 +147,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
         packet.runUpdates((pos, state) -> {
             Modules.get().get(HighwayBuilder.class).onServerBlockUpdate(pos, state);
             Modules.get().get(PrinterHelper.class).onServerBlockUpdate(pos, state);
+            Modules.get().get(CrystalAura.class).onServerBlockUpdate(pos, state);
             Modules.get().get(Surround.class).onServerBlockUpdate(pos, state);
             Modules.get().get(Scaffold.class).onServerBlockUpdate(pos, state);
         });
@@ -229,5 +233,10 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
             minecraft.gui.hud.getChat().addRecentChat(message);
             ci.cancel();
         }
+    }
+
+    @Inject(method = "sendCommand", at = @At("HEAD"))
+    private void monocle$observeCommand(String command, CallbackInfo ci) {
+        dev.monocle.client.systems.bots.Bots.get().onCommandSent(command);
     }
 }

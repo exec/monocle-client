@@ -18,6 +18,8 @@ final class BotWorkflowsTest {
             var original = library.compile(BotWorkflows.DEFAULT_ID);
             assert original.get("duty").getAsString().equals("Build");
             assert original.getAsJsonArray("actions").get(2).getAsString().equals("InventoryShulkers");
+            assert original.getAsJsonArray("actions").asList().stream().noneMatch(action -> action.getAsString().equals("EnderChestFarm"))
+                : "The default highway searches ender-chest contents but never consumes the chests themselves";
             bad(() -> library.delete(BotWorkflows.DEFAULT_ID));
             bad(() -> library.save(BotWorkflows.DEFAULT_ID, "Changed", "Highway Builder", List.of(new BotWorkflows.Step(Paving, ""))));
             var copy = library.duplicate(BotWorkflows.DEFAULT_ID, "My highway", "Highway Builder/Custom");

@@ -8,6 +8,7 @@ import dev.monocle.client.systems.modules.misc.swarm.SwarmConnection;
 
 /** Shared host state machine. P and the hooks isolate game observations/actions from coordination. */
 public abstract class HighwayCoordinator<P> {
+    public static final int MAX_CREW_MEMBERS = 3;
     private CrewTelemetry telemetry;
     private String windowDecision = "not evaluated";
     private long windowDecisionAt;
@@ -15,6 +16,8 @@ public abstract class HighwayCoordinator<P> {
     private final Deque<JsonObject> diagnosticCommands = new ArrayDeque<>();
     private String telemetryCaptureError = "";
     private long telemetryErrorAt, diagnosticCommandSequence;
+    private final Map<UUID, RecoveryTeleport> recoveryTeleports = new HashMap<>();
+    private record RecoveryTeleport(UUID target, String token, int issued, boolean accepted) { }
 
     public Path telemetryPath() { return journal().resolveSibling(journal().getFileName() + ".telemetry.jsonl"); }
     public String telemetryError() { return !telemetryCaptureError.isEmpty() ? telemetryCaptureError : telemetry == null ? "" : telemetry.error(); }
@@ -100,8 +103,10 @@ public abstract class HighwayCoordinator<P> {
     protected static final Gson JSON = new Gson();
     protected static final int WORK_WINDOW=RowVerification.WINDOW, SUPPLY_SPACING=3;
     public enum WorkSharing {
-        Lanes, BreakOrder;
-        @Override public String toString() { return this == Lanes ? "Lanes" : "Break Order"; }
+        Lanes, Roles, BreakOrder;
+        @Override public String toString() {
+            return switch (this) { case Lanes -> "Lanes"; case Roles -> "Roles"; case BreakOrder -> "Break Order"; };
+        }
     }
 
 
@@ -308,7 +313,31 @@ public abstract class HighwayCoordinator<P> {
         // A short physical leash keeps lane workers side-by-side. Long render-distance
         // windows were faster on paper but made restock/rejoin state unstable.
         return sharing == WorkSharing.BreakOrder ? Math.min(length, slowest + 1)
+            : sharing == WorkSharing.Roles ? Math.min(length, slowest + 16)
             : leadLimit(length, slowest);
+    }
+
+    public static int roleLeadLimit(int length, int current, String duty, int excavationFront, int pavingFront) {
+        int target = switch (duty) {
+            case "Excavate" -> pavingFront + 16;
+            case "Pave" -> excavationFront - 5;
+            default -> Math.min(pavingFront + 8, excavationFront - 2);
+        };
+        return Math.max(current, Math.min(length, target));
+    }
+
+    public static boolean roleFormation(JsonObject record) {
+        return roleFormation(record, activeMembers(record));
+    }
+
+    public static boolean roleFormation(JsonObject record, Collection<UUID> members) {
+        if (workSharing(record.getAsJsonObject("layout")) != WorkSharing.Roles) return false;
+        boolean excavator = false, paver = false;
+        for (UUID member : members) {
+            excavator |= duty(record, member).equals("Excavate");
+            paver |= duty(record, member).equals("Pave");
+        }
+        return excavator && paver;
     }
 
     public static int leadLimit(int length, int slowest, WorkSharing sharing) {
@@ -645,6 +674,19 @@ public abstract class HighwayCoordinator<P> {
             }
         } catch (RuntimeException malformed) { return new JsonArray(); }
         return result;
+    }
+
+    public static boolean validSharedContainer(JsonObject assignment, JsonObject site) {
+        try {
+            JsonObject layout = assignment.getAsJsonObject("layout");
+            long x = site.getAsJsonPrimitive("x").getAsBigDecimal().intValueExact() - num(assignment, "x");
+            long y = site.getAsJsonPrimitive("y").getAsBigDecimal().intValueExact();
+            long z = site.getAsJsonPrimitive("z").getAsBigDecimal().intValueExact() - num(assignment, "z");
+            long row = x * num(layout, "dx") + z * num(layout, "dz");
+            long side = x * num(layout, "dz") - z * num(layout, "dx");
+            return y == num(assignment, "y") && row >= -128 && row <= num(assignment, "length")
+                && Math.abs(side) <= num(layout, "width");
+        } catch (RuntimeException malformed) { return false; }
     }
 
     protected boolean supplyBarrierReady() {
@@ -1099,7 +1141,12 @@ public abstract class HighwayCoordinator<P> {
             .mapToInt(report -> num(report, "renderDistance"))
             .filter(distance -> distance >= 2 && distance <= 64)
             .min().orElse(0);
+        boolean roles = roleFormation(assignment);
         int limit = leadLimit(length, minimum, sharing, renderDistance);
+        int excavationFront = roles ? current.entrySet().stream().filter(entry -> duty(entry.getKey()).equals("Excavate"))
+            .mapToInt(entry -> num(entry.getValue(), "currentRow")).min().orElse(minimum) : minimum;
+        int pavingFront = roles ? current.entrySet().stream().filter(entry -> duty(entry.getKey()).equals("Pave"))
+            .mapToInt(entry -> num(entry.getValue(), "currentRow")).min().orElse(minimum) : minimum;
         JsonObject sharedMining = new JsonObject();
         if (shared) {
             Map<UUID, List<P>> targets = new LinkedHashMap<>();
@@ -1116,8 +1163,8 @@ public abstract class HighwayCoordinator<P> {
         if (hostAuthority && (!localParticipant || !worldAvailable() || !scope().equals(str(assignment, "scope")))) {
             windowDecision = "participating host world unavailable"; return false;
         }
-        // All world reads stay on the client thread. Shared results bound host verification to five
-        // forward rows plus the slowest member's current row, irrespective of the crew size.
+        // All world reads stay on the client thread. Ordinary crews inspect five forward rows;
+        // role formations extend only their dedicated excavation lead to sixteen.
         Map<Integer, Boolean> hostResolved = new HashMap<>();
         if (hostAuthority) {
             if (minimum != startRow()) hostResolved.put(minimum, hostRowResolved(rowCenter(minimum)));
@@ -1134,10 +1181,12 @@ public abstract class HighwayCoordinator<P> {
             // until the roster receipt arrives; never send unknown Break Order owners.
             if (report.has("suppliers") && !report.getAsJsonObject("suppliers").keySet().equals(suppliers(assignment).keySet())) { windowDecision = "awaiting supplier roster ACK: " + member.getKey(); continue; }
             if (report.has("serviceRevisions") && !serviceRevisions(report).equals(serviceRevisions(assignment))) { windowDecision = "awaiting service revision ACK: " + member.getKey(); continue; }
-            int base = num(report, "currentRow") + 1;
-            int mask = RowVerification.mask(hostAuthority, base, limit, worldRows, progress.get(member.getKey()));
+            int row = num(report, "currentRow");
+            int memberLimit = roles ? roleLeadLimit(length, row, duty(member.getKey()), excavationFront, pavingFront) : limit;
+            int base = row + 1;
+            int mask = RowVerification.mask(hostAuthority, base, memberLimit, worldRows, progress.get(member.getKey()));
             JsonObject permit = jobMessage("window");
-            permit.addProperty("base", base); permit.addProperty("mask", mask); permit.addProperty("limit", limit);
+            permit.addProperty("base", base); permit.addProperty("mask", mask); permit.addProperty("limit", memberLimit);
             permit.addProperty("checkpoint", checkpointRow);
             permit.addProperty("trailAuditor", member.getKey().equals(trailAuditor));
             JsonObject diagnosticPermit = permit.deepCopy(); diagnosticPermit.addProperty("sentAt", System.currentTimeMillis());
@@ -1327,12 +1376,10 @@ public abstract class HighwayCoordinator<P> {
                     || r != null && str(r, "stage").equals("failed")) { finish("cancelled"); return; }
                 if (d != null && d.has("container")) {
                     JsonObject site = d.getAsJsonObject("container");
-                    // The donor advertises only its currently placed shulker. Bound it to
-                    // the donor's observed position before forwarding it to the requester.
-                    JsonObject observation = currentReport(donor);
-                    if (observation != null && Math.abs((long) num(site,"x") - num(observation,"x")) <= 12
-                        && Math.abs((long) num(site,"z") - num(observation,"z")) <= 12
-                        && num(site,"y") == num(assignment,"y")) hostOffer.add("container", site.deepCopy());
+                    // A donor may leave its real box behind while the recipient catches up.
+                    // Keep the target bounded to this job, not the donor's newest position.
+                    if (currentReport(donor) != null && validSharedContainer(assignment, site)) hostOffer.add("container", site.deepCopy());
+                    else hostOffer.remove("container");
                 } else hostOffer.remove("container");
                 dispatch(); return;
             }
@@ -1412,7 +1459,8 @@ public abstract class HighwayCoordinator<P> {
         if (regrouping) throw new IllegalStateException("A worker is already joining; wait for supply recovery and lane positioning.");
         if (ticks < regroupRetryAfter) throw new IllegalStateException("Previous handoff was deferred; allowing the current lanes to progress before retrying.");
         if (detachedMember() != null) throw new IllegalStateException("Wait for the resupplying worker to return before adding another worker.");
-        if (participants.size() >= num(assignment.getAsJsonObject("layout"), "width")) throw new IllegalStateException("There is no unused walking lane on this highway.");
+        if (participants.size() >= MAX_CREW_MEMBERS || participants.size() >= num(assignment.getAsJsonObject("layout"), "width"))
+            throw new IllegalStateException("Highway crews are limited to three workers and available walking lanes.");
         if (!preferredMembers(assignment).contains(worker) && preferredMembers(assignment).size() >= num(assignment.getAsJsonObject("layout"), "width"))
             throw new IllegalStateException("The remaining lanes are reserved for returning workers.");
         eligibleJoin(worker);
@@ -1660,6 +1708,7 @@ public abstract class HighwayCoordinator<P> {
 
     public static void writeRecord(Path path, JsonObject record) throws java.io.IOException { TaskFiles.write(path, record); }
     protected void startPrepared(JsonObject definition, Map<UUID,SwarmConnection> selected, boolean includeHost, P origin) {
+        if (selected.isEmpty() || selected.size() > MAX_CREW_MEMBERS) throw new IllegalArgumentException("Highway crews support 1–3 workers");
         if (hasPendingEnds(selected.keySet()))
             throw new IllegalStateException("A selected worker must acknowledge its previous job ending before joining this one");
         definition = definition.deepCopy();
@@ -1676,7 +1725,7 @@ public abstract class HighwayCoordinator<P> {
         int progress = definition.has("progress") ? num(definition,"progress") : 0;
         int sectionLength = num(definition,"length"); String name = str(definition,"name"); JsonObject layout = definition.getAsJsonObject("layout");
         localParticipant = includeHost;
-        participants.clear(); participants.putAll(selected); reports.clear(); supplyContainers = new JsonObject(); pendingRejoins.clear();
+        participants.clear(); participants.putAll(selected); reports.clear(); recoveryTeleports.clear(); supplyContainers = new JsonObject(); pendingRejoins.clear();
         generation = 0;
         List<UUID> stockOwners = new ArrayList<>(participants.keySet());
         UUID initialStockOwner = stockOwners.get(java.util.concurrent.ThreadLocalRandom.current().nextInt(stockOwners.size()));
@@ -1844,6 +1893,52 @@ public abstract class HighwayCoordinator<P> {
         if (!stopped && !phase.equals("paused") && ticks % 20 == 0)
             for (UUID id : participants.keySet()) if (currentReport(id) != null) sendMember(id, jobMessage("nudge"));
     }
+
+    static UUID recoveryTeleportTarget(UUID requester, List<UUID> active, Map<UUID, JsonObject> current) {
+        return active.stream().filter(id -> !id.equals(requester)).filter(id -> {
+            JsonObject report = current.get(id);
+            if (report == null || !str(report, "phase").equals("building") || !str(report, "tpaRecovery").isEmpty()
+                || !str(report, "name").matches("[A-Za-z0-9_]{1,16}")) return false;
+            return !report.has("diagnostics") || !report.getAsJsonObject("diagnostics").has("idleTicks")
+                || num(report.getAsJsonObject("diagnostics"), "idleTicks") < 400;
+        }).min(Comparator.comparingInt(id -> {
+            JsonObject diagnostics = current.get(id).has("diagnostics") ? current.get(id).getAsJsonObject("diagnostics") : null;
+            return diagnostics != null && diagnostics.has("idleTicks") ? num(diagnostics, "idleTicks") : 0;
+        }).thenComparingInt(id -> current.get(id).has("currentRow") ? num(current.get(id), "currentRow") : Integer.MAX_VALUE)).orElse(null);
+    }
+
+    private void coordinateRecoveryTeleports() {
+        if (!isHost() || !assigned() || stopped || !begun || regrouping || releasing || phase.equals("paused")) { recoveryTeleports.clear(); return; }
+        Map<UUID, JsonObject> current = new LinkedHashMap<>();
+        for (UUID id : activeMembers()) { JsonObject report = currentReport(id); if (report != null && str(assignment, "scope").equals(str(report, "scope"))) current.put(id, report); }
+        recoveryTeleports.entrySet().removeIf(e -> !current.containsKey(e.getKey()) || !Set.of("requested", "waiting").contains(str(current.get(e.getKey()), "tpaRecovery")));
+        for (UUID requester : activeMembers()) {
+            JsonObject report = current.get(requester); if (report == null) continue;
+            String state = str(report, "tpaRecovery"); RecoveryTeleport pending = recoveryTeleports.get(requester);
+            if (state.equals("requested")) {
+                if (pending != null && pending.accepted()) recoveryTeleports.remove(requester);
+                if (!recoveryTeleports.containsKey(requester)) {
+                    UUID target = recoveryTeleportTarget(requester, activeMembers(), current); if (target == null) continue;
+                    String token = UUID.randomUUID().toString(); JsonObject command = jobMessage("tpa-recovery");
+                    command.addProperty("token", token); command.addProperty("target", target.toString()); command.addProperty("name", str(current.get(target), "name"));
+                    recoveryTeleports.put(requester, new RecoveryTeleport(target, token, ticks, false)); sendMember(requester, command);
+                    info("%s is using crew TPA recovery through %s.", memberName(requester), memberName(target));
+                }
+                continue;
+            }
+            if (!state.equals("waiting") || pending == null || pending.accepted() || ticks - pending.issued() < 10) continue;
+            JsonObject target = current.get(pending.target());
+            if (target == null || !str(target, "phase").equals("building") || !str(target, "tpaRecovery").isEmpty()) {
+                sendMember(requester, jobMessage("tpa-recovery-cancel")); recoveryTeleports.remove(requester); continue;
+            }
+            JsonObject accept = jobMessage("tpa-recovery-accept");
+            accept.addProperty("token", pending.token()); accept.addProperty("requester", str(report, "name")); accept.addProperty("requesterId", requester.toString());
+            accept.addProperty("target", pending.target().toString()); accept.addProperty("requesterScope", str(report, "scope")); accept.addProperty("targetScope", str(target, "scope"));
+            accept.addProperty("expires", System.currentTimeMillis() + 10_000);
+            sendMember(pending.target(), accept); recoveryTeleports.put(requester, new RecoveryTeleport(pending.target(), pending.token(), pending.issued(), true));
+        }
+    }
+
     protected void hostCoordinate(boolean changed) {
         try {
             if (isHost() && assigned() && !stopped && regrouping && !releasing && !phase.equals("paused") && handoffExpired(ticks, regroupStarted)) {
@@ -1851,6 +1946,7 @@ public abstract class HighwayCoordinator<P> {
                 regroupRetryAfter = ticks + 400;
                 warning("Lane handoff timed out; keeping existing duties and supply ownership. Work continues before another handoff attempt.");
             }
+            coordinateRecoveryTeleports();
             coordinate(changed);
             if (isHost() && assigned() && !stopped && !regrouping && !releasing && !phase.equals("paused") && begun) resourceExchange.coordinate();
         } finally { recordTelemetry(); }

@@ -23,6 +23,7 @@ public final class Main {
             JsonObject config = new JsonObject(), crews = new JsonObject();
             config.addProperty("bind", "127.0.0.1"); config.addProperty("workerPort", 6969); config.addProperty("apiPort", 6970); config.addProperty("historyDays", 30);
             config.addProperty("webPort", 0);
+            config.addProperty("autoTpy", false);
             config.addProperty("uiOrigin", "");
             config.addProperty("apiToken", secret()); crews.addProperty("Default", secret()); config.add("crews", crews);
             if (Files.getFileStore(directory).supportsFileAttributeView("posix")) Files.createFile(file, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
