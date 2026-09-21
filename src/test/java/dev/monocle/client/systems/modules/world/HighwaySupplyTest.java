@@ -51,6 +51,9 @@ public final class HighwaySupplyTest {
         assert HighwayBuilder.awaitRepairChunks(0,false,false);
         assert !HighwayBuilder.awaitRepairChunks(0,true,false) && !HighwayBuilder.awaitRepairChunks(0,false,true)
             : "A defect or the real job end lands; a temporary render boundary does not";
+        assert HighwayBuilder.flightPlacementBudget(1, 1) && HighwayBuilder.flightPlacementBudget(5, 5);
+        assert !HighwayBuilder.flightPlacementBudget(0, 5) && !HighwayBuilder.flightPlacementBudget(6, 5)
+            : "Only a nonempty placement-only repair within the configured tick budget may stay airborne";
         assert HighwayBuilder.operationExcavates(HighwayBuilder.Operation.Build)
             && HighwayBuilder.operationExcavates(HighwayBuilder.Operation.Repair)
             && HighwayBuilder.operationExcavates(HighwayBuilder.Operation.ClearTunnel)

@@ -785,7 +785,7 @@ public class HighwayBuilder extends Module {
     private int repairFlightRows, repairFlightLaunchTick = -1, repairFlightRetryTick, repairFlightProgressTick;
     private boolean repairFlightLanding, repairFlightMending, repairFlightBackoff;
     private boolean repairFlightEnabledFly;
-    private record RepairIssue(boolean loaded, String kind, BlockPos position) {}
+    private record RepairIssue(boolean loaded, String kind, BlockPos position, boolean placement) {}
     private record RepairScan(int cleanRows, RepairIssue issue, boolean jobEnd) {}
     private RepairScan repairScan;
     private BlockPos repairScanOrigin;
@@ -1577,19 +1577,19 @@ public class HighwayBuilder extends Module {
         BlockPos origin = workOrigin.offset(dir.offsetX * offset, 0, dir.offsetZ * offset);
         for (HighwayPlan.Cell cell : HighwayPlan.front(dir.offsetX, dir.offsetZ, width.get(), height.get())) {
             BlockPos pos = origin.offset(cell.x(), cell.y(), cell.z());
-            if (!mc.level.getChunkSource().hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) return new RepairIssue(false, "", pos);
+            if (!mc.level.getChunkSource().hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) return new RepairIssue(false, "", pos, false);
             BlockState state = crewVerifiedState(pos);
-            if (state == null) return new RepairIssue(true, "server verification", pos);
-            if (isPortalHazard(state)) return new RepairIssue(true, "end portal hazard", pos);
-            if (!crewClearanceResolved(state, mc.level, pos)) return new RepairIssue(true, "passage obstruction", pos);
+            if (state == null) return new RepairIssue(true, "server verification", pos, false);
+            if (isPortalHazard(state)) return new RepairIssue(true, "end portal hazard", pos, false);
+            if (!crewClearanceResolved(state, mc.level, pos)) return new RepairIssue(true, "passage obstruction", pos, false);
         }
         for (PavingTarget target : plannedPavingTargets(offset)) {
             BlockPos pos = target.position();
-            if (!mc.level.getChunkSource().hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) return new RepairIssue(false, "", pos);
+            if (!mc.level.getChunkSource().hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) return new RepairIssue(false, "", pos, false);
             BlockState state = crewVerifiedState(target.position());
-            if (state == null) return new RepairIssue(true, "server verification", pos);
+            if (state == null) return new RepairIssue(true, pendingPlaces.containsKey(pos) ? "paving confirmation" : "server verification", pos, pendingPlaces.containsKey(pos));
             if (!crewPavingResolved(state, false, blocksToPlace.get()))
-                return new RepairIssue(true, target.filler() ? "support gap" : pos.getY() < workOrigin.getY() ? "floor gap" : "railing gap", pos);
+                return new RepairIssue(true, target.filler() ? "support gap" : pos.getY() < workOrigin.getY() ? "floor gap" : "railing gap", pos, state.canBeReplaced());
         }
         return null;
     }
@@ -1636,6 +1636,33 @@ public class HighwayBuilder extends Module {
 
     static boolean awaitRepairChunks(int cleanRows, boolean hasIssue, boolean jobEnd) {
         return cleanRows == 0 && !hasIssue && !jobEnd;
+    }
+
+    static boolean flightPlacementBudget(int defects, int limit) {
+        return defects > 0 && defects <= limit;
+    }
+
+    private List<PavingTarget> repairFlightPlacementTargets(RepairScan scan) {
+        if (scan == null || scan.issue() == null || !scan.issue().placement() || scan.cleanRows() != repairFlightRows) return null;
+        List<PavingTarget> defects = new ArrayList<>();
+        for (PavingTarget target : plannedPavingTargets(repairFlightRows)) {
+            BlockPos pos = target.position();
+            if (pendingPlaces.containsKey(pos)) { defects.add(target); continue; }
+            BlockState state = crewVerifiedState(pos);
+            if (state == null) return null;
+            if (crewPavingResolved(state, false, blocksToPlace.get())) continue;
+            if (!state.canBeReplaced() || !state.getFluidState().isEmpty()) return null;
+            defects.add(target);
+        }
+        return flightPlacementBudget(defects.size(), placementsPerTick.get()) ? defects : null;
+    }
+
+    private boolean repairFlightPavingVerified() {
+        for (PavingTarget target : plannedPavingTargets(repairFlightRows)) {
+            BlockState state = crewVerifiedState(target.position());
+            if (state == null || !crewPavingResolved(state, false, blocksToPlace.get())) return false;
+        }
+        return true;
     }
 
     private boolean continueRepairFlight(Vec3 from) {
@@ -1710,6 +1737,8 @@ public class HighwayBuilder extends Module {
 
     private boolean tickRepairFlight() {
         if (repairFlightTarget == null) return false;
+        count = 0;
+        if (placeTimer > 0) placeTimer--;
         timingPhase(HighwayHud.Phase.Travel); input.stop(); idleTicks = 0;
         ElytraFly fly = Modules.get().get(ElytraFly.class);
         Vec3 from = mc.player.position(), target = Vec3.atBottomCenterOf(repairFlightTarget);
@@ -1738,11 +1767,19 @@ public class HighwayBuilder extends Module {
         }
         if (!fly.isActive()) { fly.enable(); repairFlightEnabledFly = true; }
         if (mc.player.isFallFlying()) {
-            if (Math.pow(from.x - target.x, 2) + Math.pow(from.z - target.z, 2) <= 2.25) {
+            RepairScan scan = repairScan();
+            List<PavingTarget> flightPaving = repairFlightPlacementTargets(scan);
+            boolean pavingPending = false;
+            if (flightPaving != null) {
+                paveAvailable(flightPaving, false);
+                pavingPending = !repairFlightPavingVerified();
+                repairScan = null; repairScanOrigin = null; repairScanTick = -1000;
+            }
+            if (!pavingPending && Math.pow(from.x - target.x, 2) + Math.pow(from.z - target.z, 2) <= 2.25) {
                 if (continueRepairFlight(from)) target = Vec3.atBottomCenterOf(repairFlightTarget);
                 else {
-                    RepairScan scan = repairScan();
-                    if (!repairFlightLanding && scan != null && awaitRepairChunks(scan.cleanRows(), scan.issue() != null, scan.jobEnd())) {
+                    RepairScan nextScan = repairScan();
+                    if (!repairFlightLanding && nextScan != null && awaitRepairChunks(nextScan.cleanRows(), nextScan.issue() != null, nextScan.jobEnd())) {
                         repairFlightProgress = from; repairFlightProgressTick = mc.player.tickCount;
                         fly.requestSurveyAutopilot(Vec3.ZERO);
                         status = "Holding altitude while the next repair chunks load";
@@ -1755,11 +1792,15 @@ public class HighwayBuilder extends Module {
             repairFlightSpeed = repairFlightSpeed(repairFlightSpeed, Math.min(6, fly.horizontalSpeed.get()),
                 fly.acceleration.get(), fly.accelerationMin.get(), fly.accelerationStep.get());
             Vec3 horizontal = repairFlightVelocity(from, target, repairFlightSpeed);
+            if (pavingPending) {
+                double remaining = Math.max(0, Math.sqrt(Math.pow(from.x - target.x, 2) + Math.pow(from.z - target.z, 2)) - .8);
+                if (horizontal.length() > remaining) horizontal = remaining == 0 ? Vec3.ZERO : horizontal.normalize().scale(remaining);
+            }
             Vec3 velocity = new Vec3(horizontal.x, repairFlightDrop(mc.player.getDeltaMovement().y, fly.fallMultiplier.get()), horizontal.z);
             if (!PrinterFlight.segmentClear(from, from.add(velocity), mc.player.getBbWidth() + .12,
                 Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear)) repairFlightLanding = true;
             else fly.requestSurveyAutopilot(velocity);
-            status = "Flying over " + repairFlightRows + " verified repair blocks"; return true;
+            status = pavingPending ? "Placing and verifying paving without landing" : "Flying over " + repairFlightRows + " verified repair blocks"; return true;
         }
         fly.requestAutopilot(Vec3.ZERO);
         if (repairFlightLaunchTick < 0) { mc.player.jumpFromGround(); repairFlightLaunchTick = mc.player.tickCount; }
