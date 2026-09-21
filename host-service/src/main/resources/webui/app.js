@@ -289,6 +289,38 @@ async function control(request, confirmation) {
 }
 function inspect(kind, id) { inspecting = { kind, id }; showInspection(); if (!$('inspect-dialog').open) $('inspect-dialog').showModal(); }
 function jsonDetails(title, value) { const node = el('details'); node.append(el('summary', '', title), el('pre', '', JSON.stringify(value, null, 2))); return node; }
+function configurationInspector(task) {
+  const panel=el('details');panel.append(el('summary','','Captured configuration & live requests'));
+  const body=el('div','management-section');panel.append(body);
+  let loaded=false;
+  const load=async()=>{
+    const refresh=button('Refresh configuration snapshot',load,demo);
+    try {
+      const data=await api('control',{op:'task-configuration',id:task.id});
+      // Preserve the selected source on manual refresh; ordinary polling never rebuilds this panel.
+      const previous=body.querySelector('select')?.value;
+      body.replaceChildren(el('p','hint',data.explanation),refresh,el('p','hint','Snapshot '+new Date().toLocaleTimeString()));
+      const select=el('select');select.setAttribute('aria-label','Configuration source');
+      const choices=[];
+      for(const [name,modules] of Object.entries(data.profiles||{}))choices.push({name:'Captured profile · '+name,key:'profile:'+name,modules});
+      for(const [id,update] of Object.entries(data.updates||{}))choices.push({name:'Latest live request · '+(snapshot.workers.find(w=>w.id===id)?.name||id),key:'worker:'+id,modules:update.modules,update});
+      choices.forEach(choice=>{const option=el('option','',choice.name);option.value=choice.key;select.append(option);});
+      if(choices.some(choice=>choice.key===previous))select.value=previous;
+      const list=el('div');body.append(select,list);
+      const show=()=>{
+        list.replaceChildren();const choice=choices.find(c=>c.key===select.value);if(!choice){list.append(el('p','hint','No captured profiles.'));return;}
+        if(choice.update){const u=choice.update;list.append(badge(u.status,u.status==='Rejected'?'bad':u.status==='Pending'?'attention':''),el('p','hint','Requested revision '+u.requestedRevision+' · acknowledged '+u.acknowledgedRevision),el('p','',u.error));}
+        const entries=Object.entries(choice.modules||{}).sort(([a],[b])=>a.localeCompare(b));
+        if(!entries.length)list.append(el('p','hint','No module overrides in this source.'));
+        for(const [name,value] of entries){const module=el('details');const executor=['highway-builder','printer-helper','schematic-selector'].includes(name);module.append(el('summary','',name+' · '+(executor?'Job-controlled':value.active?'On':'Off')),el('pre','',value.settings),el('p','hint','Serialized setting overrides; omitted settings retain worker values.'));list.append(module);}
+      };
+      select.addEventListener('change',show);show();
+      body.append(jsonDetails('Captured highway duties and supply capabilities',data.highways));loaded=true;
+    }catch(error){body.replaceChildren(el('p','',error.message),refresh);loaded=false;}
+  };
+  panel.addEventListener('toggle',()=>{if(panel.open&&!loaded){loaded=true;if(demo){body.append(el('p','hint','Connect to a host to inspect captured configuration.'));}else load();}});
+  return panel;
+}
 function managedButton(text, action, cls='') { return button(text,action,!writable(),'managed-control '+cls); }
 function assignFromManagement(crew, worker) {
   $('new-job').click();$('job-crew').value=crew;updateWorkers();
@@ -340,6 +372,7 @@ function managementControls(content, crew, worker) {
   const jobs=snapshot.tasks.filter(t=>t.crew===crew&&(!worker||t.runs?.[worker]));
   for(const task of jobs) {
     panel.append(jobCard(task));if(worker)panel.append(priorityControls(task,worker));
+    panel.append(configurationInspector(task));
     const details=el('details');details.append(el('summary','','Live module configuration · '+task.name));
     const form=el('form');const textarea=el('textarea');textarea.rows=5;textarea.value='{"auto-eat":{"active":true,"settings":"{}"}}';textarea.setAttribute('aria-label','Module configuration JSON');
     const submit=el('button','managed-control','Apply configuration');submit.type='submit';submit.disabled=!writable();form.append(textarea,submit);
@@ -385,6 +418,7 @@ function showInspection() {
   if (kind === 'job') {
     const task = [...snapshot.tasks, ...snapshot.history].find(t => t.id === id); $('inspect-title').textContent = task?.name || 'Job no longer present'; if (!task) return;
     content.append(el('p', 'muted', task.server + ' · ' + task.dimension), jobActions(task)); if (!terminal(task.status)) content.append(priorityControls(task));
+    content.append(configurationInspector(task));
     for (const [workerId, run] of Object.entries(task.runs || {})) {
       const worker = snapshot.workers.find(w => w.id === workerId); const row = el('article', 'inspection-row'); const header = el('div', 'card-header');
       header.append(el('h3', '', worker?.name || workerId), badge(run.status, tone(run.status))); row.append(header, el('p', '', run.detail || 'No reported detail'));

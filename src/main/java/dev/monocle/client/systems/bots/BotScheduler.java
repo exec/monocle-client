@@ -196,6 +196,7 @@ public final class BotScheduler {
         tasks.put(id, t); try { save(); } catch (RuntimeException e) { tasks.remove(id); throw e; } return id;
     }
     private JsonObject task(UUID id) { load(); JsonObject t = tasks.get(id); if (t == null) throw new IllegalArgumentException("Unknown task"); return t; }
+    public JsonObject configuration(UUID id) { hostOnly(); return dev.monocle.coordinator.TaskConfiguration.inspect(task(id)); }
     public void pause(UUID id) { hostOnly(); if (QueuePolicy.pause(task(id))) save(); }
     public void configure(UUID id, UUID worker, JsonObject modules) {
         hostOnly(); JsonObject t = task(id), previous = t.deepCopy();

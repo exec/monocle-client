@@ -360,3 +360,17 @@ Connection settings migrate from the old module into `monocle-client/bots.nbt`. 
 Use trusted accounts on loopback/private LAN only; no public port forwarding. Connections use fresh session challenges, ordered HMAC-authenticated messages, bounded queues and timeouts. Replacement crew keys use session-bound AES-GCM encryption. Ordinary coordinates/status traffic is authenticated but not encrypted; this is not a general TLS tunnel.
 
 Automated checks cover transport authentication/isolation, credential handoff tampering and session binding, catalog round-trips and malformed-file preservation, settings migration/preset validation, registration, GUI-close lifecycle, lane ownership, speculative excavation, sliding-window authority/spacing, late-admission generations and recovery policies. Live multi-account testing is still required, especially three-worker joins, uneven mining speeds, host/worker-only authority, offline release acknowledgments and shulker recovery.
+
+## Job configuration inspection (0.8.0)
+
+On an in-game host, open **Workers → Jobs → Inspect → Inspect configuration &
+supply capabilities**. Choose a captured profile or a worker's latest live request,
+then select a module. The view is read-only; **Refresh acknowledgements** explicitly
+updates the snapshot and **Copy configuration report** copies the displayed data.
+
+Profiles are overlays captured at queue time. Unspecified settings retain worker
+values. Native highway capabilities govern supply behavior separately from module
+toggles. An accepted live request means the worker acknowledged that revision;
+it is not proof that later workflow actions or local changes left it unchanged.
+Only the latest live request is retained. This view does not claim to show a full
+effective configuration or change future-job defaults.

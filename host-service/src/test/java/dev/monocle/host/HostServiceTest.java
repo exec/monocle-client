@@ -64,6 +64,12 @@ public final class HostServiceTest {
             JsonObject first = submit(workerId, 0); UUID firstId = UUID.fromString(text(first, "id"));
             assert request(http, api, first, TOKEN, false).statusCode() == 200;
             assert text(host.control(first), "id").equals(firstId.toString()) : "Same submission ID is idempotent";
+            JsonObject inspectConfig = op("task-configuration"); inspectConfig.addProperty("id", firstId.toString());
+            var configurationResponse = request(http, api, inspectConfig, TOKEN, false);
+            assert configurationResponse.statusCode() == 200;
+            JsonObject configuration = JsonParser.parseString(configurationResponse.body()).getAsJsonObject();
+            assert configuration.has("profiles") && configuration.has("updates") && !configuration.has("package") && !configuration.has("hostOriginal");
+            assert request(http, api, inspectConfig, "wrong", false).statusCode() == 403;
             JsonObject collision = first.deepCopy(); collision.addProperty("priority", 3); rejects(() -> host.control(collision));
             await(() -> state(host, firstId).equals("Running"), worker, other);
             // A running Lua frame legitimately has no native action between steps.

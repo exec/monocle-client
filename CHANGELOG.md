@@ -2,6 +2,12 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.8.0 — Configuration visibility
+
+- Added a read-only job configuration inspector to the in-game host and standalone WebUI, showing captured profiles, module overrides, native highway supply capabilities, and the latest live configuration request for each worker.
+- Distinguished pending, accepted, rejected, and unacknowledged-at-end requests without confusing captured settings with live worker state.
+- Documented overlay semantics and added a staged roadmap toward 1.0, with separate operator-control, GUI, HUD, logistics, performance, and release-hardening milestones.
+
 ## 0.7.139
 
 - Made crew cancellation stop Highway Builder unconditionally, preventing a cleared assignment flag from leaving the module running as an uncoordinated solo builder.

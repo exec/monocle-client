@@ -228,6 +228,8 @@ public final class BotTaskScreen extends WindowScreen {
         summary = add(theme.label(describe(bots, task), contentWidth)).expandX().widget();
         add(theme.button("Copy task report")).expandX().widget().action = () -> perform(() -> mc.keyboardHandler.setClipboard(describe(bots, current())), "Task report copied; connection keys are excluded.");
         if (bots.mode.get() != Bots.Mode.Host) { feedback.set("Read-only worker monitor. Task controls belong to the host."); return; }
+        add(theme.button("Inspect configuration & supply capabilities")).expandX().widget().action = () ->
+            mc.gui.setScreen(new TaskConfigurationScreen(theme, bots, id));
         WHorizontalList controls = add(theme.horizontalList()).expandX().widget();
         controls.add(theme.button("Pause")).widget().action = () -> perform(() -> { requireHost(); bots.tasks().pause(id); }, "Task pause requested. Current activity and any recovery blocker are shown above.");
         controls.add(theme.button("Resume")).widget().action = () -> perform(() -> { requireHost(); bots.tasks().resume(id); }, "Resume requested. Inspect any recovery or return-to-anchor blocker above.");

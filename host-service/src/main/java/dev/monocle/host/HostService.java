@@ -643,6 +643,7 @@ public final class HostService implements AutoCloseable {
         }
         UUID id = UUID.fromString(text(request, "id")); JsonObject task = tasks.get(id);
         if (task == null) throw new IllegalArgumentException("Unknown task");
+        if (op.equals("task-configuration")) return dev.monocle.coordinator.TaskConfiguration.inspect(task);
         if (op.equals("task-get")) { JsonObject result=task.deepCopy();result.remove("requestHash");if(!result.has("nativeDefinition") && result.has("highwayDefinition"))result.add("nativeDefinition",result.get("highwayDefinition").deepCopy());return result; }
         if (op.equals("task-release")) {
             for(var item:library.drafts())if(text(item.getAsJsonObject(),"sourceTask").equals(id.toString())) { cancelTask(task);persist();return item.getAsJsonObject(); }

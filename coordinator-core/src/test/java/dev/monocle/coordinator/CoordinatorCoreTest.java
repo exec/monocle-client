@@ -89,10 +89,31 @@ public final class CoordinatorCoreTest {
         task.addProperty("cancelled", true); rejects(() -> TaskWire.configure(task, WORKER, modules));
     }
 
+    private static void configurationInspection() {
+        JsonObject task = JsonParser.parseString("{\"package\":{\"profiles\":{\"Current\":{\"speed\":{\"active\":true,\"settings\":\"{}\"}}},\"highways\":{},\"programs\":{\"private\":\"not part of inspection\"}},\"runs\":{},\"hostOriginal\":{\"secret\":true}}").getAsJsonObject();
+        JsonObject run = JsonParser.parseString("{\"status\":\"Running\",\"configuration\":{\"revision\":2,\"modules\":{\"speed\":{\"active\":false,\"settings\":\"{}\"}}},\"configRevision\":1,\"configError\":\"old error\"}").getAsJsonObject();
+        task.getAsJsonObject("runs").add(WORKER.toString(), run);
+        JsonObject before = task.deepCopy(), view = TaskConfiguration.inspect(task);
+        JsonObject update = view.getAsJsonObject("updates").getAsJsonObject(WORKER.toString());
+        assert update.get("status").getAsString().equals("Pending") && update.get("error").getAsString().isEmpty();
+        assert view.keySet().equals(java.util.Set.of("explanation", "profiles", "highways", "updates"));
+        view.getAsJsonObject("profiles").getAsJsonObject("Current").remove("speed");
+        update.getAsJsonObject("modules").remove("speed");
+        assert task.equals(before) : "Inspecting or editing a returned view must not mutate the job";
+        run.addProperty("configRevision", 2);
+        assert TaskConfiguration.inspect(task).getAsJsonObject("updates").getAsJsonObject(WORKER.toString()).get("status").getAsString().equals("Rejected");
+        run.addProperty("configError", "");
+        assert TaskConfiguration.inspect(task).getAsJsonObject("updates").getAsJsonObject(WORKER.toString()).get("status").getAsString().equals("Accepted");
+        run.getAsJsonObject("configuration").addProperty("revision", 3); task.addProperty("cancelled", true);
+        assert TaskConfiguration.inspect(task).getAsJsonObject("updates").getAsJsonObject(WORKER.toString()).get("status").getAsString().equals("Ended without acknowledgement");
+        assert TaskConfiguration.inspect(new JsonObject()).getAsJsonObject("profiles").isEmpty();
+    }
+
     public static void main(String[] args) throws Exception {
         boolean enabled = false; assert enabled = true;
         if (!enabled) throw new IllegalStateException("Run with assertions enabled");
         liveConfiguration();
+        configurationInspection();
         stashScan();
         supplyRecovery();
         teleportRecovery();

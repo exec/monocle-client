@@ -35,3 +35,16 @@ The unmodified Glacial Indifference font is bundled with its OFL license and att
 ## Development checks
 
 Run `./gradlew :host-service:check` with Java 25. For a completely isolated demo host with simulated workers, run `./gradlew :host-service:webUiPreview`; it prints a temporary URL and fake test token. Stop it with Ctrl+C. Optional browser QA lives in `host-service/src/test/webui-browser-check.mjs` and uses an existing Playwright installation only as a development tool, not a runtime dependency.
+
+## Job configuration inspection (0.8.0)
+
+Open a job's **Inspect** view or a worker/crew's **Manage** view and expand
+**Captured configuration & live requests**. Profiles, module activation/serialized
+settings, native highway supply capabilities, and latest per-worker update receipts
+load on demand. Regular polling leaves this inspector alone; use its explicit
+refresh button to retrieve new receipts. Inspection never applies settings.
+
+The authenticated `task-configuration` control operation accepts a task `id` and
+returns `profiles`, `highways`, `updates`, and an explanation of their scope. Both
+host implementations use the same report logic. Captured overlays are not live
+readbacks: unspecified worker settings and subsequent workflow actions can differ.
