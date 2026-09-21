@@ -46,6 +46,9 @@ public final class HighwaySupplyTest {
         assert HighwayBuilder.repairFlightVelocity(new Vec3(0,3,0),new Vec3(10,0,0),5).equals(new Vec3(5,0,0)) : "Repair cruising must never auto-drop";
         assert Math.abs(HighwayBuilder.repairFlightSpeed(0,5)-.15)<1e-9;
         assert HighwayBuilder.repairFlightSpeed(4.9,5)==5 : "Repair survey acceleration must cap at the configured speed";
+        assert HighwayBuilder.awaitRepairChunks(0,false,false);
+        assert !HighwayBuilder.awaitRepairChunks(0,true,false) && !HighwayBuilder.awaitRepairChunks(0,false,true)
+            : "A defect or the real job end lands; a temporary render boundary does not";
         assert HighwayBuilder.fallbackToolSlot(-1,true,slot->true)==-1;
         assert HighwayBuilder.fallbackToolSlot(2,false,slot->true)==2;
         assert HighwayBuilder.fallbackToolSlot(-1,false,slot->false)==-1;

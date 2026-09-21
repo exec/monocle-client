@@ -1630,6 +1630,32 @@ public class HighwayBuilder extends Module {
         return Math.min(target, Math.max(0, current) + .15); // ElytraFly acceleration step 1.5.
     }
 
+    static boolean awaitRepairChunks(int cleanRows, boolean hasIssue, boolean jobEnd) {
+        return cleanRows == 0 && !hasIssue && !jobEnd;
+    }
+
+    private boolean continueRepairFlight(Vec3 from) {
+        if (repairFlightRows > 0) {
+            workOrigin = repairFlightTarget;
+            completedDistance += repairFlightRows;
+            forecastDirty = true;
+        }
+        repairFlightStart = workOrigin.immutable(); repairFlightTarget = workOrigin.immutable(); repairFlightRows = 0;
+        repairScan = null; repairScanOrigin = null; repairScanTick = -1000;
+        RepairScan scan = repairScan();
+        int rows = scan == null ? 0 : Math.min(PrinterFlight.MAX_SEGMENT - 2, scan.cleanRows());
+        if (rows == 0) return false;
+        BlockPos target = workOrigin.offset(dir.offsetX * rows, 0, dir.offsetZ * rows);
+        if (!PrinterFlight.segmentClear(from, new Vec3(target.getX() + .5, from.y, target.getZ() + .5),
+            mc.player.getBbWidth() + .12, Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear)) {
+            repairFlightLanding = true;
+            return false;
+        }
+        repairFlightTarget = target; repairFlightRows = rows;
+        repairFlightProgress = from; repairFlightProgressTick = mc.player.tickCount;
+        return true;
+    }
+
     private boolean repairFlightClear(AABB box) {
         if (box.minY < workOrigin.getY() - .05 || box.maxY > mc.level.getMaxY() + 1
             || !PrinterFlight.loaded(box, mc.level.getChunkSource()::hasChunk)) return false;
@@ -1699,7 +1725,20 @@ public class HighwayBuilder extends Module {
         }
         if (!fly.isActive()) { fly.enable(); repairFlightEnabledFly = true; }
         if (mc.player.isFallFlying()) {
-            if (Math.pow(from.x - target.x, 2) + Math.pow(from.z - target.z, 2) <= 2.25) { repairFlightLanding = true; return true; }
+            if (Math.pow(from.x - target.x, 2) + Math.pow(from.z - target.z, 2) <= 2.25) {
+                if (continueRepairFlight(from)) target = Vec3.atBottomCenterOf(repairFlightTarget);
+                else {
+                    RepairScan scan = repairScan();
+                    if (!repairFlightLanding && scan != null && awaitRepairChunks(scan.cleanRows(), scan.issue() != null, scan.jobEnd())) {
+                        repairFlightProgress = from; repairFlightProgressTick = mc.player.tickCount;
+                        fly.requestSurveyAutopilot(Vec3.ZERO);
+                        status = "Holding altitude while the next repair chunks load";
+                        return true;
+                    }
+                    repairFlightLanding = true;
+                    return true;
+                }
+            }
             repairFlightSpeed = repairFlightSpeed(repairFlightSpeed, Math.min(6, fly.horizontalSpeed.get()));
             Vec3 velocity = repairFlightVelocity(from, target, repairFlightSpeed);
             if (!PrinterFlight.segmentClear(from, from.add(velocity), mc.player.getBbWidth() + .12,
