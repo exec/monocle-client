@@ -9,6 +9,7 @@ import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
 import dev.monocle.client.gui.renderer.GuiRenderer;
 import dev.monocle.client.gui.screens.settings.*;
+import dev.monocle.client.gui.screens.ModuleSearch;
 import dev.monocle.client.gui.themes.monocle.widgets.WMonocleLabel;
 import dev.monocle.client.gui.utils.Cell;
 import dev.monocle.client.gui.utils.CharFilter;
@@ -27,7 +28,6 @@ import dev.monocle.client.utils.Utils;
 import dev.monocle.client.utils.render.DisplayItemUtils;
 import dev.monocle.client.utils.render.color.SettingColor;
 import net.minecraft.client.resources.language.I18n;
-import org.apache.commons.lang3.Strings;
 import org.lwjgl.util.tinyfd.TinyFileDialogs;
 
 import java.io.File;
@@ -85,8 +85,10 @@ public class DefaultSettingsWidgetFactory extends SettingsWidgetFactory {
 
         List<RemoveInfo> removeInfoList = new ArrayList<>();
 
-        // Add all settings
-        for (SettingGroup group : settings.groups) {
+        // Keep specialist controls below everyday settings without changing saved expansion state.
+        List<SettingGroup> groups = new ArrayList<>(settings.groups);
+        groups.sort(java.util.Comparator.comparing(group -> ModuleSearch.advancedGroup(group.name)));
+        for (SettingGroup group : groups) {
             group(list, group, filter, removeInfoList);
         }
 
@@ -108,15 +110,15 @@ public class DefaultSettingsWidgetFactory extends SettingsWidgetFactory {
     }
 
     private void group(WVerticalList list, SettingGroup group, String filter, List<RemoveInfo> removeInfoList) {
-        WSection section = list.add(theme.section(group.name, group.sectionExpanded)).expandX().widget();
-        section.action = () -> group.sectionExpanded = section.isExpanded();
+        WSection section = list.add(theme.section(group.name, !filter.isBlank() || group.sectionExpanded)).expandX().widget();
+        if (filter.isBlank()) section.action = () -> group.sectionExpanded = section.isExpanded();
 
         WTable table = section.add(theme.table()).expandX().widget();
 
         RemoveInfo removeInfo = null;
 
         for (Setting<?> setting : group) {
-            if (!Strings.CI.contains(setting.title, filter)) continue;
+            if (!ModuleSearch.matches(filter, group.name + " " + setting.title + " " + setting.description)) continue;
 
             boolean visible = setting.isVisible();
             setting.lastWasVisible = visible;

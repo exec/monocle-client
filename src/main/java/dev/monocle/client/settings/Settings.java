@@ -131,6 +131,10 @@ public class Settings implements ISerializable<Settings>, Iterable<SettingGroup>
     }
 
     public void tick(WContainer settings, GuiTheme theme) {
+        tick(settings, theme, "");
+    }
+
+    public void tick(WContainer settings, GuiTheme theme, String filter) {
         if (settings == null) return;
 
         for (SettingGroup group : groups) {
@@ -147,7 +151,7 @@ public class Settings implements ISerializable<Settings>, Iterable<SettingGroup>
 
         if (invalidate) {
             settings.clear();
-            settings.add(theme.settings(this)).expandX();
+            settings.add(theme.settings(this, filter)).expandX();
             invalidate = false;
         }
     }

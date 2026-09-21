@@ -11,6 +11,8 @@ public final class MonocleStyleTest {
         assert dev.monocle.client.gui.screens.ModuleSearch.matches("  food NAMED ", "Auto Eat · Protect named food");
         assert dev.monocle.client.gui.screens.ModuleSearch.matches("", "Highway Builder");
         assert !dev.monocle.client.gui.screens.ModuleSearch.matches("food crystal", "Auto Eat food");
+        assert !dev.monocle.client.gui.screens.ModuleSearch.advancedGroup("General");
+        assert dev.monocle.client.gui.screens.ModuleSearch.advancedGroup("Advanced movement");
         var locale = java.util.Locale.getDefault();
         try {
             java.util.Locale.setDefault(java.util.Locale.forLanguageTag("tr-TR"));

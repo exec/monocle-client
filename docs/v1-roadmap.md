@@ -89,6 +89,13 @@ duties and a site anchor; it is not force-removal or abandonment of supplies.
 Acceptance: common tasks take fewer navigation steps; small-window and keyboard
 use remain practical. Test layout before replacing the existing default view.
 
+0.9.1 implements the shared module-detail layout, searchable setting text,
+common-before-advanced ordering, retained query/scroll/section state, and
+worker-job ownership links. Dedicated Highway Builder and Inventory Manager
+operational screens remain the primary entry points and delegate advanced
+configuration to the shared view. Keep the checklist open until the remaining
+specialized management screens and small-window native smoke tests are complete.
+
 ## Stage 4 — 0.10.0: HUD and notifications
 
 - [ ] Reusable Activity, Crew, Supplies, Navigation, and notification panels.

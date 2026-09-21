@@ -2,6 +2,14 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.9.1 — Module detail workspace
+
+- Reorganized module details around live status and module-specific controls, settings, then keybind/export controls. Highway Builder and Inventory Manager retain their dedicated operational screens and open this shared view for advanced configuration.
+- Added setting search across names, descriptions and section titles. Filtered sections expand temporarily, while normal expansion choices, query text and scroll position remain intact when navigating away and back.
+- Common setting groups remain first; groups named Advanced are consistently moved to the end without rewriting their saved expanded/collapsed state.
+- Added explicit personal/job-profile and movement/inventory control ownership. Active worker jobs link directly to their inspection screen; native crew jobs link to Workers.
+- No module behavior, highway execution, host protocol or defaults changed. Native GUI rendering requires an in-game smoke test.
+
 ## 0.9.0 — Right Shift workspace, first slice
 
 - Promoted Workflows and Stashes alongside Modules, Workers, HUD and Profiles. Settings groups the existing Config, appearance, Friends, Macros and pathing editors; addon tabs remain visible.
