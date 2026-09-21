@@ -54,6 +54,7 @@ public final class BotActions {
     private static final Set<String> EXTERNAL = Set.of("Highway", "SetProfile");
     private static final Set<String> RESERVED_MODULES = Set.of("highway-builder", "printer-helper");
     private final Bots bots;
+    private final boolean highwayOwned;
     private JsonObject action, pending, originals = new JsonObject(), result;
     private String state = "Complete", detail = "Idle", dimension = "";
     private int elapsed, remaining, dropWait, lastTick = -1, launchTick = -1, launchAttempts;
@@ -75,7 +76,8 @@ public final class BotActions {
     private boolean recoveryReady;
     public boolean recoveryReady() { return recoveryReady; }
 
-    public BotActions(Bots bots) { this.bots = Objects.requireNonNull(bots); }
+    public BotActions(Bots bots) { this(bots,false); }
+    public BotActions(Bots bots,boolean highwayOwned) { this.bots = Objects.requireNonNull(bots);this.highwayOwned=highwayOwned; }
 
     /** Validate at the Lua/network boundary before acquiring any control or changing a module. */
     public static JsonObject validate(JsonObject source) {
@@ -217,7 +219,7 @@ public final class BotActions {
     private boolean prepareStashHome(){
         String home=action.get("homeName").getAsString();
         long now=System.currentTimeMillis(),cooldown=action.get("homeCooldownTicks").getAsLong()*50L;
-        String server=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+home.toLowerCase(Locale.ROOT);
+        String server=homeCooldownKey();
         if(homeReadyAt==0){
             long ready=bots.stashHomeReadyAt(server,cooldown);
             if(now<ready){detail="Waiting "+Math.max(1,(ready-now+999)/1000)+"s for /home "+home+" cooldown";return false;}
@@ -226,6 +228,7 @@ public final class BotActions {
         if(now<homeReadyAt){detail="Waiting "+Math.max(1,(homeReadyAt-now+999)/1000)+"s for /home "+home+" warmup";return false;}
         return true;
     }
+    public static String homeCooldownKey(){return mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip.toLowerCase(Locale.ROOT);}
 
     static boolean shouldRecover(String type, boolean recoveryReady) {
         return !recoveryReady && !type.equals("Highway");
@@ -697,7 +700,7 @@ public final class BotActions {
         if (stashNavigation != null) { stashNavigation.close(); stashNavigation = null; }
     }
     private boolean nativeBusy() {
-        return bots.crew.localAssigned() || Modules.get().get(HighwayBuilder.class).hasJob() || Modules.get().get(PrinterHelper.class).isActive()
+        return bots.crew.localAssigned() || !highwayOwned&&Modules.get().get(HighwayBuilder.class).hasJob() || Modules.get().get(PrinterHelper.class).isActive()
             || !type().equals("Modules") && stashNavigation == null && dev.monocle.client.pathing.PathManagers.get().isPathing();
     }
     private void scanStash() {

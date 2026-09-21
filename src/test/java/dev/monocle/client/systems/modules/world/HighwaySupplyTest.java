@@ -33,6 +33,10 @@ public final class HighwaySupplyTest {
         if (!assertionsEnabled) throw new IllegalStateException("Run with assertions enabled (-ea).");
         miningClassification();
         assert HighwayBuilder.fallbackToolSlot(-1,false,slot->slot==3)==3;
+        assert HighwayBuilder.soloRefillTarget(0,12,1)==20_736;
+        assert HighwayBuilder.soloRefillTarget(0,0,1)==1728;
+        assert HighwayBuilder.soloRefillTarget(1,12,2)==54;
+        assert HighwayBuilder.soloRefillTarget(2,12,2)==1728;
         assert HighwayBuilder.fallbackToolSlot(-1,true,slot->true)==-1;
         assert HighwayBuilder.fallbackToolSlot(2,false,slot->true)==2;
         assert HighwayBuilder.fallbackToolSlot(-1,false,slot->false)==-1;

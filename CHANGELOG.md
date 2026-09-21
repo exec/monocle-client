@@ -2,6 +2,13 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.11.1 — Solo stash round trips
+
+- Wired mapped stashes into solo Highway Builder exhaustion. After local inventory/shulker/ender-chest sources are exhausted, it saves the road as `/sethome monocle_work`, waits the configured server cooldown, visits the stash, refills the ender chest from indexed shulkers, waits again, returns, verifies the saved road position, and resumes the same job.
+- Added solo stash restocking and return-home-name settings. Invalid return names or absent matching stash stock retain the previous fail-safe resource-exhaustion shutdown.
+- Corrected `/home` cooldown accounting from per-home to per-server and kept it persisted across restarts, preventing stash and return commands from incorrectly bypassing one another's cooldown.
+- Reuses the existing stash catalog, authoritative withdrawal invalidation, Baritone container navigation, and refill implementation. Live server command timing and the complete round trip require an in-game smoke test.
+
 ## 0.11.0 — Autonomous stash routes
 
 - Made a valid `/home` name mandatory for every stash definition at the shared wire/catalog boundary. Legacy definitions remain editable but cannot be scanned, exported, or used for resupply until a route is added and saved.

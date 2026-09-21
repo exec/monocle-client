@@ -28,10 +28,14 @@ import dev.monocle.client.systems.modules.Categories;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.bots.Bots;
+import dev.monocle.client.systems.bots.BotActions;
 import dev.monocle.client.systems.bots.BotWorkflows.Action;
 import dev.monocle.client.systems.modules.misc.InventoryTweaks;
 import dev.monocle.client.systems.modules.misc.swarm.SwarmCrew;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import dev.monocle.coordinator.StashCatalog;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -467,6 +471,8 @@ public class HighwayBuilder extends Module {
     private final Setting<Boolean> managedInventory = sgInventory.add(new BoolSetting.Builder()
         .name("experimental-managed-inventory").description("Experimental: ask Inventory Manager to maintain highway hotbar roles, bounded filler and dedicated supply shulkers. Works solo and in worker jobs; disabled preserves casual inventory handling.")
         .defaultValue(false).build());
+    private final Setting<Boolean> soloStashRestock=sgInventory.add(new BoolSetting.Builder().name("solo-stash-restock").description("When solo supplies are exhausted, use a mapped stash: /sethome at work, wait the server cooldown, refill through /home, wait again, and /home back.").defaultValue(true).build());
+    private final Setting<String> soloReturnHome=sgInventory.add(new StringSetting.Builder().name("solo-return-home-name").description("Temporary server home used to return to solo highway work. It is replaced on each stash trip.").defaultValue("monocle_work").visible(soloStashRestock::get).build());
     private final Setting<Integer> managedPavingBoxes = sgInventory.add(new IntSetting.Builder().name("managed-paving-shulkers").description("Preferred carried paving shulkers; surplus useful supplies are never discarded.").defaultValue(7).range(1, 20).visible(managedInventory::get).build());
     private final Setting<Integer> managedToolBoxes = sgInventory.add(new IntSetting.Builder().name("managed-tool-shulkers").description("Preferred carried pickaxe shulkers.").defaultValue(1).range(1, 5).visible(managedInventory::get).build());
     private final Setting<Integer> managedFoodBoxes = sgInventory.add(new IntSetting.Builder().name("managed-food-shulkers").description("Preferred carried food shulkers.").defaultValue(1).range(1, 5).visible(managedInventory::get).build());
@@ -772,6 +778,12 @@ public class HighwayBuilder extends Module {
     private int crewSupplyProgressTick, crewSupplyRetries;
     private final Map<Setting<?>, CompoundTag> crewSettings = new java.util.LinkedHashMap<>();
     private ItemStack crewReturnedStack = ItemStack.EMPTY;
+    private BotActions soloStashAction;
+    private JsonObject soloStashPlan;
+    private BlockPos soloStashReturn;
+    private String soloStashPhase="";
+    private long soloStashReadyAt,soloStashDeadline;
+    private int soloStashRetries;
 
     private SwarmCrew crew() { return Bots.get().crew; }
     public boolean crewAssigned() { return crewAssigned; }
@@ -2426,6 +2438,39 @@ public class HighwayBuilder extends Module {
             + "\n" + mc.level.dimension().identifier() + "\n" + mc.player.getUUID();
     }
 
+    private String stashScope(){return (mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();}
+    static int soloRefillTarget(int resource,int emptyEnderSlots,int toolBoxes){int boxes=resource==CrewInventory.MATERIALS?Math.max(1,emptyEnderSlots):resource==CrewInventory.PICKS?toolBoxes:1;return Math.multiplyExact(boxes,resource==CrewInventory.PICKS?27:1728);}
+    private boolean beginSoloStash(int resource){
+        if(crewAssigned||!soloStashRestock.get()||soloStashAction!=null)return false;String home=soloReturnHome.get().strip();if(!home.matches("[A-Za-z0-9_-]{1,48}")){error("Solo return home must use letters, numbers, underscores or dashes.");return false;}
+        int slots=enderChestSearchSlots(),empty=EChestMemory.isKnown(slots)?(int)EChestMemory.ITEMS.subList(0,Math.min(slots,EChestMemory.ITEMS.size())).stream().filter(ItemStack::isEmpty).count():1;
+        int[] target=new int[CrewInventory.RESOURCES];target[resource]=soloRefillTarget(resource,empty,managedToolBoxes.get());JsonObject ledger=new JsonObject();ledger.add("target",CrewInventory.array(target));ledger.add("loose",CrewInventory.array(new int[CrewInventory.RESOURCES]));ledger.add("shulkers",CrewInventory.array(new int[CrewInventory.RESOURCES]));ledger.add("echest",CrewInventory.array(new int[CrewInventory.RESOURCES]));
+        String scope=stashScope();RuntimeException rejected=null;
+        for(JsonElement value:StashCatalog.list(MonocleClient.FOLDER.toPath()))try{
+            JsonObject summary=value.getAsJsonObject();if(!"Local".equals(summary.get("crew").getAsString())||!scope.equals(summary.get("scope").getAsString()))continue;String paving=blocksToPlace.get().isEmpty()?"":BuiltInRegistries.BLOCK.getKey(blocksToPlace.get().getFirst()).toString();JsonObject db=StashCatalog.get(MonocleClient.FOLDER.toPath(),"Local",scope,summary.get("name").getAsString()),needs=StashCatalog.refillNeeds(db,ledger,resource,paving);if(needs==null)continue;
+            JsonObject request=db.getAsJsonObject("bounds").deepCopy();request.add("needs",needs);request.addProperty("primary",needs.remove("_primary").getAsString());request.addProperty("enderSlots",Math.max(1,empty));soloStashPlan=StashCatalog.refillAction(MonocleClient.FOLDER.toPath(),"Local",scope,request,mc.player.getUUID().toString());soloStashReturn=mc.player.blockPosition();soloStashPhase="stash";soloStashRetries=0;
+            mc.getConnection().sendCommand("sethome "+home);Bots.get().recordStashHomeUse(BotActions.homeCooldownKey(),System.currentTimeMillis());restockTask.complete();State.Restock.resetSupplyJob(this);releaseControls();soloStashAction=new BotActions(Bots.get(),true);soloStashAction.start(soloStashPlan);status="Solo stash trip: saved /home "+home+" at the road";return true;
+        }catch(RuntimeException error){rejected=error;}
+        if(rejected!=null)warning("Mapped stash could not satisfy this solo refill: %s",rejected.getMessage());return false;
+    }
+    private boolean tickSoloStash(){
+        if(soloStashAction==null)return false;input.stop();timingPhase(HighwayHud.Phase.Supply);long now=System.currentTimeMillis();String home=soloReturnHome.get().strip();
+        if(soloStashPhase.equals("stash")){
+            JsonObject state=soloStashAction.tick();status="Solo stash trip: "+state.get("detail").getAsString();String outcome=state.get("state").getAsString();if(outcome.equals("Running"))return true;if(!outcome.equals("Complete")){failSoloStash(status);return true;}
+            JsonObject result=soloStashAction.stashWithdrawal();if(result!=null&&result.has("withdrawn"))StashCatalog.invalidateWithdrawn(MonocleClient.FOLDER.toPath(),"Local",stashScope(),soloStashPlan.get("name").getAsString(),result.getAsJsonArray("withdrawn"));soloStashAction.stop();soloStashPhase="cooldown";
+        }
+        long cooldown=soloStashPlan.get("homeCooldownTicks").getAsLong()*50L,ready=Bots.get().stashHomeReadyAt(BotActions.homeCooldownKey(),cooldown);
+        if(soloStashPhase.equals("cooldown")){
+            if(now<ready){status="Solo stash trip: waiting "+Math.max(1,(ready-now+999)/1000)+"s to /home back to work";return true;}
+            mc.getConnection().sendCommand("home "+home);Bots.get().recordStashHomeUse(BotActions.homeCooldownKey(),now);soloStashReadyAt=now+soloStashPlan.get("homeWarmupTicks").getAsLong()*50L;soloStashDeadline=soloStashReadyAt+30_000;soloStashPhase="return";status="Solo stash trip: returning to /home "+home;return true;
+        }
+        if(now<soloStashReadyAt){status="Solo stash trip: waiting for return teleport";return true;}
+        if(mc.player.blockPosition().closerThan(soloStashReturn,32)){finishSoloStash();return true;}
+        if(now>=soloStashDeadline){if(++soloStashRetries>=3){failSoloStash("Solo stash return was not confirmed after 3 attempts");return true;}soloStashPhase="cooldown";status="Solo stash trip: return not confirmed; waiting to retry";}
+        return true;
+    }
+    private void finishSoloStash(){soloStashAction=null;soloStashPlan=null;soloStashReturn=null;soloStashPhase="";updateVariables();setState(State.Center);status="Returned from stash; resuming highway";}
+    private void failSoloStash(String reason){if(soloStashAction!=null)soloStashAction.stop();soloStashAction=null;soloStashPlan=null;soloStashReturn=null;soloStashPhase="";error("%s",reason);disable();}
+
     static boolean worldResumeAllowed(String saved, String current, boolean loaded) {
         return loaded && !saved.isEmpty() && saved.equals(current);
     }
@@ -2761,6 +2806,7 @@ public class HighwayBuilder extends Module {
 
     @Override
     public void onDeactivate() {
+        if(soloStashAction!=null)soloStashAction.stop();soloStashAction=null;soloStashPlan=null;soloStashReturn=null;soloStashPhase="";
         disconnectAfterTicks = -1;
         disconnectReason = "";
         if (retainCrewOnToggle(crewAssigned, lifecycle.hasJob(), endingJob)) {
@@ -2847,6 +2893,7 @@ public class HighwayBuilder extends Module {
         retryCrewPause();
         diagnosticGate = "paused/suspended";
         if (lifecycle.paused() || lifecycle.suspended()) { timingPhase(HighwayHud.Phase.Paused); return; }
+        if(tickSoloStash())return;
         timingPhase(stateTimingPhase());
         if (crewAssigned && crew().isReleasing() && !crewNeedsCleanup()) {
             crewQuiesce();
@@ -5915,7 +5962,7 @@ public class HighwayBuilder extends Module {
                         initialized = true;
                     } else {
                         String reason="Resource exhausted: "+b.restockTask.item()+"; enabled local supply sources checked.";
-                        if(b.crewAssigned)b.crew().failResources(reason);else {b.error(reason);b.disable();}
+                        if(b.crewAssigned)b.crew().failResources(reason);else if(!b.beginSoloStash(b.restockTask.resource)){b.error(reason);b.disable();}
                     }
 
                     return;
