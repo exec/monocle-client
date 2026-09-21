@@ -1579,6 +1579,7 @@ public class HighwayBuilder extends Module {
             if (!mc.level.getChunkSource().hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) return new RepairIssue(false, "", pos);
             BlockState state = crewVerifiedState(pos);
             if (state == null) return new RepairIssue(true, "server verification", pos);
+            if (isPortalHazard(state)) return new RepairIssue(true, "end portal hazard", pos);
             if (!crewClearanceResolved(state, mc.level, pos)) return new RepairIssue(true, "passage obstruction", pos);
         }
         for (PavingTarget target : plannedPavingTargets(offset)) {
@@ -1630,13 +1631,13 @@ public class HighwayBuilder extends Module {
         for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY, box.minZ),
             BlockPos.containing(Math.nextDown(box.maxX), Math.nextDown(box.maxY), Math.nextDown(box.maxZ)))) {
             BlockState state = crewVerifiedState(pos);
-            if (state == null || !crewClearanceResolved(state, mc.level, pos)) return false;
+            if (state == null || isPortalHazard(state) || !crewClearanceResolved(state, mc.level, pos)) return false;
         }
         AABB footing = crewTravelFooting(box);
         for (int x = (int) Math.floor(footing.minX); x <= (int) Math.floor(Math.nextDown(footing.maxX)); x++) for (int z = (int) Math.floor(footing.minZ); z <= (int) Math.floor(Math.nextDown(footing.maxZ)); z++) {
             BlockPos floor = new BlockPos(x, workOrigin.getY() - 1, z);
             BlockState state = crewVerifiedState(floor);
-            if (state == null || !crewPavingResolved(state, false, blocksToPlace.get()) || state.is(Blocks.MAGMA_BLOCK)
+            if (state == null || isPortalHazard(state) || !crewPavingResolved(state, false, blocksToPlace.get()) || state.is(Blocks.MAGMA_BLOCK)
                 || state.is(Blocks.CAMPFIRE) || state.is(Blocks.SOUL_CAMPFIRE)) return false;
         }
         return true;
@@ -1776,13 +1777,13 @@ public class HighwayBuilder extends Module {
         for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY, box.minZ),
             BlockPos.containing(Math.nextDown(box.maxX), Math.nextDown(box.maxY), Math.nextDown(box.maxZ)))) {
             BlockState block = crewVerifiedState(pos);
-            if (!mc.level.getWorldBorder().isWithinBounds(pos) || block == null || !crewClearanceResolved(block, mc.level, pos)) return crewTravelBlocked("Clearance at " + pos.toShortString() + ": " + (block == null ? "unresolved" : block));
+            if (!mc.level.getWorldBorder().isWithinBounds(pos) || block == null || isPortalHazard(block) || !crewClearanceResolved(block, mc.level, pos)) return crewTravelBlocked("Clearance at " + pos.toShortString() + ": " + (block == null ? "unresolved" : block));
         }
         AABB footing = crewTravelFooting(box);
         for (int x = (int) Math.floor(footing.minX); x <= (int) Math.floor(Math.nextDown(footing.maxX)); x++) for (int z = (int) Math.floor(footing.minZ); z <= (int) Math.floor(Math.nextDown(footing.maxZ)); z++) {
             BlockPos floor = new BlockPos(x, roadY - 1, z);
             BlockState block = crewVerifiedState(floor);
-            if (block == null || !block.getFluidState().isEmpty() || block.is(Blocks.MAGMA_BLOCK) || block.is(Blocks.CAMPFIRE) || block.is(Blocks.SOUL_CAMPFIRE)
+            if (block == null || isPortalHazard(block) || !block.getFluidState().isEmpty() || block.is(Blocks.MAGMA_BLOCK) || block.is(Blocks.CAMPFIRE) || block.is(Blocks.SOUL_CAMPFIRE)
                 || !Block.isShapeFullBlock(block.getCollisionShape(mc.level, floor))) return crewTravelBlocked("Footing at " + floor.toShortString() + ": " + (block == null ? "unresolved" : block));
         }
         return true;
@@ -2328,6 +2329,7 @@ public class HighwayBuilder extends Module {
         var cells=new java.util.LinkedHashSet<>(clearance);for(var cell:paving)cells.add(cell.position());
         double[] mining=new double[limit+1];int[] placed=new int[limit+1];int rows=0;
         var costs=new java.util.HashMap<BlockState,Double>();
+        var seenPortals=new java.util.HashSet<BlockPos>();
         for(int row=0;row<limit;row++) {
             BlockPos origin=forecastOrigin.offset(dir.offsetX*row,0,dir.offsetZ*row);
             boolean loaded=true;for(var cell:cells){BlockPos pos=origin.offset(cell.x(),cell.y(),cell.z());if(!mc.level.getChunkSource().hasChunk(pos.getX()>>4,pos.getZ()>>4)){loaded=false;break;}}
@@ -2335,14 +2337,18 @@ public class HighwayBuilder extends Module {
             for(var cell:cells) {
                 BlockPos pos=origin.offset(cell.x(),cell.y(),cell.z());BlockState block=mc.level.getBlockState(pos);
                 boolean clear=clearance.contains(cell);
-                boolean replace=clear?!block.getCollisionShape(mc.level,pos).isEmpty():replaceCells.contains(cell)&&!block.isAir()&&!block.canBeReplaced()&&!blocksToPlace.get().contains(block.getBlock());
-                if(replace&&doesDig()&&(!crewAssigned||crew().ownsExcavation(pos))&&!block.is(Blocks.NETHERRACK))
-                    ticks+=costs.computeIfAbsent(block,b->{
+                boolean portal=block.is(Blocks.NETHER_PORTAL);
+                boolean replace=clear?portal||!block.getCollisionShape(mc.level,pos).isEmpty():replaceCells.contains(cell)&&!block.isAir()&&!block.canBeReplaced()&&!blocksToPlace.get().contains(block.getBlock());
+                if(replace&&doesDig()&&(!crewAssigned||crew().ownsExcavation(pos))&&!block.is(Blocks.NETHERRACK)&&(!portal||seenPortals.add(pos))) {
+                    if(portal) markPortalComponent(pos,seenPortals);
+                    BlockState miningState=forecastMiningState(block);
+                    ticks+=costs.computeIfAbsent(miningState,b->{
                         int tool=fallbackToolSlot(State.Forward.findBestToolSlot(this,b,false),b.requiresCorrectToolForDrops(),slot->!mc.player.getInventory().getItem(slot).isDamageableItem());
                         double delta=tool<0?0:BlockUtils.getBreakDelta(tool,b);
                         boolean paired=b.is(Blocks.OBSIDIAN)&&doubleMine.get()&&shouldDoubleMine(mc.player.isCreative(),delta,Modules.get().get(SpeedMine.class).instamine());
                         return dev.monocle.coordinator.RoadForecast.miningTicks(delta,paired,breakDelay.get());
                     });
+                }
             }
             for(var target:paving) {var cell=target.position();BlockPos pos=origin.offset(cell.x(),cell.y(),cell.z());
                 if(doesPave()&&(!crewAssigned||crew().ownsPaving(pos))&&!blocksToPlace.get().contains(mc.level.getBlockState(pos).getBlock()))placements++;}
@@ -2350,6 +2356,22 @@ public class HighwayBuilder extends Module {
         }
         forecastMining=java.util.Arrays.copyOf(mining,rows+1);forecastPlacements=java.util.Arrays.copyOf(placed,rows+1);
         forecastScanMicros=(System.nanoTime()-started)/1000;
+    }
+
+    static BlockState forecastMiningState(BlockState state) {
+        return state.is(Blocks.NETHER_PORTAL) ? Blocks.OBSIDIAN.defaultBlockState() : state;
+    }
+
+    private void markPortalComponent(BlockPos start, Set<BlockPos> seen) {
+        ArrayDeque<BlockPos> open=new ArrayDeque<>();open.add(start);int scanned=0;
+        // ponytail: 2048 comfortably exceeds a vanilla portal; remove the cap only if custom oversized portals matter.
+        while(!open.isEmpty()&&scanned++<2048) {
+            BlockPos pos=open.removeFirst();
+            for(Direction side:Direction.values()) {
+                BlockPos next=pos.relative(side);
+                if(mc.level.hasChunkAt(next)&&mc.level.getBlockState(next).is(Blocks.NETHER_PORTAL)&&seen.add(next.immutable()))open.addLast(next);
+            }
+        }
     }
     private long forecastScanMicros;
     public String getTimingSummary() { return hud.timingSummary(); }
@@ -3483,7 +3505,7 @@ public class HighwayBuilder extends Module {
         if (!mc.level.hasChunkAt(feet)) return false;
         for (int y = 0; y < 2; y++) {
             BlockState state = mc.level.getBlockState(feet.above(y));
-            if (!crewClearanceResolved(state, mc.level, feet.above(y))) return false;
+            if (isPortalHazard(state) || !crewClearanceResolved(state, mc.level, feet.above(y))) return false;
         }
         return true;
     }
@@ -3501,6 +3523,16 @@ public class HighwayBuilder extends Module {
         if (to.y() > from.y()) return clearBody(block(from).above());
         if (to.y() < from.y()) return clearBody(block(to).above());
         return true;
+    }
+
+    private List<HighwayPlan.Cell> walkingRoute(HighwayPlan.Cell start, HighwayPlan.Cell goal) {
+        List<HighwayPlan.Cell> level = HighwayPlan.route(start, goal,
+            cell -> cell.y() == start.y() && walkingStandable(cell), this::safeStep);
+        return level.isEmpty() ? HighwayPlan.route(start, goal, this::walkingStandable, this::safeStep) : level;
+    }
+
+    static boolean isPortalHazard(BlockState state) {
+        return state.is(Blocks.END_PORTAL) || state.is(Blocks.END_GATEWAY);
     }
 
     static boolean obstructionPiglin(EntityType<?> type, boolean named) {
@@ -3781,7 +3813,7 @@ public class HighwayBuilder extends Module {
         }
         if (walkGoal == null || walkGoal.distanceToSqr(target) > 0.01) {
             walkGoal = target;
-            walkPath = HighwayPlan.route(cell(walkingFeet()), cell(BlockPos.containing(target)), this::walkingStandable, this::safeStep);
+            walkPath = walkingRoute(cell(walkingFeet()), cell(BlockPos.containing(target)));
             walkIndex = walkPath.size() > 1 ? 1 : 0;
             walkTicks = 0;
             lastWalkDistance = Double.MAX_VALUE;
@@ -3887,7 +3919,7 @@ public class HighwayBuilder extends Module {
 
     private boolean advanceRoad() {
         if (predictionFlushRequested) { input.stop(); return false; }
-        Vec3 next = jobWorkPosition().add(dir.offsetX, 0, dir.offsetZ);
+        Vec3 next = safeAdvanceTarget();
         Vec3 current = mc.player.position();
         if (reachedNextSection()) {
             walkGoal = null;
@@ -3909,9 +3941,8 @@ public class HighwayBuilder extends Module {
             int feetY = HighwayPlan.roadFeetY(point.y, workOrigin.getY());
             for (double x : new double[] {-0.29, 0.29}) for (double z : new double[] {-0.29, 0.29}) {
                 if (!standable(cell(BlockPos.containing(point.x + x, feetY, point.z + z)))) {
-                    input.stop();
-                    status = "Waiting for a clear, supported path";
-                    return false;
+                    status = "Routing around hazardous or unsupported footing";
+                    return walkToWorkPosition(next);
                 }
             }
         }
@@ -3919,6 +3950,18 @@ public class HighwayBuilder extends Module {
         mc.player.setYRot((float) Rotations.getYaw(next.add(dir.offsetX * 0.5, 0, dir.offsetZ * 0.5)));
         input.forward(true);
         return false;
+    }
+
+    private Vec3 safeAdvanceTarget() {
+        Vec3 preferred = jobWorkPosition().add(dir.offsetX, 0, dir.offsetZ);
+        if (standable(cell(BlockPos.containing(preferred)))) return preferred;
+        HighwayPlan.Cell start = cell(walkingFeet());
+        return HighwayPlan.floor(dir.offsetX, dir.offsetZ, width.get()).stream()
+            .map(p -> workOrigin.offset(p.x(), p.y() + 1, p.z()))
+            .filter(p -> standable(cell(p)))
+            .sorted(Comparator.comparingDouble(p -> Vec3.atBottomCenterOf(p).distanceToSqr(preferred)))
+            .filter(p -> !walkingRoute(start, cell(p)).isEmpty())
+            .map(Vec3::atBottomCenterOf).findFirst().orElse(preferred);
     }
 
     private boolean reachedNextSection() {

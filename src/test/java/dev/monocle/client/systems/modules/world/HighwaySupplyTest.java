@@ -151,6 +151,11 @@ public final class HighwaySupplyTest {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(VanillaRegistries.createLookup()).forEach(DataComponentInitializers.PendingComponents::apply);
+        assert HighwayBuilder.isPortalHazard(Blocks.END_PORTAL.defaultBlockState());
+        assert HighwayBuilder.isPortalHazard(Blocks.END_GATEWAY.defaultBlockState());
+        assert !HighwayBuilder.isPortalHazard(Blocks.END_PORTAL_FRAME.defaultBlockState()) : "Frames are ordinary footing, not the teleport hazard";
+        assert HighwayBuilder.forecastMiningState(Blocks.NETHER_PORTAL.defaultBlockState()).is(Blocks.OBSIDIAN)
+            : "Nether portals are cleared by mining their obsidian frame";
         assert InventoryTweaks.dedicatedSupplyScore(new ItemStack[] {new ItemStack(Items.OBSIDIAN, 64), ItemStack.EMPTY}, s -> s.is(Items.OBSIDIAN)) == 64;
         assert InventoryTweaks.dedicatedSupplyScore(new ItemStack[] {new ItemStack(Items.OBSIDIAN, 64), new ItemStack(Items.NETHERITE_SWORD)}, s -> s.is(Items.OBSIDIAN)) == 0 : "PvP kits remain untouched";
         assert InventoryTweaks.dedicatedSupplyScore(new ItemStack[] {new ItemStack(Items.STONE, 32)}, s -> s.is(Items.STONE)) == 32 : "Paving is not hardcoded to obsidian";
