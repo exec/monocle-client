@@ -2,6 +2,14 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.10.0 — Operator HUD and notification history
+
+- Added one reusable Operator Panel HUD element with Activity, Crew, Supplies, Navigation, and Notifications presets. Healthy work stays compact; blocked work exposes the actionable module or crew detail.
+- Added full Highway Operator and Minimal HUD layouts. Both reuse the existing anchored, snapping HUD editor and provide per-panel width, scale, line-limit, background, and live preview controls.
+- Supply cards distinguish local observation time, road forecasts remain explicitly estimated, and crew rows identify live versus stale worker reports.
+- Grouped notification cards display repeat counts and now retain one bounded history incident per grouped card instead of duplicating every update. Notification history and feed previews are available directly from the HUD screen and Notifier.
+- No highway execution, worker protocol, supply policy, or module defaults changed. Native rendering and placement at multiple GUI scales still require an in-game smoke test.
+
 ## 0.9.2 — Management workspace refinement
 
 - Management windows now retain vertical scroll position when opening a child editor or switching away and back. Existing section expansion and editor instances remain authoritative.

@@ -104,14 +104,18 @@ test before closing Stage 3.
 
 ## Stage 4 — 0.10.0: HUD and notifications
 
-- [ ] Reusable Activity, Crew, Supplies, Navigation, and notification panels.
-- [ ] Quiet healthy state; actionable recovery/error details.
-- [ ] Explicit stale/estimated resource information and observation timestamps.
-- [ ] HUD snapping, alignment, anchors, scaling, preview data, and presets.
-- [ ] Notification grouping, deduplication, and inspectable history.
+- [x] Reusable Activity, Crew, Supplies, Navigation, and notification panels.
+- [x] Quiet healthy state; actionable recovery/error details.
+- [x] Explicit stale/estimated resource information and observation timestamps.
+- [x] HUD snapping, alignment, anchors, scaling, preview data, and presets.
+- [x] Notification grouping, deduplication, and inspectable history.
 
 Acceptance: Highway Operator and Minimal presets are readable at different GUI
 scales without obscuring chat or gameplay.
+
+0.10.0 implements the shared Operator Panel, both whole-HUD presets, and grouped
+notification history on the existing anchored/snapping editor. Complete the native
+multi-scale placement smoke test before treating the acceptance check as closed.
 
 ## Stage 5 — 0.11.0: Autonomous logistics
 

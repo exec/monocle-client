@@ -230,15 +230,8 @@ public class Notifier extends Module {
             Notifications.post("Highway Builder · Preview", "preview-warning", Severity.Warning, "Supplies running low. This is only a preview.");
             Notifications.post("Notifier · Preview", "preview-range", Severity.Info, "ExamplePlayer entered visual range (42m away).");
         };
-        list.add(theme.button("Recent Notifications")).widget().action = () -> mc.gui.setScreen(new dev.monocle.client.gui.WindowScreen(theme, "Recent Notifications") {
-            @Override public void initWidgets() {
-                var history = Notifications.FEED.history();
-                add(theme.label("Session-only snapshot · newest first · last 100 updates", 450));
-                if (history.isEmpty()) add(theme.label("No feed notifications in this world yet."));
-                for (var entry : history.reversed()) add(theme.label(entry.source() + " · " + entry.severity() + "\n" + entry.text(), 450));
-                add(theme.button("Clear History and Feed")).widget().action = () -> { Notifications.FEED.clear(); reload(); };
-            }
-        });
+        list.add(theme.button("Recent Notifications")).widget().action = () ->
+            mc.gui.setScreen(new dev.monocle.client.gui.screens.NotificationHistoryScreen(theme));
         return list;
     }
 

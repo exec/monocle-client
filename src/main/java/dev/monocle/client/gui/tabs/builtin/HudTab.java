@@ -16,6 +16,7 @@ import dev.monocle.client.gui.widgets.pressable.WButton;
 import dev.monocle.client.gui.widgets.pressable.WCheckbox;
 import dev.monocle.client.systems.hud.Hud;
 import dev.monocle.client.systems.hud.screens.HudEditorScreen;
+import dev.monocle.client.gui.screens.NotificationHistoryScreen;
 import dev.monocle.client.utils.misc.NbtUtils;
 import net.minecraft.client.gui.screens.Screen;
 
@@ -56,6 +57,18 @@ public class HudTab extends Tab {
 
             WButton openEditor = add(theme.button("Edit")).expandX().widget();
             openEditor.action = () -> mc.gui.setScreen(new HudEditorScreen(theme));
+
+            add(theme.horizontalSeparator("Layouts")).expandX();
+            WHorizontalList presets = add(theme.horizontalList()).expandX().widget();
+            presets.add(theme.confirmedButton("Highway Operator", "Replace HUD")).expandX().widget().action = hud::applyHighwayOperatorPreset;
+            presets.add(theme.confirmedButton("Minimal", "Replace HUD")).expandX().widget().action = hud::applyMinimalPreset;
+
+            WHorizontalList notifications = add(theme.horizontalList()).expandX().widget();
+            notifications.add(theme.button("Preview notification feed")).expandX().widget().action = () -> {
+                dev.monocle.client.utils.render.Notifications.post("Monocle", "hud-preview", dev.monocle.client.utils.render.NotificationFeed.Severity.Success, "HUD and notification feed ready.");
+                dev.monocle.client.utils.render.Notifications.post("Highway Builder · Preview", "hud-warning", dev.monocle.client.utils.render.NotificationFeed.Severity.Warning, "A recovery detail would appear here.");
+            };
+            notifications.add(theme.button("Notification history")).expandX().widget().action = () -> mc.gui.setScreen(new NotificationHistoryScreen(theme));
 
             WHorizontalList buttons = add(theme.horizontalList()).expandX().widget();
             buttons.add(theme.confirmedButton("Clear", "Confirm")).expandX().widget().action = hud::clear;

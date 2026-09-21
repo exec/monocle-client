@@ -100,7 +100,8 @@ public final class Notifications {
                         case Warning -> "!";
                         case Error -> "×";
                     };
-                    String title = mc.font.plainSubstrByWidth(symbol + " " + notice.source(), w - 20);
+                    String repeats = notice.count() > 1 ? " ×" + notice.count() : "";
+                    String title = mc.font.plainSubstrByWidth(symbol + " " + notice.source() + repeats, w - 20);
                     graphics.text(mc.font, title, x + 9, y + 6, color(accent, alpha), false);
                     int textY = y + 19;
                     for (var line : lines.get(i)) {

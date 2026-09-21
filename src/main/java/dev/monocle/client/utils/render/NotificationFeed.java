@@ -6,7 +6,7 @@ import java.util.List;
 /** Bounded, thread-safe feed state. No Minecraft objects or background tasks. */
 public final class NotificationFeed {
     public enum Severity { Info, Success, Warning, Error }
-    public record Notice(long id, String source, String key, String text, Severity severity, long updated) { }
+    public record Notice(long id, String source, String key, String text, Severity severity, long firstUpdated, long updated, int count) { }
     private final List<Notice> active = new ArrayList<>();
     private final List<Notice> history = new ArrayList<>();
     private long nextId;
@@ -21,20 +21,21 @@ public final class NotificationFeed {
             for (int i = 0; i < active.size(); i++) {
                 Notice old = active.get(i);
                 if (old.source.equals(source) && old.key.equals(key)) {
-                    Notice updated = new Notice(old.id, source, key, text, severity, now);
+                    Notice updated = new Notice(old.id, source, key, text, severity, old.firstUpdated, now, old.count + 1);
                     active.set(i, updated); // Updating a card never changes its position.
-                    remember(updated);
+                    remember(updated, true);
                     return;
                 }
             }
         }
-        Notice notice = new Notice(++nextId, source, key, text, severity, now);
+        Notice notice = new Notice(++nextId, source, key, text, severity, now, now, 1);
         active.add(notice);
         if (active.size() > 64) active.removeFirst();
-        remember(notice);
+        remember(notice, false);
     }
 
-    private void remember(Notice notice) {
+    private void remember(Notice notice, boolean replace) {
+        if (replace) history.removeIf(old -> old.id == notice.id);
         history.add(notice);
         if (history.size() > 100) history.removeFirst();
     }

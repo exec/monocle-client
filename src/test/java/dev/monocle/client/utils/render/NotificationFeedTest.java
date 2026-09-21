@@ -16,11 +16,12 @@ public final class NotificationFeedTest {
         var snapshot = feed.snapshot(5, 100);
         assert snapshot.size() == 2;
         assert snapshot.getFirst().id() == firstId && snapshot.getFirst().text().equals("updated");
+        assert snapshot.getFirst().count() == 2 && snapshot.getFirst().firstUpdated() == 0;
         assert snapshot.getLast().source().equals("B") : "Grouping must not reorder or cross sources";
         assert feed.snapshot(102, 100).size() == 1 : "Grouping refreshes expiration";
         feed.dismiss(firstId);
         assert feed.snapshot(103, 100).isEmpty() : "Scrolled-out cards never return";
-        assert feed.history().size() == 3;
+        assert feed.history().size() == 2 && feed.history().getLast().count() == 2 : "Grouped history keeps one inspectable incident";
         for (int i = 0; i < 10000; i++) feed.post("A", "", "burst " + i, info, 104, 100, false);
         assert feed.snapshot(104, 100).size() == 64;
         assert feed.history().size() == 100;

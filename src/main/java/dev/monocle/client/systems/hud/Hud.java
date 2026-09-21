@@ -132,6 +132,7 @@ public class Hud extends System<Hud> implements Iterable<HudElement> {
         register(CombatHud.INFO);
         register(MapHud.INFO);
         register(KeyboardHud.INFO);
+        register(OperatorHud.INFO);
 
         // Default config
         if (isFirstInit) resetToDefaultElements();
@@ -185,6 +186,28 @@ public class Hud extends System<Hud> implements Iterable<HudElement> {
 
     public void resetToDefaultElements() {
         resetToDefaultElements = true;
+    }
+
+    public void applyMinimalPreset() {
+        resetToDefaultElements = false;
+        elements.clear();
+        add(MonocleTextHud.WATERMARK, 4, 4, XAnchor.Left, YAnchor.Top);
+        add(OperatorHud.ACTIVITY, -4, 4, XAnchor.Right, YAnchor.Top);
+        add(OperatorHud.NAVIGATION, -4, -4, XAnchor.Right, YAnchor.Bottom);
+    }
+
+    public void applyHighwayOperatorPreset() {
+        resetToDefaultElements = false;
+        elements.clear();
+        int h = (int) Math.ceil(HudRenderer.INSTANCE.textHeight(true));
+        add(MonocleTextHud.WATERMARK, 4, 4, XAnchor.Left, YAnchor.Top);
+        add(MonocleTextHud.TPS, 4, 4 + h, XAnchor.Left, YAnchor.Top);
+        add(MonocleTextHud.PING, 4, 4 + h * 2, XAnchor.Left, YAnchor.Top);
+        add(OperatorHud.ACTIVITY, 4, 52, XAnchor.Left, YAnchor.Top);
+        add(OperatorHud.CREW, -4, 4, XAnchor.Right, YAnchor.Top);
+        add(OperatorHud.SUPPLIES, -4, 116, XAnchor.Right, YAnchor.Top);
+        add(OperatorHud.NOTIFICATIONS, -4, 228, XAnchor.Right, YAnchor.Top);
+        add(OperatorHud.NAVIGATION, -4, -4, XAnchor.Right, YAnchor.Bottom);
     }
 
     private void resetToDefaultElementsImpl() {
