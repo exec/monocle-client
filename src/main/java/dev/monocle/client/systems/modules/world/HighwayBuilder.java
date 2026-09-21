@@ -783,7 +783,7 @@ public class HighwayBuilder extends Module {
     private Vec3 repairFlightProgress;
     private double repairFlightSpeed;
     private int repairFlightRows, repairFlightLaunchTick = -1, repairFlightRetryTick, repairFlightProgressTick;
-    private boolean repairFlightLanding, repairFlightMending;
+    private boolean repairFlightLanding, repairFlightMending, repairFlightBackoff;
     private boolean repairFlightEnabledFly;
     private record RepairIssue(boolean loaded, String kind, BlockPos position) {}
     private record RepairScan(int cleanRows, RepairIssue issue, boolean jobEnd) {}
@@ -1698,7 +1698,7 @@ public class HighwayBuilder extends Module {
             mc.player.getBbWidth() + .12, 1.8, this::repairFlightClear)) return false;
         repairFlightStart = workOrigin.immutable(); repairFlightTarget = target; repairFlightRows = rows;
         repairFlightProgress = mc.player.position(); repairFlightProgressTick = mc.player.tickCount;
-        repairFlightLaunchTick = -1; repairFlightLanding = false; repairFlightSpeed = 0;
+        repairFlightLaunchTick = -1; repairFlightLanding = repairFlightBackoff = false; repairFlightSpeed = 0;
         return tickRepairFlight();
     }
 
@@ -1715,7 +1715,9 @@ public class HighwayBuilder extends Module {
         Vec3 from = mc.player.position(), target = Vec3.atBottomCenterOf(repairFlightTarget);
         if (from.distanceToSqr(repairFlightProgress) >= .25) { repairFlightProgress = from; repairFlightProgressTick = mc.player.tickCount; }
         else if (!repairFlightLanding && (mc.player.isFallFlying() || repairFlightLaunchTick >= 0)
-            && mc.player.tickCount - repairFlightProgressTick >= 20) repairFlightLanding = true;
+            && mc.player.tickCount - repairFlightProgressTick >= 20) {
+            repairFlightLanding = repairFlightBackoff = true;
+        }
         if (repairFlightLanding) {
             fly.clearAutopilot();
             if (mc.player.isFallFlying()) { mc.player.stopFallFlying(); mc.player.setDeltaMovement(0, -.08, 0); }
@@ -1731,7 +1733,7 @@ public class HighwayBuilder extends Module {
             if (mc.player.onGround() && mc.player.tickCount % 40 == 0
                 && mc.player.getInventory().getNonEquipmentItems().stream().anyMatch(HighwayBuilder::usableCrewGlider))
                 Modules.get().get(ChestSwap.class).requestEquip(true, true);
-            else if (!mc.player.onGround()) repairFlightLanding = true;
+            else if (!mc.player.onGround()) repairFlightLanding = repairFlightBackoff = true;
             status = "Equipping an elytra for the clean repair stretch"; return true;
         }
         if (!fly.isActive()) { fly.enable(); repairFlightEnabledFly = true; }
@@ -1764,22 +1766,22 @@ public class HighwayBuilder extends Module {
         int elapsed = mc.player.tickCount - repairFlightLaunchTick;
         if (!mc.player.onGround() && elapsed >= 3 && elapsed % 4 == 3)
             mc.getConnection().send(new ServerboundPlayerCommandPacket(mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
-        if (elapsed > 20) repairFlightLanding = true;
+        if (elapsed > 20) repairFlightLanding = repairFlightBackoff = true;
         status = "Taking off for the next repair"; return true;
     }
 
     private void finishRepairFlight(int rows, boolean arrived) {
         BlockPos start = repairFlightStart;
-        boolean maintenance = repairFlightMending;
+        boolean backoff = repairFlightBackoff && !repairFlightMending;
         stopRepairFlight();
         if (rows > 0) { workOrigin = start.offset(dir.offsetX * rows, 0, dir.offsetZ * rows); completedDistance += rows; forecastDirty = true; }
-        repairFlightRetryTick = mc.player.tickCount + repairFlightRetryDelay(arrived, maintenance);
+        repairFlightRetryTick = mc.player.tickCount + repairFlightRetryDelay(arrived, backoff);
         setState(State.Center);
         status = arrived ? "Reached the next repair area" : "Repair flight ended early; continuing from the reached road";
     }
 
-    static int repairFlightRetryDelay(boolean arrived, boolean maintenance) {
-        return maintenance ? 0 : arrived ? 20 : 200;
+    static int repairFlightRetryDelay(boolean arrived, boolean backoff) {
+        return backoff ? 200 : arrived ? 20 : 0;
     }
 
     private boolean settlePausedRepairFlight() {
@@ -1802,7 +1804,7 @@ public class HighwayBuilder extends Module {
         if (fly != null) fly.clearAutopilot();
         if (repairFlightEnabledFly && fly != null && fly.isActive() && Utils.canUpdate() && mc.player.onGround()) fly.disable();
         repairFlightStart = repairFlightTarget = null; repairFlightProgress = null; repairFlightRows = 0;
-        repairFlightLaunchTick = -1; repairFlightLanding = repairFlightMending = repairFlightEnabledFly = false; repairFlightSpeed = 0;
+        repairFlightLaunchTick = -1; repairFlightLanding = repairFlightMending = repairFlightBackoff = repairFlightEnabledFly = false; repairFlightSpeed = 0;
     }
 
     private void stopCrewFlight() {
@@ -3341,6 +3343,7 @@ public class HighwayBuilder extends Module {
         timingPhase(HighwayHud.Phase.Supply);
         if (repairFlightTarget != null) {
             repairFlightMending = true;
+            repairFlightBackoff = false;
             repairFlightLanding = true;
             status = "Landing for elytra maintenance";
             tickRepairFlight();

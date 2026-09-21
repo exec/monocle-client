@@ -56,10 +56,10 @@ public final class HighwaySupplyTest {
             && HighwayBuilder.operationExcavates(HighwayBuilder.Operation.ClearTunnel)
             && !HighwayBuilder.operationExcavates(HighwayBuilder.Operation.Pave)
             : "Repair clears passage obstructions; only Pave preserves them";
-        assert HighwayBuilder.repairFlightRetryDelay(false, true) == 0
+        assert HighwayBuilder.repairFlightRetryDelay(false, false) == 0
             && HighwayBuilder.repairFlightRetryDelay(true, false) == 20
-            && HighwayBuilder.repairFlightRetryDelay(false, false) == 200
-            : "Maintenance landing resumes repair flight immediately without weakening ordinary retry backoff";
+            && HighwayBuilder.repairFlightRetryDelay(false, true) == 200
+            : "Intentional repair landings resume immediately while real flight stalls retain their backoff";
         try (var bytes = HighwayBuilder.class.getResourceAsStream("HighwayBuilder.class")) {
             var methods = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes()).methods();
             var calls = methods.stream().filter(m -> m.methodName().equalsString("settleRepairFlightHistory")).findFirst().orElseThrow()
