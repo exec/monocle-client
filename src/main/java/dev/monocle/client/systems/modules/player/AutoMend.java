@@ -24,6 +24,7 @@ import dev.monocle.client.utils.player.InvUtils;
 import dev.monocle.client.utils.player.FindItemResult;
 import dev.monocle.client.utils.player.Rotations;
 import meteordevelopment.orbit.EventHandler;
+import meteordevelopment.orbit.EventPriority;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.EquipmentSlot;
@@ -105,14 +106,14 @@ public class AutoMend extends Module {
     private boolean safetyBusy() {
         Offhand offhand = Modules.get().get(Offhand.class);
         AutoEat eat = Modules.get().get(AutoEat.class);
-        return Modules.get().get(AutoTotem.class).isLocked()
+        return !highwayCycle && Modules.get().get(AutoTotem.class).isLocked()
             || (offhand.isActive() && offhand.locked)
             || eat.eating || eat.isActive() && eat.shouldEat()
             || Modules.get().get(AutoGap.class).isEating()
             || Modules.get().get(KillAura.class).attacking;
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.LOW)
     private void onTick(TickEvent.Pre event) {
         if (!inventoryReady()) { status = "Waiting for inventory / item use"; return; }
         if (source >= 0 && (owner != mc.player || !ownsPair())) {
@@ -252,6 +253,10 @@ public class AutoMend extends Module {
 
     public boolean reservesSlot(int slot) {
         return isActive() && owner == mc.player && source == slot;
+    }
+
+    public boolean controlsOffhand() {
+        return isActive() && highwayCycle && source >= 0 && owner == mc.player;
     }
 
     private boolean restore() {

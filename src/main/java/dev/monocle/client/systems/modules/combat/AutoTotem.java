@@ -10,6 +10,8 @@ import dev.monocle.client.events.world.TickEvent;
 import dev.monocle.client.settings.*;
 import dev.monocle.client.systems.modules.Categories;
 import dev.monocle.client.systems.modules.Module;
+import dev.monocle.client.systems.modules.Modules;
+import dev.monocle.client.systems.modules.player.AutoMend;
 import dev.monocle.client.utils.player.InvUtils;
 import dev.monocle.client.utils.player.PlayerUtils;
 import net.minecraft.world.item.ItemStack;
@@ -126,6 +128,7 @@ public class AutoTotem extends Module {
         } else warned = false;
         status = !locked ? "Standby" : mc.player.getOffhandItem().is(Items.TOTEM_OF_UNDYING) ? "Protected" : "Needs totem";
 
+        if (Modules.get().get(AutoMend.class).controlsOffhand()) { status = "Yielding to Auto Mend"; return; }
         if (!locked || mc.player.getOffhandItem().is(Items.TOTEM_OF_UNDYING)) return;
         if (totems == 0) { status = "No totems"; return; }
         if (ticks < delay.get()) { status = "Waiting for swap delay"; return; }

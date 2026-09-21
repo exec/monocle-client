@@ -783,7 +783,7 @@ public class HighwayBuilder extends Module {
     private Vec3 repairFlightProgress;
     private double repairFlightSpeed;
     private int repairFlightRows, repairFlightLaunchTick = -1, repairFlightRetryTick, repairFlightProgressTick;
-    private boolean repairFlightLanding;
+    private boolean repairFlightLanding, repairFlightMending;
     private boolean repairFlightEnabledFly;
     private record RepairIssue(boolean loaded, String kind, BlockPos position) {}
     private record RepairScan(int cleanRows, RepairIssue issue, boolean jobEnd) {}
@@ -1763,11 +1763,16 @@ public class HighwayBuilder extends Module {
 
     private void finishRepairFlight(int rows, boolean arrived) {
         BlockPos start = repairFlightStart;
+        boolean maintenance = repairFlightMending;
         stopRepairFlight();
         if (rows > 0) { workOrigin = start.offset(dir.offsetX * rows, 0, dir.offsetZ * rows); completedDistance += rows; forecastDirty = true; }
-        repairFlightRetryTick = mc.player.tickCount + (arrived ? 20 : 200);
+        repairFlightRetryTick = mc.player.tickCount + repairFlightRetryDelay(arrived, maintenance);
         setState(State.Center);
         status = arrived ? "Reached the next repair area" : "Repair flight ended early; continuing from the reached road";
+    }
+
+    static int repairFlightRetryDelay(boolean arrived, boolean maintenance) {
+        return maintenance ? 0 : arrived ? 20 : 200;
     }
 
     private boolean settlePausedRepairFlight() {
@@ -1790,7 +1795,7 @@ public class HighwayBuilder extends Module {
         if (fly != null) fly.clearAutopilot();
         if (repairFlightEnabledFly && fly != null && fly.isActive() && Utils.canUpdate() && mc.player.onGround()) fly.disable();
         repairFlightStart = repairFlightTarget = null; repairFlightProgress = null; repairFlightRows = 0;
-        repairFlightLaunchTick = -1; repairFlightLanding = repairFlightEnabledFly = false; repairFlightSpeed = 0;
+        repairFlightLaunchTick = -1; repairFlightLanding = repairFlightMending = repairFlightEnabledFly = false; repairFlightSpeed = 0;
     }
 
     private void stopCrewFlight() {
@@ -3328,6 +3333,7 @@ public class HighwayBuilder extends Module {
         diagnosticGate = "auto-mend";
         timingPhase(HighwayHud.Phase.Supply);
         if (repairFlightTarget != null) {
+            repairFlightMending = true;
             repairFlightLanding = true;
             status = "Landing for elytra maintenance";
             tickRepairFlight();

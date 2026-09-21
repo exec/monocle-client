@@ -56,6 +56,10 @@ public final class HighwaySupplyTest {
             && HighwayBuilder.operationExcavates(HighwayBuilder.Operation.ClearTunnel)
             && !HighwayBuilder.operationExcavates(HighwayBuilder.Operation.Pave)
             : "Repair clears passage obstructions; only Pave preserves them";
+        assert HighwayBuilder.repairFlightRetryDelay(false, true) == 0
+            && HighwayBuilder.repairFlightRetryDelay(true, false) == 20
+            && HighwayBuilder.repairFlightRetryDelay(false, false) == 200
+            : "Maintenance landing resumes repair flight immediately without weakening ordinary retry backoff";
         assert HighwayBuilder.fallbackToolSlot(-1,true,slot->true)==-1;
         assert HighwayBuilder.fallbackToolSlot(2,false,slot->true)==2;
         assert HighwayBuilder.fallbackToolSlot(-1,false,slot->false)==-1;

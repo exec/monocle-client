@@ -47,6 +47,9 @@ public final class AutoMendTest {
         elytra.set(DataComponents.ENCHANTMENTS, enchantments.toImmutable());
         assert AutoMend.durability(elytra) < AutoMend.durability(pick) : "Rank by fraction, not raw damage";
         assert AutoMend.highwayItem(elytra) && !AutoMend.highwayItem(new ItemStack(Items.NETHERITE_SWORD));
+        assert AutoMend.class.getDeclaredMethod("onTick", dev.monocle.client.events.world.TickEvent.Pre.class)
+            .getAnnotation(meteordevelopment.orbit.EventHandler.class).priority() < meteordevelopment.orbit.EventPriority.MEDIUM
+            : "Highway Builder must publish its handoff before Auto Mend consumes it";
         try (var bytes = AutoMend.class.getResourceAsStream("AutoMend.class")) {
             var compiled = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes());
             for (String method : List.of("restore", "swapOffhand")) {

@@ -41,7 +41,7 @@ public final class AutoTotemTest {
         assert AutoTotem.sourceSlot(menu, inventory, new ItemStack(Items.DIAMOND), null) == -1 : "Displaced offhand must fit";
         assert AutoTotem.sourceSlot(menu, inventory, ItemStack.EMPTY, null) == 1;
         var tick = calls(AutoTotem.class, "onTick");
-        assert tick.containsAll(List.of("sourceSlot", "quickSwap", "fromId", "toId", "releaseUsingItem"));
+        assert tick.containsAll(List.of("sourceSlot", "quickSwap", "fromId", "toId", "releaseUsingItem", "controlsOffhand"));
         assert !tick.contains("move") && !tick.contains("drop") : "Safety swap must not use cursor-based transfers";
         assert calls(AutoTotem.class, "onReceivePacket").containsAll(List.of("execute", "activationRevision"));
         assert calls(AutoReplenish.class, "onTick").containsAll(List.of("isBusy", "needsInventory", "controlsChest", "fillItems"));
