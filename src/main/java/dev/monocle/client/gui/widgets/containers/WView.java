@@ -27,6 +27,15 @@ public abstract class WView extends WVerticalList {
 
     protected boolean handleMouseOver;
 
+    public double scrollPosition() { return targetScroll; }
+
+    /** Restored offsets are clamped after measuring the new contents. */
+    public void restoreScroll(double offset) {
+        scroll = targetScroll = Double.isFinite(offset) ? Math.max(0, offset) : 0;
+        moveAfterPositionWidgets = true;
+        invalidate();
+    }
+
     @Override
     public void init() {
         maxHeight = Utils.getWindowHeight() - theme.scale(128);

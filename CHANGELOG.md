@@ -2,6 +2,14 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.9.0 — Right Shift workspace, first slice
+
+- Promoted Workflows and Stashes alongside Modules, Workers, HUD and Profiles. Settings groups the existing Config, appearance, Friends, Macros and pathing editors; addon tabs remain visible.
+- Kept draggable module category columns. Search now matches names, enabled aliases, descriptions and setting text, with All/Active/Favorites filters, counts and a retained query/filter. Category scroll offsets survive navigation; existing window positions and expansion preferences remain intact.
+- Added a worker-control/profile-overlay indicator and shortcut from Modules. This is assignment-level context, not a new movement or inventory ownership system.
+- Navigation wraps on narrower windows; Ctrl+Tab / Ctrl+Shift+Tab switch destinations, while Ctrl/Cmd+F focuses module search.
+- This is the navigation/Modules slice, not the completed management-screen redesign. No highway execution, host protocol, settings defaults or shutdown changes. Existing 0.8.4 host remains compatible; native GUI rendering still needs an in-game smoke test.
+
 ## 0.8.4 — Worker and crew operator controls
 
 - Added live job controls and per-worker Detach/Rejoin to the in-game worker/crew management screens and WebUI. Whole-job actions and individual participation are explicitly separated; cancellation and cleanup ownership are explained.

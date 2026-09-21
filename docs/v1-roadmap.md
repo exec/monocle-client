@@ -67,6 +67,13 @@ and check that the copy survives a client restart without changing contents.
 
 ## Stage 3 — 0.9.0: Right Shift workspace
 
+0.9.0 delivers the first navigation/Modules slice: seven primary destinations,
+grouped secondary settings, responsive navigation and keyboard switching,
+module text search and active/favorite filters, remembered query and category
+scroll offsets. Workflows and Stashes reuse their existing screens; deeper
+management-screen layout/state preservation and precise per-resource ownership
+links remain follow-up work. Validate this JAR's native rendering in game.
+
 0.8.4 closes the main operator-control slice. Validate safe native detach/rejoin,
 whole-job pause/resume, preset dispatch and preservation of drafts on both actual
 host interfaces before redesigning navigation. Native detach retains required
@@ -74,7 +81,7 @@ duties and a site anchor; it is not force-removal or abandonment of supplies.
 
 - [ ] Persistent navigation for Modules, Workers, Workflows, Stashes, HUD,
       Profiles, and Settings; retain the familiar module-category view.
-- [ ] Search module names, descriptions, and settings; active/favorite filters.
+- [x] Search module names, descriptions, and settings; active/favorite filters.
 - [ ] Module detail panels with common settings first and advanced disclosure.
 - [ ] Visible movement/inventory ownership and links to the responsible job.
 - [ ] Consistent spacing, typography, keyboard navigation, and non-color status cues.

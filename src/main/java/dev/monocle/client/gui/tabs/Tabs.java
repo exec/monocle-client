@@ -24,12 +24,15 @@ public class Tabs {
     public static void init() {
         add(new ModulesTab());
         add(new BotsTab());
+        add(new WorkflowsTab());
+        add(new StashesTab());
+        add(new HudTab());
+        add(new ProfilesTab());
+        add(new SettingsTab());
         add(new ConfigTab());
         add(new GuiTab());
-        add(new HudTab());
         add(new FriendsTab());
         add(new MacrosTab());
-        add(new ProfilesTab());
 
         if (PathManagers.get().getSettings().get().sizeGroups() > 0) {
             add(new PathManagerTab());
@@ -43,6 +46,16 @@ public class Tabs {
 
     public static List<Tab> get() {
         return tabs;
+    }
+
+    /** Keep secondary destinations registered for shortcuts and addons. */
+    public static boolean secondary(Tab tab) {
+        return tab instanceof ConfigTab || tab instanceof GuiTab || tab instanceof FriendsTab
+            || tab instanceof MacrosTab || tab instanceof PathManagerTab;
+    }
+
+    public static List<Tab> navigation() {
+        return tabs.stream().filter(tab -> !secondary(tab)).toList();
     }
 
     public static Tab get(Class<? extends Tab> klass) {

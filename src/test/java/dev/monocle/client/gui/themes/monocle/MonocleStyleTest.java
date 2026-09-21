@@ -8,6 +8,22 @@ public final class MonocleStyleTest {
         boolean assertionsEnabled = false;
         assert assertionsEnabled = true;
         if (!assertionsEnabled) throw new IllegalStateException("Run with assertions enabled (-ea).");
+        assert dev.monocle.client.gui.screens.ModuleSearch.matches("  food NAMED ", "Auto Eat · Protect named food");
+        assert dev.monocle.client.gui.screens.ModuleSearch.matches("", "Highway Builder");
+        assert !dev.monocle.client.gui.screens.ModuleSearch.matches("food crystal", "Auto Eat food");
+        var locale = java.util.Locale.getDefault();
+        try {
+            java.util.Locale.setDefault(java.util.Locale.forLanguageTag("tr-TR"));
+            assert dev.monocle.client.gui.screens.ModuleSearch.matches("INVENTORY", "inventory manager");
+        } finally { java.util.Locale.setDefault(locale); }
+        var nav = dev.monocle.client.gui.utils.NavigationLayout.wrap(200, 24, new double[]{90, 100, 70});
+        assert nav[0].x() == 0 && nav[1].x() == 90 && nav[1].y() == 0;
+        assert nav[2].x() == 0 && nav[2].y() == 24 : "Navigation must wrap within narrow windows";
+        assert dev.monocle.client.gui.utils.NavigationLayout.wrap(60, 24, new double[]{90})[0].width() == 60;
+        var view = new dev.monocle.client.gui.widgets.containers.WView() {};
+        view.restoreScroll(120); assert view.scrollPosition() == 120;
+        view.restoreScroll(-10); assert view.scrollPosition() == 0;
+        view.restoreScroll(Double.NaN); assert view.scrollPosition() == 0;
 
         Color dark = new Color(20, 40, 60, 80);
         Color light = new Color(220, 180, 140, 200);

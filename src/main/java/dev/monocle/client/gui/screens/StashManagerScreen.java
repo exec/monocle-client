@@ -14,11 +14,12 @@ import java.util.*;
 import static dev.monocle.client.MonocleClient.mc;
 
 /** Catalog-first stash workspace built entirely from the existing Meteor/Monocle widget toolkit. */
-public final class StashManagerScreen extends WindowScreen {
+public final class StashManagerScreen extends dev.monocle.client.gui.tabs.WindowTabScreen {
     private final StashManager manager;
     private WLabel status,summary;
     private WVerticalList catalog;
-    public StashManagerScreen(GuiTheme theme,StashManager manager){super(theme,"Stash Control Center");this.manager=manager;}
+    public StashManagerScreen(GuiTheme theme,StashManager manager){this(theme,manager,false);}
+    public StashManagerScreen(GuiTheme theme,StashManager manager,boolean workspace){super(theme,dev.monocle.client.gui.tabs.Tabs.get(dev.monocle.client.gui.tabs.builtin.StashesTab.class));this.manager=manager;if(!workspace)parent=mc.gui.screen();}
     @Override public void initWidgets(){
         status=add(theme.label(manager.status(),true,700)).expandX().widget();
         summary=add(theme.label("",700)).expandX().widget();

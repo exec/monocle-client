@@ -18,6 +18,8 @@ import static dev.monocle.client.MonocleClient.mc;
 import static com.mojang.blaze3d.platform.InputConstants.*;
 
 public abstract class WTopBar extends WHorizontalList {
+    private dev.monocle.client.gui.utils.NavigationLayout.Item[] layout;
+    private double rowHeight;
     protected abstract Color getButtonColor(boolean pressed, boolean hovered);
 
     protected abstract Color getNameColor();
@@ -32,8 +34,30 @@ public abstract class WTopBar extends WHorizontalList {
 
     @Override
     public void init() {
-        for (Tab tab : Tabs.get()) {
+        for (Tab tab : Tabs.navigation()) {
             add(new WTopBarButton(tab));
+        }
+    }
+
+    @Override protected void onCalculateSize() {
+        rowHeight = cells.stream().mapToDouble(c -> c.widget().height).max().orElse(0);
+        layout = dev.monocle.client.gui.utils.NavigationLayout.wrap(
+            Math.max(1, dev.monocle.client.utils.Utils.getWindowWidth() - theme.scale(16)), rowHeight,
+            cells.stream().mapToDouble(c -> c.widget().width).toArray());
+        width = height = 0;
+        for (var item : layout) {
+            width = Math.max(width, item.x() + item.width());
+            height = Math.max(height, item.y() + rowHeight);
+        }
+    }
+
+    @Override protected void onCalculateWidgetPositions() {
+        for (int i = 0; i < cells.size(); i++) {
+            var cell = cells.get(i);
+            var item = layout[i];
+            cell.x = x + item.x(); cell.y = y + item.y();
+            cell.width = item.width(); cell.height = rowHeight;
+            cell.alignWidget();
         }
     }
 
@@ -68,7 +92,7 @@ public abstract class WTopBar extends WHorizontalList {
         @Override
         protected void onRender(GuiRenderer renderer, double mouseX, double mouseY, double delta) {
             double pad = pad();
-            boolean selected = mc.gui.screen() instanceof TabScreen tabScreen && tabScreen.tab == tab;
+            boolean selected = tab.isScreen(mc.gui.screen());
             renderButton(renderer, this, selected, pressed, mouseOver);
             renderer.text(tab.name, x + pad, y + pad, getNameColor(), false);
         }

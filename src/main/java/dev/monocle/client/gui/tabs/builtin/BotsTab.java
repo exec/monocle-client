@@ -42,7 +42,13 @@ public class BotsTab extends Tab {
     public BotsTab() { super("Workers"); }
 
     @Override public TabScreen createScreen(GuiTheme theme) { return new BotsScreen(theme, this); }
-    @Override public boolean isScreen(Screen screen) { return screen instanceof BotsScreen; }
+    @Override public boolean isScreen(Screen screen) { return screen instanceof BotsScreen s && s.tab == this; }
+
+    public static TabScreen workflowsScreen(GuiTheme theme, Tab tab) {
+        BotsScreen screen = new BotsScreen(theme, tab);
+        screen.page = Page.Workflows;
+        return screen;
+    }
 
     private enum Page { Crews, Jobs, Workflows, History }
     private record Choice(String id, String label) { @Override public String toString() { return label; } }
@@ -78,8 +84,8 @@ public class BotsTab extends Tab {
             panelWidth = contentWidth - 16;
 
             Card hero = add(card()).expandX().minWidth(contentWidth).widget();
-            headline = hero.add(theme.label("WORKER CONTROL", true, contentWidth - 24).color(GOLD)).expandX().widget();
-            hero.add(theme.label("Crews are your people. Jobs are their work. Manage them independently.", contentWidth - 24)
+            headline = hero.add(theme.label(tab.name.equals("Workflows") ? "WORKFLOW LIBRARY" : "WORKER CONTROL", true, contentWidth - 24).color(GOLD)).expandX().widget();
+            hero.add(theme.label(tab instanceof WorkflowsTab ? "Reusable programs and presets. Running jobs keep their captured configuration." : "Crews are your people. Jobs are their work. Manage them independently.", contentWidth - 24)
                 .color(theme.textSecondaryColor())).expandX();
             feedback = hero.add(theme.label("Opening this tab does not pause your crew.", contentWidth - 24)).expandX().widget();
 
@@ -96,7 +102,7 @@ public class BotsTab extends Tab {
         }
 
         private void connectionPanel(WVerticalList parent) {
-            WSection section = parent.add(theme.section("Connection & private crew key", true)).expandX().minWidth(panelWidth).widget();
+            WSection section = parent.add(theme.section("Connection & private crew key", !(tab instanceof WorkflowsTab))).expandX().minWidth(panelWidth).widget();
             connection = section.add(theme.label("", true, panelWidth - 16)).expandX().widget();
             connectionDetail = section.add(theme.label("", panelWidth - 16).color(theme.textSecondaryColor())).expandX().widget();
 
@@ -171,7 +177,8 @@ public class BotsTab extends Tab {
             navigation.clear(); pageBody.clear(); memberStatus.clear(); memberChecks.clear(); jobLabels.clear(); taskLabels.clear();
             rosterShape = crewShape = catalogShape = taskShape = discoveryShape = "";
             roster = null; crewSelector = null; crewName = null; crewDetail = null; catalog = null; workflowLibrary = null; taskQueue = null; discovery = null;
-            for (Page destination : Page.values()) if (destination != Page.History || bots.mode.get() == Bots.Mode.Host) button(navigation, destination == page ? "[ " + destination + " ]" : destination.toString(), () -> {
+            for (Page destination : Page.values()) if (!(tab instanceof WorkflowsTab) && (destination != Page.History || bots.mode.get() == Bots.Mode.Host)) button(navigation, destination == page ? "[ " + destination + " ]" : destination.toString(), () -> {
+                if (destination == Page.Workflows) { dev.monocle.client.gui.tabs.Tabs.get(WorkflowsTab.class).openScreen(theme); return; }
                 page = destination; buildPage(); refresh();
             });
             if (page == Page.Workflows) {
@@ -469,7 +476,7 @@ public class BotsTab extends Tab {
                 ? new SwarmCrew.JobView("No crew", "idle", "Create a crew above, then assign it a saved job.", "", "", "", false, false, false)
                 : bots.controlCrew().inspect();
             var members = bots.allMembers();
-            headline.set("WORKER CONTROL  ·  " + bots.mode.get() + "  ·  " + members.stream().filter(SwarmCrew.MemberView::connected).count() + " online");
+            headline.set((tab.name.equals("Workflows") ? "WORKFLOW LIBRARY" : "WORKER CONTROL") + "  ·  " + bots.mode.get() + "  ·  " + members.stream().filter(SwarmCrew.MemberView::connected).count() + " online");
             connection.set(bots.connectionStatus());
             connection.color(bots.isHost() || bots.isWorker() ? GREEN : GOLD);
             connectionDetail.set(bots.connectionDetail());
