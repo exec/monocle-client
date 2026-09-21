@@ -22,6 +22,7 @@ public final class HostService implements AutoCloseable {
     private final Map<UUID, JsonObject> roster = new LinkedHashMap<>();
     private final Deque<JsonObject> activity = new ArrayDeque<>();
     private final BotChat chat = new BotChat();
+    private final ConfigurationReadback readbacks = new ConfigurationReadback();
     private final Map<UUID, Long> chatAt = new HashMap<>();
     private final Map<UUID, AutoTpy> autoTpyRequests = new LinkedHashMap<>();
     private final CrewTelemetry events;
@@ -236,6 +237,10 @@ public final class HostService implements AutoCloseable {
             }
             persist(); peer.seen = System.nanoTime(); peer.reconciled = true;sendStashCatalog(c,peer);
         } else if (type.equals("task-status")) { update(peer, message, true); persist(); }
+        else if (type.equals("task-configuration-report")) {
+            JsonObject task = tasks.get(UUID.fromString(text(message,"task")));
+            if (task != null && text(task,"crew").equals(peer.crew)) readbacks.accept(peer.id,message,System.currentTimeMillis());
+        }
         else if(type.equals("task-stash-findings")) {
             JsonObject task=tasks.get(UUID.fromString(text(message,"task")));
             if(task==null||!task.getAsJsonObject("runs").has(peer.id.toString()))throw new IllegalArgumentException("Unknown stash task");
@@ -646,6 +651,17 @@ public final class HostService implements AutoCloseable {
         UUID id = UUID.fromString(text(request, "id")); JsonObject task = tasks.get(id);
         if (task == null) throw new IllegalArgumentException("Unknown task");
         if (op.equals("task-configuration")) return dev.monocle.coordinator.TaskConfiguration.inspect(task);
+        if (op.equals("configuration-read") || op.equals("configuration-read-result")) {
+            UUID worker = UUID.fromString(text(request,"worker"));
+            if (!task.getAsJsonObject("runs").has(worker.toString())) throw new IllegalArgumentException("Worker is not assigned to this job");
+            if (op.equals("configuration-read")) {
+                var target = peers.entrySet().stream().filter(e -> e.getKey().connected() && e.getValue().id.equals(worker) && e.getValue().crew.equals(text(task,"crew")))
+                    .findFirst().orElseThrow(() -> new IllegalArgumentException("Worker is not connected in this crew"));
+                JsonObject command = readbacks.request(task,worker,text(request,"profile"),text(request,"module"),System.currentTimeMillis());
+                if (!target.getKey().send(command.toString())) throw new IllegalStateException("Worker disconnected; readback not delivered");
+            }
+            return readbacks.get(id,worker,System.currentTimeMillis());
+        }
         if (op.equals("task-get")) { JsonObject result=task.deepCopy();result.remove("requestHash");if(!result.has("nativeDefinition") && result.has("highwayDefinition"))result.add("nativeDefinition",result.get("highwayDefinition").deepCopy());return result; }
         if (op.equals("task-release")) {
             for(var item:library.drafts())if(text(item.getAsJsonObject(),"sourceTask").equals(id.toString())) { cancelTask(task);persist();return item.getAsJsonObject(); }

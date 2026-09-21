@@ -100,6 +100,10 @@ public final class TaskWire {
             if (checked.get("configurationVersion").getAsBigDecimal().intValueExact() != 1) throw new IllegalArgumentException("Unsupported configuration protocol");
             run.addProperty("configurationVersion", 1);
         }
+        if (checked.has("readbackVersion")) {
+            if (checked.get("readbackVersion").getAsBigDecimal().intValueExact() != 1) throw new IllegalArgumentException("Unsupported readback protocol");
+            run.addProperty("readbackVersion", 1);
+        }
         if (checked.has("configRevision") && (!run.has("configRevision") || checked.get("configRevision").getAsInt() >= run.get("configRevision").getAsInt())) {
             run.add("configRevision", checked.get("configRevision")); run.addProperty("configError", text(checked, "configError"));
         }

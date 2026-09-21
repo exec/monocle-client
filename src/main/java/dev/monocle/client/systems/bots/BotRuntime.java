@@ -1,6 +1,7 @@
 package dev.monocle.client.systems.bots;
 
 import com.google.gson.*;
+import dev.monocle.coordinator.TaskWire;
 import dev.monocle.client.MonocleClient;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.world.HighwayBuilder;
@@ -73,6 +74,46 @@ final class BotRuntime {
         return requested.isEmpty() && top() != null && top().has("action") && text(top().getAsJsonObject("action"), "type").equals("Highway") && actions.recoveryReady();
     }
     List<JsonObject> views() { load(); return runs.values().stream().map(JsonObject::deepCopy).toList(); }
+    private JsonObject receivedRun(UUID task) {
+        load();
+        if(current!=null&&text(run(),"task").equals(task.toString()))return run();
+        return runs.values().stream().filter(r->text(r,"task").equals(task.toString())).reduce((older,newer)->newer).orElseThrow(()->new IllegalArgumentException("Unknown received job"));
+    }
+    JsonObject configuration(UUID task) {
+        JsonObject run = receivedRun(task);
+        JsonObject view = new JsonObject(), workers = new JsonObject();
+        view.add("package",run.get("package")); workers.add(mc.getUser().getProfileId().toString(),run); view.add("runs",workers);
+        JsonObject result = dev.monocle.coordinator.TaskConfiguration.inspect(view);
+        result.addProperty("attribution", "Received host-defined job: " + text(run,"name") + " · host " + (text(run,"sourceHost").isEmpty()?"not recorded on this older job":text(run,"sourceHost")) + " · crew " + text(run,"crew") + " · task " + task);
+        return result;
+    }
+    JsonObject compare(UUID task, String profile, String module) {
+        return compareRun(receivedRun(task),profile,module);
+    }
+    private JsonObject compareRun(JsonObject run, String profile, String module) {
+        JsonObject personal=BotProfiles.leased()?BotProfiles.originalSnapshot():interruptedOriginal;
+        if (profile.equals("Latest live request / worker")) {
+            if(!run.has("configuration"))throw new IllegalArgumentException("No retained live request on this worker; send a new edit first");
+            JsonObject report=BotProfiles.compareModule(run.getAsJsonObject("configuration").getAsJsonObject("modules"),module,personal);
+            report.addProperty("note","Latest live request, revision "+text(run.getAsJsonObject("configuration"),"revision")+". Only this patch is shown, not a cumulative effective profile. "+text(run,"configError")+" "+report.get("note").getAsString());return report;
+        }
+        JsonObject profiles = run.getAsJsonObject("package").getAsJsonObject("profiles");
+        if (!profiles.has(profile)) throw new IllegalArgumentException("Unknown received profile");
+        return BotProfiles.compareModule(profiles.getAsJsonObject(profile), module, personal);
+    }
+    void readConfiguration(JsonObject request, String owner) {
+        load(); UUID id = UUID.fromString(text(request,"run")); JsonObject run = runs.get(id);
+        if (run == null || !ownedBy(run,owner) || !text(run,"task").equals(text(request,"task"))) return;
+        UUID.fromString(text(request,"request"));
+        JsonObject report;
+        try {
+            if(text(request,"profile").equals("Latest live request / worker")&&(!run.has("configuration")||!text(run.getAsJsonObject("configuration"),"revision").equals(text(request,"configurationRevision"))))
+                throw new IllegalStateException("The requested live revision is not retained on this worker yet. Check its acknowledgement, then request again.");
+            report = compareRun(run,text(request,"profile"),text(request,"module"));
+        }
+        catch (RuntimeException e) { report = new JsonObject(); report.addProperty("note",bounded("Readback unavailable: " + e.getMessage())); report.add("rows",new JsonArray()); }
+        for (JsonObject response : dev.monocle.coordinator.ConfigurationReadback.replies(request,report)) send(response);
+    }
     static boolean terminal(String status) { return dev.monocle.coordinator.QueuePolicy.terminal(status); }
     void install(UUID id, JsonObject metadata, JsonObject packaged, String owner) {
         load();
@@ -88,6 +129,7 @@ final class BotRuntime {
         JsonObject args = run.has("args") ? run.getAsJsonObject("args") : new JsonObject();
         if (args.toString().length() > BotLua.MAX_STATE) throw new IllegalArgumentException("Task arguments are too large");
         run.addProperty("run", id.toString()); run.addProperty("owner", owner);
+        run.addProperty("sourceHost",bots.ipAddress.get());
         run.add("package", checkedPackage(packaged)); run.addProperty("status", "Ready"); run.addProperty("detail", "Package validated; waiting for host to start");
         JsonArray stack = new JsonArray(); stack.add(frame(text(packaged, "entry"), args)); run.add("stack", stack);
         run.remove("effectiveProfile"); run.remove("requestedStatus"); run.remove("requestedDetail");
@@ -287,7 +329,7 @@ final class BotRuntime {
         if (bots.isWorker()) {
             JsonObject heartbeat = message("worker"); heartbeat.addProperty("current", current == null ? "" : current.toString());heartbeat.addProperty("stashCatalogProtocol",1);
             JsonArray states = new JsonArray();
-            for (var e : runs.entrySet()) if (ownedBy(e.getValue(), bots.worker.credentialId())) { JsonObject s = new JsonObject(); s.addProperty("run", e.getKey().toString()); s.addProperty("status", text(e.getValue(), "status")); states.add(s); }
+            for (var e : runs.entrySet()) if (ownedBy(e.getValue(), bots.worker.credentialId())) { JsonObject s = new JsonObject(); s.addProperty("run", e.getKey().toString()); s.addProperty("status", text(e.getValue(), "status")); s.addProperty("readbackVersion",1); states.add(s); }
             if (current != null && !ownedBy(run(), bots.worker.credentialId())) heartbeat.addProperty("current", "");
             heartbeat.add("runs", states); send(heartbeat);
             sendSurveyFindings();
@@ -466,7 +508,10 @@ final class BotRuntime {
         if (run.has("configRevision") && revision <= run.get("configRevision").getAsInt()) { sendStatus(id); return; }
         if (!id.equals(current) || !requested.isEmpty() || !bots.acceptCrew.get() || !Utils.canUpdate()) { sendStatus(id); return; }
         String error = "";
-        try { BotProfiles.applyLive(modules); run.add("effectiveProfile", BotProfiles.captureEffective()); }
+        try {
+            JsonObject config=new JsonObject();config.addProperty("revision",revision);config.add("modules",TaskWire.checkedConfiguration(modules));run.add("configuration",config);
+            BotProfiles.applyLive(modules); run.add("effectiveProfile", BotProfiles.captureEffective());
+        }
         catch (RuntimeException e) { error = bounded("Configuration rejected: " + e.getMessage()); }
         run.addProperty("configRevision", revision); run.addProperty("configError", error);
         save(); sendStatus(id);
@@ -476,6 +521,7 @@ final class BotRuntime {
         JsonObject m = message("status"); m.addProperty("run", id.toString()); m.addProperty("task", text(run, "task")); m.addProperty("status", text(run, "status")); m.addProperty("detail", bounded(text(run, "detail")));
         m.addProperty("connectionSuspended", id.equals(current) && connectionSuspended);
         m.addProperty("configurationVersion", 1);
+        m.addProperty("readbackVersion", 1);
         for (String key : List.of("configRevision", "configError")) if (run.has(key)) m.add(key, run.get(key).deepCopy());
         if (run.has("requestedStatus")) m.addProperty("requestedStatus", text(run, "requestedStatus"));
         JsonArray stack = run.getAsJsonArray("stack");

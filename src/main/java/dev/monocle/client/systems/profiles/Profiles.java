@@ -44,6 +44,13 @@ public class Profiles extends System<Profiles> implements Iterable<Profile> {
         save();
     }
 
+    /** Registers an already-written copy without capturing (and overwriting it with) live settings. */
+    public void registerSaved(Profile profile) {
+        if (get(profile.name.get()) != null) throw new IllegalArgumentException("Profile already exists");
+        profiles.add(profile);
+        save();
+    }
+
     public Profile get(String name) {
         for (Profile profile : this) {
             if (profile.name.get().equalsIgnoreCase(name)) {
@@ -105,7 +112,7 @@ public class Profiles extends System<Profiles> implements Iterable<Profile> {
                     else if (f.getName().endsWith(".nbt")) p.waypoints.set(add = true);
                 }
 
-                if (add) add(p);
+                if (add) registerSaved(p);
             }
         }
 

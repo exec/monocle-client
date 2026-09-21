@@ -42,7 +42,10 @@ public final class TaskConfigurationScreen extends WindowScreen {
         feedback = add(theme.label("Read-only snapshot. Refresh to check new acknowledgements.", width)).expandX().widget();
         try {
             snapshot = bots.tasks().configuration(task);
+            if (snapshot.has("attribution")) add(theme.label(snapshot.get("attribution").getAsString(),width)).expandX();
             add(theme.label(snapshot.get("explanation").getAsString(), width).color(theme.textSecondaryColor())).expandX();
+            add(theme.button("Compare personal / host / actual settings")).expandX().widget().action = () ->
+                mc.gui.setScreen(new ConfigurationComparisonScreen(theme,bots,task));
             List<Source> sources = new ArrayList<>();
             snapshot.getAsJsonObject("profiles").keySet().stream().sorted().forEach(name -> sources.add(new Source(name, "Captured profile · " + name, false)));
             snapshot.getAsJsonObject("updates").keySet().forEach(id -> sources.add(new Source(id, "Latest live request · " + workerName(id), true)));
@@ -65,6 +68,19 @@ public final class TaskConfigurationScreen extends WindowScreen {
                 mc.keyboardHandler.setClipboard(new GsonBuilder().setPrettyPrinting().create().toJson(snapshot));
                 feedback.set("Copied captured profiles, supply capabilities, and latest live requests.");
             };
+            var save = add(theme.section("Save captured profile as personal copy…",false)).expandX().widget();
+            save.add(theme.label("Creates a new profile on THIS client. Omitted settings inherit your personal settings. Does not apply it, overwrite existing profiles, or change any worker. Job executors remain off.",width-20)).expandX();
+            String[] profiles=snapshot.getAsJsonObject("profiles").keySet().stream().sorted().toArray(String[]::new);
+            if(profiles.length>0){
+                var chosen=save.add(theme.dropdown(profiles,profiles[0])).expandX().widget();
+                save.add(theme.label("New personal profile name"));
+                var name=save.add(theme.textBox("Imported job profile")).expandX().widget();
+                var confirm=save.add(theme.confirmedButton("Save personal copy","Create this local profile?")).expandX().widget();
+                confirm.action=()->{
+                    try{dev.monocle.client.systems.bots.BotProfiles.savePersonalCopy(name.get(),snapshot.getAsJsonObject("profiles").getAsJsonObject(chosen.get()));feedback.set("Saved personal profile '"+name.get()+"'. Nothing was applied.");}
+                    catch(RuntimeException e){feedback.set("Copy failed: "+e.getMessage());}
+                };
+            }
         } catch (RuntimeException e) { feedback.set("Configuration unavailable: " + e.getMessage()); }
         add(theme.button("Back to task")).expandX().widget().action = this::onClose;
     }

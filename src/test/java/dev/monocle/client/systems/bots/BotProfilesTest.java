@@ -19,6 +19,25 @@ public final class BotProfilesTest {
             """;
         assert BotProfiles.validate(profile(launcherSettings)).equals(profile(launcherSettings)) : "Launcher merges use the same worker SNBT validation";
         var launcherTag=TagParser.parseCompoundFully(launcherSettings);
+        JsonObject personal=profile(launcherSettings).getAsJsonObject("elytra-fly"),host=profile("{groups:[{name:'General',settings:[{name:'vanilla-speed',value:6d}]}]}").getAsJsonObject("elytra-fly");
+        JsonObject comparison=BotProfiles.comparison(personal,host,personal,"test snapshot");
+        assert comparison.getAsJsonArray("rows").asList().stream().map(v->v.getAsJsonObject()).anyMatch(row->row.get("setting").getAsString().equals("General / vanilla-speed")&&row.get("requested").getAsString().equals("6.0d")&&row.get("current").getAsString().equals("5.0d"));
+        assert comparison.getAsJsonArray("rows").asList().stream().map(v->v.getAsJsonObject()).anyMatch(row->row.get("setting").getAsString().equals("General / mode")&&row.get("requested").getAsString().equals("Inherit worker value"));
+        assert BotProfiles.comparison(null,host,personal,"legacy").getAsJsonArray("rows").get(0).getAsJsonObject().get("personal").getAsString().equals("Not recorded");
+        for(String valid:List.of("Highway copy","6b6t-import_1"))BotProfiles.checkCopyName(valid);
+        for(String invalid:List.of("../escape","a/b","a\\b","Current","CON","LPT1","trailing ","")){
+            try{BotProfiles.checkCopyName(invalid);throw new AssertionError("Unsafe name accepted: "+invalid);}catch(IllegalArgumentException expected){}
+        }
+        var localProfile=TagParser.parseCompoundFully("{modules:[{name:'elytra-fly',active:0b,settings:"+launcherSettings+"},{name:'ambience',active:1b,settings:{}},{name:'highway-builder',active:1b,settings:{}}]}");
+        var localBefore=localProfile.copy();JsonObject copyOverlay=new JsonObject();copyOverlay.add("elytra-fly",host);
+        var copied=BotProfiles.personalCopy(localProfile,copyOverlay);
+        assert localProfile.equals(localBefore):"Copying profiles must not change the local baseline";
+        var copiedModules=copied.getListOrEmpty("modules");
+        assert copiedModules.getCompoundOrEmpty(0).toString().contains("6.0d")&&copiedModules.getCompoundOrEmpty(0).toString().contains("Vanilla");
+        assert copiedModules.getCompoundOrEmpty(1).equals(localProfile.getListOrEmpty("modules").getCompoundOrEmpty(1));
+        assert !copiedModules.getCompoundOrEmpty(2).getBooleanOr("active",true):"Copied profiles must not launch a native executor";
+        JsonObject unavailable=new JsonObject();unavailable.add("missing-module",host);
+        try{BotProfiles.personalCopy(localProfile,unavailable);throw new AssertionError("Missing module silently lost");}catch(IllegalArgumentException expected){}
         for (var control : dev.monocle.coordinator.JobSettingControls.ALL) {
             JsonObject request = new JsonObject(); request.addProperty("control", control.id());
             request.addProperty("active", true); request.addProperty("value", control.example());
@@ -85,6 +104,15 @@ public final class BotProfilesTest {
             var method = ClassFile.of().parse(bytes.readAllBytes()).methods().stream().filter(m -> m.methodName().equalsString("fromTag") && m.methodTypeSymbol().returnType().descriptorString().equals("Ldev/monocle/client/systems/modules/Modules;")).findFirst().orElseThrow();
             var calls = method.code().orElseThrow().elementList().stream().filter(InvokeInstruction.class::isInstance).map(InvokeInstruction.class::cast).map(call -> call.name().stringValue()).toList();
             assert calls.indexOf("leased") >= 0 && calls.indexOf("leased") < calls.indexOf("disableAll") : "Global profile reload must not reset an active task's settings";
+        }
+        try(var bytes=BotProfiles.class.getResourceAsStream("/dev/monocle/client/systems/profiles/Profiles.class")){
+            var methods=ClassFile.of().parse(bytes.readAllBytes()).methods();
+            for(String name:List.of("registerSaved","fromTag")){
+                var method=methods.stream().filter(m->m.methodName().equalsString(name)&&!m.flags().has(java.lang.reflect.AccessFlag.BRIDGE)).findFirst().orElseThrow();
+                var calls=method.code().orElseThrow().elementList().stream().filter(InvokeInstruction.class::isInstance).map(InvokeInstruction.class::cast).toList();
+                assert calls.stream().noneMatch(c->c.owner().asInternalName().equals("dev/monocle/client/systems/profiles/Profile")&&c.name().equalsString("save")):"Registering a copy must never recapture live settings";
+                if(name.equals("fromTag"))assert calls.stream().anyMatch(c->c.name().equalsString("registerSaved")):"Rediscovery must preserve imported files";
+            }
         }
         System.out.println("Bot profile checks passed: structured settings, unchanged-state policy, bounded NBT, native-idle guards and rollback/persistence paths.");
     }

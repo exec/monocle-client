@@ -2,6 +2,14 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.8.2 — Profile comparison and personal copies
+
+- Added on-demand, per-module comparison of personal settings, a selected host-captured overlay (or latest live request), and actual worker settings in both host interfaces. Snapshots show their age and do not pretend omitted settings are host overrides.
+- Bounded and chunked readback over the existing authenticated worker connection; request/run/worker matching, timeouts, and capability checks keep older clients and late responses from being mistaken for fresh readings. No extra recurring full-profile telemetry.
+- Workers can inspect their received job profiles and explicitly save an independent personal copy under a new name. Copying never applies settings, overwrites an existing profile, or starts a job executor. Profile rediscovery no longer overwrites saved module files.
+- New job leases checkpoint default-valued settings too, enabling accurate personal-baseline comparisons. Missing values from older checkpoints remain labeled as unrecorded.
+- Readback requires 0.8.2 workers and the matching host. The latest live request remains a patch, not a cumulative desired-state profile; personal copying is intentionally local-only.
+
 ## 0.8.1 — Guided live job settings
 
 - Added matching guided editors to the in-game host and WebUI for Speed, Elytra Fly speed, Auto Eat thresholds, and common module activation controls.

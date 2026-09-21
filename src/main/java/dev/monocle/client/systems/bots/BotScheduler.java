@@ -23,6 +23,7 @@ public final class BotScheduler {
                            String status, String detail, int priority, Map<UUID, Integer> workerPriorities, boolean history) { }
     private final Bots bots;
     private final BotRuntime runtime;
+    private final dev.monocle.coordinator.ConfigurationReadback readbacks = new dev.monocle.coordinator.ConfigurationReadback();
     private final Path file = MonocleClient.FOLDER.toPath().resolve("bot-tasks.json");
     private final Map<UUID, JsonObject> tasks = new LinkedHashMap<>();
     private final Map<UUID, JsonObject> returns = new LinkedHashMap<>();
@@ -196,7 +197,32 @@ public final class BotScheduler {
         tasks.put(id, t); try { save(); } catch (RuntimeException e) { tasks.remove(id); throw e; } return id;
     }
     private JsonObject task(UUID id) { load(); JsonObject t = tasks.get(id); if (t == null) throw new IllegalArgumentException("Unknown task"); return t; }
-    public JsonObject configuration(UUID id) { hostOnly(); return dev.monocle.coordinator.TaskConfiguration.inspect(task(id)); }
+    public JsonObject configuration(UUID id) {
+        if (bots.mode.get() == Bots.Mode.Worker) return runtime.configuration(id);
+        hostOnly(); JsonObject task = task(id), view = dev.monocle.coordinator.TaskConfiguration.inspect(task);
+        view.addProperty("attribution", "Host-captured job: " + text(task,"name") + " · crew " + text(task,"crew")); return view;
+    }
+    public JsonObject compareConfiguration(UUID id, UUID worker, String profile, String module, boolean request) {
+        if (bots.mode.get() == Bots.Mode.Worker) {
+            if (!worker.equals(mc.getUser().getProfileId())) throw new IllegalArgumentException("Only your own settings can be inspected locally");
+            JsonObject result = new JsonObject(); result.addProperty("status","Snapshot"); result.addProperty("receivedAt",System.currentTimeMillis());
+            result.add("report",runtime.compare(id,profile,module)); return result;
+        }
+        hostOnly(); JsonObject task = task(id);
+        if (worker.equals(mc.getUser().getProfileId()) && flag(task,"includeHost")) {
+            JsonObject result = new JsonObject(); result.addProperty("status","Snapshot"); result.addProperty("receivedAt",System.currentTimeMillis());
+            JsonObject profiles = task.getAsJsonObject("package").getAsJsonObject("profiles");
+            if(profile.equals("Latest live request / worker"))throw new IllegalArgumentException("Local host has no worker live-request receipt; choose a captured profile");
+            if (!profiles.has(profile)) throw new IllegalArgumentException("Unknown profile");
+            result.add("report",BotProfiles.compareModule(profiles.getAsJsonObject(profile),module,BotProfiles.leased()?BotProfiles.originalSnapshot():null)); return result;
+        }
+        if (request) {
+            SwarmConnection connection = connection(worker);
+            if (connection == null || !connection.connected() || !text(task,"crew").equals(bots.workerCrew(worker))) throw new IllegalStateException("Worker is not connected in this crew");
+            if (!connection.send(readbacks.request(task,worker,profile,module,System.currentTimeMillis()).toString())) throw new IllegalStateException("Worker disconnected; readback not delivered");
+        }
+        return readbacks.get(id,worker,System.currentTimeMillis());
+    }
     public void pause(UUID id) { hostOnly(); if (QueuePolicy.pause(task(id))) save(); }
     public void configure(UUID id, UUID worker, JsonObject modules) {
         hostOnly(); JsonObject t = task(id), previous = t.deepCopy();
@@ -288,6 +314,10 @@ public final class BotScheduler {
                     if(m.has("stashCatalogProtocol")&&integer(m,"stashCatalogProtocol",1,1)==1)sendStashCatalog(connection,bots.workerCrew(worker));
                 }
                 case "task-status" -> updateStatus(worker, m, true);
+                case "task-configuration-report" -> {
+                    JsonObject task = tasks.get(UUID.fromString(text(m,"task")));
+                    if (task != null && text(task,"crew").equals(bots.workerCrew(worker))) readbacks.accept(worker,m,System.currentTimeMillis());
+                }
                 case "task-survey-findings" -> receiveSurvey(worker, m);
                 case "task-stash-findings" -> {
                     JsonObject task=tasks.get(UUID.fromString(text(m,"task")));
@@ -325,6 +355,7 @@ public final class BotScheduler {
             }
             case "task-control" -> runtime.control(UUID.fromString(text(m, "run")), text(m, "command"), owner);
             case "task-configure" -> runtime.configure(UUID.fromString(text(m, "run")), m.getAsJsonObject("modules"), integer(m, "revision", 1, Integer.MAX_VALUE), owner);
+            case "task-configuration-read" -> runtime.readConfiguration(m,owner);
             case "task-survey-ack" -> runtime.acknowledgeSurvey(UUID.fromString(text(m, "run")), text(m, "token"), integer(m, "delivery", 1, 1_048_576), owner);
             case "task-stash-ack" -> runtime.acknowledgeStash(UUID.fromString(text(m,"run")),text(m,"token"),integer(m,"delivery",1,4096),owner);
             case "task-stash-catalog" -> dev.monocle.coordinator.StashCatalog.cacheRemote(MonocleClient.FOLDER.toPath(),m.getAsJsonArray("stashes"));

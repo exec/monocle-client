@@ -80,6 +80,13 @@ public final class HostServiceTest {
             assert host.control(inspectConfig).equals(configuration) : "Previewing must not enqueue configuration updates";
             JsonObject collision = first.deepCopy(); collision.addProperty("priority", 3); rejects(() -> host.control(collision));
             await(() -> state(host, firstId).equals("Running"), worker, other);
+            JsonObject readConfig=op("configuration-read");readConfig.addProperty("id",firstId.toString());readConfig.addProperty("worker",workerId.toString());readConfig.addProperty("profile","Current");readConfig.addProperty("module","speed");
+            assert request(http,api,readConfig,"wrong",false).statusCode()==403;
+            assert request(http,api,readConfig,TOKEN,false).statusCode()==200;
+            JsonObject readResult=readConfig.deepCopy();readResult.addProperty("op","configuration-read-result");
+            await(()->text(host.control(readResult),"status").equals("Snapshot"),worker,other);
+            assert text(host.control(readResult).getAsJsonObject("report"),"note").equals("Test-only worker readback");
+            JsonObject wrongWorker=readConfig.deepCopy();wrongWorker.addProperty("worker",otherId.toString());rejects(()->host.control(wrongWorker));
             // A running Lua frame legitimately has no native action between steps.
             JsonObject betweenSteps = worker.checkpoints.get(UUID.fromString(worker.current));
             JsonObject savedAction = betweenSteps.getAsJsonObject("action");
@@ -918,6 +925,10 @@ public final class HostServiceTest {
             while ((wire = c.poll()) != null) {
                 JsonObject message = JsonParser.parseString(wire).getAsJsonObject();
                 switch (text(message, "type")) {
+                    case "task-configuration-read" -> {
+                        JsonObject report=new JsonObject();report.addProperty("note","Test-only worker readback");report.add("rows",new JsonArray());
+                        for(JsonObject reply:ConfigurationReadback.replies(message,report))c.send(reply.toString());
+                    }
                     case "manage-chat" -> { assert text(message,"scope").equals(scope);chatMessages.add(BotChat.command(text(message,"text")));JsonObject report=new JsonObject();report.addProperty("type","worker-chat");report.addProperty("direction","sent");report.addProperty("text",text(message,"text"));c.send(report.toString()); }
                     case "heartbeat" -> autoTpy=flag(message,"autoTpy");
                     case "task-tpa-accept" -> tpaAccepts.add(message.deepCopy());
@@ -1003,7 +1014,7 @@ public final class HostServiceTest {
                 }
             }
         }
-        private void sendStatus(JsonObject run) { JsonObject message = run.deepCopy(); message.addProperty("type", "task-status"); message.addProperty("detail", "Simulated native worker"); c.send(message.toString()); }
+        private void sendStatus(JsonObject run) { JsonObject message = run.deepCopy(); message.addProperty("type", "task-status"); message.addProperty("detail", "Simulated native worker"); message.addProperty("readbackVersion",1); c.send(message.toString()); }
         void nativeSend(String type,boolean detach) {
             JsonObject m=new JsonObject();m.addProperty("type",type);m.addProperty("job",text(nativeJob,"job"));m.addProperty("generation",nativeJob.get("generation").getAsInt());
             m.addProperty("serviceRevision",HighwayCoordinator.serviceRevision(nativeJob,id));m.addProperty("detach",detach);

@@ -315,10 +315,54 @@ function configurationInspector(task) {
         for(const [name,value] of entries){const module=el('details');const executor=['highway-builder','printer-helper','schematic-selector'].includes(name);module.append(el('summary','',name+' · '+(executor?'Job-controlled':value.active?'On':'Off')),el('pre','',value.settings),el('p','hint','Serialized setting overrides; omitted settings retain worker values.'));list.append(module);}
       };
       select.addEventListener('change',show);show();
+      body.append(configurationComparison(task,data));
       body.append(jsonDetails('Captured highway duties and supply capabilities',data.highways));loaded=true;
     }catch(error){body.replaceChildren(el('p','',error.message),refresh);loaded=false;}
   };
   panel.addEventListener('toggle',()=>{if(panel.open&&!loaded){loaded=true;if(demo){body.append(el('p','hint','Connect to a host to inspect captured configuration.'));}else load();}});
+  return panel;
+}
+function configurationComparison(task,data) {
+  const sources={...data.profiles};const latest=Object.assign({},...Object.values(data.updates||{}).map(update=>update.modules));if(Object.keys(latest).length)sources['Latest live request / worker']=latest;
+  const panel=el('details');panel.append(el('summary','','Compare personal / host / actual settings'));
+  const body=el('div','management-section'),worker=el('select'),profile=el('select'),module=el('select'),result=el('div');panel.append(body);
+  const field=(title,input)=>{const label=el('label','',title);label.append(input);body.append(label);};
+  for(const id of Object.keys(data.updates||{})){const o=el('option','',snapshot.workers.find(w=>w.id===id)?.name||id);o.value=id;worker.append(o);}
+  for(const name of Object.keys(sources)){const o=el('option','',name);o.value=name;profile.append(o);}
+  field('Worker',worker);field('Host source',profile);field('Module',module);
+  let revision=0,pending=false;
+  const changed=()=>{revision++;pending=false;result.replaceChildren(el('p','hint','Selection changed. Request a new snapshot.'));};
+  const modules=()=>{module.replaceChildren();for(const name of Object.keys(sources[profile.value]||{}).sort()){const o=el('option','',name);o.value=name;module.append(o);}changed();};
+  profile.addEventListener('change',modules);worker.addEventListener('change',changed);module.addEventListener('change',changed);modules();
+  const renderSample=sample=>{
+    result.replaceChildren(el('p','',sample.status));
+    if(!sample.report)return;
+    result.append(el('p','hint','Snapshot received '+new Date(sample.receivedAt).toLocaleString()+'. Refresh after edits or reconnects.'),el('p','hint',sample.report.note));
+    const wrapper=el('div');wrapper.style.overflowX='auto';const table=el('table'),head=el('thead'),titles=el('tr'),rows=el('tbody');
+    for(const title of ['Setting','Personal','Selected host overlay','Actual now']){const th=el('th','',title);th.scope='col';titles.append(th);}head.append(titles);
+    for(const row of sample.report.rows){const tr=el('tr');for(const key of ['setting','personal','requested','current']){const td=el('td','',row[key]);td.style.whiteSpace='pre-wrap';td.style.overflowWrap='anywhere';tr.append(td);}rows.append(tr);}table.append(head,rows);wrapper.append(table);result.append(wrapper);
+  };
+  const request=button('Request fresh comparison',async()=>{
+    if(pending||!writable()||!module.value||!worker.value)return;
+    const version=++revision,session=generation,selected={id:task.id,worker:worker.value,profile:profile.value,module:module.value};pending=true;
+    const relevant=()=>version===revision&&session===generation&&panel.isConnected&&panel.open;
+    try{
+      let sample=await api('control',{op:'configuration-read',...selected});
+      if(!relevant())return;renderSample(sample);
+      const deadline=Date.now()+12000;
+      while(sample.status==='Pending'&&Date.now()<deadline){
+        await new Promise(resolve=>setTimeout(resolve,500));if(!relevant())return;
+        sample=await api('control',{op:'configuration-read-result',id:selected.id,worker:selected.worker});
+        if(!relevant())return;
+        if(sample.profile!==selected.profile||sample.module!==selected.module){result.replaceChildren(el('p','','Readback was replaced by another operator. Request again.'));return;}
+        renderSample(sample);
+      }
+    }catch(error){if(relevant())result.replaceChildren(el('p','',error.message));}
+    finally{if(version===revision)pending=false;}
+  },demo);
+  body.append(el('p','hint','Read-only, on-demand worker snapshot. Requires a 0.8.2+ worker. Personal means its pre-job checkpoint (or current settings when no job owns them). Captured overlays may differ from later live edits.'),request,result,
+    el('p','hint','To keep a received profile, open Workers → job → Inspect configuration on that client and choose Save captured profile as personal copy. The web host cannot overwrite personal profiles.'));
+  panel.addEventListener('toggle',()=>{if(!panel.open){revision++;pending=false;}});
   return panel;
 }
 function managedButton(text, action, cls='') { return button(text,action,!writable(),'managed-control '+cls); }

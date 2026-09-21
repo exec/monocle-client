@@ -25,11 +25,12 @@ workflow permits, and whether the latest live update was acknowledged.
 
 - [x] Guided common-setting editors with explicit job/worker scope (0.8.1).
 - [ ] Guided editing of future-job defaults.
-- [ ] Compare and duplicate presets; preview changes before applying.
+- [x] Compare received job profiles against personal/current settings; explicitly save local personal copies (0.8.2).
+- [ ] Compare and duplicate reusable host presets; preview changes before applying.
 - [ ] Consistent Start/Pause/Resume/Cancel/Detach actions and ownership explanations.
 - [ ] Start and manage every ordinary highway job without API/assistant access.
 - [ ] Preserve drafts, expanded sections, selections, and scroll during updates.
-- [ ] Add actual worker configuration readback before labeling values "effective".
+- [x] Add on-demand actual worker configuration readback before labeling values "effective" (0.8.2).
 
 Acceptance: a fresh operator can launch, modify, pause, and cancel a job from
 either host UI, and distinguish a queued request from successful application.
@@ -41,6 +42,28 @@ not live readings. Acknowledgements refresh without rebuilding the editor.
 The guided speed ranges are deliberately bounded; the existing advanced JSON
 editor remains available. Flight mode, acceleration, food protections, and
 future-job defaults are not changed by these numeric edits.
+
+0.8.2 adds **Compare personal / host / actual settings** inside the configuration
+inspector in both host UIs. Choose a worker, captured profile (or latest live
+request), and module; request a fresh snapshot. Comparisons are explicit,
+timestamped reads, not continuous telemetry or a merged desired-state policy.
+Only the most recent live patch is retained. Missing legacy baseline settings
+are unknown, not inferred defaults. Remote workers must run 0.8.2+.
+
+Workers can open their received job's **Inspect configuration & supply
+capabilities** even though host-only task controls remain unavailable. Under
+**Save captured profile as personal copy…**, choose a captured profile and a
+new name. This creates an independent local module profile, resolving omitted
+settings against personal settings, without applying it. Host control APIs
+cannot save or overwrite workers' personal profiles. Received profiles remain
+job checkpoints, not automatically imported personal profiles.
+
+Operator smoke test: request Speed readback, change speed through the guided
+editor, wait for acceptance, refresh the comparison against the latest live
+request, and confirm actual speed agrees. Switch workers/sources while a
+readback is pending; old responses must not replace the new selection. Save a
+personal copy, verify the active job keeps running, reject a duplicate name,
+and check that the copy survives a client restart without changing contents.
 
 ## Stage 3 — 0.9.0: Right Shift workspace
 
@@ -112,3 +135,4 @@ no unresolved permanent waits, silent road gaps, or unsafe cancellation.
 |---|---|---|---|
 | 0.8.0 | Configuration visibility | Clean build, shared report tests, authenticated API, JS syntax passed | Pending; browser automation unavailable; live host unchanged |
 | 0.8.1 | Guided live job setting edits | Clean build, catalog validation, NBT overlay preservation, authenticated preview API, JS syntax passed | Pending; live host unchanged |
+| 0.8.2 | Worker readback and local personal copies | Clean build and JS syntax passed; chunk correlation/timeout/isolation/Unicode, comparison values, copy preservation and authenticated API checks passed | Pending; live host unchanged |

@@ -132,12 +132,40 @@ public final class CoordinatorCoreTest {
         request.addProperty("control", "highway-builder"); rejects(() -> JobSettingControls.preview(request));
     }
 
+    private static void configurationReadback() {
+        UUID taskId=UUID.randomUUID();JsonObject task=JsonParser.parseString("{\"package\":{\"profiles\":{\"Current\":{}}},\"runs\":{}}").getAsJsonObject();task.addProperty("id",taskId.toString());
+        JsonObject run=new JsonObject();run.addProperty("id",UUID.randomUUID().toString());task.getAsJsonObject("runs").add(WORKER.toString(),run);
+        ConfigurationReadback readbacks=new ConfigurationReadback();
+        rejects(()->readbacks.request(task,WORKER,"Current","speed",1000));
+        run.addProperty("readbackVersion",1);
+        rejects(()->readbacks.request(task,OTHER,"Current","speed",1000));
+        rejects(()->readbacks.request(task,WORKER,"missing","speed",1000));
+        JsonObject request=readbacks.request(task,WORKER,"Current","speed",1000);
+        rejects(()->readbacks.request(task,WORKER,"Current","speed",1500));
+        JsonObject report=JsonParser.parseString("{\"note\":\"Snapshot\",\"rows\":[]}").getAsJsonObject();
+        for(int i=0;i<70;i++){JsonObject row=new JsonObject();row.addProperty("setting","setting-"+i);for(String key:List.of("personal","requested","current"))row.addProperty(key,"quoted \\\"value\\\" 🧐 "+"x".repeat(50));report.getAsJsonArray("rows").add(row);}
+        var replies=ConfigurationReadback.replies(request,report);assert replies.size()>1;
+        assert !readbacks.accept(OTHER,replies.getFirst(),1600);
+        assert !readbacks.accept(WORKER,replies.getLast(),1600):"Out-of-order data cannot be presented as a snapshot";
+        for(JsonObject reply:replies){assert reply.toString().length()<16000;readbacks.accept(WORKER,reply,2000);}
+        JsonObject result=readbacks.get(taskId,WORKER,2000);assert result.getAsJsonObject("report").equals(report);
+        result.getAsJsonObject("report").addProperty("note","mutated");assert readbacks.get(taskId,WORKER,2000).getAsJsonObject("report").equals(report);
+        assert !readbacks.accept(WORKER,replies.getFirst(),2001):"Duplicate replies do not overwrite a completed snapshot";
+        var next=readbacks.request(task,WORKER,"Current","speed",3000);
+        assert !readbacks.accept(WORKER,replies.getFirst(),3001):"Late replies cannot satisfy a new request";
+        assert readbacks.get(taskId,WORKER,13001).get("status").getAsString().startsWith("Timed out");
+        assert !readbacks.accept(WORKER,ConfigurationReadback.replies(next,report).getFirst(),13001);
+        assert !task.has("report")&&!run.has("report"):"Readback is transient, not persistent telemetry";
+        report.addProperty("extra","not allowed");rejects(()->ConfigurationReadback.checkedReport(report));
+    }
+
     public static void main(String[] args) throws Exception {
         boolean enabled = false; assert enabled = true;
         if (!enabled) throw new IllegalStateException("Run with assertions enabled");
         liveConfiguration();
         configurationInspection();
         guidedConfiguration();
+        configurationReadback();
         stashScan();
         supplyRecovery();
         teleportRecovery();

@@ -103,7 +103,100 @@ public final class BotProfiles {
     public static JsonObject begin() {
         if (originals != null) return originals.deepCopy();
         requireIdle();
-        originals = capture("Current"); return originals.deepCopy();
+        JsonObject full = new JsonObject();
+        for (Module module : Modules.get().getAll()) if (gameplay(module))
+            full.add(module.name, encode(fullSettings(module.settings), module.isActive() && !executorOwned(module.name)));
+        originals = validate(full); return originals.deepCopy();
+    }
+
+    /** A client-thread observation, not the effectiveProfile checkpoint (which may be old). */
+    public static JsonObject compareModule(JsonObject profile, String name, JsonObject personal) {
+        if (!dev.monocle.client.MonocleClient.mc.isSameThread()) throw new IllegalStateException("Read module settings on the client thread");
+        Module module = Modules.get().get(name);
+        if (module == null || !gameplay(module)) throw new IllegalArgumentException("Unknown gameplay module");
+        JsonObject current = encode(fullSettings(module.settings), module.isActive());
+        JsonObject baseline = personal == null ? current : personal.has(name) ? personal.getAsJsonObject(name) : null;
+        return comparison(baseline, profile.has(name) ? profile.getAsJsonObject(name) : null, current,
+            "Point-in-time client-thread snapshot. Host column is the selected captured overlay, not a claim that it is the active workflow profile. Live edits are shown separately in Latest live request. "
+            + (personal == null ? "No job lease: personal and current values coincide." : "Personal values are the pre-job checkpoint; missing legacy values are not guessed.")
+            + (executorOwned(name) ? " Executor activation is job-controlled." : ""));
+    }
+    static JsonObject comparison(JsonObject personal, JsonObject requested, JsonObject current, String note) {
+        Map<String,String> now = flattened(current), before = flattened(personal), desired = flattened(requested);
+        Set<String> keys = new TreeSet<>(now.keySet()); keys.addAll(before.keySet()); keys.addAll(desired.keySet());
+        JsonArray rows = new JsonArray();
+        for (String key : keys) {
+            JsonObject row = new JsonObject(); row.addProperty("setting", key);
+            row.addProperty("personal", before.getOrDefault(key,"Not recorded"));
+            row.addProperty("requested", desired.getOrDefault(key,"Inherit worker value"));
+            row.addProperty("current", now.getOrDefault(key,"Unavailable")); rows.add(row);
+        }
+        JsonObject report = new JsonObject(); report.addProperty("note", note); report.add("rows",rows);
+        return dev.monocle.coordinator.ConfigurationReadback.checkedReport(report);
+    }
+    private static Map<String,String> flattened(JsonObject module) {
+        Map<String,String> values = new TreeMap<>(); if (module == null) return values;
+        values.put("Activation", module.get("active").getAsBoolean() ? "On" : "Off");
+        for (Tag item : parse(module.get("settings").getAsString()).getListOrEmpty("groups")) {
+            CompoundTag group = (CompoundTag)item;
+            for (Tag entry : group.getListOrEmpty("settings")) {
+                CompoundTag setting = (CompoundTag)entry;
+                values.put(group.getStringOr("name","") + " / " + setting.getStringOr("name",""), String.valueOf(setting.get("value")));
+            }
+        }
+        return values;
+    }
+
+    /** Explicit local copy only: build the file without applying any module or changing the active job. */
+    public static void savePersonalCopy(String name, JsonObject overlay) {
+        if (!dev.monocle.client.MonocleClient.mc.isSameThread()) throw new IllegalStateException("Save profiles on the client thread");
+        checkCopyName(name);
+        if (Profiles.get().get(name) != null) throw new IllegalArgumentException("A personal profile with that name already exists");
+        JsonObject checked = validate(overlay);
+        for(String id:checked.keySet())if(Modules.get().get(id)==null||!gameplay(Modules.get().get(id)))throw new IllegalArgumentException("Unknown gameplay module: "+id);
+        CompoundTag output = Modules.get().toTag();
+        for (Tag item : output.getListOrEmpty("modules")) {
+            CompoundTag tag = (CompoundTag)item; String id = tag.getStringOr("name",""); Module module = Modules.get().get(id);
+            if (module == null) continue;
+            tag.put("settings",originals != null && originals.has(id) ? parse(originals.getAsJsonObject(id).get("settings").getAsString()) : fullSettings(module.settings));
+        }
+        output = personalCopy(output,checked);
+        Path folder = Profiles.FOLDER.toPath().resolve(name);
+        Path temporary = null;
+        boolean created=false;
+        try {
+            Files.createDirectories(Profiles.FOLDER.toPath()); Files.createDirectory(folder); // Never replace an existing profile, even an unregistered one.
+            created=true;
+            temporary = Files.createTempFile(folder,"modules-",".tmp");
+            NbtIo.write(output,temporary);
+            try { Files.move(temporary,folder.resolve("modules.nbt"),java.nio.file.StandardCopyOption.ATOMIC_MOVE); }
+            catch(java.nio.file.AtomicMoveNotSupportedException e){Files.move(temporary,folder.resolve("modules.nbt"));}
+            Profile profile = new Profile(); profile.name.set(name); profile.modules.set(true);
+            Profiles.get().registerSaved(profile);
+        } catch (IOException e) { throw new IllegalStateException("Could not save profile: " + e.getMessage(),e); }
+        finally {
+            if(temporary!=null)try{Files.deleteIfExists(temporary);}catch(IOException ignored){}
+            if(created&&!Files.exists(folder.resolve("modules.nbt")))try{Files.deleteIfExists(folder);}catch(IOException ignored){}
+        }
+    }
+    static void checkCopyName(String name) {
+        if (!name.matches("[A-Za-z0-9][A-Za-z0-9 _-]{0,63}") || !name.equals(name.strip()) || name.equalsIgnoreCase("Current")
+            || name.toUpperCase(Locale.ROOT).matches("CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]"))
+            throw new IllegalArgumentException("Use a new non-reserved name: letters, numbers, spaces, underscores or dashes (1–64 characters)");
+    }
+    static CompoundTag personalCopy(CompoundTag local, JsonObject overlay) {
+        JsonObject checked=validate(overlay);CompoundTag output=local.copy();Set<String> remaining=new HashSet<>(checked.keySet());
+        for(Tag item:output.getListOrEmpty("modules")) {
+            CompoundTag module=(CompoundTag)item;String id=module.getStringOr("name","");
+            if(checked.has(id)) {
+                JsonObject patch=checked.getAsJsonObject(id);
+                module.put("settings",mergeSettings(module.getCompoundOrEmpty("settings"),parse(patch.get("settings").getAsString())));
+                module.putBoolean("active",patch.get("active").getAsBoolean());remaining.remove(id);
+            }
+            if(executorOwned(id))module.putBoolean("active",false);
+        }
+        if(!remaining.isEmpty())throw new IllegalArgumentException("Cannot copy unavailable modules: "+remaining);
+        return output;
     }
     public static void apply(JsonObject snapshot) {
         apply(snapshot, false);
