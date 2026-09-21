@@ -168,7 +168,7 @@ public final class BotActionsTest {
     private static void stashScan() throws Exception {
         assert java.util.stream.IntStream.range(0,5).map(i->BotStashScan.layerY(i,5)).boxed().toList().equals(List.of(0,4,3,2,1)) : "Lazy scan visits bottom, top, then downward";
         assert !BotStashScan.includeContainer(true,true)&&BotStashScan.includeContainer(true,false)&&BotStashScan.includeContainer(false,true) : "Lazy scans skip hoppers; full audits retain them";
-        JsonObject plan=BotActions.validate(json("{\"type\":\"StashScan\",\"name\":\"Depot\",\"minX\":0,\"maxX\":0,\"minY\":116,\"maxY\":116,\"minZ\":0,\"maxZ\":0}"));
+        JsonObject plan=BotActions.validate(json("{\"type\":\"StashScan\",\"name\":\"Depot\",\"homeName\":\"depot\",\"minX\":0,\"maxX\":0,\"minY\":116,\"maxY\":116,\"minZ\":0,\"maxZ\":0}"));
         var scan=new BotStashScan(plan);JsonObject checkpoint=scan.snapshot();checkpoint.addProperty("cursor",1);checkpoint.addProperty("discovered",1);checkpoint.addProperty("observed",1);
         checkpoint.addProperty("targetX",0);checkpoint.addProperty("targetY",116);checkpoint.addProperty("targetZ",0);
         checkpoint.add("pending",json("{\"x\":0,\"y\":116,\"z\":0,\"status\":\"observed\",\"block\":\"minecraft:chest\",\"reason\":\"\",\"items\":{\"minecraft:stone\":64},\"shulkers\":[]}"));

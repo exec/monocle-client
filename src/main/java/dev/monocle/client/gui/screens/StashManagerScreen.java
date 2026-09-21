@@ -19,9 +19,9 @@ import static dev.monocle.client.MonocleClient.mc;
 public final class StashManagerScreen extends dev.monocle.client.gui.tabs.WindowTabScreen {
     private final StashManager manager;
     private static final Set<String> expanded = new HashSet<>();
-    private WLabel status,summary;
+    private WLabel status,summary,readiness;
     private WVerticalList catalog;
-    private dev.monocle.client.gui.widgets.pressable.WButton scan;
+    private dev.monocle.client.gui.widgets.pressable.WButton save,scan;
     private double contentWidth;
     public StashManagerScreen(GuiTheme theme,StashManager manager){this(theme,manager,false);}
     public StashManagerScreen(GuiTheme theme,StashManager manager,boolean workspace){super(theme,dev.monocle.client.gui.tabs.Tabs.get(dev.monocle.client.gui.tabs.builtin.StashesTab.class));this.manager=manager;if(!workspace)parent=mc.gui.screen();}
@@ -30,17 +30,18 @@ public final class StashManagerScreen extends dev.monocle.client.gui.tabs.Window
         status=add(theme.label(manager.status(),true,contentWidth)).expandX().widget();
         summary=add(theme.label("",contentWidth)).expandX().widget();
         WContainer actions=add(WorkspaceLayout.stacked(contentWidth,560)?theme.verticalList():theme.horizontalList()).expandX().widget();
-        actions.add(theme.button("Select cuboid · Wooden Pickaxe")).expandX().widget().action=()->dev.monocle.client.systems.modules.Modules.get().get(SchematicSelector.class).equipWand();
-        actions.add(theme.button("Save / sync definition")).expandX().widget().action=()->run(manager::exportSelection);
-        scan=actions.add(theme.button(manager.isScanning()?"Stop scan":"Scan now")).expandX().widget();scan.action=()->run(manager.isScanning()?manager::stopScan:manager::startScan);
+        actions.add(theme.button("1 · Select / reselect cuboid")).expandX().widget().action=()->dev.monocle.client.systems.modules.Modules.get().get(SchematicSelector.class).equipWand();
+        save=actions.add(theme.button("2 · Validate and save")).expandX().widget();save.action=()->run(manager::exportSelection);
+        scan=actions.add(theme.button(manager.isScanning()?"Stop scan":"3 · Save and scan")).expandX().widget();scan.action=()->run(manager.isScanning()?manager::stopScan:manager::startScan);
+        readiness=add(theme.label(manager.definitionReadiness(),true,contentWidth)).expandX().widget();
         add(theme.horizontalSeparator()).expandX();
         WContainer body=add(WorkspaceLayout.stacked(contentWidth,650)?theme.verticalList():theme.horizontalList()).expandX().widget();
         WVerticalList setup=body.add(theme.verticalList()).top().minWidth(WorkspaceLayout.stacked(contentWidth,650)?contentWidth:310).widget();
         setup.add(theme.horizontalSeparator("Definition & route")).expandX();
-        setup.add(theme.label("The cuboid identifies storage. Home routing is saved per worker by the host, so every bot may use its own /home name.",300).color(theme.textSecondaryColor()));
+        setup.add(theme.label("A /home name is required. Select the storage cuboid, validate it, then scan. Save and scan records this worker's route before opening any container.",300).color(theme.textSecondaryColor()));
         setup.add(theme.settings(manager.settings)).expandX();
         setup.add(theme.horizontalSeparator("Workflow")).expandX();
-        setup.add(theme.label("Save first, then scan locally or assign Inspect stash from Workers. Host scans automatically substitute each selected worker's saved home route.",300));
+        setup.add(theme.label("Scan now automatically validates and saves first. Host jobs substitute each selected worker's own saved /home route.",300));
         catalog=body.add(theme.verticalList()).top().expandX().widget();rebuild();
         add(theme.horizontalSeparator()).expandX();
         WContainer footer=add(WorkspaceLayout.stacked(contentWidth,520)?theme.verticalList():theme.horizontalList()).expandX().widget();
@@ -53,7 +54,7 @@ public final class StashManagerScreen extends dev.monocle.client.gui.tabs.Window
         List<JsonObject> rows=new ArrayList<>();for(JsonElement value:values){JsonObject s=value.getAsJsonObject();rows.add(s);obsidian+=count(s,"minecraft:obsidian");observed+=number(s,"observed");inferred+=number(s,"inferred");unscanned+=number(s,"unscanned");}
         summary.set(rows.size()+" catalog entries · "+format(obsidian)+" obsidian indexed · "+observed+" observed / "+inferred+" inferred / "+unscanned+" unscanned");
         rows.sort(Comparator.comparingLong((JsonObject s)->s.has("updatedAt")?s.get("updatedAt").getAsLong():0).reversed());
-        for(JsonObject stash:rows)card(stash);if(rows.isEmpty())catalog.add(theme.label("No stashes yet. Select two corners, name the stash, then Save / sync definition.",360));
+        for(JsonObject stash:rows)card(stash);if(rows.isEmpty())catalog.add(theme.label("No stashes yet. Enter its /home name, select two corners, then validate and save.",360));
     }
     private void card(JsonObject s){
         String name=text(s,"name"),scope=text(s,"scope"),crew=text(s,"crew"),key=scope+"\n"+name+"\n"+crew;WSection card=catalog.add(theme.section(name+"  ·  "+(crew.equals("Local")?"LOCAL":"HOST · "+crew),expanded.contains(key))).expandX().widget();card.action=()->{if(card.isExpanded())expanded.add(key);else expanded.remove(key);};
@@ -66,5 +67,5 @@ public final class StashManagerScreen extends dev.monocle.client.gui.tabs.Window
         WContainer edit=card.add(WorkspaceLayout.stacked(contentWidth,460)?theme.verticalList():theme.horizontalList()).expandX().widget();edit.add(theme.button("Edit definition")).expandX().widget().action=()->{manager.editDefinition(s,false);mc.gui.setScreen(new StashManagerScreen(theme,manager));};edit.add(theme.button("Reselect corners")).expandX().widget().action=()->manager.editDefinition(s,true);
     }
     private static String text(JsonObject o,String key){return o.has(key)?o.get(key).getAsString():"";}private static int number(JsonObject o,String key){return o.has(key)?o.get(key).getAsInt():0;}private static long count(JsonObject o,String key){return o.has("items")&&o.getAsJsonObject("items").has(key)?o.getAsJsonObject("items").get(key).getAsLong():0;}private static String format(long n){return String.format(Locale.ROOT,"%,d",n);}private static String shortId(String id){return id.length()>8?id.substring(0,8):id;}
-    @Override public void tick(){super.tick();status.set(manager.status());scan.set(manager.isScanning()?"Stop scan":"Scan now");}
+    @Override public void tick(){super.tick();status.set(manager.status());String ready=manager.definitionReadiness();boolean valid=ready.startsWith("Ready");readiness.set(ready);readiness.color(valid?new Color(100,220,145):new Color(230,95,90));save.disabled=!valid;scan.disabled=!manager.isScanning()&&!valid;scan.set(manager.isScanning()?"Stop scan":"3 · Save and scan");}
 }

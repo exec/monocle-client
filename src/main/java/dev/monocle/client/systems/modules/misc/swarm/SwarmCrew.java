@@ -69,6 +69,17 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     private int tpaRecoverySince;
     // Only unacknowledged cancellations persist; a reconnect must not resurrect an ended job.
     private final ResourcePool resourcePool = new ResourcePool();
+    private final Deque<JsonObject> stashRequests=new ArrayDeque<>();
+
+    public JsonObject pollStashRequest(){JsonObject request=stashRequests.peekFirst();return request==null||request.has("retryAt")&&request.get("retryAt").getAsLong()>System.currentTimeMillis()?null:stashRequests.pollFirst();}
+    public void retryStashRequest(JsonObject request){request.addProperty("retryAt",System.currentTimeMillis()+5_000);stashRequests.addFirst(request);}
+    public void clearStashRequests(Collection<String> workers){stashRequests.removeIf(r->workers.contains(str(r,"worker")));}
+    public JsonObject workerReport(UUID worker){return currentReport(worker);}
+    public void failStashRequest(JsonObject request){UUID worker=UUID.fromString(str(request,"worker"));JsonObject failure=jobMessage("resource-exhausted");failure.addProperty("resource",num(request,"resource"));sendMember(worker,failure);}
+    @Override protected boolean onResourceExhausted(UUID worker,int resource){
+        if(stashRequests.stream().anyMatch(r->str(r,"worker").equals(worker.toString())))return true;
+        JsonObject request=new JsonObject();request.addProperty("worker",worker.toString());request.addProperty("resource",resource);request.addProperty("scope",scope());stashRequests.add(request);info("Worker requested stash resupply for resource %d; other builders continue.",resource);return true;
+    }
 
     public CrewInventory.Policy inventoryPolicy() { return assigned() ? CrewInventory.Policy.read(assignment.getAsJsonObject("layout")) : CrewInventory.Policy.defaults(); }
     public float trashYaw(float forward) {

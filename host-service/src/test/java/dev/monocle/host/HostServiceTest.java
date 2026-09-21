@@ -746,12 +746,12 @@ public final class HostServiceTest {
         Path dir=Files.createTempDirectory("monocle-host-stash-check-");UUID workerId=UUID.randomUUID();
         try(HostService host=new HostService(dir,"127.0.0.1",0,CREWS,30);Worker worker=new Worker(host.port(),KEY,workerId,new LinkedHashMap<>())){
             await(()->host.control(op("status")).getAsJsonArray("workers").size()==1,worker);
-            JsonObject definition=message("stash-definition");definition.addProperty("scope","test.invalid\nminecraft:the_nether");definition.add("stash",JsonParser.parseString("{\"name\":\"Depot\",\"minX\":0,\"maxX\":1,\"minY\":116,\"maxY\":116,\"minZ\":0,\"maxZ\":0}").getAsJsonObject());worker.c.send(definition.toString());
+            JsonObject definition=message("stash-definition");definition.addProperty("scope","test.invalid\nminecraft:the_nether");definition.add("stash",JsonParser.parseString("{\"name\":\"Depot\",\"homeName\":\"depot\",\"minX\":0,\"maxX\":1,\"minY\":116,\"maxY\":116,\"minZ\":0,\"maxZ\":0}").getAsJsonObject());worker.c.send(definition.toString());
             await(()->host.control(op("status")).getAsJsonArray("stashes").size()==1,worker);
             JsonObject imported=message("stash-import");imported.addProperty("scope","test.invalid\nminecraft:the_nether");imported.add("stash",definition.get("stash").deepCopy());imported.add("observation",JsonParser.parseString("{\"x\":1,\"y\":116,\"z\":0,\"status\":\"observed\",\"block\":\"minecraft:chest\",\"reason\":\"\",\"items\":{\"minecraft:obsidian\":64},\"shulkers\":[]}").getAsJsonObject());worker.c.send(imported.toString());
             await(()->host.control(op("status")).getAsJsonArray("stashes").get(0).getAsJsonObject().getAsJsonObject("items").has("minecraft:obsidian"),worker);
             JsonObject request=submit(workerId,0);UUID task=UUID.fromString(text(request,"id"));request.addProperty("name","Inspect depot");request.addProperty("script","return function(ctx) return bot.stash_scan(ctx.args) end");
-            request.add("args",JsonParser.parseString("{\"name\":\"Depot\",\"minX\":0,\"maxX\":1,\"minY\":116,\"maxY\":116,\"minZ\":0,\"maxZ\":0}").getAsJsonObject());host.control(request);
+            request.add("args",JsonParser.parseString("{\"name\":\"Depot\",\"homeName\":\"depot\",\"minX\":0,\"maxX\":1,\"minY\":116,\"maxY\":116,\"minZ\":0,\"maxZ\":0}").getAsJsonObject());host.control(request);
             await(()->state(host,task).equals("Running"),worker);
             JsonObject run=worker.checkpoints.values().iterator().next();
             JsonObject observation=JsonParser.parseString("{\"x\":0,\"y\":116,\"z\":0,\"status\":\"observed\",\"block\":\"minecraft:chest\",\"reason\":\"\",\"items\":{\"minecraft:stone\":1728},\"shulkers\":[]}").getAsJsonObject();

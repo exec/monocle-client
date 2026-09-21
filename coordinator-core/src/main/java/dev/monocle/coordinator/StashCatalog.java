@@ -8,7 +8,7 @@ import java.util.*;
 /** Shared observation store and wire validation for both kinds of host. Never treats observations as stock reservations. */
 public final class StashCatalog {
     private StashCatalog() {}
-    public static JsonObject plan(JsonObject source) {
+    public static JsonObject bounds(JsonObject source) {
         JsonObject p = source.deepCopy();
         String name = TaskWire.text(p, "name");
         if (name.isBlank() || name.length() > 48 || name.chars().anyMatch(Character::isISOControl)) throw new IllegalArgumentException("Give the stash a name of at most 48 characters");
@@ -20,13 +20,16 @@ public final class StashCatalog {
             volume *= (long) max - min + 1;
             if (volume > 1_048_576) throw new IllegalArgumentException("Limit a stash selection to 1,048,576 blocks");
         }
+        return p;
+    }
+    public static JsonObject plan(JsonObject source) {
+        JsonObject p = bounds(source);
         if (!p.has("workerCount")) p.addProperty("workerCount", 1);
         if (!p.has("workerIndex")) p.addProperty("workerIndex", 0);
         if (!p.has("lazyMode")) p.addProperty("lazyMode", true);
         if (!p.get("lazyMode").isJsonPrimitive() || !p.getAsJsonPrimitive("lazyMode").isBoolean()) throw new IllegalArgumentException("Invalid stash lazyMode");
-        if (!p.has("homeName")) p.addProperty("homeName", "");
         String home=TaskWire.text(p,"homeName").strip();
-        if (!home.isEmpty()&&!home.matches("[A-Za-z0-9_-]{1,48}")) throw new IllegalArgumentException("Home name may contain letters, numbers, underscores and dashes");
+        if (!home.matches("[A-Za-z0-9_-]{1,48}")) throw new IllegalArgumentException("Give the stash its required /home name using letters, numbers, underscores or dashes");
         p.addProperty("homeName",home);
         if (!p.has("homeWarmupTicks")) p.addProperty("homeWarmupTicks",300);
         if (!p.has("homeCooldownTicks")) p.addProperty("homeCooldownTicks",12_000);
@@ -141,6 +144,17 @@ public final class StashCatalog {
     }
     public static JsonArray remote(Path root){JsonObject cache=TaskFiles.read(root.resolve("stash-host-catalog.json"));return cache.has("stashes")?cache.getAsJsonArray("stashes"):new JsonArray();}
     public static JsonObject get(Path root,String crew,String scope,String name) {return TaskFiles.read(file(root,crew,scope,name));}
+    /** Convert a worker shortage category into one batched, catalog-backed refill request. */
+    public static JsonObject refillNeeds(JsonObject db,JsonObject inventory,int primary,String paving){
+        if(db==null||db.isEmpty()||!db.has("containers"))return null;JsonObject needs=new JsonObject();String primaryItem="";
+        for(var value:db.getAsJsonObject("containers").entrySet())for(JsonElement element:value.getValue().getAsJsonObject().getAsJsonArray("shulkers")){
+            JsonObject box=element.getAsJsonObject();if(box.has("mixed")&&box.get("mixed").getAsBoolean())continue;String item=TaskWire.text(box,"dominant");
+            int category=item.equals(paving)?0:item.endsWith("_pickaxe")?1:Set.of("minecraft:enchanted_golden_apple","minecraft:golden_apple").contains(item)?2:item.equals("minecraft:netherrack")?3:item.equals("minecraft:ender_chest")?4:-1;
+            if(category<0)continue;int missing=Math.max(0,ResourceLedger.value(inventory,"target",category)-ResourceLedger.available(inventory,category)),boxCount=box.getAsJsonObject("items").has(item)?box.getAsJsonObject("items").get(item).getAsInt():0;
+            if(missing>=boxCount&&boxCount>0)needs.addProperty(item,Math.max(needs.has(item)?needs.get(item).getAsInt():0,missing));if(category==primary&&boxCount>0)primaryItem=item;
+        }
+        if(primaryItem.isEmpty())return null;if(!needs.has(primaryItem))needs.addProperty(primaryItem,1);needs.addProperty("_primary",primaryItem);return needs;
+    }
     /** Select real, observed shulkers for one batched refill. Primary need wins; other needs join only when a full box short. */
     public static JsonArray refill(JsonObject db,JsonObject needs,String primary,int enderSlots){
         if(db==null||!db.has("containers")||needs==null||needs.isEmpty()||needs.size()>16||primary==null||!needs.has(primary)||enderSlots<0||enderSlots>54)throw new IllegalArgumentException("Invalid stash refill request");

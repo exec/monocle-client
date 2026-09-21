@@ -427,6 +427,7 @@ public final class BotScheduler {
                 bots.reportConnectionFailure("Native cleanup will retry: " + e.getMessage());
             }
         }
+        for(var preset:bots.presets()){SwarmCrew crew=bots.coordinator(preset.name());try{dispatchStashResupply(preset.name(),crew);}catch(RuntimeException e){if(lastStashRequest!=null)crew.retryStashRequest(lastStashRequest);bots.reportConnectionFailure("Stash resupply dispatch will retry: "+e.getMessage());}finally{lastStashRequest=null;}}
         for (UUID worker : bots.allMembers().stream().filter(m -> !m.id().equals(mc.player.getUUID()) && m.connected()).map(SwarmCrew.MemberView::id).toList()) {
             try { schedule(worker); }
             catch (RuntimeException e) {
@@ -440,6 +441,19 @@ public final class BotScheduler {
             for (JsonObject t : tasks.values()) summarize(t);
             if (dirty || System.nanoTime() - savedAt > 10_000_000_000L) save();
         }
+    }
+    private JsonObject lastStashRequest;
+    private void dispatchStashResupply(String crew,SwarmCrew highway){
+        JsonObject active=tasks.values().stream().filter(t->text(t,"crew").equals(crew)&&text(t,"workflowName").equals("Resupply from stash")&&!terminal(text(t,"status"))).findFirst().orElse(null);if(active!=null){highway.clearStashRequests(active.getAsJsonObject("runs").keySet());return;}
+        JsonObject request=highway.pollStashRequest();if(request==null)return;lastStashRequest=request;UUID worker=UUID.fromString(text(request,"worker"));JsonObject report=highway.workerReport(worker),state=highway.jobSnapshot();
+        if(worker.equals(mc.player.getUUID())||report==null||!report.has("inventory")||state==null){highway.failStashRequest(request);return;}
+        String scope=text(request,"scope");int split=scope.indexOf('\n'),resource=integer(request,"resource",0,4);if(split<1){highway.failStashRequest(request);return;}
+        UUID anchor=state.getAsJsonArray("activeMembers").asList().stream().map(v->UUID.fromString(v.getAsString())).filter(id->!id.equals(worker)).findFirst().orElse(null);if(anchor==null){highway.failStashRequest(request);return;}
+        for(JsonElement value:dev.monocle.coordinator.StashCatalog.list(MonocleClient.FOLDER.toPath())){
+            JsonObject summary=value.getAsJsonObject();if(!text(summary,"crew").equals(crew)||!text(summary,"scope").equals(scope))continue;JsonObject db=dev.monocle.coordinator.StashCatalog.get(MonocleClient.FOLDER.toPath(),crew,scope,text(summary,"name"));JsonObject needs=dev.monocle.coordinator.StashCatalog.refillNeeds(db,report.getAsJsonObject("inventory"),resource,text(state.getAsJsonObject("layout"),"blocks"));if(needs==null)continue;
+            JsonObject args=db.getAsJsonObject("bounds").deepCopy();args.add("needs",needs);args.addProperty("primary",text(needs,"_primary"));needs.remove("_primary");args.addProperty("enderSlots",54);args.addProperty("target",anchor.toString());args.addProperty("warmupTicks",bots.teleportWarmupSeconds.get()*20);args.addProperty("acceptDelayTicks",Math.max(0,(bots.teleportAcceptDelayMs.get()+49)/50));create("Resupply from stash","task-stash-resupply",crew,Set.of(worker),args,100,Map.of());lastStashRequest=null;return;
+        }
+        highway.failStashRequest(request);lastStashRequest=null;
     }
     private void reconcileWorker(UUID worker, JsonArray states, SwarmConnection connection) {
         Set<String> present = new HashSet<>();

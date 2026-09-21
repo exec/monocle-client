@@ -266,11 +266,11 @@ public class SchematicSelector extends Module {
         p.addProperty("minX", Math.min(pos1.getX(), pos2.getX())); p.addProperty("maxX", Math.max(pos1.getX(), pos2.getX()));
         p.addProperty("minY", Math.min(pos1.getY(), pos2.getY())); p.addProperty("maxY", Math.max(pos1.getY(), pos2.getY()));
         p.addProperty("minZ", Math.min(pos1.getZ(), pos2.getZ())); p.addProperty("maxZ", Math.max(pos1.getZ(), pos2.getZ()));
-        return dev.monocle.coordinator.StashCatalog.plan(p);
+        return dev.monocle.coordinator.StashCatalog.bounds(p);
     }
     public void selectionBounds(com.google.gson.JsonObject bounds){
         if(mc.level==null)throw new IllegalStateException("Join the stash world before editing its selection");
-        com.google.gson.JsonObject p=dev.monocle.coordinator.StashCatalog.plan(bounds);
+        com.google.gson.JsonObject p=dev.monocle.coordinator.StashCatalog.bounds(bounds);
         pos1=new BlockPos(p.get("minX").getAsInt(),p.get("minY").getAsInt(),p.get("minZ").getAsInt());pos2=new BlockPos(p.get("maxX").getAsInt(),p.get("maxY").getAsInt(),p.get("maxZ").getAsInt());selectionWorld=mc.level;setStatus("Loaded stash selection; click either corner to replace it.");
     }
     public String getStatus() { return status; }

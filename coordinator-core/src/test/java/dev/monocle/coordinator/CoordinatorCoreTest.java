@@ -211,9 +211,10 @@ public final class CoordinatorCoreTest {
         System.out.println("Coordinator core checks passed without Minecraft/Fabric/LWJGL: queues, recovery, teleport, Lua, player observations and row verification authority.");
     }
     private static void stashScan() throws Exception {
-        JsonObject p=JsonParser.parseString("{\"name\":\"Depot\",\"minX\":-2,\"maxX\":2,\"minY\":116,\"maxY\":117,\"minZ\":-1,\"maxZ\":1}").getAsJsonObject();
+        JsonObject p=JsonParser.parseString("{\"name\":\"Depot\",\"homeName\":\"main-stash_1\",\"minX\":-2,\"maxX\":2,\"minY\":116,\"maxY\":117,\"minZ\":-1,\"maxZ\":1}").getAsJsonObject();
         p=StashCatalog.plan(p);
-        assert p.get("homeName").getAsString().isEmpty()&&p.get("homeWarmupTicks").getAsInt()==300&&p.get("homeCooldownTicks").getAsInt()==12_000;
+        assert p.get("homeName").getAsString().equals("main-stash_1")&&p.get("homeWarmupTicks").getAsInt()==300&&p.get("homeCooldownTicks").getAsInt()==12_000;
+        JsonObject missingHome=p.deepCopy();missingHome.remove("homeName");rejects(()->StashCatalog.plan(missingHome));
         JsonObject home=p.deepCopy();home.addProperty("homeName","main-stash_1");home.addProperty("homeWarmupTicks",400);home.addProperty("homeCooldownTicks",24_000);assert StashCatalog.plan(home).get("homeName").getAsString().equals("main-stash_1");
         JsonObject badHome=p.deepCopy();badHome.addProperty("homeName","bad home");rejects(()->StashCatalog.plan(badHome));
         for(int workers=1;workers<=5;workers++)for(int x=-2;x<=2;x++)for(int y=116;y<=117;y++)for(int z=-1;z<=1;z++){
@@ -238,6 +239,7 @@ public final class CoordinatorCoreTest {
         rejects(()->StashCatalog.save(root,"A","server\nnether",assignment,invalid));
         invalid.addProperty("x",0);invalid.getAsJsonObject("items").addProperty("minecraft:stone",-1);rejects(()->StashCatalog.observation(assignment,invalid));
         JsonObject refillDb=JsonParser.parseString("{containers:{'1,116,2':{status:'observed',shulkers:[{slot:0,dominant:'minecraft:obsidian',mixed:false,items:{'minecraft:obsidian':1728}},{slot:1,dominant:'minecraft:golden_apple',mixed:false,items:{'minecraft:golden_apple':1728}}]},'2,116,2':{status:'observed',inferred:true,shulkers:[{slot:0,dominant:'minecraft:obsidian',mixed:false,items:{'minecraft:obsidian':1728}}]}}}").getAsJsonObject();
+        JsonObject inventory=JsonParser.parseString("{target:[3456,2,64,64,64],loose:[0,0,0,0,0],echest:[0,0,0,0,0],shulkers:[0,0,0,0,0]}").getAsJsonObject();JsonObject planned=StashCatalog.refillNeeds(refillDb,inventory,0,"minecraft:obsidian");assert planned!=null&&planned.get("_primary").getAsString().equals("minecraft:obsidian");
         JsonObject needs=JsonParser.parseString("{'minecraft:obsidian':3456,'minecraft:golden_apple':1728,'minecraft:netherrack':100}").getAsJsonObject();JsonArray refill=StashCatalog.refill(refillDb,needs,"minecraft:obsidian",27);
         assert refill.size()==2&&refill.get(0).getAsJsonObject().get("resource").getAsString().equals("minecraft:obsidian") : "Primary shortage is first; inferred stock and sub-box shortages are skipped";
         JsonObject withdrawalPlan=p.deepCopy();withdrawalPlan.addProperty("name","Withdrawals");StashCatalog.define(root,"A","server\nnether",withdrawalPlan);JsonObject withdrawalObservation=observation.deepCopy();JsonArray receipt=refill.deepCopy();receipt.forEach(v->{v.getAsJsonObject().addProperty("x",0);v.getAsJsonObject().addProperty("z",0);});StashCatalog.save(root,"A","server\nnether",withdrawalPlan,withdrawalObservation);StashCatalog.invalidateWithdrawn(root,"A","server\nnether","Withdrawals",receipt);

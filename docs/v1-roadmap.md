@@ -119,8 +119,8 @@ multi-scale placement smoke test before treating the acceptance check as closed.
 
 ## Stage 5 — 0.11.0: Autonomous logistics
 
-- [ ] Finish stash scan → home → inventory/echest refill → TPA return.
-- [ ] Respect per-worker home cooldowns and configured teleport warmups.
+- [x] Finish stash scan → home → inventory/echest refill → TPA return.
+- [x] Respect per-worker home cooldowns and configured teleport warmups.
 - [ ] Stable managed inventory that protects unrelated belongings.
 - [ ] Combine resource needs into fewer stops; reliable donor travel and pickup.
 - [ ] Explain planned retention, disposal, and resource exhaustion.

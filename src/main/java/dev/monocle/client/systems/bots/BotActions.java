@@ -53,7 +53,6 @@ public final class BotActions {
     private static final Set<String> TYPES = Set.of("Travel", "StashHunt", "StashScan", "StashResupply", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies");
     private static final Set<String> EXTERNAL = Set.of("Highway", "SetProfile");
     private static final Set<String> RESERVED_MODULES = Set.of("highway-builder", "printer-helper");
-    private static final Map<String,Long> HOME_USE=new HashMap<>();
     private final Bots bots;
     private JsonObject action, pending, originals = new JsonObject(), result;
     private String state = "Complete", detail = "Idle", dimension = "";
@@ -216,13 +215,13 @@ public final class BotActions {
     }
 
     private boolean prepareStashHome(){
-        String home=action.get("homeName").getAsString();if(home.isEmpty())return true;
+        String home=action.get("homeName").getAsString();
         long now=System.currentTimeMillis(),cooldown=action.get("homeCooldownTicks").getAsLong()*50L;
         String server=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+home.toLowerCase(Locale.ROOT);
         if(homeReadyAt==0){
-            long ready=HOME_USE.getOrDefault(server,0L)+cooldown;
+            long ready=bots.stashHomeReadyAt(server,cooldown);
             if(now<ready){detail="Waiting "+Math.max(1,(ready-now+999)/1000)+"s for /home "+home+" cooldown";return false;}
-            mc.getConnection().sendCommand("home "+home);HOME_USE.put(server,now);homeReadyAt=now+action.get("homeWarmupTicks").getAsLong()*50L;
+            mc.getConnection().sendCommand("home "+home);bots.recordStashHomeUse(server,now);homeReadyAt=now+action.get("homeWarmupTicks").getAsLong()*50L;
         }
         if(now<homeReadyAt){detail="Waiting "+Math.max(1,(homeReadyAt-now+999)/1000)+"s for /home "+home+" warmup";return false;}
         return true;

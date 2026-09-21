@@ -92,6 +92,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     private final Map<String, String> crewLabels = new LinkedHashMap<>();
     private final Map<String, String> crewKeys = new LinkedHashMap<>();
     private final Map<String, SwarmCrew> coordinators = new LinkedHashMap<>();
+    private final Map<String,Long> stashHomeUses = new LinkedHashMap<>();
     private volatile Map<String, String> credentials = Map.of();
     private String selectedCrew = "Default";
     private String workerCrewName = "";
@@ -137,6 +138,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public void disable() { close(); active = false; connectionDetail = "Offline"; }
     public void setEnabled(boolean enabled) { if (enabled) enable(); else disable(); save(); }
     public String connectionDetail() { return connectionDetail; }
+    public long stashHomeReadyAt(String route,long cooldownMillis){return stashHomeUses.getOrDefault(route,0L)+cooldownMillis;}
+    public void recordStashHomeUse(String route,long now){stashHomeUses.put(route,now);stashHomeUses.entrySet().removeIf(e->now-e.getValue()>2_592_000_000L);save();}
 
     public void hostAutoTpy(boolean enabled) { hostAutoTpy = mode.get() == Mode.Worker && enabled; }
 
@@ -784,7 +787,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             for (UUID id : preset.workers()) workers.add(StringTag.valueOf(id.toString()));
             value.put("workers", workers); crews.add(value);
         }
-        tag.put("crews", crews); return tag;
+        tag.put("crews", crews);
+        ListTag homes=new ListTag();for(var entry:stashHomeUses.entrySet()){CompoundTag value=new CompoundTag();value.putString("route",entry.getKey());value.putLong("usedAt",entry.getValue());homes.add(value);}tag.put("stashHomeUses",homes);return tag;
     }
     @Override public Bots fromTag(CompoundTag tag) {
         if (settingsLoaded && (hasJobs() || hasPersistedCrewWork())) {
@@ -800,7 +804,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         pendingJoinCrew=tag.getStringOr("pendingJoinCrew","");pendingJoinJob=tag.getStringOr("pendingJoinJob","");
         try { if(!pendingJoinJob.isEmpty())UUID.fromString(pendingJoinJob); } catch(IllegalArgumentException e){pendingJoinCrew="";pendingJoinJob="";}
         presets.clear();
-        crewKeys.clear(); crewLabels.clear(); coordinators.clear();
+        crewKeys.clear(); crewLabels.clear(); coordinators.clear();stashHomeUses.clear();
+        long now=System.currentTimeMillis();for(Tag item:tag.getListOrEmpty("stashHomeUses"))if(item instanceof CompoundTag value&&stashHomeUses.size()<128){String route=value.getStringOr("route","");long used=value.getLongOr("usedAt",0);if(!route.isBlank()&&route.length()<=256&&used>0&&used<=now+86_400_000L&&now-used<=2_592_000_000L)stashHomeUses.put(route,used);}
         Set<String> usedKeys = new HashSet<>();
         usedKeys.add(crewKey.get());
         for (Tag item : tag.getListOrEmpty("crews")) {

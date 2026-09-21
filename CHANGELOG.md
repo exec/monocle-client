@@ -2,6 +2,14 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.11.0 — Autonomous stash routes
+
+- Made a valid `/home` name mandatory for every stash definition at the shared wire/catalog boundary. Legacy definitions remain editable but cannot be scanned, exported, or used for resupply until a route is added and saved.
+- Reworked stash setup into an explicit select → validate/save → save/scan flow. Scanning now saves the definition and this worker's route before opening containers, while readiness and validation failures remain visible in the workspace.
+- Persisted `/home` cooldown use across restarts and retained each worker's individual route, warmup, and cooldown. TPA return timing continues to use the host's configured teleport settings.
+- Added catalog-backed highway shortage dispatch to the in-game host, matching the standalone host's existing stash refill → ender-chest deposit → TPA return workflow. Resource selection remains batched and authoritative observations are invalidated after confirmed withdrawal.
+- Automated checks cover mandatory route validation, refill planning, both host implementations, workflow transport, and client compilation. Live `/home`, container, and TPA behavior still requires an in-game smoke test.
+
 ## 0.10.0 — Operator HUD and notification history
 
 - Added one reusable Operator Panel HUD element with Activity, Crew, Supplies, Navigation, and Notifications presets. Healthy work stays compact; blocked work exposes the actionable module or crew detail.

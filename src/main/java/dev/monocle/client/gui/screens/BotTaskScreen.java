@@ -140,12 +140,12 @@ public final class BotTaskScreen extends WindowScreen {
                 try { selected=dev.monocle.client.systems.modules.Modules.get().get(dev.monocle.client.systems.modules.world.SchematicSelector.class).selectionBounds("Main stash"); }
                 catch(RuntimeException e){selected=new JsonObject();for(String axis:List.of("X","Y","Z")){int coordinate=mc.player==null?0:axis.equals("X")?mc.player.getBlockX():axis.equals("Y")?mc.player.getBlockY():mc.player.getBlockZ();selected.addProperty("min"+axis,coordinate);selected.addProperty("max"+axis,coordinate);}}
                 fields.add(theme.label("Stash name"));WTextBox name=fields.add(theme.textBox("Main stash")).expandX().widget();fields.row();
-                fields.add(theme.label("Home name"));WTextBox home=fields.add(theme.textBox("")).expandX().widget();fields.row();
+                fields.add(theme.label("Home name (required)"));WTextBox home=fields.add(theme.textBox("")).expandX().widget();fields.row();
                 WIntEdit warmup=integer(fields,"Home warmup (seconds)",15,0,3600),cooldown=integer(fields,"Home cooldown (minutes)",10,0,1440);
                 Map<String,WIntEdit> bounds=new LinkedHashMap<>();
                 for(String axis:List.of("X","Y","Z"))for(String end:List.of("min","max")){String key=end+axis;int limit=axis.equals("Y")?2048:29_900_000;bounds.put(key,integer(fields,key,selected.get(key).getAsInt(),-limit,limit));}
                 parameters=()->{JsonObject p=new JsonObject();p.addProperty("name",name.get());p.addProperty("homeName",home.get());p.addProperty("homeWarmupTicks",warmup.get()*20);p.addProperty("homeCooldownTicks",cooldown.get()*1200);bounds.forEach((key,value)->p.addProperty(key,value.get()));return dev.monocle.coordinator.StashCatalog.plan(p);};
-                arguments.add(theme.label("Optional Home name runs /home [name] before scanning. Bounds copy the current wooden-pickaxe selection. Workers inspect disjoint containers; no items or terrain are changed.",contentWidth-20));
+                arguments.add(theme.label("The stash's /home name is required. Bounds copy the current wooden-pickaxe selection. Workers inspect disjoint containers; no items or terrain are changed.",contentWidth-20));
             }
             case "task-stash-hunt" -> {
                 int ox = mc.player == null ? 0 : mc.player.getBlockX(), oz = mc.player == null ? 0 : mc.player.getBlockZ();

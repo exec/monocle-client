@@ -16,49 +16,54 @@ import meteordevelopment.orbit.EventHandler;
 
 /** Experimental discovery only: no withdrawal, inventory management, container breaking or teleport commands. */
 public final class StashManager extends Module {
-    private final Setting<String> stashName=settings.getDefaultGroup().add(new StringSetting.Builder().name("stash-name").description("Named stash in this world; later scans update observations at each container coordinate.").defaultValue("Main stash").build());
-    private final Setting<Boolean> exportToHost=settings.getDefaultGroup().add(new BoolSetting.Builder().name("export-to-connected-host").description("Publish this stash name and cuboid to the authenticated Workers host so crews can scan it. Item observations are still sent only by assigned scans.").defaultValue(true).build());
-    private final Setting<Boolean> lazyMode=settings.getDefaultGroup().add(new BoolSetting.Builder().name("lazy-mode").description("Scan the bottom and top storage layers first. If both are uniformly full and homogeneous, estimate matching containers between them. Inferred totals are labeled.").defaultValue(true).build());
-    private final Setting<String> homeName=settings.getDefaultGroup().add(new StringSetting.Builder().name("home-name").description("Optional server home used before scanning. Runs /home [name]; leave blank to scan from the current position.").defaultValue("").build());
-    private final Setting<Integer> homeWarmup=settings.getDefaultGroup().add(new IntSetting.Builder().name("home-warmup").description("Seconds to wait after /home before scanning.").defaultValue(15).range(0,3600).sliderRange(0,60).build());
-    private final Setting<Integer> homeCooldown=settings.getDefaultGroup().add(new IntSetting.Builder().name("home-cooldown").description("Minutes before this home may be requested again.").defaultValue(10).range(0,1440).sliderRange(0,60).build());
+    private final SettingGroup definition=settings.getDefaultGroup(),route=settings.createGroup("Route"),scanning=settings.createGroup("Scanning");
+    private final Setting<String> stashName=definition.add(new StringSetting.Builder().name("stash-name").description("Named stash in this world; later scans update observations at each container coordinate.").defaultValue("Main stash").build());
+    private final Setting<String> homeName=route.add(new StringSetting.Builder().name("home-name").description("Required server /home name used to reach this stash. A definition cannot be saved or scanned without it.").defaultValue("").build());
+    private final Setting<Integer> homeWarmup=route.add(new IntSetting.Builder().name("home-warmup").description("Seconds to wait after /home before scanning.").defaultValue(15).range(0,3600).sliderRange(0,60).build());
+    private final Setting<Integer> homeCooldown=route.add(new IntSetting.Builder().name("home-cooldown").description("Minutes before this home may be requested again.").defaultValue(10).range(0,1440).sliderRange(0,60).build());
+    private final Setting<Boolean> exportToHost=scanning.add(new BoolSetting.Builder().name("export-to-connected-host").description("Publish this stash definition and observations to the authenticated Workers host.").defaultValue(true).build());
+    private final Setting<Boolean> lazyMode=scanning.add(new BoolSetting.Builder().name("lazy-mode").description("Scan the bottom and top storage layers first. If both are uniformly full and homogeneous, estimate matching containers between them. Inferred totals are labeled.").defaultValue(true).build());
     private BotActions scanner;
     private JsonObject exportedPlan;
     private String exportedScope="";
-    private String status="Experimental read-only scanner. Select a cuboid, then start scanning.";
+    private String status="Enter the required /home name, select both corners, then save or scan.";
     private WLabel label;
     public StashManager(){super(Categories.World,"stash-manager","Experimental: inspect a selected stash, classify supply shulkers and save resource observations. Solo or bot workflow; never moves items.");}
     public boolean isScanning(){return scanner!=null;}
+    private String scope(){if(mc.level==null)throw new IllegalStateException("Join the stash world first");return (mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();}
+    private JsonObject definitionPlan(){
+        JsonObject p=Modules.get().get(SchematicSelector.class).selectionBounds(stashName.get());p.addProperty("type","StashScan");p.addProperty("lazyMode",lazyMode.get());p.addProperty("homeName",homeName.get());p.addProperty("homeWarmupTicks",homeWarmup.get()*20);p.addProperty("homeCooldownTicks",homeCooldown.get()*1200);return StashCatalog.plan(p);
+    }
+    public String definitionReadiness(){try{JsonObject p=definitionPlan();return "Ready · /home "+p.get("homeName").getAsString()+" · cuboid validated";}catch(RuntimeException e){return "Not ready · "+e.getMessage();}}
+    private JsonObject saveDefinition(boolean sync){
+        JsonObject p=definitionPlan();String scope=scope(),worker=mc.player.getUUID().toString();StashCatalog.define(MonocleClient.FOLDER.toPath(),"Local",scope,p,worker);
+        if(sync&&exportToHost.get()){JsonObject export=dev.monocle.coordinator.TaskWire.message("stash-definition");export.add("stash",p.deepCopy());export.addProperty("scope",scope);if(!Bots.get().sendToHost(export))warning("Saved locally; no Workers host is connected.");}
+        return p;
+    }
     public void startScan(){
         try{
             if(scanner!=null)throw new IllegalStateException("Stop the current scan first");
             exportedPlan=null;exportedScope="";
             if(Bots.get().tasks().hasWork()&&Bots.get().isWorker())throw new IllegalStateException("Pause or cancel the worker job before scanning locally");
-            SchematicSelector selector=Modules.get().get(SchematicSelector.class);
-            JsonObject p=selector.selectionBounds(stashName.get());p.addProperty("type","StashScan");p.addProperty("lazyMode",lazyMode.get());
-            p.addProperty("homeName",homeName.get());p.addProperty("homeWarmupTicks",homeWarmup.get()*20);p.addProperty("homeCooldownTicks",homeCooldown.get()*1200);
+            SchematicSelector selector=Modules.get().get(SchematicSelector.class);JsonObject p=saveDefinition(true);
             if(exportToHost.get()){
-                exportedPlan=p.deepCopy();exportedScope=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();
-                JsonObject export=dev.monocle.coordinator.TaskWire.message("stash-definition");export.add("stash",exportedPlan.deepCopy());export.addProperty("scope",exportedScope);
-                if(!Bots.get().sendToHost(export))warning("Stash definition stayed local because no Workers host is connected.");
+                exportedPlan=p.deepCopy();exportedScope=scope();
             }
             selector.disable(); if(!isActive())enable();
             scanner=new BotActions(Bots.get());scanner.start(p);setStatus("Scan started; no items will be moved.");
         }catch(RuntimeException e){setStatus(e.getMessage());error("%s",status);}
     }
     public void exportSelection(){
-        SchematicSelector selector=Modules.get().get(SchematicSelector.class);JsonObject p=selector.selectionBounds(stashName.get());p.addProperty("type","StashScan");p.addProperty("lazyMode",lazyMode.get());p.addProperty("homeName",homeName.get());p.addProperty("homeWarmupTicks",homeWarmup.get()*20);p.addProperty("homeCooldownTicks",homeCooldown.get()*1200);
-        String scope=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();StashCatalog.define(MonocleClient.FOLDER.toPath(),"Local",scope,p);
-        JsonObject export=dev.monocle.coordinator.TaskWire.message("stash-definition");export.add("stash",p);export.addProperty("scope",scope);if(!Bots.get().sendToHost(export))warning("Saved locally; no Workers host is connected.");setStatus("Stash definition saved and offered to the connected host.");
+        saveDefinition(true);setStatus("Stash definition validated and saved with its worker /home route.");
     }
     public void stopScan(){if(scanner!=null){scanner.stop();scanner=null;}exportedPlan=null;exportedScope="";setStatus("Scan stopped; saved observations retained.");}
     @Override public void onDeactivate(){stopScan();label=null;}
     public String status(){return status;}
     public JsonArray catalog(){JsonArray all=StashCatalog.list(MonocleClient.FOLDER.toPath());for(var value:StashCatalog.remote(MonocleClient.FOLDER.toPath()))all.add(value.deepCopy());return all;}
     public void editDefinition(JsonObject stash,boolean reselect){
-        JsonObject p=StashCatalog.plan(stash.getAsJsonObject("bounds"));stashName.set(stash.get("name").getAsString());lazyMode.set(p.get("lazyMode").getAsBoolean());
+        JsonObject p=StashCatalog.bounds(stash.getAsJsonObject("bounds"));stashName.set(stash.get("name").getAsString());lazyMode.set(!p.has("lazyMode")||p.get("lazyMode").getAsBoolean());
         JsonObject route=p;if(stash.has("homes")&&mc.player!=null&&stash.getAsJsonObject("homes").has(mc.player.getUUID().toString()))route=stash.getAsJsonObject("homes").getAsJsonObject(mc.player.getUUID().toString());
-        homeName.set(route.has("name")?route.get("name").getAsString():p.get("homeName").getAsString());homeWarmup.set((route.has("warmupTicks")?route.get("warmupTicks"):p.get("homeWarmupTicks")).getAsInt()/20);homeCooldown.set((route.has("cooldownTicks")?route.get("cooldownTicks"):p.get("homeCooldownTicks")).getAsInt()/1200);
+        homeName.set(route.has("name")?route.get("name").getAsString():route.has("homeName")?route.get("homeName").getAsString():"");homeWarmup.set((route.has("warmupTicks")?route.get("warmupTicks").getAsInt():p.has("homeWarmupTicks")?p.get("homeWarmupTicks").getAsInt():300)/20);homeCooldown.set((route.has("cooldownTicks")?route.get("cooldownTicks").getAsInt():p.has("homeCooldownTicks")?p.get("homeCooldownTicks").getAsInt():12_000)/1200);
         SchematicSelector selector=Modules.get().get(SchematicSelector.class);selector.selectionBounds(p);if(reselect){selector.clearSelection();selector.equipWand();}setStatus(reselect?"Reselect both corners, then save the definition.":"Definition loaded for editing.");
     }
     private void setStatus(String text){status=text;if(label!=null)label.set(text);}
