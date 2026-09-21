@@ -2,6 +2,12 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.11.3 — Render-distance repair survey
+
+- Repair HUD now scans the complete loaded road out to render distance and reports the next defect type, distance, and coordinates, or the verified clean horizon.
+- Clean-stretch Repair flight now uses ElytraFly's bounded high-speed survey lease. A configured speed of 5 blocks/tick yields 100 blocks/sec while each movement step remains collision-, footing-, chunk-, and server-verification-checked.
+- Repair flights remain capped to 126-block legs and chain as chunks load; normal building, printer, supply, and crew travel retain their conservative speed ceilings.
+
 ## 0.11.2 — Repair transit
 
 - Solo Repair jobs now scan the loaded highway pattern and use the existing ElytraFly autopilot to cross clean stretches, landing immediately before the next defective row.

@@ -784,6 +784,11 @@ public class HighwayBuilder extends Module {
     private int repairFlightRows, repairFlightLaunchTick = -1, repairFlightRetryTick, repairFlightProgressTick;
     private boolean repairFlightLanding;
     private boolean repairFlightEnabledFly;
+    private record RepairIssue(boolean loaded, String kind, BlockPos position) {}
+    private record RepairScan(int cleanRows, RepairIssue issue, boolean jobEnd) {}
+    private RepairScan repairScan;
+    private BlockPos repairScanOrigin;
+    private int repairScanTick = -1000;
     private boolean crewTravelToSupply, crewTravelEnabledFly, endingJob, crewToggledOff;
     private int crewLaunchTick = -1, crewTravelTick = -1;
     private int crewRunUntil = -1;
@@ -1563,28 +1568,60 @@ public class HighwayBuilder extends Module {
         tickCrewTravel();
     }
 
-    static int repairSkipRows(int minimum, int maximum, java.util.function.IntPredicate resolved) {
-        int rows = 0;
-        while (rows < maximum && resolved.test(rows)) rows++;
-        return rows >= minimum ? rows : 0;
-    }
-
     static int reachedRepairRows(double projection, int planned) {
         return Math.clamp((int) Math.floor(projection + .1), 0, planned);
     }
 
-    private boolean repairSectionResolved(int offset) {
+    private RepairIssue repairSectionIssue(int offset) {
         BlockPos origin = workOrigin.offset(dir.offsetX * offset, 0, dir.offsetZ * offset);
         for (HighwayPlan.Cell cell : HighwayPlan.front(dir.offsetX, dir.offsetZ, width.get(), height.get())) {
             BlockPos pos = origin.offset(cell.x(), cell.y(), cell.z());
+            if (!mc.level.getChunkSource().hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) return new RepairIssue(false, "", pos);
             BlockState state = crewVerifiedState(pos);
-            if (state == null || !crewClearanceResolved(state, mc.level, pos)) return false;
+            if (state == null) return new RepairIssue(true, "server verification", pos);
+            if (!crewClearanceResolved(state, mc.level, pos)) return new RepairIssue(true, "passage obstruction", pos);
         }
         for (PavingTarget target : plannedPavingTargets(offset)) {
+            BlockPos pos = target.position();
+            if (!mc.level.getChunkSource().hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) return new RepairIssue(false, "", pos);
             BlockState state = crewVerifiedState(target.position());
-            if (state == null || !crewPavingResolved(state, false, blocksToPlace.get())) return false;
+            if (state == null) return new RepairIssue(true, "server verification", pos);
+            if (!crewPavingResolved(state, false, blocksToPlace.get()))
+                return new RepairIssue(true, target.filler() ? "support gap" : pos.getY() < workOrigin.getY() ? "floor gap" : "railing gap", pos);
         }
-        return true;
+        return null;
+    }
+
+    private RepairScan repairScan() {
+        if (!controlsPlayer() || operation.get() != Operation.Repair || dir.diagonal || workOrigin == null) return null;
+        int tick = mc.player.tickCount;
+        if (repairScan != null && workOrigin.equals(repairScanOrigin) && tick >= repairScanTick && tick - repairScanTick < 20) return repairScan;
+        int jobLimit = testLength > 0 ? testLength : length.get();
+        int remaining = jobLimit <= 0 ? Integer.MAX_VALUE : Math.max(0, (int) Math.floor(jobLimit - completedDistance));
+        int maximum = Math.min(Math.max(16, Utils.getRenderDistance() * 16), Math.min(1024, remaining));
+        int clean = 0;
+        RepairIssue issue = null;
+        while (clean < maximum) {
+            RepairIssue next = repairSectionIssue(clean);
+            if (next != null) { if (next.loaded()) issue = next; break; }
+            clean++;
+        }
+        boolean end = jobLimit > 0 && clean >= remaining;
+        repairScanOrigin = workOrigin.immutable(); repairScanTick = tick;
+        return repairScan = new RepairScan(clean, issue, end);
+    }
+
+    public String getRepairScanStatus() {
+        RepairScan scan = repairScan();
+        if (scan == null) return "Repair scan unavailable";
+        if (scan.issue() != null) return "Next defect: " + scan.issue().kind() + " in " + (scan.cleanRows() + 1) + " blocks at " + scan.issue().position().toShortString();
+        if (scan.jobEnd()) return "Verified clean to the end of this repair job (" + scan.cleanRows() + " blocks)";
+        return "No defects in " + scan.cleanRows() + " loaded blocks (" + Math.ceilDiv(scan.cleanRows(), 16) + " chunks)";
+    }
+
+    static Vec3 repairFlightVelocity(Vec3 from, Vec3 to, double speed) {
+        Vec3 delta = to.subtract(from);
+        return delta.length() <= speed ? delta : delta.normalize().scale(speed);
     }
 
     private boolean repairFlightClear(AABB box) {
@@ -1613,11 +1650,10 @@ public class HighwayBuilder extends Module {
         ElytraFly fly = Modules.get().get(ElytraFly.class);
         boolean hasGlider = usableCrewGlider(mc.player.getItemBySlot(EquipmentSlot.CHEST))
             || mc.player.getInventory().getNonEquipmentItems().stream().anyMatch(HighwayBuilder::usableCrewGlider);
-        if (fly.flightMode.get() != ElytraFlightModes.Vanilla || !hasGlider) { repairFlightRetryTick = mc.player.tickCount + 200; return false; }
-        int limit = testLength > 0 ? testLength : length.get();
-        int remaining = limit <= 0 ? PrinterFlight.MAX_SEGMENT - 2
-            : Math.min(PrinterFlight.MAX_SEGMENT - 2, Math.max(0, (int) Math.floor(limit - completedDistance)));
-        int rows = repairSkipRows(repairFlightMinimum.get(), remaining, this::repairSectionResolved);
+        if (fly.flightMode.get() != ElytraFlightModes.Vanilla || fly.horizontalSpeed.get() <= 0 || !hasGlider) { repairFlightRetryTick = mc.player.tickCount + 200; return false; }
+        RepairScan scan = repairScan();
+        int rows = scan == null ? 0 : Math.min(PrinterFlight.MAX_SEGMENT - 2, scan.cleanRows());
+        if (rows < repairFlightMinimum.get()) rows = 0;
         repairFlightRetryTick = mc.player.tickCount + 20;
         if (rows == 0) return false;
         BlockPos target = workOrigin.offset(dir.offsetX * rows, 0, dir.offsetZ * rows);
@@ -1658,10 +1694,10 @@ public class HighwayBuilder extends Module {
         if (!fly.isActive()) { fly.enable(); repairFlightEnabledFly = true; }
         if (mc.player.isFallFlying()) {
             if (from.distanceToSqr(target) <= 2.25) { repairFlightLanding = true; return true; }
-            Vec3 velocity = PrinterFlight.safeVelocity(from, target.add(0, .5, 0), crewFlightSpeed(fly.horizontalSpeed.get()),
-                mc.player.getBbWidth() + .12, Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear);
-            if (velocity.lengthSqr() == 0) repairFlightLanding = true;
-            else fly.requestAutopilot(velocity);
+            Vec3 velocity = repairFlightVelocity(from, target.add(0, .5, 0), Math.min(6, fly.horizontalSpeed.get()));
+            if (!PrinterFlight.segmentClear(from, from.add(velocity), mc.player.getBbWidth() + .12,
+                Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear)) repairFlightLanding = true;
+            else fly.requestSurveyAutopilot(velocity);
             status = "Flying over " + repairFlightRows + " verified repair blocks"; return true;
         }
         fly.requestAutopilot(Vec3.ZERO);
@@ -2256,7 +2292,7 @@ public class HighwayBuilder extends Module {
         var chunk=event.chunk().getPos();
         long along=((long)chunk.x()*16+8-workOrigin.getX())*dir.offsetX+((long)chunk.z()*16+8-workOrigin.getZ())*dir.offsetZ;
         long across=((long)chunk.x()*16+8-workOrigin.getX())*dir.offsetZ-((long)chunk.z()*16+8-workOrigin.getZ())*dir.offsetX;
-        if(along>=-16&&Math.abs(across)<=16)forecastDirty=true;
+        if(along>=-16&&Math.abs(across)<=16){forecastDirty=true;repairScan=null;}
     }
     public JsonObject roadPrediction() {
         try { return computeRoadPrediction(); } catch(RuntimeException unavailable) { forecastOrigin=null;return null; } // Advisory telemetry cannot stop building.
@@ -2277,6 +2313,7 @@ public class HighwayBuilder extends Module {
         result.addProperty("ageTicks",Math.max(0,tick-forecastTick));return result;
     }
     public String getRoadPrediction() {
+        if(operation.get()==Operation.Repair)return getRepairScanStatus();
         JsonObject forecast=roadPrediction();if(forecast==null||forecast.get("nextBlocks").getAsInt()==0)return "Visible-road estimate unavailable";
         return String.format(java.util.Locale.ROOT,"Estimated %.1f blocks/sec for next %d blocks",forecast.get("blocksPerSecond").getAsDouble(),forecast.get("nextBlocks").getAsInt());
     }
@@ -4381,6 +4418,10 @@ public class HighwayBuilder extends Module {
         double x = 8 + text.getWidth(prefix);
         text.render(health, x, 8, isHudHealthy() ? new Color(100, 220, 145) : new Color(245, 187, 90), true);
         text.render(" · " + Math.round(hud.distance()) + " blocks · " + getPavingRate(), x + text.getWidth(health), 8, Color.WHITE, true);
+        if (operation.get() == Operation.Repair) {
+            String scan = getRepairScanStatus();
+            text.render(scan, 8, 10 + text.getHeight(), scan.startsWith("Next defect") ? new Color(245, 187, 90) : new Color(100, 220, 145), true);
+        }
         text.end();
         if (!controlsPlayer() || !renderMine.get()) return;
 
