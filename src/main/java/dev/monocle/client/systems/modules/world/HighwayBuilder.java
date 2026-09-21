@@ -781,6 +781,7 @@ public class HighwayBuilder extends Module {
     private final Set<BlockPos> crewTriedSupplySites = new HashSet<>();
     private BlockPos repairFlightStart, repairFlightTarget;
     private Vec3 repairFlightProgress;
+    private double repairFlightSpeed;
     private int repairFlightRows, repairFlightLaunchTick = -1, repairFlightRetryTick, repairFlightProgressTick;
     private boolean repairFlightLanding;
     private boolean repairFlightEnabledFly;
@@ -1625,6 +1626,10 @@ public class HighwayBuilder extends Module {
         return delta.length() <= speed ? delta : delta.normalize().scale(speed);
     }
 
+    static double repairFlightSpeed(double current, double target) {
+        return Math.min(target, Math.max(0, current) + .15); // ElytraFly acceleration step 1.5.
+    }
+
     private boolean repairFlightClear(AABB box) {
         if (box.minY < workOrigin.getY() - .05 || box.maxY > mc.level.getMaxY() + 1
             || !PrinterFlight.loaded(box, mc.level.getChunkSource()::hasChunk)) return false;
@@ -1662,7 +1667,7 @@ public class HighwayBuilder extends Module {
             mc.player.getBbWidth() + .12, 1.8, this::repairFlightClear)) return false;
         repairFlightStart = workOrigin.immutable(); repairFlightTarget = target; repairFlightRows = rows;
         repairFlightProgress = mc.player.position(); repairFlightProgressTick = mc.player.tickCount;
-        repairFlightLaunchTick = -1; repairFlightLanding = false;
+        repairFlightLaunchTick = -1; repairFlightLanding = false; repairFlightSpeed = 0;
         return tickRepairFlight();
     }
 
@@ -1695,7 +1700,8 @@ public class HighwayBuilder extends Module {
         if (!fly.isActive()) { fly.enable(); repairFlightEnabledFly = true; }
         if (mc.player.isFallFlying()) {
             if (from.distanceToSqr(target) <= 2.25) { repairFlightLanding = true; return true; }
-            Vec3 velocity = repairFlightVelocity(from, target.add(0, .5, 0), Math.min(6, fly.horizontalSpeed.get()));
+            repairFlightSpeed = repairFlightSpeed(repairFlightSpeed, Math.min(6, fly.horizontalSpeed.get()));
+            Vec3 velocity = repairFlightVelocity(from, target.add(0, .5, 0), repairFlightSpeed);
             if (!PrinterFlight.segmentClear(from, from.add(velocity), mc.player.getBbWidth() + .12,
                 Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear)) repairFlightLanding = true;
             else fly.requestSurveyAutopilot(velocity);
@@ -1739,7 +1745,7 @@ public class HighwayBuilder extends Module {
         if (fly != null) fly.clearAutopilot();
         if (repairFlightEnabledFly && fly != null && fly.isActive() && Utils.canUpdate() && mc.player.onGround()) fly.disable();
         repairFlightStart = repairFlightTarget = null; repairFlightProgress = null; repairFlightRows = 0;
-        repairFlightLaunchTick = -1; repairFlightLanding = repairFlightEnabledFly = false;
+        repairFlightLaunchTick = -1; repairFlightLanding = repairFlightEnabledFly = false; repairFlightSpeed = 0;
     }
 
     private void stopCrewFlight() {
