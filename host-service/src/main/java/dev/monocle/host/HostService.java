@@ -385,6 +385,24 @@ public final class HostService implements AutoCloseable {
         }
         JsonObject active = eligible.stream().filter(task -> task.getAsJsonObject("runs").has(peer.id.toString()) && text(run(task, peer.id), "id").equals(peer.current)).findFirst().orElse(null);
         if (active == null && !peer.current.isEmpty()) return; // Foreign/unknown work requires manual cleanup on the worker.
+        for(JsonObject task:eligible) {
+            if(!task.getAsJsonObject("runs").has(peer.id.toString())||flag(task,"cancelled")||QueuePolicy.terminal(text(task,"status")))continue;
+            HighwayHost highway=highways.get(peer.crew);
+            if(!ownsHighway(task,highway)||!highway.assigned())continue;
+            JsonObject r=run(task,peer.id);
+            if(QueuePolicy.detached(task,peer.id)&&!highway.borrowReady(peer.id)) {
+                String reason=highway.borrowingReason(Set.of(peer.id));
+                if(!highway.reservedReturns().contains(peer.id)&&reason==null)highway.requestBorrow(Set.of(peer.id));
+                r.addProperty("detail",reason==null?"Waiting for safe withdrawal acknowledgement":reason);
+                return;
+            }
+            if(highway.reservedReturns().contains(peer.id)&&!QueuePolicy.detached(task,peer.id)) {
+                if(!highway.borrowReady(peer.id))return;
+                if(!flag(task,"paused")&&nativeReady(peer.crew,peer.id)) {
+                    try {highway.addWorker(peer.id);}catch(IllegalStateException e){r.addProperty("detail","Rejoin waiting: "+e.getMessage());}
+                }
+            }
+        }
         if (active != null && !flag(active, "cancelled") && !flag(active, "paused")) {
             JsonObject config = TaskWire.configurationToSend(run(active, peer.id), System.currentTimeMillis());
             if (config != null) c.send(config.toString());
@@ -684,6 +702,19 @@ public final class HostService implements AutoCloseable {
                     task.addProperty("publicJoin",request.get("enabled").getAsBoolean());
                 }
                 case "configure" -> TaskWire.configure(task, request.has("worker") ? UUID.fromString(text(request, "worker")) : null, request.getAsJsonObject("modules"));
+                case "detach" -> {
+                    UUID worker=UUID.fromString(text(request,"worker"));
+                    if(!task.getAsJsonObject("runs").has(worker.toString()))throw new IllegalArgumentException("Worker is not assigned to this job");
+                    if(!request.has("detached")||!request.get("detached").isJsonPrimitive()||!request.getAsJsonPrimitive("detached").isBoolean())throw new IllegalArgumentException("Specify detached true or false");
+                    if(!task.getAsJsonObject("package").getAsJsonObject("highways").isEmpty()) {
+                        HighwayHost highway=highways.get(text(task,"crew"));
+                        if(!task.has("nativeDefinition")||!ownsHighway(task,highway)||!highway.independentSupplies())throw new IllegalStateException("Wait for the independent highway to start, or pause the whole job");
+                        if(request.get("detached").getAsBoolean()&&!QueuePolicy.detached(task,worker)&&!highway.reservedReturns().contains(worker)) {
+                            String reason=highway.borrowingReason(Set.of(worker));if(reason!=null)throw new IllegalStateException(reason);
+                        }
+                    }
+                    QueuePolicy.detach(task,worker,request.get("detached").getAsBoolean());
+                }
                 case "pause" -> QueuePolicy.pause(task);
                 case "resume" -> {
                     HighwayHost highway=highways.get(text(task,"crew"));
@@ -889,6 +920,7 @@ public final class HostService implements AutoCloseable {
             JsonObject view = task.deepCopy(); view.remove("package"); view.remove("requestHash"); view.remove("args");
             if(!view.has("nativeDefinition") && view.has("highwayDefinition"))view.add("nativeDefinition",view.get("highwayDefinition").deepCopy());
             view.addProperty("cleanupPending", QueuePolicy.terminal(text(task,"status")) && !BotHistory.taskFinished(task, task.has("nativeDefinition")));
+            view.addProperty("operatorGuidance",QueuePolicy.guidance(task));
             (QueuePolicy.terminal(text(task, "status")) ? history : active).add(view);
         }
         JsonObject nativeHighways=new JsonObject();highways.forEach((crew,highway)->nativeHighways.add(crew,highway.status()));result.add("highways",nativeHighways);

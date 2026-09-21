@@ -328,6 +328,23 @@ public final class CoordinatorCoreTest {
     }
 
     private static void dispatch() {
+        JsonObject detached=task("detached",0);
+        detached.getAsJsonObject("runs").add(OTHER.toString(),run(detached).deepCopy());
+        run(detached).addProperty("status","Running");
+        QueuePolicy.detach(detached,WORKER,true);
+        assert QueuePolicy.choose(List.of(detached),WORKER)==null;
+        assert QueuePolicy.choose(List.of(detached),OTHER)==detached;
+        assert QueuePolicy.dispatch(detached,null,WORKER).command().equals("pause");
+        run(detached).addProperty("status","Suspending");run(detached).addProperty("requestedStatus","Suspended");
+        QueuePolicy.pause(detached);QueuePolicy.resume(detached);
+        assert QueuePolicy.detached(checkpoint(detached),WORKER) : "Global resume and persistence preserve individual intent";
+        assert QueuePolicy.dispatch(detached,detached,WORKER).command().isEmpty();
+        QueuePolicy.detach(detached,WORKER,false);
+        assert QueuePolicy.dispatch(detached,detached,WORKER).command().equals("resume");
+        rejects(()->QueuePolicy.detach(detached,UUID.randomUUID(),true));
+        QueuePolicy.cancel(detached);
+        assert QueuePolicy.dispatch(detached,null,WORKER).command().equals("cancel");
+        rejects(()->QueuePolicy.detach(detached,WORKER,false));
         JsonObject older = task("older", 0), urgent = task("urgent", 10);
         assert QueuePolicy.dispatch(null, older, WORKER).command().equals("transfer");
         run(older).addProperty("status", "Ready");

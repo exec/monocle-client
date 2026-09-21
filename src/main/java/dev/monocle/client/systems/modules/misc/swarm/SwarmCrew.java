@@ -539,26 +539,8 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         return rowCenter(safeProgress());
     }
     public boolean canBorrow(Set<UUID> workers) { return borrowBlocker(workers).isEmpty(); }
-    public String borrowingReason(Set<UUID> workers) { String reason = borrowBlocker(workers); return reason.isEmpty() ? null : reason; }
     public String borrowBlocker(Set<UUID> workers) {
-        if (!swarm.isHost() || !assigned() || stopped || !live() || !allMembersConnected() || !begun || phase.equals("complete")) return "Choose a connected, running highway job.";
-        if (regrouping || !borrowingWorkers.isEmpty()) return "Wait for the current membership handoff.";
-        if (ticks < regroupRetryAfter) return "Allow the current lanes to make progress before retrying the handoff.";
-        if (detachedMember() != null) return "Wait for the detached supply worker to return.";
-        for (UUID member : activeMembers()) {
-            JsonObject report = currentReport(member);
-            if (report == null || !str(assignment, "scope").equals(str(report, "scope")) || !report.has("x")
-                || !joinNearby(returnRendezvous(), new BlockPos(num(report, "x"), num(report, "y"), num(report, "z"))))
-                return "Every active worker must report a fresh, on-site position before handing off the highway.";
-        }
-        return borrowingBlocker(assignment, workers, localParticipant ? me() : null);
-    }
-    public void requestBorrow(Set<UUID> workers) {
-        String blocker = borrowBlocker(workers);
-        if (!blocker.isEmpty()) throw new IllegalStateException(blocker);
-        borrowingWorkers.addAll(workers);
-        broadcast(jobMessage("regroup"));
-        swarm.info("Safely handing off %d workers; confirming road work and recovering supply containers first.", workers.size());
+        return Objects.requireNonNullElse(borrowingReason(workers), "");
     }
     public void requestReturn(UUID worker) {
         if (!borrowReady(worker)) throw new IllegalStateException("This worker has no confirmed return reservation.");

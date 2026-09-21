@@ -13,7 +13,7 @@ const headings = {
 };
 let token = '', demo = false, snapshot = null, page = 'overview', refreshedAt = 0, refreshing = false, polling;
 let busy = false, packaged = null, pendingSubmission = null, inspecting = null;
-let presetList=[],reviewedSubmission=null;
+let presetList=[],reviewedSubmission=null,lastLaunch=null,inspectionKey='';
 let generation = 0;
 const WAIT = 'return function(ctx)\n if ctx.state.waited then return bot.done() end\n ctx.state.waited=true\n return bot.wait(200)\nend';
 const STASH_SCAN = 'return function(ctx)\n if ctx.state.started then return bot.done(ctx.result) end\n ctx.state.started=true\n return bot.stash_scan(ctx.args)\nend';
@@ -173,7 +173,8 @@ function render() {
     if (snapshot.lastConnectionError || snapshot.telemetryError) notice(snapshot.lastConnectionError || snapshot.telemetryError);
   }
   if (focused) $('content').querySelector('[data-key="' + CSS.escape(focused) + '"]')?.focus({ preventScroll: true });
-  if ($('inspect-dialog').open) { updateChat();document.querySelectorAll('.managed-control').forEach(n=>{n.disabled=!writable();});document.querySelectorAll('.guided-settings').forEach(n=>n.updateStatus?.()); }
+  if ($('inspect-dialog').open) {if(inspecting?.shape!==inspectionShape())showInspection();updateChat();document.querySelectorAll('.managed-control').forEach(n=>{n.disabled=!writable();});document.querySelectorAll('.guided-settings').forEach(n=>n.updateStatus?.()); }
+  document.querySelectorAll('.operator-live').forEach(n=>n.updateStatus?.());
 }
 function progress(node, value, total) {
   const percent = Math.max(0, Math.min(100, 100 * (value || 0) / Math.max(1, total || 1)));
@@ -262,20 +263,23 @@ function workerTable(workers) {
   table.append(body); panel.append(table); return panel;
 }
 function jobActions(task) {
-  const actions = el('div', 'actions'); const dead = terminal(task.status);
-  if (!dead) {
-    const paused = !!task.paused || /paused|inspection|suspended/i.test(task.status);
-    actions.append(button(paused ? 'Resume' : 'Pause', () => control({ op: paused ? 'resume' : 'pause', id: task.id }), !writable(), '', task.id + '-pause'));
-    if(task.nativeDefinition)actions.append(button(task.publicJoin?'Close joining':'Open joining',()=>control({op:'public-join',id:task.id,enabled:!task.publicJoin}),!writable(),'','public-'+task.id));
-    actions.append(button('Cancel job', () => control({ op: 'cancel', id: task.id }, 'Cancel “' + task.name + '”? Offline workers reconcile this decision when they reconnect. Outstanding resource recovery stays recorded.'), !writable(), 'danger', task.id + '-cancel'));
-  } else actions.append(button('Delete history', () => control({ op: 'delete', id: task.id }, 'Delete this finished history record?'), !writable() || task.cleanupPending, 'danger', task.id + '-delete'));
+  const actions = el('div', 'actions operator-live');
+  const current=()=>[...snapshot.tasks,...snapshot.history].find(t=>t.id===task.id)||task;
+  const pause=button('Pause job',()=>control({op:'pause',id:task.id}),!writable(),' ',task.id+'-pause');
+  const resume=button('Resume job',()=>control({op:'resume',id:task.id}),!writable(),' ',task.id+'-resume');
+  const cancel=button('Cancel job',()=>control({op:'cancel',id:task.id},'Cancel this whole job? Offline workers reconcile on reconnect; recovery records are retained.'),!writable(),'danger',task.id+'-cancel');
+  const remove=button('Delete history',()=>control({op:'delete',id:task.id},'Delete this finished record?'),true,'danger',task.id+'-delete');
+  const joining=button('Open joining',()=>control({op:'public-join',id:task.id,enabled:!current().publicJoin}),!writable());
+  actions.append(pause,resume,cancel,joining,remove);
+  actions.updateStatus=()=>{const t=current(),dead=terminal(t.status);pause.disabled=!writable()||dead||!!t.paused;resume.disabled=!writable()||dead;cancel.disabled=!writable()||dead;remove.hidden=!dead;remove.disabled=!writable()||!dead||t.cleanupPending;joining.hidden=dead||!t.nativeDefinition;joining.disabled=!writable();joining.textContent=t.publicJoin?'Close joining':'Open joining';};actions.updateStatus();
   actions.append(button('Inspect', () => inspect('job', task.id), false, '', task.id + '-inspect')); return actions;
 }
 function jobCard(task) {
   const card = el('article', 'card job-card'); const header = el('div', 'card-header'); header.append(el('h3', '', task.name), badge(task.status, tone(task.status))); card.append(header);
-  const meta = el('div', 'job-meta'); [task.crew, task.workflowName || 'Workflow', 'Priority ' + task.priority, Object.keys(task.runs || {}).length + ' workers',task.publicJoin?'Public joining':'Invite only'].forEach(t => meta.append(el('span', '', t))); card.append(meta);
-  const total = task.nativeDefinition?.length; if (total) progress(card, task.highwayProgress || 0, total);
-  card.append(el('p', 'job-detail', task.detail || 'Awaiting dispatch'), jobActions(task));
+  const meta = el('div', 'job-meta'),distance=el('div');card.append(meta,distance);
+  const detail=el('p','job-detail'),guidance=el('p','hint operator-live');
+  guidance.updateStatus=()=>{const t=[...snapshot.tasks,...snapshot.history].find(v=>v.id===task.id)||task;detail.textContent=t.detail||'Awaiting worker checkpoint';guidance.textContent=t.operatorGuidance||'Host-owned job. Pause/Resume/Cancel affect all assigned workers; Detach affects one.';header.lastChild.textContent=t.status;header.lastChild.className='pill '+tone(t.status);meta.replaceChildren(...[t.crew,t.workflowName||'Workflow','Priority '+t.priority,Object.keys(t.runs||{}).length+' workers',t.publicJoin?'Public joining':'Invite only'].map(v=>el('span','',v)));distance.replaceChildren();if(t.nativeDefinition?.length)progress(distance,t.highwayProgress||0,t.nativeDefinition.length);};guidance.updateStatus();
+  card.append(detail,guidance,jobActions(task));
   if (task.cleanupPending) card.append(el('p', 'hint', 'Decision is final; delivery/recovery acknowledgements remain outstanding. History deletion is protected.'));
   return card;
 }
@@ -288,12 +292,13 @@ async function control(request, confirmation) {
   busy = true; render();
   try { await api('control', request); notice('Host accepted ' + request.op + '. Worker cleanup and delivery may continue independently.', true); }
   catch (error) { notice(error.message + ' Refresh status before retrying; the command may already have reached the host.'); }
-  finally { busy = false; await refresh(); if ($('inspect-dialog').open) showInspection(); }
+  finally { busy = false; await refresh(); }
 }
 function inspect(kind, id) { inspecting = { kind, id }; showInspection(); if (!$('inspect-dialog').open) $('inspect-dialog').showModal(); }
 function jsonDetails(title, value) { const node = el('details'); node.append(el('summary', '', title), el('pre', '', JSON.stringify(value, null, 2))); return node; }
 function configurationInspector(task) {
   const panel=el('details');panel.append(el('summary','','Captured configuration & live requests'));
+  panel.dataset.preserve='configuration:'+task.id;
   const body=el('div','management-section');panel.append(body);
   let loaded=false;
   const load=async()=>{
@@ -371,6 +376,7 @@ function configurationComparison(task,data) {
 function managedButton(text, action, cls='') { return button(text,action,!writable(),'managed-control '+cls); }
 function guidedSettings(task, initialWorker) {
   const panel=el('details','guided-settings');panel.append(el('summary','','Edit live job settings'));
+  panel.dataset.preserve='guided:'+task.id+':'+(initialWorker||'');
   const body=el('div','management-section');panel.append(body);
   let loaded=false;
   panel.addEventListener('toggle',async()=>{
@@ -433,9 +439,7 @@ function guidedSettings(task, initialWorker) {
   return panel;
 }
 function assignFromManagement(crew, worker) {
-  $('new-job').click();$('job-crew').value=crew;updateWorkers();
-  if(worker)for(const input of $('job-workers').querySelectorAll('input'))input.checked=input.value===worker;
-  updateScope();
+  openJob({crew,worker});
 }
 function updateChat() {
   const feed=$('management-chat');if(!feed||!inspecting)return;
@@ -465,6 +469,7 @@ function chatColor(color) {
 }
 function chatPanel(content, crew, worker) {
   const panel=el('section','management-section');panel.append(el('h3','','Game chat'));
+  panel.dataset.preserve='chat:'+crew+':'+(worker||'');
   const feed=el('div','chat-feed');feed.id='management-chat';feed.setAttribute('role','log');feed.setAttribute('aria-label','Worker game chat');panel.append(feed);
   const form=el('form','chat-compose');const input=el('input');input.maxLength=256;input.required=true;input.placeholder=worker?'Message or /server command':'Send through every connected worker in this crew';input.setAttribute('aria-label','Chat message or server command');
   const send=el('button','managed-control primary','Send');send.type='submit';send.disabled=!writable();form.append(input,send);
@@ -482,9 +487,11 @@ function managementControls(content, crew, worker) {
   const jobs=snapshot.tasks.filter(t=>t.crew===crew&&(!worker||t.runs?.[worker]));
   for(const task of jobs) {
     panel.append(jobCard(task));if(worker)panel.append(priorityControls(task,worker));
+    for(const id of Object.keys(task.runs||{}))if(!worker||id===worker)panel.append(participationControls(task,id));
     panel.append(configurationInspector(task));
     if(!terminal(task.status))panel.append(guidedSettings(task,worker));
     const details=el('details');details.append(el('summary','','Advanced: raw module configuration · '+task.name));
+    details.dataset.preserve='raw:'+task.id+':'+(worker||'');
     const form=el('form');const textarea=el('textarea');textarea.rows=5;textarea.value='{"auto-eat":{"active":true,"settings":"{}"}}';textarea.setAttribute('aria-label','Module configuration JSON');
     const submit=el('button','managed-control','Apply configuration');submit.type='submit';submit.disabled=!writable();form.append(textarea,submit);
     form.addEventListener('submit',e=>{e.preventDefault();if(!writable())return;try {const modules=JSON.parse(textarea.value);control({op:'configure',id:task.id,...(worker?{worker}:{}),modules});}catch(error){notice(error.message);}});
@@ -498,7 +505,9 @@ function managementControls(content, crew, worker) {
 function crewControls(content, crew, worker) {
   const panel=el('section','management-section');panel.append(el('h3','',worker?'Crew membership':'Crew management'));const actions=el('div','actions');
   if(worker) {
+    panel.dataset.preserve='membership:'+crew+':'+worker;
     const select=el('select');select.setAttribute('aria-label','Destination crew');for(const id of snapshot.crews){const option=el('option','',snapshot.crewLabels?.[id]||id);option.value=id;select.append(option);}select.value=crew;
+    panel.classList.add('operator-live');panel.updateStatus=()=>{const selected=select.value,options=snapshot.crews.map(id=>{const o=el('option','',snapshot.crewLabels?.[id]||id);o.value=id;return o;});if(JSON.stringify([...select.options].map(o=>[o.value,o.textContent]))!==JSON.stringify(options.map(o=>[o.value,o.textContent]))){select.replaceChildren(...options);select.value=snapshot.crews.includes(selected)?selected:crew;}select.disabled=!writable();};
     actions.append(select,managedButton('Move worker',()=>control({op:'crew-move',crew:select.value,worker},'Move this worker? Its jobs must be finished/cancelled and cleanup acknowledged first.')));
   } else {
     actions.append(managedButton('Rename crew',()=>{const name=prompt('Crew name',snapshot.crewLabels?.[crew]||crew);if(name)control({op:'crew-rename',crew,name});}),
@@ -507,17 +516,31 @@ function crewControls(content, crew, worker) {
   panel.append(actions);content.append(panel);
 }
 function priorityControls(task, workerId) {
-  const row = el('div', 'priority-row'); const input = el('input'); input.type = 'number'; input.min = -1000; input.max = 1000; input.step = 1;
+  const row = el('div', 'priority-row operator-live'); const input = el('input'); input.type = 'number'; input.min = -1000; input.max = 1000; input.step = 1;
+  row.dataset.preserve='priority:'+task.id+':'+(workerId||'');
   input.value = workerId ? task.overrides?.[workerId] ?? task.priority : task.priority; input.setAttribute('aria-label', workerId ? 'Worker job priority' : 'Job priority');
   row.append(el('span', 'hint', workerId ? 'Worker priority' : 'Job priority'), input, button('Set priority', () => {
     if (!input.checkValidity() || input.value === '') { input.reportValidity(); return; }
     control({ op: 'priority', id: task.id, priority: Number(input.value), ...(workerId ? { worker: workerId } : {}) });
-  }, !writable())); return row;
+  }, !writable()));row.updateStatus=()=>{const t=[...snapshot.tasks,...snapshot.history].find(t=>t.id===task.id);input.disabled=!writable()||!t||terminal(t.status);row.querySelector('button').disabled=input.disabled;};return row;
 }
+function participationControls(task,worker) {
+  const row=el('div','inspection-row operator-live'),status=el('p'),toggle=button('Detach worker',()=>{
+    const t=[...snapshot.tasks,...snapshot.history].find(t=>t.id===task.id),r=t?.runs?.[worker];if(!r)return;
+    control({op:'detach',id:task.id,worker,detached:!r.operatorDetached},r.operatorDetached?null:'Detach only this worker from this job? Its checkpoint and any cleanup remain; other eligible workers keep working.');
+  },!writable());
+  row.append(status,toggle);
+  row.updateStatus=()=>{const t=[...snapshot.tasks,...snapshot.history].find(t=>t.id===task.id)||task,r=t.runs?.[worker];if(!r)return;status.textContent=(snapshot.workers.find(w=>w.id===worker)?.name||worker)+' · '+(r.operatorDetached?'Detached by operator · ':'')+r.status+' · '+(r.detail||'Awaiting worker report');toggle.textContent=r.operatorDetached?'Rejoin worker':'Detach worker';toggle.disabled=!writable()||terminal(t.status)||terminal(r.status);};row.updateStatus();return row;
+}
+function inspectionShape(){if(!inspecting||!snapshot)return '';const {kind,id}=inspecting;const jobs=[...snapshot.tasks,...snapshot.history].filter(t=>kind==='job'?t.id===id:kind==='crew'?t.crew===id:t.runs?.[id]);return JSON.stringify([kind,id,jobs.map(t=>[t.id,terminal(t.status),Object.keys(t.runs||{})]),snapshot.workers.map(w=>[w.id,w.crew])]);}
 function showInspection() {
   if (!inspecting || !snapshot) return;
-  const { kind, id } = inspecting; const content = $('inspect-content'); content.replaceChildren();
-  content.append(button('Refresh inspection ↻', async () => { await refresh(); showInspection(); }), el('p', 'hint', 'Snapshot ' + new Date(refreshedAt || Date.now()).toLocaleTimeString() + '. Uncertain resources are not cleared by opening this view.'));
+  const { kind, id } = inspecting; const content = $('inspect-content'),key=kind+':'+id,same=key===inspectionKey;
+  const kept=new Map(same?[...content.querySelectorAll('[data-preserve]')].map(n=>[n.dataset.preserve,n]):[]);
+  const expanded=new Set(same?[...content.querySelectorAll('details[open]')].map(n=>n.querySelector('summary')?.textContent):[]);
+  const scroll=same?$('inspect-dialog').scrollTop:0,focus=same?document.activeElement:null;
+  inspectionKey=key;inspecting.shape=inspectionShape();content.replaceChildren();
+  content.append(button('Refresh inspection ↻', async () => { await refresh(); showInspection(); }), el('p', 'hint', 'Diagnostics snapshot ' + new Date(refreshedAt || Date.now()).toLocaleTimeString() + '; operational status updates live. Uncertain resources are not cleared by opening this view.'));
   if (kind === 'stash') {
     const db=stashDetails.get(id); $('inspect-title').textContent=db?.name || 'Stash'; if(!db)return;
     content.append(el('p','hint',db.scope+' · observations can be stale; scan again before withdrawing'));
@@ -533,28 +556,32 @@ function showInspection() {
     if(!terminal(task.status))content.append(guidedSettings(task));
     for (const [workerId, run] of Object.entries(task.runs || {})) {
       const worker = snapshot.workers.find(w => w.id === workerId); const row = el('article', 'inspection-row'); const header = el('div', 'card-header');
-      header.append(el('h3', '', worker?.name || workerId), badge(run.status, tone(run.status))); row.append(header, el('p', '', run.detail || 'No reported detail'));
-      if (run.requestedStatus) row.append(el('p', 'hint', 'Pending cleanup target: ' + run.requestedStatus));
+      header.append(el('h3', '', worker?.name || workerId), badge(run.status, tone(run.status)));const detail=el('p'),cleanup=el('p','hint');row.append(header,detail,cleanup);
+      row.classList.add('operator-live');row.updateStatus=()=>{const r=[...snapshot.tasks,...snapshot.history].find(t=>t.id===id)?.runs?.[workerId]||run;header.lastChild.textContent=r.status;header.lastChild.className='pill '+tone(r.status);detail.textContent=r.detail||'No reported detail';cleanup.textContent=r.requestedStatus?'Pending cleanup target: '+r.requestedStatus:'';};row.updateStatus();
       if (run.stashScan) row.append(stashPanel(run));
       if (!terminal(task.status)) row.append(priorityControls(task, workerId)); content.append(row);
+      if(!terminal(task.status))content.append(participationControls(task,workerId));
     }
     if (snapshot.highways[task.crew]?.execution) content.append(jsonDetails('Crew verification, supply reservations and exchange state', snapshot.highways[task.crew]));
     content.append(jsonDetails('Full job snapshot', task));
   } else if (kind === 'crew') {
     const native = snapshot.highways[id] || {}; $('inspect-title').textContent = snapshot.crewLabels?.[id]||id;
-    content.append(resourceLine(native.resourceCounts,true),predictionLine(native.roadPrediction,id));chatPanel(content,id);managementControls(content,id);crewControls(content,id);
-    content.append(workerTable(snapshot.workers.filter(w => w.crew === id)));
+    const live=el('div','operator-live');live.updateStatus=()=>{const n=snapshot.highways[id]||{};live.replaceChildren(resourceLine(n.resourceCounts,true),predictionLine(n.roadPrediction,id));};live.updateStatus();content.append(live);managementControls(content,id);chatPanel(content,id);crewControls(content,id);
+    const roster=el('div','operator-live');roster.updateStatus=()=>roster.replaceChildren(workerTable(snapshot.workers.filter(w=>w.crew===id)));roster.updateStatus();content.append(roster);
     for(const task of snapshot.tasks.filter(t=>t.crew===id))for(const run of Object.values(task.runs || {}))if(run.stashScan)content.append(stashPanel(run));
     if (native.execution) content.append(button('End native highway', () => control({ op: 'end-highway', crew: id }, 'End this crew’s native highway and cancel its owning job? Outstanding supplies remain recorded.'), !writable(), 'danger'));
     content.append(jsonDetails('Supply ownership, verification and diagnostics', native), eventList((native.events || []).slice(-20).reverse()));
   } else {
     const worker = snapshot.workers.find(w => w.id === id); $('inspect-title').textContent = worker?.name || 'Worker no longer connected'; if (!worker) return;
-    const state = workerState(worker); content.append(el('p', 'job-detail', state.detail), el('p', 'hint', worker.id));
+    const state = workerState(worker),live=el('div','operator-live');live.updateStatus=()=>{const w=snapshot.workers.find(w=>w.id===id);if(!w){live.replaceChildren(el('p','hint','Worker no longer present'));return;}const s=workerState(w);live.replaceChildren(el('p','job-detail',s.status+' · '+s.detail),el('p','hint',w.id),resourceLine(s.native?.resourceCounts),predictionLine(s.native?.roadPrediction,w.crew,w.id));};live.updateStatus();content.append(live);
     if(state.run?.stashScan)content.append(stashPanel(state.run));
-    content.append(resourceLine(state.native?.resourceCounts),predictionLine(state.native?.roadPrediction,worker.crew,worker.id));chatPanel(content,worker.crew,worker.id);managementControls(content,worker.crew,worker.id);crewControls(content,worker.crew,worker.id);
+    managementControls(content,worker.crew,worker.id);chatPanel(content,worker.crew,worker.id);crewControls(content,worker.crew,worker.id);
     content.append(jsonDetails('Worker diagnostics and current crew report', { ...worker, crewReport: state.native || null }));
   }
-  updateChat();
+  for(const node of content.querySelectorAll('[data-preserve]')){const old=kept.get(node.dataset.preserve);if(old)node.replaceWith(old);}
+  for(const node of content.querySelectorAll('details'))if(expanded.has(node.querySelector('summary')?.textContent))node.open=true;
+  if(focus?.isConnected)focus.focus({preventScroll:true});$('inspect-dialog').scrollTop=scroll;
+  updateChat();document.querySelectorAll('.operator-live').forEach(n=>n.updateStatus?.());
 }
 function stashPanel(run) {
   const panel=el('section','management-section');panel.dataset.stashRun=run.id;fillStashPanel(panel,run);return panel;
@@ -604,6 +631,7 @@ async function presetLibrary() {
     const load=async()=>{change();const current=revision;const r=await api('control',{op:'workflow-get',id:selected.value});if(current!==revision)return;record=r;name.value=r.name;folder.value=r.folder;message.textContent=r.builtin?'Duplicate this built-in to edit it.':'Custom preset ready.';};
     const operation=async fn=>{try{await fn();}catch(e){message.textContent=e.message;}};
     selected.addEventListener('change',()=>operation(load));
+    body.append(button('Start job from this preset',()=>{dialog.close();openJob({preset:selected.value});},!writable()));
     body.append(button('Duplicate',()=>operation(async()=>{if(!record||record.id!==selected.value)return;await api('control',{op:'workflow-duplicate',source:record.id,id:crypto.randomUUID(),name:name.value+' copy',folder:folder.value});dialog.close();await presetLibrary();})),button('Rename / move',()=>operation(async()=>{if(!record||record.id!==selected.value)return;await api('control',{op:'workflow-save',id:record.id,name:name.value,folder:folder.value,package:record.package});await load();})));
     field('Guided control',setting);field('Proposed activation',active);field('Proposed value (not a current reading)',value);
     const update=()=>{change();const c=catalog.controls.find(c=>c.id===setting.value);value.parentElement.hidden=!c.setting;value.min=c.min;value.max=c.max;value.step=c.step||1;value.value=c.example;message.textContent=c.help;};
@@ -616,21 +644,36 @@ async function presetLibrary() {
     body.append(button('Show current captured package',()=>operation(async()=>{const r=await api('control',{op:'workflow-get',id:selected.value});details.replaceChildren(el('summary','','Captured package'),el('pre','',JSON.stringify(r.package,null,2)));details.open=true;})));
   } catch(e){body.append(el('p','error',e.message),button('Close',()=>dialog.close()));}
 }
-$('new-job').addEventListener('click', async () => {
+const rememberedFields=['job-kind','job-name','job-crew','job-priority','job-preset','highway-direction','highway-length','follow-radius'];
+function rememberLaunch(){lastLaunch=Object.fromEntries(rememberedFields.map(id=>[id,$(id).value]));}
+async function openJob(context={}) {
   if (!writable()) return;
   $('job-error').textContent = pendingSubmission ? 'Submission outcome is uncertain. Retry the same request or inspect Jobs; editing is locked to avoid duplicate work.' : '';
   reviewedSubmission=null;$('job-preview').hidden=true;
   $('job-fields').disabled = !!pendingSubmission; $('job-submit').textContent = pendingSubmission ? 'Retry same submission ↗' : 'Preview job';
   if (!pendingSubmission) {
+    for(const axis of ['x','y','z'])$('highway-'+axis).value='';
     $('job-crew').replaceChildren(); snapshot.crews.forEach(crew => { const option = el('option', '', crew); option.value = crew; $('job-crew').append(option); });
+    if(lastLaunch)for(const id of rememberedFields.filter(id=>id!=='job-preset'))if($(id).tagName!=='SELECT'||[...$(id).options].some(o=>o.value===lastLaunch[id]))$(id).value=lastLaunch[id];
+    if(context.crew)$('job-crew').value=context.crew;
     updateWorkers(); updateSource();
+    if(context.worker){for(const input of $('job-workers').querySelectorAll('input'))input.checked=input.value===context.worker;updateScope();}
   }
   $('job-dialog').showModal();
   if(!pendingSubmission){$('job-fields').disabled=true;$('job-submit').disabled=true;
-    try {presetList=(await api('control',{op:'workflow-list'})).workflows;$('job-preset').replaceChildren();for(const p of presetList){const o=el('option','',p.folder+' / '+p.name);o.value=p.id;$('job-preset').append(o);}updateSource();}catch(e){$('job-error').textContent=e.message;}
+    try {
+      presetList=(await api('control',{op:'workflow-list'})).workflows;$('job-preset').replaceChildren();
+      for(const p of presetList){const o=el('option','',p.folder+' / '+p.name);o.value=p.id;$('job-preset').append(o);}
+      const preferred=context.preset||lastLaunch?.['job-preset'];
+      if(preferred&&presetList.some(p=>p.id===preferred))$('job-preset').value=preferred;
+      if(context.preset)$('job-kind').value='preset';
+      updateSource();useWorkerPosition();if(lastLaunch&&!context.preset)$('job-name').value=lastLaunch['job-name'];
+    }catch(e){$('job-error').textContent=e.message;}
     finally{$('job-fields').disabled=false;$('job-submit').disabled=false;}
   }
-});
+}
+$('new-job').addEventListener('click',()=>openJob());
+$('job-dialog').addEventListener('close',()=>{if(!pendingSubmission)rememberLaunch();});
 function updateWorkers() {
   $('job-workers').replaceChildren(); const crew = $('job-crew').value;
   const workers = snapshot.workers.filter(w => w.crew === crew && w.connected && w.reconciled);

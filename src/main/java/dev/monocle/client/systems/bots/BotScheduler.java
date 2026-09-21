@@ -230,6 +230,24 @@ public final class BotScheduler {
         return readbacks.get(id,worker,System.currentTimeMillis());
     }
     public void pause(UUID id) { hostOnly(); if (QueuePolicy.pause(task(id))) save(); }
+    public JsonObject management(UUID id) {
+        hostOnly();JsonObject task=task(id),value=new JsonObject();
+        for(String key:List.of("status","detail","paused","cancelled","runs"))if(task.has(key))value.add(key,task.get(key).deepCopy());
+        value.addProperty("operatorGuidance",QueuePolicy.guidance(task));return value;
+    }
+    public void detach(UUID id,UUID worker,boolean detached) {
+        hostOnly();JsonObject t=task(id),previous=t.deepCopy();
+        if(!t.getAsJsonObject("runs").has(worker.toString()))throw new IllegalArgumentException("Worker is not assigned to this job");
+        if(!t.getAsJsonObject("package").getAsJsonObject("highways").isEmpty()) {
+            var source=bots.coordinator(text(t,"crew"));
+            if(!t.has("highway")||!ownsHighway(t,source)||!source.independentSupplies())throw new IllegalStateException("Wait for the independent highway to start, or pause the whole job");
+            if(detached && !QueuePolicy.detached(t,worker) && !source.reservedReturns().contains(worker)) {
+                String reason=source.borrowingReason(Set.of(worker));if(reason!=null)throw new IllegalStateException(reason);
+            }
+        }
+        QueuePolicy.detach(t,worker,detached);
+        try{save();}catch(RuntimeException e){tasks.put(id,previous);throw e;}
+    }
     public void configure(UUID id, UUID worker, JsonObject modules) {
         hostOnly(); JsonObject t = task(id), previous = t.deepCopy();
         TaskWire.configure(t, worker, modules);
@@ -493,7 +511,12 @@ public final class BotScheduler {
         if (active != null) {
             JsonObject r = run(active, worker);
             boolean cleanup = text(r, "status").equals("Suspending");
-            boolean cancel = flag(active, "cancelled"), pause = flag(active, "paused"), preempt = QueuePolicy.preempts(active, next, worker);
+            boolean cancel = flag(active, "cancelled"), pause = flag(active, "paused"), detached=QueuePolicy.detached(active,worker), preempt = QueuePolicy.preempts(active, next, worker);
+            if(detached&&!cancel){
+                SwarmCrew source=source(worker);
+                if(source!=null && !borrow(worker,source)){r.addProperty("detail",Objects.requireNonNullElse(source.borrowingReason(Set.of(worker)),"Waiting for safe withdrawal acknowledgement"));return;}
+                if(!cleanup)control(worker,r,"pause");return;
+            }
             if (preempt && teleportPinned(worker)) { r.addProperty("detail", "Reserved as the target of a pending crew teleport"); return; }
             if (cancel || pause || preempt || cleanup) {
                 SwarmCrew source = source(worker);
@@ -774,9 +797,12 @@ public final class BotScheduler {
         && run.has("action") && text(run.getAsJsonObject("action"), "type").equals("Highway") && text(task.getAsJsonObject("highwayTokens"), worker.toString()).equals(text(run, "token")); }
     private void result(UUID worker, JsonObject r, boolean success, String detail) { JsonObject m = message("result"); m.addProperty("run", text(r, "id")); m.addProperty("token", text(r, "token")); m.addProperty("success", success); m.addProperty("detail", detail); send(worker, m); }
     private void returnWorker(UUID worker) {
+        if(tasks.values().stream().anyMatch(t->!terminal(text(t,"status"))&&!flag(t,"cancelled")&&t.getAsJsonObject("runs").has(worker.toString())&&QueuePolicy.detached(t,worker)))return;
         JsonObject reservation = returns.get(worker); if (reservation == null) return;
         SwarmCrew source = bots.coordinator(text(reservation, "crew"));
         if (!source.assigned()) { returns.remove(worker); dirty = true; return; }
+        if(tasks.values().stream().anyMatch(t->t.has("highway")&&ownsHighway(t,source)&&(flag(t,"paused")||flag(t,"cancelled"))))return;
+        if(source.borrowing(worker))return;
         if (source.isParticipant(worker)) { returns.remove(worker); dirty = true; return; }
         if (!source.borrowReady(worker)) return;
         PlayerObservation report = observation(worker); BlockPos target = source.returnRendezvous();

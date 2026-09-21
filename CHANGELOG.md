@@ -2,6 +2,14 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.8.4 — Worker and crew operator controls
+
+- Added live job controls and per-worker Detach/Rejoin to the in-game worker/crew management screens and WebUI. Whole-job actions and individual participation are explicitly separated; cancellation and cleanup ownership are explained.
+- Per-worker participation intent is host-owned and persisted. Whole-job Resume cannot silently rejoin an operator-detached worker. Native highways reuse the existing safe withdrawal/return handshake, retaining container recovery and required-duty/site-anchor checks; rejected or pending handoffs explain why.
+- Added direct preset launch shortcuts and session-local launch preferences. New highway origins come from current positions rather than remembered coordinates. Every dispatch still requires review.
+- Preserve WebUI editor nodes, selections, expanded sections and scroll through inspection refreshes; update operational status without rebuilding editors. In-game management refreshes update labels in place and retain job section expansion when membership changes.
+- Use matching 0.8.4 host and client builds for both operator interfaces. Automated API, native handoff and browser checks use simulated workers; a live Minecraft smoke test remains required. No mining, paving or restock policy changes.
+
 ## 0.8.3 — Reusable job presets and passive following
 
 - Added preset-library controls in both host interfaces: inspect, duplicate, rename/move and preview guided changes to future-job defaults. Built-ins remain read-only; running jobs retain captured settings. Stale guided edits are rejected.

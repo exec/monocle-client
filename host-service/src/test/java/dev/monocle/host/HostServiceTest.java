@@ -25,6 +25,7 @@ public final class HostServiceTest {
         }
         assert HostService.ACTIONS.contains("Tpa") : "Standalone workers must be able to use the trusted TPA action";
         operationsCheck();
+        operatorDetachCheck();
         followPresetCheck();
         autoTpyCheck();
         stashScanCheck();
@@ -105,6 +106,17 @@ public final class HostServiceTest {
             JsonObject cancel = op("cancel"); cancel.addProperty("id", urgentId.toString()); host.control(cancel); host.control(cancel);
             await(() -> state(host, urgentId).equals("Cancelled") && state(host, firstId).equals("Running"), worker, other);
             assert worker.installs == 2 : "Preempted workflow resumes the same package, not a fresh execution";
+            JsonObject detach=op("detach");detach.addProperty("id",firstId.toString());detach.addProperty("worker",workerId.toString());detach.addProperty("detached",true);
+            assert request(http,api,detach,"wrong",false).statusCode()==403;
+            JsonObject invalidDetach=detach.deepCopy();invalidDetach.addProperty("detached","true");rejects(()->host.control(invalidDetach));
+            invalidDetach.addProperty("detached",true);invalidDetach.addProperty("worker",otherId.toString());rejects(()->host.control(invalidDetach));
+            host.control(detach);await(()->state(host,firstId).equals("Suspended"),worker,other);
+            JsonObject globalResume=op("resume");globalResume.addProperty("id",firstId.toString());host.control(globalResume);
+            for(int i=0;i<20;i++){worker.pump();other.pump();Thread.sleep(10);}
+            assert flag(taskView(host,firstId).getAsJsonObject("runs").getAsJsonObject(workerId.toString()),"operatorDetached");
+            assert !state(host,firstId).equals("Running") : "Whole-job Resume must not silently rejoin detached workers";
+            detach.addProperty("detached",false);host.control(detach);await(()->state(host,firstId).equals("Running"),worker,other);
+            assert worker.installs==2 : "Rejoin resumes the checkpoint rather than replaying the package";
             JsonObject pause = op("pause"); pause.addProperty("id", firstId.toString()); host.control(pause);
             await(() -> state(host, firstId).equals("Paused") && worker.current.isEmpty(), worker, other);
             pause.addProperty("op", "resume"); host.control(pause); await(() -> state(host, firstId).equals("Running"), worker, other);
@@ -165,6 +177,36 @@ public final class HostServiceTest {
         webTls();
         WebUiTest.run();
     }
+    private static void operatorDetachCheck() throws Exception {
+        Path directory=Files.createTempDirectory("monocle-operator-detach-");
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
+            Worker first=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());
+            Worker second=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())) {
+            await(()->connected(host)==2,first,second);
+            JsonObject request=highwayRequest(first.id,second.id);UUID task=UUID.fromString(text(request,"id"));host.control(request);
+            await(()->first.begun&&second.begun,first,second);
+            JsonObject detach=op("detach");detach.addProperty("id",task.toString());detach.addProperty("worker",first.id.toString());detach.addProperty("detached",true);
+            host.control(detach);
+            await(()->first.nativeJob==null && first.current.isEmpty(),first,second);
+            assert second.nativeJob!=null && second.nativeJob.getAsJsonArray("members").size()==1;
+            assert flag(taskView(host,task).getAsJsonObject("runs").getAsJsonObject(first.id.toString()),"operatorDetached");
+            second.advance=true;await(()->second.row>=2,first,second);second.advance=false;
+            JsonObject resume=op("resume");resume.addProperty("id",task.toString());host.control(resume);
+            for(int i=0;i<20;i++){first.pump();second.pump();Thread.sleep(10);}
+            assert first.nativeJob==null && first.current.isEmpty() : "Detached native worker stays released across whole-job Resume";
+            detach.addProperty("detached",false);host.control(detach);
+            await(()->first.nativeJob!=null&&first.begun&&second.nativeJob.getAsJsonArray("members").size()==2,first,second);
+            assert first.installs==1 : "Rejoin must resume the original checkpoint";
+            first.delayWithdrawal=true;detach.addProperty("detached",true);host.control(detach);
+            await(()->first.withdrawalRequests>1,first,second);
+            detach.addProperty("detached",false);host.control(detach);first.delayWithdrawal=false;
+            await(()->first.nativeJob!=null&&first.begun&&second.nativeJob.getAsJsonArray("members").size()==2,first,second);
+            assert first.installs==1 : "Rejoin during withdrawal must not replay or strand the worker";
+            resume.addProperty("op","cancel");host.control(resume);await(()->first.nativeJob==null&&second.nativeJob==null,first,second);
+        }
+        System.out.println("Operator detach checks passed: safe native withdrawal, other worker progress, explicit rejoin and cancellation.");
+    }
+
     private static void webUiPreview() throws Exception {
         Path directory=Files.createTempDirectory("monocle-ui-preview-");
         try (HostService host = new HostService(directory, "127.0.0.1", 0, CREWS, 30);
@@ -882,6 +924,7 @@ public final class HostServiceTest {
         boolean ignoreJoin;
         boolean autoTpy;
         boolean delayLanding;
+        boolean delayWithdrawal;int withdrawalRequests;
         int frontUpdates;
         int rejectedJoins;
         int nativeResumes, inspections;
@@ -902,6 +945,7 @@ public final class HostServiceTest {
         private void announce() {
             JsonObject hello = new JsonObject(); hello.addProperty("type", "hello"); hello.addProperty("id", id.toString()); hello.addProperty("name", name);
             hello.addProperty("taskProtocol", 1); hello.addProperty("scope", scope); hello.addProperty("job", "");
+            hello.addProperty("available",nativeJob==null&&current.isEmpty());
             hello.addProperty("chatProtocol",1);
             hello.addProperty("reconnectReady",reconnectReady); hello.addProperty("supplyProtocol",supplyProtocol);
             hello.addProperty("initialStockProtocol",1); hello.addProperty("initialStockReady",true);
@@ -1028,6 +1072,13 @@ public final class HostServiceTest {
                     }
                     case "supply-containers" -> { }
                     case "service-front" -> { serviceFront = message.deepCopy(); frontUpdates++; announce(); }
+                    case "withdraw" -> {
+                        withdrawalRequests++;if(delayWithdrawal){announce();break;}
+                        if(nativeJob!=null&&text(nativeJob,"job").equals(text(message,"job"))&&nativeJob.get("generation").equals(message.get("generation"))) {
+                            nativeJob=null;begun=false;detached=false;returning=false;
+                        }
+                        JsonObject ack=message.deepCopy();ack.addProperty("type","withdrawn");ack.addProperty("worker",id.toString());c.send(ack.toString());announce();
+                    }
                     case "regroup", "regroupCancel", "lost", "nudge", "anticipate-supply" -> { announce(); }
                     default -> throw new AssertionError("Unexpected host message " + text(message, "type"));
                 }

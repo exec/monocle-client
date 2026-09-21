@@ -45,6 +45,7 @@ public final class BotsTest {
         assert Bots.tpaTarget("tpa bad-name") == null;
         sharedCoordinator();
         dev.monocle.client.gui.screens.WorkflowCodeBoxTest.run();
+        dev.monocle.client.gui.widgets.pressable.WPressableTest.run();
 
         UUID first = UUID.randomUUID(), second = UUID.randomUUID();
         Set<UUID> workers = new HashSet<>(Set.of(first, second));

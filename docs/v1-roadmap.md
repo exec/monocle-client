@@ -27,9 +27,9 @@ workflow permits, and whether the latest live update was acknowledged.
 - [x] Guided editing of future-job defaults (0.8.3).
 - [x] Compare received job profiles against personal/current settings; explicitly save local personal copies (0.8.2).
 - [x] Compare and duplicate reusable host presets; preview changes before applying (0.8.3).
-- [ ] Consistent Start/Pause/Resume/Cancel/Detach actions and ownership explanations.
-- [ ] Start and manage every ordinary highway job without API/assistant access.
-- [ ] Preserve drafts, expanded sections, selections, and scroll during updates.
+- [x] Start/Pause/Resume/Cancel/Detach controls and ownership explanations in both host interfaces (0.8.4; operator smoke test pending).
+- [x] Preset-based launch and management of ordinary highway jobs without API/assistant access (0.8.4).
+- [x] Preserve WebUI inspection drafts, selections, expansion and scroll; update in-game management controls in place (0.8.4).
 - [x] Add on-demand actual worker configuration readback before labeling values "effective" (0.8.2).
 
 Acceptance: a fresh operator can launch, modify, pause, and cancel a job from
@@ -66,6 +66,11 @@ personal copy, verify the active job keeps running, reject a duplicate name,
 and check that the copy survives a client restart without changing contents.
 
 ## Stage 3 — 0.9.0: Right Shift workspace
+
+0.8.4 closes the main operator-control slice. Validate safe native detach/rejoin,
+whole-job pause/resume, preset dispatch and preservation of drafts on both actual
+host interfaces before redesigning navigation. Native detach retains required
+duties and a site anchor; it is not force-removal or abandonment of supplies.
 
 - [ ] Persistent navigation for Modules, Workers, Workflows, Stashes, HUD,
       Profiles, and Settings; retain the familiar module-category view.
@@ -136,3 +141,4 @@ no unresolved permanent waits, silent road gaps, or unsafe cancellation.
 | 0.8.0 | Configuration visibility | Clean build, shared report tests, authenticated API, JS syntax passed | Pending; browser automation unavailable; live host unchanged |
 | 0.8.1 | Guided live job setting edits | Clean build, catalog validation, NBT overlay preservation, authenticated preview API, JS syntax passed | Pending; live host unchanged |
 | 0.8.2 | Worker readback and local personal copies | Clean build and JS syntax passed; chunk correlation/timeout/isolation/Unicode, comparison values, copy preservation and authenticated API checks passed | Pending; live host unchanged |
+| 0.8.4 | Worker/crew management and preset launch | Clean build; authenticated detach/rejoin and rapid native handoff checks; browser controls, draft preservation, retry identity, stale gating and mobile layout | Live Minecraft testing pending; live host unchanged |

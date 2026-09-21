@@ -31,6 +31,33 @@ Future bodyguard behavior is not enabled by this preset.
 
 The standalone Java host now bundles a dark-and-gold operator dashboard. No Node, frontend server, or browser extension is needed. It uses the existing host coordinator and job controls; the in-game Workers GUI remains available without this dashboard.
 
+### Worker and crew management (0.8.4)
+
+Open **Manage** on a crew or worker. Start work from a saved preset, inspect its
+captured configuration, or use **Pause job**, **Resume job**, and **Cancel job**.
+Those three controls affect the entire job, even from a single worker's view.
+**Detach worker** parks only that worker's execution at a safe checkpoint;
+**Rejoin worker** requests participation again. Whole-job Resume deliberately
+does not clear individual detach decisions. Detached is operator intent; the
+reported execution state shows whether cleanup has actually finished.
+
+Native highway detachment uses safe lane withdrawal, not forced removal. It
+requires an independent running highway, connected on-site workers, no competing
+supply/handoff, and another worker covering the remaining required duties.
+A participating in-game host stays as the site anchor. If those checks fail,
+the control explains the blocker; use whole-job Pause when appropriate. A
+standalone-host rejoin waits until the worker is on the highway floor within
+16 blocks along each horizontal axis of the current front. Bring it back or
+complete a separate travel task first. Cancellation remains final and is
+reconciled with offline workers when they reconnect.
+
+Preset launch shortcuts are available directly in the library and management
+views. Common launch preferences last for this UI session only; new origins
+are taken from fresh worker observations (or the in-game host's current position)
+and must be reviewed. Inspection refreshes keep unfinished edits, expanded
+sections, selections and scroll. Operational labels update live; explicitly
+refresh timestamped configuration snapshots when a new reading is needed.
+
 ## Open it
 
 Update the standalone host distribution between jobs, keeping the existing protected data directory, crew keys and journals. Start it normally, then open **http://127.0.0.1:6970/ui/** on the host machine (or the API port configured in `host-config.json`). Enter the **API token**, not a worker crew key. The token grants full host administration; do not share it with workers or clanmates.

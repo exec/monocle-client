@@ -288,6 +288,7 @@ public abstract class HighwayCoordinator<P> {
         JsonObject reservation = borrowedMembers().getAsJsonObject(worker.toString());
         return reservation.has("ready") && reservation.get("ready").getAsBoolean() && !participants.containsKey(worker);
     }
+    public boolean borrowing(UUID worker) { return borrowingWorkers.contains(worker); }
 
     protected int startRow() { return assignment.has("startRow") ? num(assignment, "startRow") : 0; }
 
@@ -1481,6 +1482,28 @@ public abstract class HighwayCoordinator<P> {
         if (!report.has("x") || !hostNearby(front, point(num(report, "x"), num(report, "y"), num(report, "z"))))
             throw new IllegalStateException("Bring the worker onto the same highway floor within 16 blocks along each axis of the current front.");
         return connection;
+    }
+
+    public String borrowingReason(Set<UUID> workers) {
+        if (!isHost() || !assigned() || stopped || !live() || !allMembersConnected() || !begun || phase.equals("complete")) return "Choose a connected, running highway job.";
+        if (regrouping || !borrowingWorkers.isEmpty()) return "Wait for the current membership handoff.";
+        if (ticks < regroupRetryAfter) return "Allow the current lanes to make progress before retrying the handoff.";
+        if (detachedMember() != null) return "Wait for the detached supply worker to return.";
+        for (UUID member : activeMembers()) {
+            JsonObject report = currentReport(member);
+            if (report == null || !str(assignment, "scope").equals(str(report, "scope")) || !report.has("x")
+                || !hostNearby(returnRendezvous(), point(num(report, "x"), num(report, "y"), num(report, "z"))))
+                return "Every active worker must report a fresh, on-site position before handing off the highway.";
+        }
+        String reason = borrowingBlocker(assignment, workers, localParticipant ? me() : null);
+        return reason.isEmpty() ? null : reason;
+    }
+    public void requestBorrow(Set<UUID> workers) {
+        String reason = borrowingReason(workers);
+        if (reason != null) throw new IllegalStateException(reason);
+        borrowingWorkers.addAll(workers);
+        broadcast(jobMessage("regroup"));
+        info("Safely handing off %d workers; confirming road work and recovering supply containers first.", workers.size());
     }
 
     protected void finishBorrow() {

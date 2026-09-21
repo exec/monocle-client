@@ -838,10 +838,17 @@ public class BotsTab extends Tab {
     /** Same authenticated chat channel as the standalone dashboard; no launcher dependency. */
     private static class ManagementScreen extends WindowScreen {
         private final Bots bots;private final String crewId;private final UUID worker;private WLabel feed,feedback;private int ticks;
+        private WVerticalList jobs;private String jobShape="";private double width;
+        private final List<Runnable> updates=new ArrayList<>();
+        private final Map<UUID,WSection> jobSections=new HashMap<>();
         ManagementScreen(GuiTheme theme,Bots bots,String crewId,UUID worker) {super(theme,worker==null?"Manage crew":"Manage worker");this.bots=bots;this.crewId=crewId;this.worker=worker;}
         @Override public void initWidgets() {
-            double width=Math.clamp(Utils.getWindowWidth()/theme.scale(1)-100,320,640);
+            jobShape="";updates.clear();
+            width=Math.clamp(Utils.getWindowWidth()/theme.scale(1)-100,320,640);
             add(theme.label(bots.crewLabel(crewId)+(worker==null?" · all workers":" · "+bots.allMembers().stream().filter(m->m.id().equals(worker)).map(SwarmCrew.MemberView::name).findFirst().orElse(worker.toString())),true,width)).expandX();
+            add(theme.label("Host-owned jobs. Job controls affect everyone assigned; Detach/Rejoin affects one worker and preserves its checkpoint.",width).color(theme.textSecondaryColor())).expandX();
+            add(theme.button(worker==null?"Start crew job from preset":"Start job for this worker")).expandX().widget().action=()->mc.gui.setScreen(new BotTaskScreen(theme,bots,null,null,crewId,worker));
+            jobs=add(theme.verticalList()).expandX().widget();
             add(theme.label("Game chat · session-only · slash commands go to the server. Crew messages are sent from every connected worker.",width).color(theme.textSecondaryColor())).expandX();
             feed=add(theme.label("Waiting for chat",width)).expandX().widget();
             WHorizontalList compose=add(theme.horizontalList()).expandX().widget();WTextBox text=compose.add(theme.textBox("","Message or /server command")).expandX().widget();
@@ -849,7 +856,7 @@ public class BotsTab extends Tab {
             feedback=add(theme.label("",width)).expandX().widget();
             send.action=()->{try {bots.sendChat(crewId,worker,text.get());text.set("");feedback.set("Sent to connected clients; not a server acknowledgement.");}catch(RuntimeException e){feedback.set(failure(e));}};
             add(theme.button("Manage current job & recovery")).widget().action=()->mc.gui.setScreen(new InspectionScreen(theme,bots,bots.coordinator(crewId)));
-            add(theme.button("Queue workflow")).widget().action=()->mc.gui.setScreen(new BotTaskScreen(theme,bots,null,null,crewId));
+            refreshJobs();
             add(theme.button("Back")).widget().action=this::onClose;refreshChat();
         }
         private void refreshChat() {
@@ -858,7 +865,34 @@ public class BotsTab extends Tab {
             StringBuilder lines=new StringBuilder();for(var row:rows.subList(Math.max(0,rows.size()-40),rows.size()))lines.append('[').append(row.get("name").getAsString()).append(" · ").append(row.get("direction").getAsString()).append("] ").append(row.get("text").getAsString()).append('\n');
             feed.set(lines.isEmpty()?"No chat captured yet.":lines.toString());
         }
-        @Override public void tick() {super.tick();if(++ticks%20==0)refreshChat();}
+        private void act(Runnable action){try{action.run();feedback.set("Host accepted the request; worker delivery/cleanup may still be pending.");refreshJobs();}catch(RuntimeException e){feedback.set(failure(e));}}
+        private void refreshJobs(){
+            var tasks=bots.tasks().list().stream().filter(t->!t.history()&&t.crewId().equals(crewId)&&(worker==null||t.targets().contains(worker))).toList();
+            String shape=tasks.stream().map(t->t.id()+":"+t.targets()).toList().toString();
+            if(!shape.equals(jobShape)){
+                Map<UUID,Boolean> expanded=new HashMap<>();jobSections.forEach((id,section)->expanded.put(id,section.isExpanded()));jobSections.clear();
+                jobShape=shape;jobs.clear();updates.clear();
+                if(tasks.isEmpty())jobs.add(theme.label("No active assignments. Start a job from a preset above.",width)).expandX();
+                for(var task:tasks){
+                    var box=jobs.add(theme.section(task.name(),expanded.getOrDefault(task.id(),true))).expandX().widget();jobSections.put(task.id(),box);
+                    var status=box.add(theme.label("",width-20)).expandX().widget();
+                    var controls=box.add(theme.horizontalList()).expandX().widget();
+                    var pause=controls.add(theme.button("Pause job")).widget();pause.action=()->act(()->bots.tasks().pause(task.id()));
+                    var resume=controls.add(theme.button("Resume job")).widget();resume.action=()->act(()->bots.tasks().resume(task.id()));
+                    var cancel=controls.add(theme.confirmedButton("Cancel job","Cancel entire job?")).widget();cancel.action=()->act(()->bots.tasks().cancel(task.id()));
+                    box.add(theme.button("Inspect settings, priority & diagnostics")).expandX().widget().action=()->mc.gui.setScreen(new BotTaskScreen(theme,bots,task.id()));
+                    updates.add(()->{var t=bots.tasks().management(task.id());status.set(t.get("status").getAsString()+"\n"+(t.has("detail")?t.get("detail").getAsString():"Awaiting worker report")+"\n"+t.get("operatorGuidance").getAsString());pause.disabled=t.has("paused")&&t.get("paused").getAsBoolean();});
+                    for(UUID member:task.targets())if(worker==null||worker.equals(member)){
+                        var row=box.add(theme.verticalList()).expandX().widget();var state=row.add(theme.label("",width-20)).expandX().widget();
+                        var detach=row.add(theme.button("Detach worker")).widget();
+                        detach.action=()->act(()->{var r=bots.tasks().management(task.id()).getAsJsonObject("runs").getAsJsonObject(member.toString());bots.tasks().detach(task.id(),member,!r.has("operatorDetached")||!r.get("operatorDetached").getAsBoolean());});
+                        updates.add(()->{var r=bots.tasks().management(task.id()).getAsJsonObject("runs").getAsJsonObject(member.toString());boolean away=r.has("operatorDetached")&&r.get("operatorDetached").getAsBoolean();String name=bots.allMembers().stream().filter(m->m.id().equals(member)).map(SwarmCrew.MemberView::name).findFirst().orElse(member.toString());state.set(name+" · "+(away?"Detached by operator · ":"")+r.get("status").getAsString()+"\n"+(r.has("detail")?r.get("detail").getAsString():"Awaiting worker"));detach.set(away?"Rejoin worker":"Detach worker");detach.disabled=Set.of("Complete","Failed","Cancelled").contains(r.get("status").getAsString());});
+                    }
+                }
+            }
+            updates.forEach(Runnable::run);
+        }
+        @Override public void tick() {super.tick();if(++ticks%20==0){refreshChat();try{refreshJobs();}catch(RuntimeException e){feedback.set(failure(e));}}}
     }
 
     private static class InspectionScreen extends WindowScreen {

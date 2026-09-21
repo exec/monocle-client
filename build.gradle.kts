@@ -337,6 +337,7 @@ tasks {
         exclude("**/AutoLogTest*.class")
         exclude("**/StashFinderTest*.class")
         // These assertion-based mains run through their JavaExec tasks, not a test framework.
+        exclude("**/WPressableTest*.class") // Run by botsCheck.
         exclude("**/HighwayPlanTest*.class", "**/HighwaySupplyTest*.class", "**/HighwayFarmingTest*.class", "**/MonocleStyleTest*.class", "**/MonocleFontTest*.class")
         exclude("**/InventoryLoadoutTest*.class", "**/InventoryTransferTest*.class", "**/InventoryManagerTest*.class", "**/InventoryManagerUiTest*.class")
         exclude("**/LitematicExporterTest*.class", "**/SchematicSelectorTest*.class")

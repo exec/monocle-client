@@ -30,6 +30,7 @@ public abstract class WConfirmedButton extends WButton {
 
     @Override
     public boolean onMouseReleased(MouseButtonEvent click) {
+        if (disabled) { pressedOnce = false; return pressed = false; }
         if (pressed && pressedOnce) super.onMouseReleased(click);
         pressedOnce = pressed;
         invalidate();

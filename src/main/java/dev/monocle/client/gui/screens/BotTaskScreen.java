@@ -30,6 +30,9 @@ public final class BotTaskScreen extends WindowScreen {
     private final Bots bots;
     private final UUID id;
     private final String initialWorkflow, initialCrew;
+    private final UUID initialWorker;
+    private static final Map<String,String> launchInputs=new LinkedHashMap<>();
+    private final List<Runnable> controlRefresh=new ArrayList<>();
     private final Set<UUID> targets = new LinkedHashSet<>();
     private final Map<UUID, Integer> overrides = new LinkedHashMap<>();
     private WLabel feedback, summary, workflowDetails;
@@ -45,11 +48,15 @@ public final class BotTaskScreen extends WindowScreen {
 
     public BotTaskScreen(GuiTheme theme, Bots bots, UUID id) { this(theme, bots, id, null, null); }
     public BotTaskScreen(GuiTheme theme, Bots bots, UUID id, String initialWorkflow, String initialCrew) {
+        this(theme,bots,id,initialWorkflow,initialCrew,null);
+    }
+    public BotTaskScreen(GuiTheme theme,Bots bots,UUID id,String initialWorkflow,String initialCrew,UUID initialWorker) {
         super(theme, id == null ? "Queue a workflow" : "Task execution");
-        this.bots = bots; this.id = id; this.initialWorkflow = initialWorkflow; this.initialCrew = initialCrew;
+        this.bots = bots; this.id = id; this.initialWorkflow = initialWorkflow; this.initialCrew = initialCrew;this.initialWorker=initialWorker;
     }
 
     @Override public void initWidgets() {
+        controlRefresh.clear();
         contentWidth = Math.clamp(Utils.getWindowWidth() / theme.scale(1) - 100, 330, 700);
         feedback = add(theme.label("", contentWidth)).expandX().widget();
         try { if (id == null) createEditor(); else inspect(); }
@@ -72,13 +79,15 @@ public final class BotTaskScreen extends WindowScreen {
         WTable fields = add(theme.table()).expandX().widget();
         fields.add(theme.label("Task name")); WTextBox name = fields.add(theme.textBox("Workflow task")).minWidth(220).expandX().widget();
         fields.row(); fields.add(theme.label("Workflow"));
-        workflow = fields.add(theme.dropdown(choices.toArray(Choice[]::new), choices.stream().filter(c -> c.id().equals("package:"+initialWorkflow)).findFirst().orElseGet(()->choices.stream().filter(c->c.id().equals(initialWorkflow)).findFirst().orElseGet(()->choices.stream().filter(c->c.id().equals("package:highway-default")).findFirst().orElse(choices.getFirst()))))).expandX().widget();
+        String preferred=initialWorkflow==null?launchInputs.getOrDefault("workflow","package:highway-default"):initialWorkflow;
+        workflow = fields.add(theme.dropdown(choices.toArray(Choice[]::new), choices.stream().filter(c -> c.id().equals("package:"+preferred)).findFirst().orElseGet(()->choices.stream().filter(c->c.id().equals(preferred)).findFirst().orElse(choices.getFirst())))).expandX().widget();
         fields.row(); fields.add(theme.label("Crew"));
         crew = fields.add(theme.dropdown(crews, Arrays.stream(crews).filter(c -> c.id().equals(initialCrew == null ? bots.selectedCrew() : initialCrew)).findFirst().orElse(crews[0]))).expandX().widget();
-        fields.row(); fields.add(theme.label("Priority")); priority = fields.add(theme.intEdit(0, -1000, 1000, true)).expandX().widget();
+        fields.row(); fields.add(theme.label("Priority")); priority = fields.add(theme.intEdit(Integer.parseInt(launchInputs.getOrDefault("priority","0")), -1000, 1000, true)).expandX().widget();
+        priority.action=()->remember("priority",Integer.toString(priority.get()));
         priority.tooltip = "Higher runs first. An interruption waits for container recovery and a safe checkpoint; it never abandons supplies.";
         workflowDetails = add(theme.label("", contentWidth)).expandX().widget();
-        workflow.action = () -> perform(() -> { describeWorkflow(); rebuildArguments(); }, "Workflow selected. Review its refreshed inputs before queuing.");
+        workflow.action = () -> perform(() -> { remember("workflow",workflow.get().id());describeWorkflow(); rebuildArguments(); }, "Workflow selected. Review its refreshed inputs before queuing.");
         describeWorkflow();
         WSection workers = add(theme.section("Target workers & individual priorities", true)).expandX().widget();
         workers.add(theme.label("The host coordinates but is not a target. Select every connected member for a crew task, or choose a single worker. Busy workers can accept queued work.", contentWidth - 20).color(theme.textSecondaryColor()));
@@ -116,7 +125,8 @@ public final class BotTaskScreen extends WindowScreen {
             case "highway-default", "highway-excavate", "highway-pave" -> {
                 WIntEdit x=integer(fields,"Start X",mc.player.getBlockX(),-29_900_000,29_900_000),y=integer(fields,"Start Y",mc.player.getBlockY(),-2048,2048),z=integer(fields,"Start Z",mc.player.getBlockZ(),-29_900_000,29_900_000);
                 WIntEdit length=integer(fields,"Length",10000,16,100000);
-                fields.add(theme.label("Direction"));var direction=fields.add(theme.dropdown(new String[]{"North","East","South","West"},"North")).expandX().widget();
+                String directionKey=crew.get().id()+"/direction";
+                fields.add(theme.label("Direction"));var direction=fields.add(theme.dropdown(new String[]{"North","East","South","West"},launchInputs.getOrDefault(directionKey,"North"))).expandX().widget();direction.action=()->remember(directionKey,direction.get());
                 parameters=()->{JsonObject a=new JsonObject();a.addProperty("x",x.get());a.addProperty("y",y.get());a.addProperty("z",z.get());a.addProperty("length",length.get());a.addProperty("direction",direction.get());return a;};
             }
             case "task-follow" -> {
@@ -206,11 +216,16 @@ public final class BotTaskScreen extends WindowScreen {
         }
     }
     private WTextBox string(WTable table, String label, String value) {
-        table.add(theme.label(label)); WTextBox field = table.add(theme.textBox(value)).expandX().widget(); table.row(); return field;
+        String key=crew.get().id()+"/"+workflow.get().id()+"/"+label;
+        table.add(theme.label(label)); WTextBox field = table.add(theme.textBox(launchInputs.getOrDefault(key,value))).expandX().widget();field.action=()->remember(key,field.get()); table.row(); return field;
     }
     private WIntEdit integer(WTable table, String label, int value, int minimum, int maximum) {
-        table.add(theme.label(label)); WIntEdit field = table.add(theme.intEdit(value, minimum, maximum, true)).expandX().widget(); table.row(); return field;
+        String key=crew.get().id()+"/"+workflow.get().id()+"/"+label;
+        boolean remember=!label.matches("(?i)(start |minimum |maximum |min|max)?[xyz]")&&!label.toLowerCase(Locale.ROOT).contains("altitude");
+        int initial=value;try{if(remember)initial=Math.clamp(Integer.parseInt(launchInputs.getOrDefault(key,Integer.toString(value))),minimum,maximum);}catch(NumberFormatException ignored){}
+        table.add(theme.label(label)); WIntEdit field = table.add(theme.intEdit(initial, minimum, maximum, true)).expandX().widget();if(remember)field.action=()->remember(key,Integer.toString(field.get())); table.row(); return field;
     }
+    private static void remember(String key,String value){launchInputs.put(key,value);while(launchInputs.size()>128)launchInputs.remove(launchInputs.keySet().iterator().next());}
 
     private void describeWorkflow() {
         if(workflow.get().id().startsWith("package:")) {
@@ -228,7 +243,7 @@ public final class BotTaskScreen extends WindowScreen {
         targetList.clear();
         UUID local = mc.player == null ? mc.getUser().getProfileId() : mc.player.getUUID();
         var members = bots.allMembers().stream().filter(m -> !m.id().equals(local) && m.connected() && crew.get().id().equals(bots.workerCrew(m.id()))).toList();
-        if (reset) members.forEach(m -> targets.add(m.id()));
+        if (reset) members.stream().filter(m->initialWorker==null||m.id().equals(initialWorker)).forEach(m -> targets.add(m.id()));
         if (members.isEmpty()) targetList.add(theme.label("No connected remote workers in this crew. Connect or move a worker from Crews first.", contentWidth - 20));
         for (var member : members) {
             WVerticalList entry = targetList.add(theme.verticalList()).expandX().widget();
@@ -258,10 +273,12 @@ public final class BotTaskScreen extends WindowScreen {
         if (!task.history()) add(theme.button("Edit live job settings")).expandX().widget().action = () ->
             mc.gui.setScreen(new JobSettingsScreen(theme, bots, id));
         WHorizontalList controls = add(theme.horizontalList()).expandX().widget();
-        controls.add(theme.button("Pause")).widget().action = () -> perform(() -> { requireHost(); bots.tasks().pause(id); }, "Task pause requested. Current activity and any recovery blocker are shown above.");
-        controls.add(theme.button("Resume")).widget().action = () -> perform(() -> { requireHost(); bots.tasks().resume(id); }, "Resume requested. Inspect any recovery or return-to-anchor blocker above.");
-        var cancel = controls.add(theme.confirmedButton("Cancel task", "Cancel this task?")).widget();
+        var pause=controls.add(theme.button("Pause job")).widget();pause.action = () -> perform(() -> { requireHost(); bots.tasks().pause(id); }, "Job pause requested; cleanup may still be running.");
+        var resume=controls.add(theme.button("Resume job")).widget();resume.action = () -> perform(() -> { requireHost(); bots.tasks().resume(id); }, "Resume requested. Separately detached workers stay detached.");
+        var cancel = controls.add(theme.confirmedButton("Cancel job", "Cancel this whole job?")).widget();
         cancel.action = () -> perform(() -> { requireHost(); bots.tasks().cancel(id); }, "Cancellation requested. Native supply recovery remains protected.");
+        var guidance=add(theme.label("",contentWidth)).expandX().widget();
+        controlRefresh.add(()->{var t=bots.tasks().management(id);boolean dead=current().history(),paused=t.has("paused")&&t.get("paused").getAsBoolean();pause.disabled=dead||paused;resume.disabled=dead;cancel.disabled=dead;guidance.set(t.get("operatorGuidance").getAsString());});
         historyVisible = false;
         history = add(theme.verticalList()).expandX().widget();
         refreshHistory(task);
@@ -275,7 +292,11 @@ public final class BotTaskScreen extends WindowScreen {
             row.add(theme.label(workerName(bots, worker))).expandX();
             WIntEdit value = row.add(theme.intEdit(task.workerPriorities().getOrDefault(worker, task.priority()), -1000, 1000, true)).widget();
             row.add(theme.button("Apply")).widget().action = () -> perform(() -> { requireHost(); bots.tasks().workerPriority(id, worker, value.get()); }, "Worker-specific priority updated.");
+            var detach=workers.add(theme.button("Detach "+workerName(bots,worker))).expandX().widget();
+            detach.action=()->perform(()->{var r=bots.tasks().management(id).getAsJsonObject("runs").getAsJsonObject(worker.toString());bots.tasks().detach(id,worker,!r.has("operatorDetached")||!r.get("operatorDetached").getAsBoolean());},"Participation updated. Wait for the worker's checkpoint acknowledgement.");
+            controlRefresh.add(()->{var r=bots.tasks().management(id).getAsJsonObject("runs").getAsJsonObject(worker.toString());boolean away=r.has("operatorDetached")&&r.get("operatorDetached").getAsBoolean();detach.set((away?"Rejoin ":"Detach ")+workerName(bots,worker));detach.disabled=current().history()||Set.of("Complete","Cancelled","Failed").contains(r.get("status").getAsString());});
         }
+        controlRefresh.forEach(Runnable::run);
     }
     private void refreshHistory(BotScheduler.TaskView task) {
         if (history == null) return;
@@ -317,7 +338,7 @@ public final class BotTaskScreen extends WindowScreen {
     @Override public void tick() {
         super.tick();
         if (summary != null && ++ticks % 5 == 0) try {
-            var task = current(); summary.set(describe(bots, task)); refreshHistory(task);
+            var task = current(); summary.set(describe(bots, task)); refreshHistory(task);controlRefresh.forEach(Runnable::run);
         } catch (RuntimeException e) { error(e); }
     }
 }

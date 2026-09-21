@@ -26,12 +26,13 @@ public class WMonocleConfirmedButton extends WConfirmedButton implements Monocle
         MonocleGuiTheme theme = theme();
         double pad = pad();
 
-        hoverProgress = MonocleStyle.approach(hoverProgress, mouseOver && !theme.disableHoverColor ? 1 : 0, delta);
-        pressProgress = MonocleStyle.approach(pressProgress, pressed ? 1 : 0, delta);
+        if (disabled) pressedOnce = false;
+        hoverProgress = MonocleStyle.approach(hoverProgress, !disabled && mouseOver && !theme.disableHoverColor ? 1 : 0, delta);
+        pressProgress = MonocleStyle.approach(pressProgress, !disabled && pressed ? 1 : 0, delta);
         double intensity = Math.max(hoverProgress, pressProgress);
         Color outline = pressedOnce ? theme.accentColor.get()
             : MonocleStyle.mix(theme.outlineColor.get(), theme.outlineColor.get(pressed, true), intensity);
-        Color fg = pressedOnce ? theme.backgroundColor.get() : theme.textColor.get();
+        Color fg = disabled ? theme.textSecondaryColor.get() : pressedOnce ? theme.backgroundColor.get() : theme.textColor.get();
         Color bg = pressedOnce ? theme.accentColor.get()
             : MonocleStyle.mix(theme.backgroundColor.get(), theme.backgroundColor.get(pressed, true), intensity);
 

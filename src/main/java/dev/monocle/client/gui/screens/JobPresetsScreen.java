@@ -17,6 +17,7 @@ public final class JobPresetsScreen extends WindowScreen {
         add(theme.label("Built-ins are read-only. Duplicate to customize. Running jobs never change.",550)).expandX();
         Choice[] choices=bots.operations().list().asList().stream().map(v->{JsonObject r=v.getAsJsonObject();return new Choice(r.get("id").getAsString(),r.get("folder").getAsString()+" / "+r.get("name").getAsString());}).toArray(Choice[]::new);
         var selected=add(theme.dropdown(choices,choices[0])).expandX().widget();
+        add(theme.button("Start job from selected preset")).expandX().widget().action=()->mc.gui.setScreen(new BotTaskScreen(theme,bots,null,"package:"+selected.get().id(),null));
         add(theme.label("Preset name"));var name=add(theme.textBox("")).expandX().widget();
         add(theme.label("Folder"));var folder=add(theme.textBox("")).expandX().widget();
         var feedback=add(theme.label("",550)).expandX().widget();

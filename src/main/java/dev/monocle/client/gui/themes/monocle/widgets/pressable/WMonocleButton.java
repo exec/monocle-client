@@ -25,15 +25,15 @@ public class WMonocleButton extends WButton implements MonocleWidget {
         MonocleGuiTheme theme = theme();
         double pad = pad();
 
-        hoverProgress = MonocleStyle.approach(hoverProgress, mouseOver && !theme.disableHoverColor ? 1 : 0, delta);
-        pressProgress = MonocleStyle.approach(pressProgress, pressed ? 1 : 0, delta);
+        hoverProgress = MonocleStyle.approach(hoverProgress, !disabled && mouseOver && !theme.disableHoverColor ? 1 : 0, delta);
+        pressProgress = MonocleStyle.approach(pressProgress, !disabled && pressed ? 1 : 0, delta);
         renderBackground(renderer, this,
             MonocleStyle.mix(theme.outlineColor.get(), theme.outlineColor.get(pressed, true), Math.max(hoverProgress, pressProgress)),
             MonocleStyle.mix(theme.backgroundColor.get(), theme.backgroundColor.get(pressed, true), Math.max(hoverProgress, pressProgress)));
         double contentY = y + pad + theme.scale(0.75) * pressProgress;
 
         if (text != null) {
-            renderer.text(text, x + width / 2 - textWidth / 2, contentY, theme.textColor.get(), false);
+            renderer.text(text, x + width / 2 - textWidth / 2, contentY, disabled ? theme.textSecondaryColor.get() : theme.textColor.get(), false);
         }
         else {
             double ts = theme.textHeight();

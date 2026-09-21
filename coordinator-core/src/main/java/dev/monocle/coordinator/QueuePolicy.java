@@ -26,7 +26,7 @@ public final class QueuePolicy {
         JsonObject best = null;
         for (JsonObject task : tasks) {
             if (flag(task, "paused") || flag(task, "cancelled") || terminal(text(task, "status"))
-                || !task.getAsJsonObject("runs").has(worker.toString()) || terminal(text(run(task, worker), "status"))) continue;
+                || !task.getAsJsonObject("runs").has(worker.toString()) || detached(task,worker) || terminal(text(run(task, worker), "status"))) continue;
             if (best == null || priority(task, worker) > priority(best, worker)) best = task;
         }
         return best; // Caller preserves insertion order; UI sorting must not change FIFO ties.
@@ -35,13 +35,30 @@ public final class QueuePolicy {
         return next != null && next != active && priority(next, worker) > priority(active, worker);
     }
     public record Dispatch(JsonObject task, String command) { }
+    public static boolean detached(JsonObject task, UUID worker) { return flag(run(task,worker),"operatorDetached"); }
+    /** Host participation intent survives reconnects and never discards a checkpoint. */
+    public static void detach(JsonObject task,UUID worker,boolean detached) {
+        if(terminal(text(task,"status"))||flag(task,"cancelled"))throw new IllegalStateException("This job has ended; create a new job");
+        if(!task.getAsJsonObject("runs").has(worker.toString()))throw new IllegalArgumentException("Worker is not assigned to this job");
+        JsonObject r=run(task,worker);
+        if(terminal(text(r,"status")))throw new IllegalStateException("This worker's run has ended");
+        r.addProperty("operatorDetached",detached);
+        if(!detached&&text(r,"status").equals("Inspection required"))r.addProperty("resumeInspection",true);
+    }
+    public static String guidance(JsonObject task) {
+        if(flag(task,"cancelled"))return "Cancelled by host. Offline workers receive cancellation on reconnect; cleanup records remain until acknowledged. Start a new job to work again.";
+        if(terminal(text(task,"status")))return "Finished. Start a new job from a preset; this execution cannot be resumed.";
+        if(flag(task,"paused"))return "Paused by host. Resume continues saved work; separately detached workers stay detached.";
+        if(task.getAsJsonObject("runs").asMap().values().stream().anyMatch(v->flag(v.getAsJsonObject(),"operatorDetached")))return "Host controls this job. Detached workers keep their checkpoints; Rejoin restores participation. Other eligible workers continue.";
+        return "Host controls this job. Pause/Resume/Cancel affect the whole job. Detach affects only the selected worker; cleanup may delay release.";
+    }
     /** Generic workflow scheduling, after the adapter has resolved native lane/TPA reservations. */
     public static Dispatch dispatch(JsonObject active, JsonObject next, UUID worker) {
         if (active != null) {
             if (flag(active, "cancelled")) return new Dispatch(active, "cancel");
             if (text(run(active, worker), "status").equals("Suspending")) return new Dispatch(active,
-                resumingSuspension(run(active, worker)) && next == active && !flag(active, "paused") ? "resume" : "");
-            return new Dispatch(active, flag(active, "paused") || preempts(active, next, worker) ? "pause" : "external");
+                resumingSuspension(run(active, worker)) && next == active && !flag(active, "paused") && !detached(active,worker) ? "resume" : "");
+            return new Dispatch(active, flag(active, "paused") || detached(active,worker) || preempts(active, next, worker) ? "pause" : "external");
         }
         if (next == null) return new Dispatch(null, "");
         String state = text(run(next, worker), "status");
