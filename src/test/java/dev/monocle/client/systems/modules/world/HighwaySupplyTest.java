@@ -60,6 +60,14 @@ public final class HighwaySupplyTest {
             && HighwayBuilder.repairFlightRetryDelay(true, false) == 20
             && HighwayBuilder.repairFlightRetryDelay(false, false) == 200
             : "Maintenance landing resumes repair flight immediately without weakening ordinary retry backoff";
+        try (var bytes = HighwayBuilder.class.getResourceAsStream("HighwayBuilder.class")) {
+            var methods = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes()).methods();
+            var calls = methods.stream().filter(m -> m.methodName().equalsString("settleRepairFlightHistory")).findFirst().orElseThrow()
+                .code().orElseThrow().elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
+            assert calls.containsAll(List.of("paveSection", "retirePavingSection"))
+                : "A repaired row must be verified and retired before the next clean flight";
+        }
         assert HighwayBuilder.fallbackToolSlot(-1,true,slot->true)==-1;
         assert HighwayBuilder.fallbackToolSlot(2,false,slot->true)==2;
         assert HighwayBuilder.fallbackToolSlot(-1,false,slot->false)==-1;

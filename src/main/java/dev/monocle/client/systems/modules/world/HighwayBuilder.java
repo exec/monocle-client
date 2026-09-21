@@ -1680,9 +1680,10 @@ public class HighwayBuilder extends Module {
 
     private boolean tryStartRepairFlight() {
         if (repairFlightTarget != null || !flyCleanRepair.get() || operation.get() != Operation.Repair || crewAssigned || dir.diagonal
-            || state != State.Forward || advancing || !pavingChecks.isEmpty() || !pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()
+            || state != State.Forward || advancing || !pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()
             || !temporarySteps.isEmpty() || !mc.player.onGround() || mc.player.tickCount < repairFlightRetryTick
             || mc.player.position().distanceToSqr(jobWorkPosition()) > 1) return false;
+        if (!settleRepairFlightHistory()) return false;
         ElytraFly fly = Modules.get().get(ElytraFly.class);
         boolean hasGlider = usableCrewGlider(mc.player.getItemBySlot(EquipmentSlot.CHEST))
             || mc.player.getInventory().getNonEquipmentItems().stream().anyMatch(HighwayBuilder::usableCrewGlider);
@@ -1699,6 +1700,12 @@ public class HighwayBuilder extends Module {
         repairFlightProgress = mc.player.position(); repairFlightProgressTick = mc.player.tickCount;
         repairFlightLaunchTick = -1; repairFlightLanding = false; repairFlightSpeed = 0;
         return tickRepairFlight();
+    }
+
+    private boolean settleRepairFlightHistory() {
+        for (List<PavingTarget> section : pavingChecks) if (!paveSection(section, true)) return false;
+        while (!pavingChecks.isEmpty()) retirePavingSection();
+        return true;
     }
 
     private boolean tickRepairFlight() {
