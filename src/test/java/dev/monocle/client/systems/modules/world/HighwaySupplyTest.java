@@ -44,8 +44,10 @@ public final class HighwaySupplyTest {
         assert HighwayBuilder.repairFlightVelocity(new Vec3(0,0,0),new Vec3(10,0,0),5).equals(new Vec3(5,0,0));
         assert HighwayBuilder.repairFlightVelocity(new Vec3(0,0,0),new Vec3(3,0,0),5).equals(new Vec3(3,0,0));
         assert HighwayBuilder.repairFlightVelocity(new Vec3(0,3,0),new Vec3(10,0,0),5).equals(new Vec3(5,0,0)) : "Repair cruising must never auto-drop";
-        assert Math.abs(HighwayBuilder.repairFlightSpeed(0,5)-.15)<1e-9;
-        assert HighwayBuilder.repairFlightSpeed(4.9,5)==5 : "Repair survey acceleration must cap at the configured speed";
+        assert Math.abs(HighwayBuilder.repairFlightSpeed(0,5,true,0,1.5)-.15)<1e-9;
+        assert HighwayBuilder.repairFlightSpeed(4.9,5,true,0,1.5)==5 : "Repair survey acceleration must cap at the configured speed";
+        assert HighwayBuilder.repairFlightSpeed(0,5,false,0,1.5)==5 : "Disabling ElytraFly acceleration applies its configured speed immediately";
+        assert HighwayBuilder.repairFlightDrop(-.08,0)==0 && HighwayBuilder.repairFlightDrop(-.08,.5)==-.04;
         assert HighwayBuilder.awaitRepairChunks(0,false,false);
         assert !HighwayBuilder.awaitRepairChunks(0,true,false) && !HighwayBuilder.awaitRepairChunks(0,false,true)
             : "A defect or the real job end lands; a temporary render boundary does not";

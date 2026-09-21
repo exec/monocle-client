@@ -1626,8 +1626,12 @@ public class HighwayBuilder extends Module {
         return delta.length() <= speed ? delta : delta.normalize().scale(speed);
     }
 
-    static double repairFlightSpeed(double current, double target) {
-        return Math.min(target, Math.max(0, current) + .15); // ElytraFly acceleration step 1.5.
+    static double repairFlightSpeed(double current, double target, boolean acceleration, double start, double step) {
+        return acceleration ? Math.min(target, Math.max(0, current) + start + step * .1) : target;
+    }
+
+    static double repairFlightDrop(double movementY, double multiplier) {
+        return movementY < 0 ? movementY * multiplier : 0;
     }
 
     static boolean awaitRepairChunks(int cleanRows, boolean hasIssue, boolean jobEnd) {
@@ -1739,8 +1743,10 @@ public class HighwayBuilder extends Module {
                     return true;
                 }
             }
-            repairFlightSpeed = repairFlightSpeed(repairFlightSpeed, Math.min(6, fly.horizontalSpeed.get()));
-            Vec3 velocity = repairFlightVelocity(from, target, repairFlightSpeed);
+            repairFlightSpeed = repairFlightSpeed(repairFlightSpeed, Math.min(6, fly.horizontalSpeed.get()),
+                fly.acceleration.get(), fly.accelerationMin.get(), fly.accelerationStep.get());
+            Vec3 horizontal = repairFlightVelocity(from, target, repairFlightSpeed);
+            Vec3 velocity = new Vec3(horizontal.x, repairFlightDrop(mc.player.getDeltaMovement().y, fly.fallMultiplier.get()), horizontal.z);
             if (!PrinterFlight.segmentClear(from, from.add(velocity), mc.player.getBbWidth() + .12,
                 Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear)) repairFlightLanding = true;
             else fly.requestSurveyAutopilot(velocity);
