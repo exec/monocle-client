@@ -23,7 +23,8 @@ workflow permits, and whether the latest live update was acknowledged.
 
 ## Stage 2 — 0.8.x: Operator controls and configuration editing
 
-- [ ] Guided common-setting editors, with explicit job/worker/future-job scope.
+- [x] Guided common-setting editors with explicit job/worker scope (0.8.1).
+- [ ] Guided editing of future-job defaults.
 - [ ] Compare and duplicate presets; preview changes before applying.
 - [ ] Consistent Start/Pause/Resume/Cancel/Detach actions and ownership explanations.
 - [ ] Start and manage every ordinary highway job without API/assistant access.
@@ -32,6 +33,14 @@ workflow permits, and whether the latest live update was acknowledged.
 
 Acceptance: a fresh operator can launch, modify, pause, and cancel a job from
 either host UI, and distinguish a queued request from successful application.
+
+0.8.1 is the first slice, not completion of this stage. Open a job's inspection
+view and choose **Edit live job settings** in either host interface. Select one
+worker or all unfinished workers, preview, then apply. Numbers are proposals,
+not live readings. Acknowledgements refresh without rebuilding the editor.
+The guided speed ranges are deliberately bounded; the existing advanced JSON
+editor remains available. Flight mode, acceleration, food protections, and
+future-job defaults are not changed by these numeric edits.
 
 ## Stage 3 — 0.9.0: Right Shift workspace
 
@@ -102,3 +111,4 @@ no unresolved permanent waits, silent road gaps, or unsafe cancellation.
 | Build | Scope | Automated checks | Operator result |
 |---|---|---|---|
 | 0.8.0 | Configuration visibility | Clean build, shared report tests, authenticated API, JS syntax passed | Pending; browser automation unavailable; live host unchanged |
+| 0.8.1 | Guided live job setting edits | Clean build, catalog validation, NBT overlay preservation, authenticated preview API, JS syntax passed | Pending; live host unchanged |

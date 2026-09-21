@@ -109,11 +109,35 @@ public final class CoordinatorCoreTest {
         assert TaskConfiguration.inspect(new JsonObject()).getAsJsonObject("profiles").isEmpty();
     }
 
+    private static void guidedConfiguration() {
+        assert JobSettingControls.catalog().getAsJsonArray("controls").size() == JobSettingControls.ALL.size();
+        for (var control : JobSettingControls.ALL) {
+            JsonObject request = new JsonObject(); request.addProperty("control", control.id()); request.addProperty("active", false);
+            request.addProperty("value", control.example());
+            JsonObject before = request.deepCopy(), preview = JobSettingControls.preview(request);
+            assert request.equals(before);
+            JsonObject modules = preview.getAsJsonObject("modules");
+            assert modules.size() == 1 && !modules.getAsJsonObject(control.module()).get("active").getAsBoolean();
+            if (!control.numeric()) assert modules.getAsJsonObject(control.module()).get("settings").getAsString().equals("{}");
+            else {
+                for (double bad : new double[]{control.min() - 1, control.max() + 1, Double.NaN, Double.POSITIVE_INFINITY}) {
+                    request.addProperty("value", bad); rejects(() -> JobSettingControls.preview(request));
+                }
+                request.addProperty("value", "5"); rejects(() -> JobSettingControls.preview(request));
+            }
+            request.addProperty("active", "false"); rejects(() -> JobSettingControls.preview(request));
+        }
+        JsonObject request = JsonParser.parseString("{\"control\":\"eat-hunger\",\"active\":true,\"value\":5.5}").getAsJsonObject();
+        rejects(() -> JobSettingControls.preview(request));
+        request.addProperty("control", "highway-builder"); rejects(() -> JobSettingControls.preview(request));
+    }
+
     public static void main(String[] args) throws Exception {
         boolean enabled = false; assert enabled = true;
         if (!enabled) throw new IllegalStateException("Run with assertions enabled");
         liveConfiguration();
         configurationInspection();
+        guidedConfiguration();
         stashScan();
         supplyRecovery();
         teleportRecovery();

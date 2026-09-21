@@ -70,6 +70,14 @@ public final class HostServiceTest {
             JsonObject configuration = JsonParser.parseString(configurationResponse.body()).getAsJsonObject();
             assert configuration.has("profiles") && configuration.has("updates") && !configuration.has("package") && !configuration.has("hostOriginal");
             assert request(http, api, inspectConfig, "wrong", false).statusCode() == 403;
+            assert request(http, api, op("configuration-controls"), TOKEN, false).statusCode() == 200;
+            JsonObject previewRequest = op("preview-configuration"); previewRequest.addProperty("control", "speed");
+            previewRequest.addProperty("active", true); previewRequest.addProperty("value", 5.5);
+            assert request(http, api, previewRequest, "wrong", false).statusCode() == 403;
+            var previewResponse = request(http, api, previewRequest, TOKEN, false);
+            assert previewResponse.statusCode() == 200;
+            assert JsonParser.parseString(previewResponse.body()).getAsJsonObject().getAsJsonObject("modules").has("speed");
+            assert host.control(inspectConfig).equals(configuration) : "Previewing must not enqueue configuration updates";
             JsonObject collision = first.deepCopy(); collision.addProperty("priority", 3); rejects(() -> host.control(collision));
             await(() -> state(host, firstId).equals("Running"), worker, other);
             // A running Lua frame legitimately has no native action between steps.

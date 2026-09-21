@@ -170,7 +170,7 @@ function render() {
     if (snapshot.lastConnectionError || snapshot.telemetryError) notice(snapshot.lastConnectionError || snapshot.telemetryError);
   }
   if (focused) $('content').querySelector('[data-key="' + CSS.escape(focused) + '"]')?.focus({ preventScroll: true });
-  if ($('inspect-dialog').open) { updateChat();document.querySelectorAll('.managed-control').forEach(n=>{n.disabled=!writable();}); }
+  if ($('inspect-dialog').open) { updateChat();document.querySelectorAll('.managed-control').forEach(n=>{n.disabled=!writable();});document.querySelectorAll('.guided-settings').forEach(n=>n.updateStatus?.()); }
 }
 function progress(node, value, total) {
   const percent = Math.max(0, Math.min(100, 100 * (value || 0) / Math.max(1, total || 1)));
@@ -322,6 +322,69 @@ function configurationInspector(task) {
   return panel;
 }
 function managedButton(text, action, cls='') { return button(text,action,!writable(),'managed-control '+cls); }
+function guidedSettings(task, initialWorker) {
+  const panel=el('details','guided-settings');panel.append(el('summary','','Edit live job settings'));
+  const body=el('div','management-section');panel.append(body);
+  let loaded=false;
+  panel.addEventListener('toggle',async()=>{
+    if(!panel.open||loaded)return;loaded=true;
+    if(demo){body.append(el('p','hint','Connect to a host to edit settings.'));return;}
+    try {
+      const catalog=await api('control',{op:'configuration-controls'});
+      if(!panel.isConnected)return;
+      body.append(el('p','hint','This job only. Values are proposed edits, not readings from workers. Future-job defaults and other settings are unchanged.'));
+      const form=el('form'),target=el('select'),setting=el('select'),activation=el('select'),value=el('input');value.type='number';
+      const field=(title,input)=>{const label=el('label','',title);label.append(input);form.append(label);};
+      let option=el('option','','All unfinished workers in this job');option.value='';target.append(option);
+      for(const id of Object.keys(task.runs||{})){option=el('option','',snapshot.workers.find(w=>w.id===id)?.name||id);option.value=id;target.append(option);}
+      target.value=initialWorker||'';
+      for(const c of catalog.controls){option=el('option','',c.label);option.value=c.id;setting.append(option);}
+      for(const state of ['On','Off']){option=el('option','',state);option.value=state;activation.append(option);}
+      field('Apply to',target);field('Control',setting);field('Proposed module activation',activation);field('Proposed value (not read from worker)',value);
+      const help=el('p','hint'),preview=el('p','','Choose values, then preview the change.'),receipts=el('div');receipts.setAttribute('aria-live','polite');
+      preview.style.whiteSpace='pre-line';receipts.style.whiteSpace='pre-line';
+      const previewButton=el('button','','Preview change');previewButton.type='submit';
+      const apply=button('Apply previewed change',async()=>{
+        if(!draft||!writable())return;
+        const request=draft;draft=null;busy=true;panel.updateStatus();
+        try {await api('control',request);preview.textContent='Request saved. Await the worker acknowledgement below.';}
+        catch(error){preview.textContent='Request not confirmed: '+error.message+' Check acknowledgements before retrying.';}
+        finally {busy=false;await refresh();panel.updateStatus();}
+      },true);
+      let draft=null,revision=0,previewing=false;
+      const changed=()=>{revision++;draft=null;preview.textContent='Draft changed. Preview again before applying.';panel.updateStatus?.();};
+      const updateValue=()=>{const c=catalog.controls.find(c=>c.id===setting.value);value.parentElement.hidden=!c.setting;value.required=!!c.setting;value.min=c.min;value.max=c.max;value.step=c.step||1;value.value=c.example;help.textContent=c.help;changed();};
+      target.addEventListener('change',changed);activation.addEventListener('change',changed);value.addEventListener('input',changed);setting.addEventListener('change',updateValue);
+      panel.updateStatus=()=>{
+        const current=[...snapshot.tasks,...snapshot.history].find(t=>t.id===task.id);
+        const allowed=writable()&&current&&!terminal(current.status)&&!current.cancelled;
+        previewButton.disabled=!allowed||previewing;apply.disabled=!allowed||!draft;
+        const lines=Object.entries(current?.runs||{}).filter(([id])=>!target.value||id===target.value).map(([id,run])=>{
+          const requested=run.configuration?.revision||0,ack=run.configRevision||0;
+          const status=!requested?'No live request':ack<requested?(terminal(run.status)||current.cancelled?'Ended without acknowledgement':'Pending'):run.configError?'Rejected':'Accepted';
+          return (snapshot.workers.find(w=>w.id===id)?.name||id)+': '+status+' · requested '+requested+' / acknowledged '+ack+(requested&&ack>=requested&&run.configError?' · '+run.configError:'');
+        }).join('\n');
+        if(receipts.textContent!==lines)receipts.textContent=lines;
+      };
+      form.addEventListener('submit',async e=>{
+        e.preventDefault();if(!writable()||previewing)return;
+        const c=catalog.controls.find(c=>c.id===setting.value),version=revision,worker=target.value;
+        draft=null;previewing=true;panel.updateStatus();
+        try {
+          const request={op:'preview-configuration',control:c.id,active:activation.value==='On'};
+          if(c.setting)request.value=Number(value.value);
+          const result=await api('control',request);
+          if(version!==revision||!panel.isConnected)return;
+          draft={op:'configure',id:task.id,...(worker?{worker}:{}),modules:result.modules};
+          preview.textContent='Target: '+target.selectedOptions[0].textContent+'\n'+result.description+'\n'+result.scope;
+        }catch(error){if(version===revision)preview.textContent='Cannot preview: '+error.message;}
+        finally{previewing=false;panel.updateStatus();}
+      });
+      form.append(help,previewButton,preview,apply);body.append(form,el('h4','','Latest acknowledgements'),receipts);updateValue();
+    } catch(error) {body.replaceChildren(el('p','',error.message+' Close and reopen to retry.'));loaded=false;}
+  });
+  return panel;
+}
 function assignFromManagement(crew, worker) {
   $('new-job').click();$('job-crew').value=crew;updateWorkers();
   if(worker)for(const input of $('job-workers').querySelectorAll('input'))input.checked=input.value===worker;
@@ -373,7 +436,8 @@ function managementControls(content, crew, worker) {
   for(const task of jobs) {
     panel.append(jobCard(task));if(worker)panel.append(priorityControls(task,worker));
     panel.append(configurationInspector(task));
-    const details=el('details');details.append(el('summary','','Live module configuration · '+task.name));
+    if(!terminal(task.status))panel.append(guidedSettings(task,worker));
+    const details=el('details');details.append(el('summary','','Advanced: raw module configuration · '+task.name));
     const form=el('form');const textarea=el('textarea');textarea.rows=5;textarea.value='{"auto-eat":{"active":true,"settings":"{}"}}';textarea.setAttribute('aria-label','Module configuration JSON');
     const submit=el('button','managed-control','Apply configuration');submit.type='submit';submit.disabled=!writable();form.append(textarea,submit);
     form.addEventListener('submit',e=>{e.preventDefault();if(!writable())return;try {const modules=JSON.parse(textarea.value);control({op:'configure',id:task.id,...(worker?{worker}:{}),modules});}catch(error){notice(error.message);}});
@@ -419,6 +483,7 @@ function showInspection() {
     const task = [...snapshot.tasks, ...snapshot.history].find(t => t.id === id); $('inspect-title').textContent = task?.name || 'Job no longer present'; if (!task) return;
     content.append(el('p', 'muted', task.server + ' · ' + task.dimension), jobActions(task)); if (!terminal(task.status)) content.append(priorityControls(task));
     content.append(configurationInspector(task));
+    if(!terminal(task.status))content.append(guidedSettings(task));
     for (const [workerId, run] of Object.entries(task.runs || {})) {
       const worker = snapshot.workers.find(w => w.id === workerId); const row = el('article', 'inspection-row'); const header = el('div', 'card-header');
       header.append(el('h3', '', worker?.name || workerId), badge(run.status, tone(run.status))); row.append(header, el('p', '', run.detail || 'No reported detail'));

@@ -19,6 +19,21 @@ public final class BotProfilesTest {
             """;
         assert BotProfiles.validate(profile(launcherSettings)).equals(profile(launcherSettings)) : "Launcher merges use the same worker SNBT validation";
         var launcherTag=TagParser.parseCompoundFully(launcherSettings);
+        for (var control : dev.monocle.coordinator.JobSettingControls.ALL) {
+            JsonObject request = new JsonObject(); request.addProperty("control", control.id());
+            request.addProperty("active", true); request.addProperty("value", control.example());
+            var modules = dev.monocle.coordinator.JobSettingControls.preview(request).getAsJsonObject("modules");
+            assert BotProfiles.validate(modules).equals(modules);
+            var settings = TagParser.parseCompoundFully(modules.getAsJsonObject(control.module()).get("settings").getAsString());
+            if (control.numeric()) {
+                var value = settings.getListOrEmpty("groups").getCompoundOrEmpty(0).getListOrEmpty("settings").getCompoundOrEmpty(0).get("value");
+                assert control.step() == 1 ? value instanceof net.minecraft.nbt.IntTag : value instanceof net.minecraft.nbt.DoubleTag;
+            }
+            if (control.id().equals("speed")) {
+                String mergedPreview = BotProfiles.mergeSettings(launcherTag, settings).toString();
+                assert mergedPreview.contains("5.5d") && mergedPreview.contains("Vanilla") && mergedPreview.contains("a]b");
+            }
+        }
         assert launcherTag.getListOrEmpty("groups").size()==1;
         for (String valid : List.of("{}", "{groups:[]}", "{groups:[{name:'General',settings:[{name:'speed',value:2.5}]}]}")) {
             JsonObject profile = profile(valid);

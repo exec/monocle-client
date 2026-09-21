@@ -2,6 +2,13 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.8.1 — Guided live job settings
+
+- Added matching guided editors to the in-game host and WebUI for Speed, Elytra Fly speed, Auto Eat thresholds, and common module activation controls.
+- Require an explicit target and preview before applying to one worker or all unfinished workers in a job. Preserve unrelated settings and future-job defaults.
+- Keep drafts intact while configuration acknowledgements refresh. Proposed values are clearly distinguished from worker readings; actual readback and preset comparison remain later milestones.
+- Standalone operators need the matching host distribution for the new WebUI. No highway execution or worker protocol changes.
+
 ## 0.8.0 — Configuration visibility
 
 - Added a read-only job configuration inspector to the in-game host and standalone WebUI, showing captured profiles, module overrides, native highway supply capabilities, and the latest live configuration request for each worker.

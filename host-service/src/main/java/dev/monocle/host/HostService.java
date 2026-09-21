@@ -562,6 +562,8 @@ public final class HostService implements AutoCloseable {
         String op = text(request, "op");
         logEvent("control-request", "", text(request, "id"), op);
         if (op.equals("submit")) return submit(request);
+        if (op.equals("configuration-controls")) return dev.monocle.coordinator.JobSettingControls.catalog();
+        if (op.equals("preview-configuration")) return dev.monocle.coordinator.JobSettingControls.preview(request);
         if (op.equals("submit-highway")) return submit(highwaySubmission(request));
         if (op.equals("stash-get")) {
             if(!crews.containsKey(text(request,"crew")))throw new IllegalArgumentException("Unknown crew");
