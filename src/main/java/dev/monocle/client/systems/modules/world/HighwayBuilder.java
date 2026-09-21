@@ -1622,7 +1622,7 @@ public class HighwayBuilder extends Module {
     }
 
     static Vec3 repairFlightVelocity(Vec3 from, Vec3 to, double speed) {
-        Vec3 delta = to.subtract(from);
+        Vec3 delta = new Vec3(to.x - from.x, 0, to.z - from.z);
         return delta.length() <= speed ? delta : delta.normalize().scale(speed);
     }
 
@@ -1699,9 +1699,9 @@ public class HighwayBuilder extends Module {
         }
         if (!fly.isActive()) { fly.enable(); repairFlightEnabledFly = true; }
         if (mc.player.isFallFlying()) {
-            if (from.distanceToSqr(target) <= 2.25) { repairFlightLanding = true; return true; }
+            if (Math.pow(from.x - target.x, 2) + Math.pow(from.z - target.z, 2) <= 2.25) { repairFlightLanding = true; return true; }
             repairFlightSpeed = repairFlightSpeed(repairFlightSpeed, Math.min(6, fly.horizontalSpeed.get()));
-            Vec3 velocity = repairFlightVelocity(from, target.add(0, .5, 0), repairFlightSpeed);
+            Vec3 velocity = repairFlightVelocity(from, target, repairFlightSpeed);
             if (!PrinterFlight.segmentClear(from, from.add(velocity), mc.player.getBbWidth() + .12,
                 Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear)) repairFlightLanding = true;
             else fly.requestSurveyAutopilot(velocity);
