@@ -68,6 +68,13 @@ public final class HighwaySupplyTest {
             assert calls.containsAll(List.of("paveSection", "retirePavingSection"))
                 : "A repaired row must be verified and retired before the next clean flight";
         }
+        try (var bytes = HighwayBuilder.class.getResourceAsStream("HighwayBuilder$State$2.class")) {
+            var calls = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes()).methods().stream()
+                .filter(m -> m.methodName().equalsString("tick")).findFirst().orElseThrow().code().orElseThrow().elementList().stream()
+                .filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
+            assert calls.contains("tryStartRepairFlight") : "Forward must reconsider flight at every completed repair row";
+        }
         assert HighwayBuilder.fallbackToolSlot(-1,true,slot->true)==-1;
         assert HighwayBuilder.fallbackToolSlot(2,false,slot->true)==2;
         assert HighwayBuilder.fallbackToolSlot(-1,false,slot->false)==-1;

@@ -3302,7 +3302,6 @@ public class HighwayBuilder extends Module {
 
         count = breakCount = queuedHotbarSlots = 0;
         waitingForMob = false;
-        if (tryStartRepairFlight()) return;
         if (mc.player.getY() < workOrigin.getY() - 0.5 && state != State.ReLevel) setState(State.ReLevel);
         if ((state == State.MineFront || state == State.MineFloor || state == State.MineRailings || state == State.MineAboveRailings) && needsBarrierSealing()) {
             actionEpoch++;
@@ -5220,6 +5219,10 @@ public class HighwayBuilder extends Module {
                     while (b.pavingChecks.size() > HighwayPlan.PAVING_LOOKBACK + 1) b.retirePavingSection();
                     b.idleTicks = 0;
                 }
+                // Flight belongs to the verified row boundary. A pre-state check never
+                // observes this moment because Forward completes one arrival and starts
+                // the next advance in the same tick.
+                if (!b.advancing && b.tryStartRepairFlight()) return;
                 if (b.verifyAfterCombat) {
                     b.diagnosticGate = "forward:combat-verification";
                     b.status = "Verifying paving after piglin clearing";
