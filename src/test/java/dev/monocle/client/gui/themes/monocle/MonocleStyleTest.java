@@ -22,6 +22,10 @@ public final class MonocleStyleTest {
         assert nav[0].x() == 0 && nav[1].x() == 90 && nav[1].y() == 0;
         assert nav[2].x() == 0 && nav[2].y() == 24 : "Navigation must wrap within narrow windows";
         assert dev.monocle.client.gui.utils.NavigationLayout.wrap(60, 24, new double[]{90})[0].width() == 60;
+        assert dev.monocle.client.gui.utils.WorkspaceLayout.width(1920,2,320,760)==760;
+        assert dev.monocle.client.gui.utils.WorkspaceLayout.width(640,2,320,760)==320;
+        assert dev.monocle.client.gui.utils.WorkspaceLayout.stacked(519,520);
+        assert !dev.monocle.client.gui.utils.WorkspaceLayout.stacked(520,520);
         var view = new dev.monocle.client.gui.widgets.containers.WView() {};
         view.restoreScroll(120); assert view.scrollPosition() == 120;
         view.restoreScroll(-10); assert view.scrollPosition() == 0;

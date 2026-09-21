@@ -2,6 +2,14 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.9.2 — Management workspace refinement
+
+- Management windows now retain vertical scroll position when opening a child editor or switching away and back. Existing section expansion and editor instances remain authoritative.
+- Workers remembers its Crews, Jobs or History page; Workflows remembers its folder. The redundant Workflows sub-page was removed from Workers now that Workflows is a primary destination.
+- Worker action groups, the Stash catalog/editor, Highway Builder setup, and Inventory Manager adapt to narrow windows. Compact inventory rules become expandable cards instead of an overflowing five-column table.
+- Stash cards retain expansion across catalog refreshes, scan controls track the live scan state, and recovered errors return to normal status styling. Empty and error explanations remain visible text rather than color-only indicators.
+- No worker protocol, workflow execution, module behavior, highway settings or job defaults changed. Native GUI rendering requires an in-game smoke test.
+
 ## 0.9.1 — Module detail workspace
 
 - Reorganized module details around live status and module-specific controls, settings, then keybind/export controls. Highway Builder and Inventory Manager retain their dedicated operational screens and open this shared view for advanced configuration.

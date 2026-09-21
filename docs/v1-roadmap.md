@@ -96,6 +96,12 @@ operational screens remain the primary entry points and delegate advanced
 configuration to the shared view. Keep the checklist open until the remaining
 specialized management screens and small-window native smoke tests are complete.
 
+0.9.2 adds shared scroll restoration and responsive management layouts. Workers
+retains its selected page, Workflows retains its folder, Stash cards retain
+expansion during refresh, and narrow Inventory/Highway/Stash/Worker layouts
+stack controls instead of overflowing. Complete the native small-window smoke
+test before closing Stage 3.
+
 ## Stage 4 — 0.10.0: HUD and notifications
 
 - [ ] Reusable Activity, Crew, Supplies, Navigation, and notification panels.

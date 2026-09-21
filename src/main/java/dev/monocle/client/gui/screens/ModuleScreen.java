@@ -46,7 +46,6 @@ import static com.mojang.blaze3d.platform.InputConstants.*;
 
 public class ModuleScreen extends WindowScreen {
     private static final Map<String, String> searches = new HashMap<>();
-    private static final Map<String, Double> scrolls = new HashMap<>();
     private final Module module;
 
     private WContainer settingsContainer;
@@ -56,7 +55,6 @@ public class ModuleScreen extends WindowScreen {
     private WLabel stateLabel;
     private WTextBox searchBox;
     private String search;
-    private boolean restoredScroll;
 
     public ModuleScreen(GuiTheme theme, Module module) {
         super(theme, theme.favorite(module.favorite), module.title);
@@ -66,18 +64,9 @@ public class ModuleScreen extends WindowScreen {
         search = searches.getOrDefault(module.name, "");
     }
 
-    @Override protected void init() {
-        super.init();
-        if (!restoredScroll) {
-            restoredScroll = true;
-            window.view.restoreScroll(theme.scale(scrolls.getOrDefault(module.name, 0.0)));
-        }
-    }
-
     @Override protected void onClosed() {
         super.onClosed();
         searches.put(module.name, search);
-        scrolls.put(module.name, window.view.scrollPosition() / theme.scale(1));
     }
 
     @Override

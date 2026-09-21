@@ -6,7 +6,6 @@ import dev.monocle.client.gui.renderer.GuiRenderer;
 import dev.monocle.client.gui.widgets.WLabel;
 import dev.monocle.client.gui.widgets.WWidget;
 import dev.monocle.client.gui.widgets.containers.WContainer;
-import dev.monocle.client.gui.widgets.containers.WHorizontalList;
 import dev.monocle.client.gui.widgets.containers.WVerticalList;
 import dev.monocle.client.gui.widgets.containers.WSection;
 import dev.monocle.client.gui.widgets.pressable.WButton;
@@ -14,6 +13,8 @@ import dev.monocle.client.settings.Settings;
 import dev.monocle.client.systems.bots.Bots;
 import dev.monocle.client.systems.modules.world.HighwayBuilder;
 import dev.monocle.client.utils.render.color.Color;
+import dev.monocle.client.utils.Utils;
+import dev.monocle.client.gui.utils.WorkspaceLayout;
 import net.minecraft.util.StringUtil;
 
 import static dev.monocle.client.MonocleClient.mc;
@@ -24,9 +25,10 @@ public class HighwayBuilderScreen extends WindowScreen {
     private WLabel status, plan, stats, readiness, supplies, timings;
     private int timingTicks;
     private WContainer setup;
-    private WHorizontalList actions;
+    private WContainer actions;
     private WButton preview;
     private boolean shownJob, shownPaused;
+    private double contentWidth;
 
     public HighwayBuilderScreen(GuiTheme theme, HighwayBuilder builder) {
         super(theme, "Highway Builder");
@@ -46,13 +48,14 @@ public class HighwayBuilderScreen extends WindowScreen {
 
     @Override
     public void initWidgets() {
-        status = add(theme.label(builder.getStatus(), true, 580)).expandX().widget();
-        actions = add(theme.horizontalList()).expandX().widget();
-        plan = add(theme.label(builder.getPlanSummary(), 580)).expandX().widget();
-        stats = add(theme.label("", 580)).expandX().widget();
+        contentWidth=WorkspaceLayout.width(Utils.getWindowWidth(),theme.scale(1),320,580);
+        status = add(theme.label(builder.getStatus(), true, contentWidth)).expandX().widget();
+        actions = add(WorkspaceLayout.stacked(contentWidth,460)?theme.verticalList():theme.horizontalList()).expandX().widget();
+        plan = add(theme.label(builder.getPlanSummary(), contentWidth)).expandX().widget();
+        stats = add(theme.label("", contentWidth)).expandX().widget();
         add(theme.horizontalSeparator()).expandX();
 
-        WHorizontalList body = add(theme.horizontalList()).expandX().widget();
+        WContainer body = add(WorkspaceLayout.stacked(contentWidth,540)?theme.verticalList():theme.horizontalList()).expandX().widget();
         setup = body.add(theme.verticalList()).top().expandX().widget();
         WVerticalList details = body.add(theme.verticalList()).top().widget();
 
@@ -66,13 +69,13 @@ public class HighwayBuilderScreen extends WindowScreen {
         supplies = details.add(theme.label(builder.getSuppliesSummary(), 205)).widget();
 
         WSection timingSection = add(theme.section("Timing breakdown (local job)", false)).expandX().widget();
-        timingSection.add(theme.label("Controller phase time, not CPU time. Background mining/paving can continue during a verification or entity wait. Same-job crew handoffs retain totals; a new job resets them.", 580));
-        timings = timingSection.add(theme.label(builder.getTimingSummary(), 580)).expandX().widget();
+        timingSection.add(theme.label("Controller phase time, not CPU time. Background mining/paving can continue during a verification or entity wait. Same-job crew handoffs retain totals; a new job resets them.", contentWidth));
+        timings = timingSection.add(theme.label(builder.getTimingSummary(), contentWidth)).expandX().widget();
         timingSection.add(theme.button("Copy timings")).widget().action = () -> mc.keyboardHandler.setClipboard(
             "Monocle " + dev.monocle.client.MonocleClient.VERSION + "\n" + builder.getTimingSummary());
 
         add(theme.horizontalSeparator()).expandX();
-        WHorizontalList bottom = add(theme.horizontalList()).expandX().widget();
+        WContainer bottom = add(WorkspaceLayout.stacked(contentWidth,480)?theme.verticalList():theme.horizontalList()).expandX().widget();
         preview = bottom.add(theme.button("Show world preview")).widget();
         preview.action = () -> {
             builder.setPreview(!builder.isPreviewEnabled());
@@ -80,7 +83,7 @@ public class HighwayBuilderScreen extends WindowScreen {
         };
         preview.tooltip = "Show the planned work in the world before starting. Close this window to inspect it.";
 
-        WButton advanced = bottom.add(theme.button("Advanced & keybind")).expandCellX().right().widget();
+        WButton advanced = bottom.add(theme.button("Advanced & keybind")).expandX().right().widget();
         advanced.action = () -> {
             mc.gui.setScreen(new ModuleScreen(theme, builder));
         };

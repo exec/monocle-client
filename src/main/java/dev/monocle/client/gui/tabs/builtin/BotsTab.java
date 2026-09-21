@@ -26,6 +26,7 @@ import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.misc.swarm.SwarmCrew;
 import dev.monocle.client.systems.modules.world.HighwayBuilder;
 import dev.monocle.client.utils.Utils;
+import dev.monocle.client.gui.utils.WorkspaceLayout;
 import dev.monocle.client.utils.render.color.Color;
 import net.minecraft.client.gui.screens.Screen;
 
@@ -51,6 +52,8 @@ public class BotsTab extends Tab {
     }
 
     private enum Page { Crews, Jobs, Workflows, History }
+    private static Page rememberedPage = Page.Crews;
+    private static String rememberedWorkflowFolder = "";
     private record Choice(String id, String label) { @Override public String toString() { return label; } }
 
     private static class BotsScreen extends WindowTabScreen {
@@ -77,10 +80,12 @@ public class BotsTab extends Tab {
 
         BotsScreen(GuiTheme theme, Tab tab) {
             super(theme, tab);
+            page = tab instanceof WorkflowsTab ? Page.Workflows : rememberedPage;
+            workflowFolder = rememberedWorkflowFolder;
         }
 
         @Override public void initWidgets() {
-            contentWidth = Math.clamp(Utils.getWindowWidth() / theme.scale(1) - 100, 340, 820);
+            contentWidth = WorkspaceLayout.width(Utils.getWindowWidth(), theme.scale(1), 340, 820);
             panelWidth = contentWidth - 16;
 
             Card hero = add(card()).expandX().minWidth(contentWidth).widget();
@@ -120,7 +125,7 @@ public class BotsTab extends Tab {
 
             connectionControls = section.add(theme.verticalList()).expandX().widget();
             keyStatus = section.add(theme.label("", panelWidth - 16)).expandX().widget();
-            WHorizontalList keys = section.add(theme.horizontalList()).expandX().widget();
+            WContainer keys = actionRow(section);
             button(keys, "Paste key", () -> perform(() -> {
                 connectionEditable();
                 if (bots.mode.get() == Bots.Mode.Host) throw new IllegalStateException("Host crew keys are generated here. Paste the copied crew key on a worker instead.");
@@ -174,12 +179,12 @@ public class BotsTab extends Tab {
         }
 
         private void buildPage() {
+            if (!(tab instanceof WorkflowsTab) && page == Page.History && bots.mode.get() != Bots.Mode.Host) page = rememberedPage = Page.Crews;
             navigation.clear(); pageBody.clear(); memberStatus.clear(); memberChecks.clear(); jobLabels.clear(); taskLabels.clear();
             rosterShape = crewShape = catalogShape = taskShape = discoveryShape = "";
             roster = null; crewSelector = null; crewName = null; crewDetail = null; catalog = null; workflowLibrary = null; taskQueue = null; discovery = null;
-            for (Page destination : Page.values()) if (!(tab instanceof WorkflowsTab) && (destination != Page.History || bots.mode.get() == Bots.Mode.Host)) button(navigation, destination == page ? "[ " + destination + " ]" : destination.toString(), () -> {
-                if (destination == Page.Workflows) { dev.monocle.client.gui.tabs.Tabs.get(WorkflowsTab.class).openScreen(theme); return; }
-                page = destination; buildPage(); refresh();
+            for (Page destination : Page.values()) if (!(tab instanceof WorkflowsTab) && destination != Page.Workflows && (destination != Page.History || bots.mode.get() == Bots.Mode.Host)) button(navigation, destination == page ? "[ " + destination + " ]" : destination.toString(), () -> {
+                page = destination; rememberedPage = page; buildPage(); refresh();
             });
             if (page == Page.Workflows) {
                 pageBody.add(theme.label("Lua programs make decisions and run resumable actions. Native presets configure highway duties and supply fallback. Built-ins are read-only; queued tasks keep captured code and tool profiles.", panelWidth)
@@ -237,7 +242,7 @@ public class BotsTab extends Tab {
         private void crewsPage() {
             pageBody.add(theme.label("Create a crew once, rename it freely, then assign it work. Renaming preserves its identity and private key.", panelWidth)
                 .color(theme.textSecondaryColor()));
-            WHorizontalList create = pageBody.add(theme.horizontalList()).expandX().widget();
+            WContainer create = actionRow(pageBody);
             WTextBox newName = create.add(theme.textBox("", "New crew name")).expandX().widget();
             button(create, "Create crew", () -> perform(() -> {
                 String id = bots.createCrew(newName.get()); bots.selectCrew(id); newName.set(""); buildPage();
@@ -264,12 +269,12 @@ public class BotsTab extends Tab {
             crewSelector.action = () -> perform(() -> { bots.selectCrew(crewSelector.get().id()); selectedCrew = ""; rebuildCrewControls(); }, "Crew selected. Other crews keep working.");
             var remove = choose.add(theme.confirmedButton("Delete crew", "Delete idle crew?")).widget();
             remove.action = () -> perform(() -> { bots.removePreset(bots.selectedCrew()); selectedCrew = ""; rebuildCrewControls(); }, "Crew removed. Its saved jobs are not deleted.");
-            WHorizontalList rename = crewControls.add(theme.horizontalList()).expandX().widget();
+            WContainer rename = actionRow(crewControls);
             crewName = rename.add(theme.textBox(bots.crewLabel(bots.selectedCrew()))).expandX().widget();
             button(rename, "Rename", () -> perform(() -> { bots.renameCrew(bots.selectedCrew(), crewName.get()); rebuildCrewControls(); }, "Crew renamed. Its key, identity and worker connections are unchanged."));
             Card details = crewControls.add(card()).expandX().widget();
             crewDetail = details.add(theme.label("", panelWidth - 20)).expandX().widget();
-            WHorizontalList actions = details.add(theme.horizontalList()).expandX().widget();
+            WContainer actions = actionRow(details);
             button(actions, "Assign crew", () -> mc.gui.setScreen(new AssignmentScreen(theme, bots, bots.selectedCrew(), null)));
             button(actions, "Queue workflow", () -> mc.gui.setScreen(new BotTaskScreen(theme, bots, null, null, bots.selectedCrew())));
             button(actions, "Inspect current job", () -> mc.gui.setScreen(new InspectionScreen(theme, bots, bots.controlCrew())));
@@ -329,7 +334,7 @@ public class BotsTab extends Tab {
                 for (var job : jobs) {
                     Card entry = catalog.add(card()).expandX().widget();
                     jobLabels.put(job.id(), entry.add(theme.label("", panelWidth - 20)).expandX().widget());
-                    WHorizontalList actions = entry.add(theme.horizontalList()).expandX().widget();
+                    WContainer actions = actionRow(entry);
                     button(actions, "Details / edit", () -> mc.gui.setScreen(new JobEditorScreen(theme, bots, job.id())));
                     if (job.unclaimed() && job.unfinished()) button(actions, "Assign crew", () -> mc.gui.setScreen(new AssignmentScreen(theme, bots, null, job.id())));
                     if (!job.unclaimed()) {
@@ -400,7 +405,7 @@ public class BotsTab extends Tab {
             Choice selectedFolder = folders.stream().filter(f -> f.id().equals(workflowFolder)).findFirst().orElse(folders.getFirst());
             workflowFolder = selectedFolder.id();
             WDropdown<Choice> filter = workflowLibrary.add(theme.dropdown(folders.toArray(Choice[]::new), selectedFolder)).expandX().widget();
-            filter.action = () -> { workflowFolder = filter.get().id(); refreshWorkflows(); };
+            filter.action = () -> { workflowFolder = rememberedWorkflowFolder = filter.get().id(); refreshWorkflows(); };
             for (BotWorkflows.Workflow workflow : workflows) {
                 if (!workflowFolder.isEmpty() && !workflow.folder().equals(workflowFolder)) continue;
                 Card entry = workflowLibrary.add(card()).expandX().widget();
@@ -409,7 +414,7 @@ public class BotsTab extends Tab {
                 long calls = program ? workflow.dependencies().size() : workflow.steps().stream().filter(step -> step.action() == BotWorkflows.Action.Call).count();
                 entry.add(theme.label((program ? "Lua program · " + workflow.profiles().size() + " shared profile(s)" : "Native preset · " + workflow.steps().size() + " capabilities/fallbacks")
                     + " · " + calls + " call(s) · " + (workflow.builtin() ? "built-in, read-only" : "custom"), panelWidth - 20));
-                WHorizontalList actions = entry.add(theme.horizontalList()).expandX().widget();
+                WContainer actions = actionRow(entry);
                 button(actions, workflow.builtin() || bots.mode.get() != Bots.Mode.Host ? "View definition" : "Edit definition", () -> mc.gui.setScreen(new WorkflowEditorScreen(theme, bots, workflow.id())));
                 if (bots.mode.get() == Bots.Mode.Host && (program || !bots.workflows().compile(workflow.id()).get("duty").getAsString().equals("Supply")))
                     button(actions, "Queue", () -> mc.gui.setScreen(new BotTaskScreen(theme, bots, null, workflow.id(), null)));
@@ -600,10 +605,16 @@ public class BotsTab extends Tab {
         }
 
         @Override public void tick() { super.tick(); if (++ticks % 5 == 0) refresh(); }
-        @Override protected void onClosed() { bots.save(); }
+        @Override protected void onClosed() { rememberedPage = page == Page.Workflows ? rememberedPage : page; rememberedWorkflowFolder = workflowFolder; bots.save(); }
 
         private WButton button(WContainer parent, String text, Runnable action) {
-            WButton button = parent.add(theme.button(text)).widget(); button.action = action; return button;
+            var cell = parent.add(theme.button(text));
+            if (parent instanceof WVerticalList) cell.expandX();
+            WButton button = cell.widget(); button.action = action; return button;
+        }
+
+        private WContainer actionRow(WContainer parent) {
+            return parent.add(WorkspaceLayout.stacked(contentWidth, 560) ? theme.verticalList() : theme.horizontalList()).expandX().widget();
         }
 
         private Card card() { Card card = new Card(); card.theme = theme; return card; }
@@ -657,7 +668,7 @@ public class BotsTab extends Tab {
         }
 
         @Override public void initWidgets() {
-            double width = Math.clamp(Utils.getWindowWidth() / theme.scale(1) - 100, 320, 580);
+            double width = WorkspaceLayout.width(Utils.getWindowWidth(), theme.scale(1), 320, 580);
             add(theme.label("ASSIGN WORK", true, width).color(GOLD));
             feedback = add(theme.label("Choose an available crew and an unfinished, unclaimed job. Assignment uses the job's saved origin and layout.", width)).expandX().widget();
             Choice[] availableCrews, availableJobs;
@@ -752,7 +763,7 @@ public class BotsTab extends Tab {
         JobEditorScreen(GuiTheme theme, Bots bots, UUID id) { super(theme, "Workflow job"); this.bots = bots; this.id = id; }
 
         @Override public void initWidgets() {
-            double width = Math.clamp(Utils.getWindowWidth() / theme.scale(1) - 100, 320, 580);
+            double width = WorkspaceLayout.width(Utils.getWindowWidth(), theme.scale(1), 320, 580);
             add(theme.label(id == null ? "CREATE JOB" : "WORKFLOW JOB", true, width).color(GOLD));
             Bots.JobView existing;
             Choice[] workflows;
@@ -851,7 +862,7 @@ public class BotsTab extends Tab {
         ManagementScreen(GuiTheme theme,Bots bots,String crewId,UUID worker) {super(theme,worker==null?"Manage crew":"Manage worker");this.bots=bots;this.crewId=crewId;this.worker=worker;}
         @Override public void initWidgets() {
             jobShape="";updates.clear();
-            width=Math.clamp(Utils.getWindowWidth()/theme.scale(1)-100,320,640);
+            width=WorkspaceLayout.width(Utils.getWindowWidth(),theme.scale(1),320,640);
             add(theme.label(bots.crewLabel(crewId)+(worker==null?" · all workers":" · "+bots.allMembers().stream().filter(m->m.id().equals(worker)).map(SwarmCrew.MemberView::name).findFirst().orElse(worker.toString())),true,width)).expandX();
             add(theme.label("Host-owned jobs. Job controls affect everyone assigned; Detach/Rejoin affects one worker and preserves its checkpoint.",width).color(theme.textSecondaryColor())).expandX();
             add(theme.button(worker==null?"Start crew job from preset":"Start job for this worker")).expandX().widget().action=()->mc.gui.setScreen(new BotTaskScreen(theme,bots,null,null,crewId,worker));
@@ -921,7 +932,7 @@ public class BotsTab extends Tab {
         }
 
         @Override public void initWidgets() {
-            double reportWidth = Math.clamp(Utils.getWindowWidth() / theme.scale(1) - 100, 320, 580);
+            double reportWidth = WorkspaceLayout.width(Utils.getWindowWidth(), theme.scale(1), 320, 580);
             add(theme.label("RECOVERY DESK", true, reportWidth).color(GOLD)).expandX();
             add(theme.label("This is the inspection view. Review the live blocker and locations below; recover any containers or drops before ending a job.", reportWidth)).expandX();
             details = add(theme.label("", reportWidth)).expandX().widget();

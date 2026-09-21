@@ -6,11 +6,14 @@ import dev.monocle.client.gui.widgets.WLabel;
 import dev.monocle.client.gui.widgets.containers.WContainer;
 import dev.monocle.client.gui.widgets.containers.WHorizontalList;
 import dev.monocle.client.gui.widgets.containers.WTable;
+import dev.monocle.client.gui.widgets.containers.WSection;
 import dev.monocle.client.gui.widgets.input.WDropdown;
 import dev.monocle.client.gui.widgets.input.WIntEdit;
 import dev.monocle.client.gui.widgets.pressable.WButton;
 import dev.monocle.client.settings.Settings;
 import dev.monocle.client.utils.player.InventoryLoadout;
+import dev.monocle.client.utils.Utils;
+import dev.monocle.client.gui.utils.WorkspaceLayout;
 import dev.monocle.client.systems.modules.misc.InventoryTweaks;
 import dev.monocle.client.utils.render.prompts.YesNoPrompt;
 import net.minecraft.client.input.KeyEvent;
@@ -31,6 +34,7 @@ public class InventoryManagerScreen extends WindowScreen {
     private final List<WDropdown<String>> pins = new ArrayList<>();
     private WLabel status;
     private WContainer settings;
+    private double contentWidth;
 
     public InventoryManagerScreen(GuiTheme theme, InventoryTweaks manager) {
         super(theme, "Inventory Manager");
@@ -40,14 +44,15 @@ public class InventoryManagerScreen extends WindowScreen {
 
     @Override
     public void initWidgets() {
+        contentWidth=WorkspaceLayout.width(Utils.getWindowWidth(),theme.scale(1),320,560);
         counts.clear();
         pins.clear();
-        status = add(theme.label(manager.getStatus(), true, 560)).expandX().widget();
-        add(theme.label("Save what you carry, choose how much to keep, and pin your hotbar.\nOpen a storage container to Refill Loadout, Deposit Excess, or Compact Stacks.", 560)
+        status = add(theme.label(manager.getStatus(), true, contentWidth)).expandX().widget();
+        add(theme.label("Save what you carry, choose how much to keep, and pin your hotbar.\nOpen a storage container to Refill Loadout, Deposit Excess, or Compact Stacks.", contentWidth)
             .color(theme.textSecondaryColor())).expandX();
 
-        WHorizontalList actions = add(theme.horizontalList()).expandX().widget();
-        WButton capture = actions.add(theme.button("Capture current inventory")).widget();
+        WContainer actions = add(WorkspaceLayout.stacked(contentWidth,480)?theme.verticalList():theme.horizontalList()).expandX().widget();
+        WButton capture = actions.add(theme.button("Capture current inventory")).expandX().widget();
         capture.tooltip = "Save the items and total quantities in your 36 inventory slots. Existing hotbar items become pins. Armor and offhand are excluded. No items move.";
         capture.action = () -> {
             if (mc.player == null) {
@@ -64,7 +69,7 @@ public class InventoryManagerScreen extends WindowScreen {
             }
         };
 
-        WButton clear = actions.add(theme.button("Clear loadout")).widget();
+        WButton clear = actions.add(theme.button("Clear loadout")).expandX().widget();
         clear.tooltip = "Remove the saved rules only. Inventory items are never deleted.";
         clear.action = () -> {
             if (manager.hasLoadout()) confirm("Clear saved loadout?", "Remove all saved quantities and pins? Your inventory will not change.", () -> {
@@ -79,69 +84,58 @@ public class InventoryManagerScreen extends WindowScreen {
         if (!manager.hasLoadout()) {
             add(theme.label("Carry the items you want, then Capture current inventory.\nYou can change quantities or remove rules afterward.", 560)).expandX();
         } else {
-            WTable table = add(theme.table()).expandX().widget();
-            table.add(theme.label("Item"));
-            table.add(theme.label("Have (total)"));
-            table.add(theme.label("Keep (items)"));
-            table.add(theme.label("Hotbar"));
-            table.add(theme.label(""));
-            table.row();
-
             List<InventoryLoadout.Rule> rules = manager.getLoadout();
+            WTable table = WorkspaceLayout.stacked(contentWidth,520)?null:add(theme.table()).expandX().widget();
+            if(table!=null){table.add(theme.label("Item"));table.add(theme.label("Have"));table.add(theme.label("Keep"));table.add(theme.label("Hotbar"));table.add(theme.label(""));table.row();}
             for (int i = 0; i < rules.size(); i++) {
                 int index = i;
                 InventoryLoadout.Rule rule = rules.get(i);
-                WHorizontalList item = table.add(theme.horizontalList()).expandCellX().widget();
-                item.add(theme.item(rule.template()));
-                item.add(theme.label(rule.template().getHoverName().getString(), 180)).centerY();
-                item.tooltip = "Matches this item, enchantments, names and contents. Tool wear is ignored. Multiple matching rules add their quantities together.";
-
-                counts.add(table.add(theme.label("0")).centerY().widget());
                 int max = Math.max(rule.amount(), Math.min(2304, 36 * rule.template().getMaxStackSize()));
-                WIntEdit amount = table.add(theme.intEdit(rule.amount(), 1, max, true)).centerY().widget();
-                amount.tooltip = "Desired total item count across your inventory, not a number of stacks.";
-                WDropdown<String> pin = table.add(theme.dropdown(HOTBAR_SLOTS, HOTBAR_SLOTS[rule.hotbarSlot() + 1])).centerY().widget();
-                pin.tooltip = "Keep a stack in this hotbar slot. Each slot accepts one rule; unpin its current rule before assigning another.";
-                pins.add(pin);
-                amount.action = () -> {
-                    int value = Math.clamp(amount.get(), 1, max);
-                    if (amount.get() != value) amount.set(value);
-                    manager.updateRule(index, value, pin.get().equals("None") ? -1 : Integer.parseInt(pin.get()) - 1);
-                };
-                pin.action = () -> {
-                    amount.action.run();
-                    refreshLabels();
-                };
-                WButton remove = table.add(theme.button("Remove")).centerY().widget();
-                remove.tooltip = "Stop refilling and reserving this item. Does not discard anything.";
-                remove.action = () -> {
-                    manager.removeRule(index);
-                    reload();
-                };
-                table.row();
+                if(table!=null){
+                    WHorizontalList item=table.add(theme.horizontalList()).expandCellX().widget();item.add(theme.item(rule.template()));item.add(theme.label(rule.template().getHoverName().getString(),150)).centerY();
+                    item.tooltip="Matches this item, enchantments, names and contents. Tool wear is ignored. Multiple matching rules add their quantities together.";
+                    WLabel count=table.add(theme.label("0")).centerY().widget();WIntEdit amount=table.add(theme.intEdit(rule.amount(),1,max,true)).centerY().widget();
+                    WDropdown<String> pin=table.add(theme.dropdown(HOTBAR_SLOTS,HOTBAR_SLOTS[rule.hotbarSlot()+1])).centerY().widget();WButton remove=table.add(theme.button("Remove")).centerY().widget();table.row();
+                    wireRule(index,max,count,amount,pin,remove);
+                }else{
+                    WSection card=add(theme.section(rule.template().getHoverName().getString(),false)).expandX().widget();
+                    WHorizontalList identity=card.add(theme.horizontalList()).expandX().widget();identity.add(theme.item(rule.template()));identity.add(theme.label("Have (total)"));WLabel count=identity.add(theme.label("0")).expandCellX().right().widget();
+                    WTable fields=card.add(theme.table()).expandX().widget();fields.add(theme.label("Keep (items)"));WIntEdit amount=fields.add(theme.intEdit(rule.amount(),1,max,true)).expandX().widget();fields.row();fields.add(theme.label("Hotbar"));WDropdown<String> pin=fields.add(theme.dropdown(HOTBAR_SLOTS,HOTBAR_SLOTS[rule.hotbarSlot()+1])).expandX().widget();fields.row();
+                    WButton remove=card.add(theme.button("Remove rule")).expandX().widget();wireRule(index,max,count,amount,pin,remove);
+                }
             }
         }
 
         add(theme.horizontalSeparator()).expandX();
-        WHorizontalList bottom = add(theme.horizontalList()).expandX().widget();
-        WButton arrange = bottom.add(theme.button("Arrange hotbar")).widget();
+        WContainer bottom = add(WorkspaceLayout.stacked(contentWidth,520)?theme.verticalList():theme.horizontalList()).expandX().widget();
+        WButton arrange = bottom.add(theme.button("Arrange hotbar")).expandX().widget();
         arrange.tooltip = "Apply saved pins to the items you already carry. Does not take from containers or discard items.";
         arrange.action = () -> {
             if (mc.player != null) manager.arrange(mc.player.inventoryMenu);
         };
-        WButton compact = bottom.add(theme.button("Compact stacks")).widget();
+        WButton compact = bottom.add(theme.button("Compact stacks")).expandX().widget();
         compact.tooltip = "Merge matching stacks in your main inventory. Leaves the hotbar unchanged and never throws items away.";
         compact.action = () -> {
             if (mc.player != null) manager.compact(mc.player.inventoryMenu);
         };
-        WButton cancel = bottom.add(theme.button("Cancel")).widget();
+        WButton cancel = bottom.add(theme.button("Cancel")).expandX().widget();
         cancel.action = manager::cancelOperation;
-        WButton advanced = bottom.add(theme.button("Advanced & keybind")).expandCellX().right().widget();
+        WButton advanced = bottom.add(theme.button("Advanced & keybind")).expandX().right().widget();
         advanced.action = () -> {
             manager.cancelOperation();
             mc.gui.setScreen(new ModuleScreen(theme, manager));
         };
         refreshLabels();
+    }
+
+    private void wireRule(int index,int max,WLabel count,WIntEdit amount,WDropdown<String> pin,WButton remove){
+        counts.add(count);pins.add(pin);
+        amount.tooltip="Desired total item count across your inventory, not a number of stacks.";
+        pin.tooltip="Keep a stack in this hotbar slot. Each slot accepts one rule; unpin its current rule before assigning another.";
+        amount.action=()->{int value=Math.clamp(amount.get(),1,max);if(amount.get()!=value)amount.set(value);manager.updateRule(index,value,pin.get().equals("None")?-1:Integer.parseInt(pin.get())-1);};
+        pin.action=()->{amount.action.run();refreshLabels();};
+        remove.tooltip="Stop refilling and reserving this item. Does not discard anything.";
+        remove.action=()->{manager.removeRule(index);reload();};
     }
 
     private void confirm(String title, String message, Runnable action) {
