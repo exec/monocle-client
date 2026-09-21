@@ -51,6 +51,11 @@ public final class HighwaySupplyTest {
         assert HighwayBuilder.awaitRepairChunks(0,false,false);
         assert !HighwayBuilder.awaitRepairChunks(0,true,false) && !HighwayBuilder.awaitRepairChunks(0,false,true)
             : "A defect or the real job end lands; a temporary render boundary does not";
+        assert HighwayBuilder.operationExcavates(HighwayBuilder.Operation.Build)
+            && HighwayBuilder.operationExcavates(HighwayBuilder.Operation.Repair)
+            && HighwayBuilder.operationExcavates(HighwayBuilder.Operation.ClearTunnel)
+            && !HighwayBuilder.operationExcavates(HighwayBuilder.Operation.Pave)
+            : "Repair clears passage obstructions; only Pave preserves them";
         assert HighwayBuilder.fallbackToolSlot(-1,true,slot->true)==-1;
         assert HighwayBuilder.fallbackToolSlot(2,false,slot->true)==2;
         assert HighwayBuilder.fallbackToolSlot(-1,false,slot->false)==-1;

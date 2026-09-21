@@ -3,12 +3,15 @@ package dev.monocle.client.systems.modules.player;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.core.component.DataComponentInitializers;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.world.item.enchantment.ItemEnchantments;
 import java.util.List;
 
 /** ./gradlew autoMendCheck */
@@ -22,6 +25,9 @@ public final class AutoMendTest {
         BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(VanillaRegistries.createLookup()).forEach(DataComponentInitializers.PendingComponents::apply);
         ItemStack pick = new ItemStack(Items.NETHERITE_PICKAXE);
         pick.setDamageValue(pick.getMaxDamage() / 2);
+        ItemEnchantments.Mutable enchantments = new ItemEnchantments.Mutable(ItemEnchantments.EMPTY);
+        enchantments.set(VanillaRegistries.createLookup().lookupOrThrow(Registries.ENCHANTMENT).getOrThrow(Enchantments.MENDING), 1);
+        pick.set(DataComponents.ENCHANTMENTS, enchantments.toImmutable());
         ItemStack repaired = pick.copy();
         repaired.setDamageValue(1);
         assert AutoMend.belowTarget(pick, 95);
@@ -38,7 +44,9 @@ public final class AutoMendTest {
         assert !AutoMend.belowTarget(new ItemStack(Items.OBSIDIAN), 100);
         ItemStack elytra = new ItemStack(Items.ELYTRA);
         elytra.setDamageValue(elytra.getMaxDamage() - 1);
+        elytra.set(DataComponents.ENCHANTMENTS, enchantments.toImmutable());
         assert AutoMend.durability(elytra) < AutoMend.durability(pick) : "Rank by fraction, not raw damage";
+        assert AutoMend.highwayItem(elytra) && !AutoMend.highwayItem(new ItemStack(Items.NETHERITE_SWORD));
         try (var bytes = AutoMend.class.getResourceAsStream("AutoMend.class")) {
             var compiled = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes());
             for (String method : List.of("restore", "swapOffhand")) {

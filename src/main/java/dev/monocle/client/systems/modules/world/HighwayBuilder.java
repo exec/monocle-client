@@ -307,7 +307,7 @@ public class HighwayBuilder extends Module {
 
     private final Setting<Floor> floor = sgGeneral.add(new EnumSetting.Builder<Floor>()
         .name("floor")
-        .description("Build only: replace unsuitable floor blocks, or preserve the floor and fill gaps. Repair and Pave always preserve existing blocks.")
+        .description("Build only: replace unsuitable floor blocks, or preserve the floor and fill gaps. Repair and Pave preserve existing floor blocks; Repair still clears the passage.")
         .defaultValue(Floor.Replace)
         .visible(() -> operation.get() == Operation.Build)
         .build()
@@ -790,7 +790,7 @@ public class HighwayBuilder extends Module {
     private RepairScan repairScan;
     private BlockPos repairScanOrigin;
     private int repairScanTick = -1000;
-    private boolean crewTravelToSupply, crewTravelEnabledFly, endingJob, crewToggledOff;
+    private boolean crewTravelToSupply, crewTravelEnabledFly, endingJob, crewToggledOff, autoMendYielding;
     private int crewLaunchTick = -1, crewTravelTick = -1;
     private int crewRunUntil = -1;
     private Vec3 crewRunTarget;
@@ -2306,7 +2306,9 @@ public class HighwayBuilder extends Module {
     public boolean hasJob() { return lifecycle.hasJob(); }
     public boolean isJobPaused() { return lifecycle.hasJob() && lifecycle.paused(); }
     public boolean controlsPlayer() { return isActive() && lifecycle == Lifecycle.Running && Utils.canUpdate() && mc.level == jobWorld; }
-    public boolean doesDig() { return (operation.get() == Operation.Build || operation.get() == Operation.ClearTunnel) && (!crewAssigned || crew().doesExcavate()); }
+    static boolean operationExcavates(Operation operation) { return operation != Operation.Pave; }
+    public boolean doesDig() { return operationExcavates(operation.get()) && (!crewAssigned || crew().doesExcavate()); }
+    public boolean autoMendYielding() { return autoMendYielding; }
     public boolean doesPave() { return operation.get() != Operation.ClearTunnel && (!crewAssigned || crew().doesPave()); }
     public int getPreviewWidth() { return width.get(); }
     public int getPreviewHeight() { return height.get(); }
@@ -3139,6 +3141,7 @@ public class HighwayBuilder extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        autoMendYielding = false;
         diagnosticTickAt = System.nanoTime();
         diagnosticGate = "world";
         if (disconnectAfterTicks >= 0) {
@@ -3250,6 +3253,7 @@ public class HighwayBuilder extends Module {
             if (++idleTicks > 400) pauseRecoverably("Another feature retained movement control for 20 seconds.");
             return;
         }
+        if (tickAutoMendMaintenance()) return;
         if (repairFlightTarget != null) { diagnosticGate = "repair-flight"; tickRepairFlight(); return; }
         tickCrewSupplyRecovery();
         if (crewAssigned && switch (state) { case MineEnderChests, PlaceEChestBlockade, MineEChestBlockade -> true; default -> false; }) {
@@ -3316,6 +3320,33 @@ public class HighwayBuilder extends Module {
         if (miningInProgress()) stopWorkMining();
         // The food slot has already replaced any bow; do not release Auto Eat's new use.
         drawingBow = false;
+    }
+
+    private boolean tickAutoMendMaintenance() {
+        AutoMend mend = Modules.get().get(AutoMend.class);
+        if (!mend.requestHighwayMaintenance()) return false;
+        diagnosticGate = "auto-mend";
+        timingPhase(HighwayHud.Phase.Supply);
+        if (repairFlightTarget != null) {
+            repairFlightLanding = true;
+            status = "Landing for elytra maintenance";
+            tickRepairFlight();
+            return true;
+        }
+        if (state != State.Forward || !restockTask.tasksInactive() || crewNeedsCleanup() || crewDetachedSupply()
+            || !pendingPlaces.isEmpty() || !pendingBreaks.isEmpty() || predictionFlushRequested || !temporarySteps.isEmpty()) return false;
+        input.stop(); idleTicks = 0; stopWorkMining();
+        if (mc.player.isFallFlying()) {
+            Modules.get().get(ElytraFly.class).clearAutopilot();
+            mc.player.stopFallFlying();
+            mc.player.setDeltaMovement(0, -.08, 0);
+            status = "Landing for highway maintenance";
+            return true;
+        }
+        if (!mc.player.onGround()) { status = "Settling for highway maintenance"; return true; }
+        autoMendYielding = true;
+        status = "Yielding to Auto Mend";
+        return true;
     }
 
     private int pendingPredictionSince = -1, predictionProbeTick = -1, predictionProbeSequence = -1, predictionProbeAttempts;
@@ -5319,14 +5350,14 @@ public class HighwayBuilder extends Module {
                     for (MBlockPos pos : b.blockPosProvider.getFront()) {
                         if (!pos.getState().getFluidState().isEmpty()) {
                             if (b.crewAssigned) waitForExcavation(b);
-                            else b.pauseJob("Liquid in the passage. Use Build to seal and clear it; Repair and Pave only seal the floor and outside edges.");
+                            else b.pauseJob("Liquid in the passage. Pave preserves the passage; choose Repair or Build to seal and clear it.");
                             return true;
                         }
                     }
                 }
                 if (hasObstruction(b, b.blockPosProvider.getFront())) {
                     if (!b.doesDig() && b.crewAssigned) waitForExcavation(b);
-                    else if (!b.doesDig()) b.pauseJob("Passage obstructed. Repair and Pave preserve existing blocks; clear it or choose Build.");
+                    else if (!b.doesDig()) b.pauseJob("Passage obstructed. Pave preserves existing passage blocks; clear it or choose Repair or Build.");
                     else b.setState(b.needsBarrierSealing() ? FillLiquids : MineFront);
                     return true;
                 }
