@@ -37,6 +37,12 @@ public final class HighwaySupplyTest {
         assert HighwayBuilder.soloRefillTarget(0,0,1)==1728;
         assert HighwayBuilder.soloRefillTarget(1,12,2)==54;
         assert HighwayBuilder.soloRefillTarget(2,12,2)==1728;
+        assert HighwayBuilder.repairSkipRows(16,32,row->row<20)==20;
+        assert HighwayBuilder.repairSkipRows(16,32,row->row<15)==0;
+        assert HighwayBuilder.repairSkipRows(16,18,row->true)==18;
+        assert HighwayBuilder.reachedRepairRows(17.5,32)==17;
+        assert HighwayBuilder.reachedRepairRows(-2,32)==0;
+        assert HighwayBuilder.reachedRepairRows(40,32)==32;
         assert HighwayBuilder.fallbackToolSlot(-1,true,slot->true)==-1;
         assert HighwayBuilder.fallbackToolSlot(2,false,slot->true)==2;
         assert HighwayBuilder.fallbackToolSlot(-1,false,slot->false)==-1;

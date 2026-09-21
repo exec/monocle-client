@@ -275,6 +275,17 @@ public class HighwayBuilder extends Module {
         .defaultValue(0).min(0).sliderRange(0, 1000).build()
     );
 
+    private final Setting<Boolean> flyCleanRepair = sgGeneral.add(new BoolSetting.Builder()
+        .name("fly-over-clean-stretches").description("In solo Repair jobs, fly across fully verified road until the row before the next defect.")
+        .defaultValue(true).visible(() -> operation.get() == Operation.Repair).build()
+    );
+
+    private final Setting<Integer> repairFlightMinimum = sgGeneral.add(new IntSetting.Builder()
+        .name("minimum-clean-flight-distance").description("Minimum consecutive verified blocks before Repair uses ElytraFly. Loaded road is scanned up to 126 blocks at a time.")
+        .defaultValue(16).range(4, 126).sliderRange(4, 64)
+        .visible(() -> operation.get() == Operation.Repair && flyCleanRepair.get()).build()
+    );
+
     private final Setting<Integer> width = sgGeneral.add(new IntSetting.Builder()
         .name("width")
         .description("Width of the roadway, excluding the railings. Diagonal roads require at least 3.")
@@ -768,6 +779,11 @@ public class HighwayBuilder extends Module {
     private BlockPos crewSupplyOrigin, crewTravelTarget;
     private BlockPos crewSupplySite, crewSupplyReservation;
     private final Set<BlockPos> crewTriedSupplySites = new HashSet<>();
+    private BlockPos repairFlightStart, repairFlightTarget;
+    private Vec3 repairFlightProgress;
+    private int repairFlightRows, repairFlightLaunchTick = -1, repairFlightRetryTick, repairFlightProgressTick;
+    private boolean repairFlightLanding;
+    private boolean repairFlightEnabledFly;
     private boolean crewTravelToSupply, crewTravelEnabledFly, endingJob, crewToggledOff;
     private int crewLaunchTick = -1, crewTravelTick = -1;
     private int crewRunUntil = -1;
@@ -1547,6 +1563,148 @@ public class HighwayBuilder extends Module {
         tickCrewTravel();
     }
 
+    static int repairSkipRows(int minimum, int maximum, java.util.function.IntPredicate resolved) {
+        int rows = 0;
+        while (rows < maximum && resolved.test(rows)) rows++;
+        return rows >= minimum ? rows : 0;
+    }
+
+    static int reachedRepairRows(double projection, int planned) {
+        return Math.clamp((int) Math.floor(projection + .1), 0, planned);
+    }
+
+    private boolean repairSectionResolved(int offset) {
+        BlockPos origin = workOrigin.offset(dir.offsetX * offset, 0, dir.offsetZ * offset);
+        for (HighwayPlan.Cell cell : HighwayPlan.front(dir.offsetX, dir.offsetZ, width.get(), height.get())) {
+            BlockPos pos = origin.offset(cell.x(), cell.y(), cell.z());
+            BlockState state = crewVerifiedState(pos);
+            if (state == null || !crewClearanceResolved(state, mc.level, pos)) return false;
+        }
+        for (PavingTarget target : plannedPavingTargets(offset)) {
+            BlockState state = crewVerifiedState(target.position());
+            if (state == null || !crewPavingResolved(state, false, blocksToPlace.get())) return false;
+        }
+        return true;
+    }
+
+    private boolean repairFlightClear(AABB box) {
+        if (box.minY < workOrigin.getY() - .05 || box.maxY > mc.level.getMaxY() + 1
+            || !PrinterFlight.loaded(box, mc.level.getChunkSource()::hasChunk)) return false;
+        for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY, box.minZ),
+            BlockPos.containing(Math.nextDown(box.maxX), Math.nextDown(box.maxY), Math.nextDown(box.maxZ)))) {
+            BlockState state = crewVerifiedState(pos);
+            if (state == null || !crewClearanceResolved(state, mc.level, pos)) return false;
+        }
+        AABB footing = crewTravelFooting(box);
+        for (int x = (int) Math.floor(footing.minX); x <= (int) Math.floor(Math.nextDown(footing.maxX)); x++) for (int z = (int) Math.floor(footing.minZ); z <= (int) Math.floor(Math.nextDown(footing.maxZ)); z++) {
+            BlockPos floor = new BlockPos(x, workOrigin.getY() - 1, z);
+            BlockState state = crewVerifiedState(floor);
+            if (state == null || !crewPavingResolved(state, false, blocksToPlace.get()) || state.is(Blocks.MAGMA_BLOCK)
+                || state.is(Blocks.CAMPFIRE) || state.is(Blocks.SOUL_CAMPFIRE)) return false;
+        }
+        return true;
+    }
+
+    private boolean tryStartRepairFlight() {
+        if (repairFlightTarget != null || !flyCleanRepair.get() || operation.get() != Operation.Repair || crewAssigned || dir.diagonal
+            || state != State.Forward || advancing || !pavingChecks.isEmpty() || !pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()
+            || !temporarySteps.isEmpty() || !mc.player.onGround() || mc.player.tickCount < repairFlightRetryTick
+            || mc.player.position().distanceToSqr(jobWorkPosition()) > 1) return false;
+        ElytraFly fly = Modules.get().get(ElytraFly.class);
+        boolean hasGlider = usableCrewGlider(mc.player.getItemBySlot(EquipmentSlot.CHEST))
+            || mc.player.getInventory().getNonEquipmentItems().stream().anyMatch(HighwayBuilder::usableCrewGlider);
+        if (fly.flightMode.get() != ElytraFlightModes.Vanilla || !hasGlider) { repairFlightRetryTick = mc.player.tickCount + 200; return false; }
+        int limit = testLength > 0 ? testLength : length.get();
+        int remaining = limit <= 0 ? PrinterFlight.MAX_SEGMENT - 2
+            : Math.min(PrinterFlight.MAX_SEGMENT - 2, Math.max(0, (int) Math.floor(limit - completedDistance)));
+        int rows = repairSkipRows(repairFlightMinimum.get(), remaining, this::repairSectionResolved);
+        repairFlightRetryTick = mc.player.tickCount + 20;
+        if (rows == 0) return false;
+        BlockPos target = workOrigin.offset(dir.offsetX * rows, 0, dir.offsetZ * rows);
+        if (!PrinterFlight.segmentClear(mc.player.position(), Vec3.atBottomCenterOf(target).add(0, .5, 0),
+            mc.player.getBbWidth() + .12, 1.8, this::repairFlightClear)) return false;
+        repairFlightStart = workOrigin.immutable(); repairFlightTarget = target; repairFlightRows = rows;
+        repairFlightProgress = mc.player.position(); repairFlightProgressTick = mc.player.tickCount;
+        repairFlightLaunchTick = -1; repairFlightLanding = false;
+        return tickRepairFlight();
+    }
+
+    private boolean tickRepairFlight() {
+        if (repairFlightTarget == null) return false;
+        timingPhase(HighwayHud.Phase.Travel); input.stop(); idleTicks = 0;
+        ElytraFly fly = Modules.get().get(ElytraFly.class);
+        Vec3 from = mc.player.position(), target = Vec3.atBottomCenterOf(repairFlightTarget);
+        if (from.distanceToSqr(repairFlightProgress) >= .25) { repairFlightProgress = from; repairFlightProgressTick = mc.player.tickCount; }
+        else if (!repairFlightLanding && (mc.player.isFallFlying() || repairFlightLaunchTick >= 0)
+            && mc.player.tickCount - repairFlightProgressTick >= 20) repairFlightLanding = true;
+        if (repairFlightLanding) {
+            fly.clearAutopilot();
+            if (mc.player.isFallFlying()) { mc.player.stopFallFlying(); mc.player.setDeltaMovement(0, -.08, 0); }
+            if (!mc.player.onGround()) { status = "Repair flight stalled; landing safely"; return true; }
+            int reached = reachedRepairRows((from.x - repairFlightStart.getX() - .5) * dir.offsetX
+                + (from.z - repairFlightStart.getZ() - .5) * dir.offsetZ, repairFlightRows);
+            finishRepairFlight(reached, false); return true;
+        }
+        if (mc.player.onGround() && from.distanceToSqr(target) < .64) { finishRepairFlight(repairFlightRows, true); return true; }
+        ItemStack glider = mc.player.getItemBySlot(EquipmentSlot.CHEST);
+        if (!usableCrewGlider(glider)) {
+            fly.clearAutopilot();
+            if (mc.player.onGround() && mc.player.tickCount % 40 == 0
+                && mc.player.getInventory().getNonEquipmentItems().stream().anyMatch(HighwayBuilder::usableCrewGlider))
+                Modules.get().get(ChestSwap.class).requestEquip(true, true);
+            else if (!mc.player.onGround()) repairFlightLanding = true;
+            status = "Equipping an elytra for the clean repair stretch"; return true;
+        }
+        if (!fly.isActive()) { fly.enable(); repairFlightEnabledFly = true; }
+        if (mc.player.isFallFlying()) {
+            if (from.distanceToSqr(target) <= 2.25) { repairFlightLanding = true; return true; }
+            Vec3 velocity = PrinterFlight.safeVelocity(from, target.add(0, .5, 0), crewFlightSpeed(fly.horizontalSpeed.get()),
+                mc.player.getBbWidth() + .12, Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear);
+            if (velocity.lengthSqr() == 0) repairFlightLanding = true;
+            else fly.requestAutopilot(velocity);
+            status = "Flying over " + repairFlightRows + " verified repair blocks"; return true;
+        }
+        fly.requestAutopilot(Vec3.ZERO);
+        if (repairFlightLaunchTick < 0) { mc.player.jumpFromGround(); repairFlightLaunchTick = mc.player.tickCount; }
+        int elapsed = mc.player.tickCount - repairFlightLaunchTick;
+        if (!mc.player.onGround() && elapsed >= 3 && elapsed % 4 == 3)
+            mc.getConnection().send(new ServerboundPlayerCommandPacket(mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+        if (elapsed > 20) repairFlightLanding = true;
+        status = "Taking off for the next repair"; return true;
+    }
+
+    private void finishRepairFlight(int rows, boolean arrived) {
+        BlockPos start = repairFlightStart;
+        stopRepairFlight();
+        if (rows > 0) { workOrigin = start.offset(dir.offsetX * rows, 0, dir.offsetZ * rows); completedDistance += rows; forecastDirty = true; }
+        repairFlightRetryTick = mc.player.tickCount + (arrived ? 20 : 200);
+        setState(State.Center);
+        status = arrived ? "Reached the next repair area" : "Repair flight ended early; continuing from the reached road";
+    }
+
+    private boolean settlePausedRepairFlight() {
+        if (repairFlightTarget == null || !mc.player.onGround()) return false;
+        Vec3 feet = mc.player.position();
+        int reached = reachedRepairRows((feet.x - repairFlightStart.getX() - .5) * dir.offsetX
+            + (feet.z - repairFlightStart.getZ() - .5) * dir.offsetZ, repairFlightRows);
+        BlockPos start = repairFlightStart;
+        stopRepairFlight();
+        if (reached > 0) { workOrigin = start.offset(dir.offsetX * reached, 0, dir.offsetZ * reached); completedDistance += reached; forecastDirty = true; }
+        return true;
+    }
+
+    private void holdRepairFlight() {
+        if (repairFlightTarget != null) Modules.get().get(ElytraFly.class).requestAutopilot(Vec3.ZERO);
+    }
+
+    private void stopRepairFlight() {
+        ElytraFly fly = Modules.get().get(ElytraFly.class);
+        if (fly != null) fly.clearAutopilot();
+        if (repairFlightEnabledFly && fly != null && fly.isActive() && Utils.canUpdate() && mc.player.onGround()) fly.disable();
+        repairFlightStart = repairFlightTarget = null; repairFlightProgress = null; repairFlightRows = 0;
+        repairFlightLaunchTick = -1; repairFlightLanding = repairFlightEnabledFly = false;
+    }
+
     private void stopCrewFlight() {
         crewRunTarget = null;
         ElytraFly fly = Modules.get().get(ElytraFly.class);
@@ -2039,7 +2197,7 @@ public class HighwayBuilder extends Module {
     public Settings buildSettings() {
         Settings view = new Settings();
         SettingGroup build = view.createGroup("Build");
-        for (Setting<?> setting : List.of(operation, heading, width, height, length, floor, railings, cornerBlock, mineAboveRailings, blocksToPlace)) build.add(setting);
+        for (Setting<?> setting : List.of(operation, heading, width, height, length, flyCleanRepair, repairFlightMinimum, floor, railings, cornerBlock, mineAboveRailings, blocksToPlace)) build.add(setting);
         SettingGroup supplies = view.createGroup("Supplies", false);
         for (Setting<?> setting : List.of(searchShulkers, searchEnderChest, maxShulkersPerRestock, doubleEnderChests, keepShulkers, mineEnderChests, dontBreakTools, breakDurability, savePickaxes, saveEchests, minEmpty, fillerBlocks, trashItems)) supplies.add(setting);
         SettingGroup crewInventory = view.createGroup("Workers · Crew Inventory", false);
@@ -2600,6 +2758,7 @@ public class HighwayBuilder extends Module {
         if (crewAssigned && !crew().canResume() && !crew().resumeNearbyReconnect()) { status = "Wait for the crew connection or explicitly leave the crew."; return; }
         if (crewAssigned && crew().isPausedByHost() && !crew().isReleasing()) { status = "Crew is paused by the host; resume it from Workers."; return; }
         if (!refreshJobWorld()) { waitForWorld(); return; }
+        boolean repairSettled = !crewAssigned && settlePausedRepairFlight();
         BlockPos nearbyCrew = crewAssigned ? crew().nearbyCrewCenter(32) : null;
         if (nearbyCrew != null && mc.player.position().distanceToSqr(jobWorkPosition()) > 144) {
             workOrigin = nearbyCrew;
@@ -2608,7 +2767,7 @@ public class HighwayBuilder extends Module {
         }
         boolean supplyCleanup = crewAssigned && crewNeedsCleanup();
         boolean manualReturn = !supplyCleanup && mc.player.position().distanceToSqr(jobWorkPosition()) > 144 && crewAssigned && crew().resumeDetachedReturn();
-        if (!supplyCleanup && crewTravelTarget == null && !crewAwaitingRejoin() && mc.player.position().distanceToSqr(jobWorkPosition()) > 144) { status = "Return within 12 blocks of the build position to resume."; return; }
+        if (!supplyCleanup && crewTravelTarget == null && repairFlightTarget == null && !crewAwaitingRejoin() && mc.player.position().distanceToSqr(jobWorkPosition()) > 144) { status = "Return within 12 blocks of the build position to resume."; return; }
         if (heading.get() != Heading.Facing && selectedHeading() != dir) { status = "Stop the current job before changing its direction."; return; }
         String problem = state == State.Restock || crewAssigned && (crewNeedsCleanup() || crewAwaitingRejoin()) ? null : readinessProblem();
         if (problem != null) { status = problem; return; }
@@ -2628,6 +2787,7 @@ public class HighwayBuilder extends Module {
         mobTicks = 0;
         updateVariables();
         enableVelocity();
+        if (repairSettled) setState(State.Center);
         if (supplyCleanup) resumeCrewSupplyCleanup();
         if (manualReturn) setState(State.Forward); // State transitions require the resumed movement lease.
         if (changed) {
@@ -2690,6 +2850,8 @@ public class HighwayBuilder extends Module {
     }
 
     private void releaseControls() {
+        if (repairFlightTarget != null) { repairFlightLanding = true; holdRepairFlight(); }
+        else stopRepairFlight();
         stopCrewFlight();
         actionEpoch++;
         pendingPlaces.keySet().removeIf(pos -> !placeSequences.containsKey(pos));
@@ -2775,6 +2937,7 @@ public class HighwayBuilder extends Module {
         verifyAfterCombat = false;
         mobPreviousSlot = mobToolSlot = -1;
         completedDistance = 0;
+        stopRepairFlight(); repairFlightRetryTick = 0;
         blocksBroken = blocksPlaced = idleTicks = 0;
         hud.reset(System.nanoTime() / 1e9);
         forecastOrigin=null;forecastDirty=true;
@@ -2820,6 +2983,7 @@ public class HighwayBuilder extends Module {
         if (lifecycle.hasJob()) updateHud();
         if (lifecycle.hasJob()) hud.stopTiming(System.nanoTime() / 1e9);
         releaseControls();
+        stopRepairFlight();
         if (lifecycle.hasJob() && Utils.canUpdate()) {
             info("Completed road: (highlight)%.1f(default) blocks. Broken: (highlight)%d(default). Placed: (highlight)%d(default).",
                 completedDistance, blocksBroken, blocksPlaced);
@@ -2966,6 +3130,7 @@ public class HighwayBuilder extends Module {
             actionEpoch++;
             pendingPlaces.keySet().removeIf(pos -> !placeSequences.containsKey(pos));
             if (drawingBow) { mc.gameMode.releaseUsingItem(mc.player); drawingBow = false; }
+            holdRepairFlight();
             return;
         }
         waiting = "";
@@ -2975,6 +3140,7 @@ public class HighwayBuilder extends Module {
             if (++idleTicks > 400) pauseRecoverably("Another feature retained movement control for 20 seconds.");
             return;
         }
+        if (repairFlightTarget != null) { diagnosticGate = "repair-flight"; tickRepairFlight(); return; }
         tickCrewSupplyRecovery();
         if (crewAssigned && switch (state) { case MineEnderChests, PlaceEChestBlockade, MineEChestBlockade -> true; default -> false; }) {
             if (!crew().supplyReady(this)) { timingPhase(HighwayHud.Phase.Crew); idleTicks = 0; status = "Waiting for crew supply reservation"; return; }
@@ -3008,6 +3174,7 @@ public class HighwayBuilder extends Module {
 
         count = breakCount = queuedHotbarSlots = 0;
         waitingForMob = false;
+        if (tryStartRepairFlight()) return;
         if (mc.player.getY() < workOrigin.getY() - 0.5 && state != State.ReLevel) setState(State.ReLevel);
         if ((state == State.MineFront || state == State.MineFloor || state == State.MineRailings || state == State.MineAboveRailings) && needsBarrierSealing()) {
             actionEpoch++;
@@ -3033,6 +3200,7 @@ public class HighwayBuilder extends Module {
         waiting = "Paused for eating";
         input.stop();
         if (crewDetachedSupply()) brakeCrewFlight();
+        holdRepairFlight();
         actionEpoch++;
         pendingPlaces.keySet().removeIf(pos -> !placeSequences.containsKey(pos));
         if (miningInProgress()) stopWorkMining();

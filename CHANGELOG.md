@@ -2,6 +2,12 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.11.2 — Repair transit
+
+- Solo Repair jobs now scan the loaded highway pattern and use the existing ElytraFly autopilot to cross clean stretches, landing immediately before the next defective row.
+- Added `fly-over-clean-stretches` (on by default for Repair) and a configurable minimum flight distance (16 blocks by default). Flights are bounded to verified, loaded, supported road and fall back to the reached row if takeoff or flight stalls.
+- Build, Pave, Clear Tunnel, diagonal, and coordinated crew behavior are unchanged; crew repair flights require host-assigned repair segments rather than competing client-side scans.
+
 ## 0.11.1 — Solo stash round trips
 
 - Wired mapped stashes into solo Highway Builder exhaustion. After local inventory/shulker/ender-chest sources are exhausted, it saves the road as `/sethome monocle_work`, waits the configured server cooldown, visits the stash, refills the ender chest from indexed shulkers, waits again, returns, verifies the saved road position, and resumes the same job.
