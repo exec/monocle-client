@@ -19,6 +19,8 @@ public final class BotProfilesTest {
             """;
         assert BotProfiles.validate(profile(launcherSettings)).equals(profile(launcherSettings)) : "Launcher merges use the same worker SNBT validation";
         var launcherTag=TagParser.parseCompoundFully(launcherSettings);
+        String settingsPatch="{groups:[{name:'General',settings:[{name:'vanilla-speed',value:6d}]}]}";
+        assert TagParser.parseCompoundFully(dev.monocle.coordinator.SettingsOverlay.merge(launcherSettings,settingsPatch)).equals(BotProfiles.mergeSettings(launcherTag,TagParser.parseCompoundFully(settingsPatch))):"Host overlay must agree with Minecraft's settings merge";
         JsonObject personal=profile(launcherSettings).getAsJsonObject("elytra-fly"),host=profile("{groups:[{name:'General',settings:[{name:'vanilla-speed',value:6d}]}]}").getAsJsonObject("elytra-fly");
         JsonObject comparison=BotProfiles.comparison(personal,host,personal,"test snapshot");
         assert comparison.getAsJsonArray("rows").asList().stream().map(v->v.getAsJsonObject()).anyMatch(row->row.get("setting").getAsString().equals("General / vanilla-speed")&&row.get("requested").getAsString().equals("6.0d")&&row.get("current").getAsString().equals("5.0d"));

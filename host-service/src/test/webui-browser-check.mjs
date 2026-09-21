@@ -40,7 +40,8 @@ try {
     if (data.op === 'submit' && !firstRequest) { firstRequest = data; await route.abort('failed'); }
     else { if (data.op === 'submit') retryRequest = data; await route.continue(); }
   });
-  await page.getByRole('button', { name: 'Dispatch job' }).click();
+  await page.getByRole('button', { name: 'Preview job', exact: true }).click();
+  await page.getByRole('button', { name: 'Dispatch reviewed job' }).click();
   await page.getByRole('button', { name: 'Retry same submission' }).waitFor();
   assert.equal(await page.locator('#job-fields').evaluate(fieldset => fieldset.disabled), true);
   assert.equal(await page.getByLabel('Job name').isDisabled(), true);
@@ -54,7 +55,8 @@ try {
   const script = 'return function(ctx) if ctx.state.started then return bot.done() end ctx.state.started=true return bot.wait(200) end';
   await page.getByLabel('Workflow package (.json)').setInputFiles({ name: 'workflow.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ version: 1, entry: 'test', programs: { test: { name: 'Uploaded package smoke', script } }, profiles: { Current: {} }, highways: {} })) });
   await page.locator('#package-summary').filter({ hasText: 'Uploaded package smoke' }).waitFor();
-  await page.getByRole('button', { name: 'Dispatch job' }).click();
+  await page.getByRole('button', { name: 'Preview job', exact: true }).click();
+  await page.getByRole('button', { name: 'Dispatch reviewed job' }).click();
   await page.locator('#job-dialog').waitFor({ state: 'hidden' });
   await page.locator('.job-card').filter({ hasText: 'Uploaded package smoke' }).waitFor();
   await page.route('**/ui/api/status', route => route.abort('failed'));

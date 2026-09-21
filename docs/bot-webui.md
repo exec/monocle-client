@@ -1,4 +1,33 @@
-# Operator WebUI — 0.7.54
+# Operator WebUI
+
+## Job presets (0.8.3)
+
+Open **Presets → Open preset library** to inspect captured packages, duplicate
+built-ins, rename/move custom presets, or preview and save guided settings changes.
+These change **future jobs only**; a running job keeps its own captured package.
+Guided edits include before/after settings and reject stale previews.
+
+In **New job**, select **Saved job preset**. The built-in **6b6t Highway Builder**
+also remains a direct choice. Set the highway origin, direction and length, then
+**Preview job → Dispatch reviewed job**. The preview captures the package; edits
+to the preset afterward cannot silently change the reviewed dispatch.
+
+Simple presets include **Follow crewmate**, **Travel to coordinates**, and **Wait**.
+For Follow, choose a connected leader and select only the followers. The leader
+receives no task and plays normally. Followers walk using live visible positions,
+wait when the leader disappears, and do not mine, pave, teleport or enable combat.
+Cancel the job to stop following. This first version does not follow through
+portals or promise navigation around arbitrary terrain; test on clear ground.
+The follow profile disables Speed, Elytra Fly, Kill Aura and Crystal Aura and
+enables Auto Eat; unspecified modules/settings still inherit worker configuration.
+
+Client hosts have the same library under **Workers → Workflows → Job presets**
+and in the new-task screen. No launcher is required. Install 0.8.3 on followers
+and use the matching host distribution; old workers cannot execute `bot.follow`.
+
+Lua: `bot.follow({target="player-uuid", radius=3, ticks=0})`; zero duration runs
+until cancelled. It uses the existing Travel action lifecycle and cancellation.
+Future bodyguard behavior is not enabled by this preset.
 
 The standalone Java host now bundles a dark-and-gold operator dashboard. No Node, frontend server, or browser extension is needed. It uses the existing host coordinator and job controls; the in-game Workers GUI remains available without this dashboard.
 

@@ -13,6 +13,8 @@ public final class BotLuaTest {
         BotLua.Decision first = BotLua.next(script, state, arguments, result, new JsonObject());
         assert first.state().get("count").getAsInt() == 12 && first.action().get("ticks").getAsInt() == 12;
         assert first.equals(BotLua.next(script, state, arguments, result, new JsonObject()));
+        var follow=decide("return function(ctx) return bot.follow({target='00000000-0000-0000-0000-000000000001'}) end").action();
+        assert follow.get("type").getAsString().equals("Travel")&&follow.get("follow").getAsBoolean();
         assert state.get("count").getAsInt() == 2 && arguments.get("step").getAsInt() == 3 && result.get("moved").getAsInt() == 7;
         assert BotLua.next(script, first.state(), arguments, result, new JsonObject()).state().get("count").getAsInt() == 22;
         assert decide("local n=0; return function(ctx) n=n+1; ctx.state.n=n; return bot.done() end").state().get("n").getAsInt() == 1;

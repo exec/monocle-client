@@ -21,7 +21,7 @@ final class WebUiTest {
             assert index.headers().firstValue("content-security-policy").orElseThrow().contains("frame-ancestors 'none'")
                 && index.headers().firstValue("cache-control").orElseThrow().equals("no-store");
             String app = send(http, origin + "/ui/app.js", null, null, false).body();
-            assert app.contains("textContent") && app.contains("submit-highway") && app.contains("Auto TPY") && app.contains("public-join") && !app.contains("localStorage");
+            assert app.contains("textContent") && app.contains("workflow-prepare") && app.contains("Auto TPY") && app.contains("public-join") && !app.contains("localStorage");
             assert send(http, origin + "/ui/GlacialIndifference-Regular.otf", null, null, false).statusCode() == 200;
             assert send(http, origin + "/ui/GlacialIndifference-OFL.txt", null, null, false).body().contains("OPEN FONT LICENSE");
             for (String path : new String[]{"/ui/../host-config.json", "/ui/%2e%2e/host-config.json", "/ui/api/status?token=secret"})

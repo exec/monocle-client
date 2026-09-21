@@ -54,3 +54,19 @@ sampleCurrentRate('crew','another-job',0,8000);
 assert.equal(currentRates.get('crew').forecasts.size,0);
 `, { el, number: String, assert });
 console.log('WebUI measured rate and chunk horizon checks passed.');
+
+// Exercise the actual dispatch handler without a browser or a live host.
+const fields=new Map(),node=id=>{if(!fields.has(id))fields.set(id,{value:'',textContent:'',hidden:true,open:false,disabled:false,close(){this.open=false;},addEventListener(_event,handler){this.handler=handler;}});return fields.get(id);};
+for(const [id,value] of Object.entries({'job-kind':'preset','job-preset':'task-follow','job-name':'Follow','job-crew':'Default','job-server':'test.invalid','job-dimension':'minecraft:the_nether','job-priority':'0','job-args':'{}','follow-leader':'leader','follow-radius':'3'}))node(id).value=value;
+const calls=[],followers=[{id:'follower',scope:'test.invalid\nminecraft:the_nether'}];
+const dispatchContext={$:node,busy:false,pendingSubmission:null,reviewedSubmission:null,packaged:null,presetList:[{id:'task-follow',entry:'task-follow'}],selectedWorkers:()=>followers,writable:()=>true,crypto:{randomUUID:()=> 'test-job'},render(){},notice(){},async refresh(){},async api(_path,request){calls.push(structuredClone(request));return {entry:'task-follow',profiles:{Current:{}}};}};
+runInNewContext(source.slice(source.indexOf("$('job-form').addEventListener('submit'"),source.indexOf("$('demo').addEventListener")),dispatchContext);
+const submit=()=>node('job-form').handler({preventDefault(){}});
+await submit();
+assert.deepEqual(calls.map(c=>c.op),['workflow-prepare'],'Preview must not submit work');
+assert.ok(dispatchContext.reviewedSubmission.package);
+const reviewed=JSON.stringify(dispatchContext.reviewedSubmission);
+await submit();assert.equal(calls[1].op,'submit');assert.equal(JSON.stringify(calls[1]),reviewed,'Dispatch must use the reviewed snapshot');
+dispatchContext.reviewedSubmission=null;followers.push({id:'leader',scope:'test.invalid\nminecraft:the_nether'});
+await submit();assert.ok(node('job-error').textContent.includes('Uncheck the leader'));assert.equal(calls.length,2);
+console.log('WebUI preset checks passed: non-mutating preview, captured dispatch and passive leader exclusion.');

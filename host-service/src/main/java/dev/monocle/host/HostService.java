@@ -576,6 +576,9 @@ public final class HostService implements AutoCloseable {
         }
         if (op.equals("workflow-list")) { JsonObject r=new JsonObject();r.add("workflows",library.list());return r; }
         if (op.equals("workflow-get")) return library.get(text(request,"id"));
+        if (op.equals("workflow-preview-control")) return library.previewControl(text(request,"id"),request);
+        if (op.equals("workflow-edit-control")) return library.editControl(text(request,"id"),text(request,"expected"),request);
+        if (op.equals("workflow-prepare")) return library.prepare(text(request,"id"),text(request,"scope"),request.getAsJsonObject("args"));
         if (op.equals("workflow-save")) return library.save(text(request,"id"),text(request,"name"),text(request,"folder"),request.getAsJsonObject("package"));
         if (op.equals("workflow-duplicate")) { JsonObject original=library.get(text(request,"source"));return library.save(text(request,"id"),text(request,"name"),text(request,"folder"),original.getAsJsonObject("package")); }
         if (op.equals("workflow-delete")) { library.delete(text(request,"id"));return status(); }
@@ -818,6 +821,11 @@ public final class HostService implements AutoCloseable {
             JsonObject programs = new JsonObject(), program = new JsonObject(), profiles = new JsonObject();
             program.addProperty("name", name); program.addProperty("script", script); programs.add("main", program); profiles.add("Current", new JsonObject());
             packaged.add("programs", programs); packaged.add("profiles", profiles); packaged.add("highways", new JsonObject());
+        }
+        if (text(packaged,"entry").equals("task-follow")) {
+            UUID leader=UUID.fromString(text(args,"target"));
+            if(workers.asList().stream().anyMatch(w->w.getAsString().equals(leader.toString())))throw new IllegalArgumentException("Select followers only; the leader must not receive this job");
+            if(peers.entrySet().stream().noneMatch(e->e.getKey().connected()&&e.getValue().id.equals(leader)&&e.getValue().crew.equals(crew)&&e.getValue().reconciled))throw new IllegalArgumentException("Choose a connected leader in this crew");
         }
         JsonObject task = new JsonObject(), runs = new JsonObject();
         if(request.has("nativeDefinition")) {

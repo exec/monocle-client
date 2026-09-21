@@ -22,6 +22,8 @@ public final class BotActionsTest {
         assert !BotActions.shouldTick("Complete", false, false, false);
         assert !BotActions.shouldTick("Running", true, false, false);
         var travel = BotActions.validate(json("{\"type\":\"Travel\",\"x\":-12000,\"y\":64,\"z\":20000}"));
+        var follow=BotActions.validate(json("{\"type\":\"Travel\",\"follow\":true,\"target\":\"00000000-0000-0000-0000-000000000001\"}"));
+        assert follow.get("ticks").getAsInt()==0&&!follow.has("x");
         var recovery = BotActions.validate(json("{\"type\":\"RecoverSupplies\"}"));
         assert !BotActions.shouldRecover("Highway", false) : "A fresh native highway must not replay an unrelated supply journal";
         assert BotActions.shouldRecover("RecoverSupplies", false);

@@ -7,11 +7,13 @@ const headings = {
   crews: ['TEAM OPERATIONS', 'Your crews', 'Separate teams, separate work. One shared control room.'],
   workers: ['THE ROSTER', 'Your workers', 'Who is here, where they are, and what is holding them up.'],
   jobs: ['THE WORK AHEAD', 'Active jobs', 'Host decisions are authoritative—even when workers are offline.'],
+  presets: ['REUSABLE WORK', 'Job presets', 'Built-in starting points and your own defaults. Running jobs keep their captured settings.'],
   stashes: ['RESOURCE INTELLIGENCE', 'Your stashes', 'Observed contents, not guaranteed stock. Unscanned is never empty.'],
   history: ['OFF THE WORKBENCH', 'Job history', 'Finished work stays here. Cleanup receipts are never silently erased.']
 };
 let token = '', demo = false, snapshot = null, page = 'overview', refreshedAt = 0, refreshing = false, polling;
 let busy = false, packaged = null, pendingSubmission = null, inspecting = null;
+let presetList=[],reviewedSubmission=null;
 let generation = 0;
 const WAIT = 'return function(ctx)\n if ctx.state.waited then return bot.done() end\n ctx.state.waited=true\n return bot.wait(200)\nend';
 const STASH_SCAN = 'return function(ctx)\n if ctx.state.started then return bot.done(ctx.result) end\n ctx.state.started=true\n return bot.stash_scan(ctx.args)\nend';
@@ -157,6 +159,7 @@ function render() {
     jobs.forEach(task => $('content').append(jobCard(task)));
     if (!jobs.length) $('content').append(empty(page === 'history' ? 'A clean slate' : 'Nothing in the queue', page === 'history' ? 'Finished jobs appear here, not in your active work.' : 'Connect workers, then dispatch a workflow to get moving.'));
   }
+  if(page==='presets')$('content').append(empty('Reusable job presets','6b6t Highway, Follow crewmate, Travel to coordinates and Wait. Duplicate built-ins to customize future jobs.'),button('Open preset library',presetLibrary,!writable()));
   if (page === 'stashes') {
     section('Overall resources', 'Combined observations across all exported and host-defined stashes');
     $('content').append(overallResources(snapshot.stashes || []));
@@ -583,15 +586,50 @@ function overallResources(stashes) {
   card.append(table.childElementCount?table:el('p','hint','No observed resources yet. Export a stash definition, then assign a scan.'));return card;
 }
 
-$('new-job').addEventListener('click', () => {
+async function presetLibrary() {
+  const dialog=el('dialog'),body=el('div','management-section');dialog.append(body);document.body.append(dialog);
+  dialog.addEventListener('close',()=>dialog.remove());dialog.showModal();
+  const message=el('p','hint');
+  try {
+    const list=await api('control',{op:'workflow-list'}),catalog=await api('control',{op:'configuration-controls'});
+    const selected=el('select'),name=el('input'),folder=el('input'),setting=el('select'),active=el('select'),value=el('input');value.type='number';
+    for(const r of list.workflows){const o=el('option','',(r.builtin?'Built-in · ':'Custom · ')+r.folder+' / '+r.name);o.value=r.id;selected.append(o);}
+    for(const c of catalog.controls){const o=el('option','',c.label);o.value=c.id;setting.append(o);}
+    for(const state of ['On','Off'])active.append(el('option','',state));
+    body.append(el('h2','','Job presets'),el('p','hint','Future jobs only. Built-ins are read-only; duplicate first. Running jobs remain unchanged.'));
+    const field=(title,input)=>{const l=el('label','',title);l.append(input);body.append(l);};
+    field('Preset',selected);field('Name',name);field('Folder',folder);
+    let record,draft=null,revision=0;
+    const change=()=>{revision++;draft=null;};
+    const load=async()=>{change();const current=revision;const r=await api('control',{op:'workflow-get',id:selected.value});if(current!==revision)return;record=r;name.value=r.name;folder.value=r.folder;message.textContent=r.builtin?'Duplicate this built-in to edit it.':'Custom preset ready.';};
+    const operation=async fn=>{try{await fn();}catch(e){message.textContent=e.message;}};
+    selected.addEventListener('change',()=>operation(load));
+    body.append(button('Duplicate',()=>operation(async()=>{if(!record||record.id!==selected.value)return;await api('control',{op:'workflow-duplicate',source:record.id,id:crypto.randomUUID(),name:name.value+' copy',folder:folder.value});dialog.close();await presetLibrary();})),button('Rename / move',()=>operation(async()=>{if(!record||record.id!==selected.value)return;await api('control',{op:'workflow-save',id:record.id,name:name.value,folder:folder.value,package:record.package});await load();})));
+    field('Guided control',setting);field('Proposed activation',active);field('Proposed value (not a current reading)',value);
+    const update=()=>{change();const c=catalog.controls.find(c=>c.id===setting.value);value.parentElement.hidden=!c.setting;value.min=c.min;value.max=c.max;value.step=c.step||1;value.value=c.example;message.textContent=c.help;};
+    setting.addEventListener('change',update);active.addEventListener('change',change);value.addEventListener('input',change);update();
+    const preview=el('pre');
+    body.append(button('Preview change',()=>operation(async()=>{change();const rev=revision,request={id:selected.value,control:setting.value,active:active.value==='On',value:Number(value.value)};const p=await api('control',{op:'workflow-preview-control',...request});if(rev!==revision)return;draft={op:'workflow-edit-control',...request,expected:p.expected};preview.textContent=p.description+'\n'+p.scope+'\n'+JSON.stringify({before:p.before,after:p.after},null,2);})),button('Save reviewed change',()=>operation(async()=>{if(!draft)throw Error('Preview the change first.');const request=draft;change();await api('control',request);await load();message.textContent='Saved for future jobs. Running jobs unchanged.';})),preview,message,button('Close',()=>dialog.close()));
+    const details=jsonDetails('Captured package',{});body.append(details);
+    await load();details.replaceChildren(el('summary','','Captured package'),el('pre','',JSON.stringify(record?.package,null,2)));
+    selected.addEventListener('change',()=>{details.replaceChildren(el('summary','','Captured package · select Copy to inspect'));});
+    body.append(button('Show current captured package',()=>operation(async()=>{const r=await api('control',{op:'workflow-get',id:selected.value});details.replaceChildren(el('summary','','Captured package'),el('pre','',JSON.stringify(r.package,null,2)));details.open=true;})));
+  } catch(e){body.append(el('p','error',e.message),button('Close',()=>dialog.close()));}
+}
+$('new-job').addEventListener('click', async () => {
   if (!writable()) return;
   $('job-error').textContent = pendingSubmission ? 'Submission outcome is uncertain. Retry the same request or inspect Jobs; editing is locked to avoid duplicate work.' : '';
-  $('job-fields').disabled = !!pendingSubmission; $('job-submit').textContent = pendingSubmission ? 'Retry same submission ↗' : 'Dispatch job ↗';
+  reviewedSubmission=null;$('job-preview').hidden=true;
+  $('job-fields').disabled = !!pendingSubmission; $('job-submit').textContent = pendingSubmission ? 'Retry same submission ↗' : 'Preview job';
   if (!pendingSubmission) {
     $('job-crew').replaceChildren(); snapshot.crews.forEach(crew => { const option = el('option', '', crew); option.value = crew; $('job-crew').append(option); });
     updateWorkers(); updateSource();
   }
   $('job-dialog').showModal();
+  if(!pendingSubmission){$('job-fields').disabled=true;$('job-submit').disabled=true;
+    try {presetList=(await api('control',{op:'workflow-list'})).workflows;$('job-preset').replaceChildren();for(const p of presetList){const o=el('option','',p.folder+' / '+p.name);o.value=p.id;$('job-preset').append(o);}updateSource();}catch(e){$('job-error').textContent=e.message;}
+    finally{$('job-fields').disabled=false;$('job-submit').disabled=false;}
+  }
 });
 function updateWorkers() {
   $('job-workers').replaceChildren(); const crew = $('job-crew').value;
@@ -600,6 +638,8 @@ function updateWorkers() {
     const label = el('label', 'worker-option'); const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.value = worker.id; checkbox.checked = true; checkbox.addEventListener('change', updateScope);
     const text = el('span', '', worker.name); text.append(el('small', '', ' · ' + workerState(worker).status)); label.append(checkbox, text); $('job-workers').append(label);
   }
+  $('follow-leader').replaceChildren();for(const w of workers){const o=el('option','',w.name);o.value=w.id;$('follow-leader').append(o);}
+  if(!$('follow-field').hidden)excludeLeader();
   if (!workers.length) $('job-workers').append(el('p', 'hint', 'No connected, reconciled workers in this crew.')); updateScope();
 }
 function selectedWorkers() { return [...$('job-workers').querySelectorAll('input:checked')].map(n => snapshot.workers.find(w => w.id === n.value)).filter(Boolean); }
@@ -609,11 +649,19 @@ function useWorkerPosition() {
 }
 function updateScope() { const worker = selectedWorkers()[0]; if (worker) { const [server, dimension] = worker.scope.split('\n'); $('job-server').value = server; $('job-dimension').value = dimension; if($('job-kind').value==='highway')useWorkerPosition(); } }
 function updateSource() {
-  const kind = $('job-kind').value; $('highway-field').hidden=kind!=='highway';$('package-field').hidden = kind !== 'package'; $('lua-field').hidden = kind !== 'lua';$('args-field').hidden=kind==='highway';
+  const kind = $('job-kind').value,preset=presetList.find(p=>p.id===$('job-preset').value),highway=kind==='highway'||kind==='preset'&&preset?.highway,follow=kind==='preset'&&preset?.entry==='task-follow';
+  $('preset-field').hidden=kind!=='preset';$('follow-field').hidden=!follow;$('highway-field').hidden=!highway;$('package-field').hidden=kind!=='package';$('lua-field').hidden=kind!=='lua';$('args-field').hidden=highway||follow;
+  for(const input of $('highway-field').querySelectorAll('input'))input.required=highway;
+  if(kind==='preset'){if(preset)$('job-name').value=preset.name;if(preset?.entry==='task-travel'){const w=selectedWorkers()[0];$('job-args').value=JSON.stringify({x:Math.floor(w?.x||0),y:Math.floor(w?.y??116),z:Math.floor(w?.z||0),radius:2});}if(preset?.entry==='task-wait')$('job-args').value='{"ticks":200}';}
+  if(follow)excludeLeader();
   if (!$('job-script').value) $('job-script').value = WAIT;
   if(kind==='highway') { if(!$('job-name').value||['Highway job','Inspect stash'].includes($('job-name').value))$('job-name').value='6b6t highway';useWorkerPosition(); }
   if(kind==='stash') { $('job-name').value='Inspect stash'; if($('job-args').value==='{}')$('job-args').value=JSON.stringify({name:'Main stash',minX:0,maxX:15,minY:116,maxY:120,minZ:0,maxZ:15}); }
 }
+function excludeLeader(){for(const box of $('job-workers').querySelectorAll('input'))if(box.value===$('follow-leader').value)box.checked=false;}
+$('follow-leader').addEventListener('change',excludeLeader);
+$('job-preset').addEventListener('change',updateSource);
+$('job-fields').addEventListener('input',()=>{reviewedSubmission=null;$('job-preview').hidden=true;$('job-submit').textContent='Preview job';});
 $('job-crew').addEventListener('change', updateWorkers); $('job-kind').addEventListener('change', updateSource);
 $('highway-worker-position').addEventListener('click',()=>{if(!useWorkerPosition())$('job-error').textContent='The first selected worker does not have a fresh in-world position.';});
 $('package-file').addEventListener('change', async () => {
@@ -628,29 +676,37 @@ $('package-file').addEventListener('change', async () => {
 });
 $('job-form').addEventListener('submit', async event => {
   event.preventDefault(); if (!writable()) return; $('job-error').textContent = '';
+  busy=true;$('job-fields').disabled=true;$('job-submit').disabled=true;
   try {
+    if (!pendingSubmission && reviewedSubmission) {pendingSubmission=reviewedSubmission;reviewedSubmission=null;}
     if (!pendingSubmission) {
       const workers = selectedWorkers(); if (!workers.length) throw new Error('Select at least one connected worker.');
       const scope = $('job-server').value.trim() + '\n' + $('job-dimension').value.trim();
       if (workers.some(w => w.scope !== scope)) throw new Error('Selected workers must be on the specified server and dimension.');
       const kind = $('job-kind').value; if (kind === 'package' && !packaged) throw new Error('Choose an exported workflow package first.');
       const common={id:crypto.randomUUID(),name:$('job-name').value.trim(),crew:$('job-crew').value,workers:workers.map(w=>w.id),server:$('job-server').value.trim(),dimension:$('job-dimension').value.trim(),priority:Number($('job-priority').value)};
-      if(kind==='highway') {
-        if(workers.length>5)throw new Error('Native highway jobs support at most five workers.');
-        pendingSubmission={op:'submit-highway',...common,direction:$('highway-direction').value,length:Number($('highway-length').value),x:Number($('highway-x').value),y:Number($('highway-y').value),z:Number($('highway-z').value)};
+      if(kind==='highway'||kind==='preset') {
+        const preset=kind==='highway'?{id:'highway-default',highway:true}:presetList.find(p=>p.id===$('job-preset').value);
+        if(!preset)throw Error('Choose a preset.');
+        let args=preset.highway||preset.entry==='task-follow'?{}:JSON.parse($('job-args').value);
+        if(preset.highway){if(workers.length>3)throw Error('Native highway jobs support at most three workers.');args={direction:$('highway-direction').value,length:Number($('highway-length').value),x:Number($('highway-x').value),y:Number($('highway-y').value),z:Number($('highway-z').value)};}
+        if(preset.entry==='task-follow'){args={target:$('follow-leader').value,radius:Number($('follow-radius').value),ticks:0};if(workers.some(w=>w.id===args.target))throw Error('Uncheck the leader; select followers only.');}
+        const packet=await api('control',{op:'workflow-prepare',id:preset.id,scope,args});
+        pendingSubmission={op:'submit',...common,args,package:packet};
       } else {
         const args = JSON.parse($('job-args').value); if (!args || Array.isArray(args) || typeof args !== 'object') throw new Error('Workflow arguments must be a JSON object.');
         pendingSubmission = {op:'submit',...common,args,...(kind === 'package' ? { package: packaged } : { script: kind === 'stash' ? STASH_SCAN : kind === 'wait' ? WAIT : $('job-script').value })};
       }
+      reviewedSubmission=pendingSubmission;pendingSubmission=null;$('job-preview-text').textContent=JSON.stringify(reviewedSubmission,null,2);$('job-preview').hidden=false;$('job-preview').open=true;$('job-submit').textContent='Dispatch reviewed job ↗';return;
     }
     busy = true; $('job-fields').disabled = true; $('job-submit').disabled = true; render();
     await api('control', pendingSubmission); pendingSubmission = null; $('job-dialog').close(); notice('Job dispatched. Follow delivery and worker readiness in Jobs.', true);
   } catch (error) {
     const uncertain = pendingSubmission && error.uncertain;
     if (!uncertain) pendingSubmission = null;
-    $('job-fields').disabled = !!pendingSubmission; $('job-submit').textContent = pendingSubmission ? 'Retry same submission ↗' : 'Dispatch job ↗';
+    $('job-fields').disabled = !!pendingSubmission; $('job-submit').textContent = pendingSubmission ? 'Retry same submission ↗' : 'Preview job';
     $('job-error').textContent = error.message + (pendingSubmission ? ' Outcome uncertain: retry uses the same submission ID. Inspect Jobs before creating replacement work.' : '');
-  } finally { busy = false; $('job-submit').disabled = false; await refresh(); }
+  } finally { busy = false; $('job-fields').disabled=!!pendingSubmission;$('job-submit').disabled = false; await refresh(); }
 });
 
 $('demo').addEventListener('click', () => {

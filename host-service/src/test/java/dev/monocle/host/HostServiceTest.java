@@ -25,6 +25,7 @@ public final class HostServiceTest {
         }
         assert HostService.ACTIONS.contains("Tpa") : "Standalone workers must be able to use the trusted TPA action";
         operationsCheck();
+        followPresetCheck();
         autoTpyCheck();
         stashScanCheck();
         rollingHistoryCheck();
@@ -766,6 +767,24 @@ public final class HostServiceTest {
         System.out.println("Native release checks passed: final cancellation, recovery-gated reassignment, immutable verified checkpoint and saved history geometry.");
     }
 
+    private static void followPresetCheck() throws Exception {
+        try(HostService host=new HostService(Files.createTempDirectory("monocle-follow-host-"),"127.0.0.1",0,CREWS,30);
+            Worker leader=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());
+            Worker follower=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());
+            Worker stranger=new Worker(host.port(),OTHER_KEY,UUID.randomUUID(),new LinkedHashMap<>())) {
+            await(()->connected(host)==3,leader,follower,stranger);
+            JsonObject args=new JsonObject();args.addProperty("target",leader.id.toString());args.addProperty("radius",3);
+            JsonObject prepare=op("workflow-prepare");prepare.addProperty("id","task-follow");prepare.addProperty("scope","test.invalid\nminecraft:the_nether");prepare.add("args",args);
+            JsonObject packet=host.control(prepare),request=op("submit");request.addProperty("id",UUID.randomUUID().toString());request.addProperty("name","Follow leader");request.addProperty("crew","Default");request.addProperty("server","test.invalid");request.addProperty("dimension","minecraft:the_nether");request.add("package",packet);request.add("args",args);
+            JsonArray workers=new JsonArray();workers.add(follower.id.toString());request.add("workers",workers);
+            JsonObject invalid=request.deepCopy();invalid.getAsJsonObject("args").addProperty("target",follower.id.toString());rejects(()->host.control(invalid));
+            JsonObject foreign=request.deepCopy();foreign.getAsJsonObject("args").addProperty("target",stranger.id.toString());rejects(()->host.control(foreign));
+            host.control(request);
+            JsonObject task=host.control(op("status")).getAsJsonArray("tasks").get(0).getAsJsonObject();
+            assert task.getAsJsonObject("runs").has(follower.id.toString())&&!task.getAsJsonObject("runs").has(leader.id.toString());
+            assert !packet.getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("kill-aura").get("active").getAsBoolean();
+        }
+    }
     private static void operationsCheck() throws Exception {
         UUID released=UUID.randomUUID(),pending=UUID.randomUUID();
         JsonObject old=JsonParser.parseString("{status:'Cancelled',runs:{'"+released+"':{status:'Cancelled'},'"+pending+"':{status:'Inspection required'}}}").getAsJsonObject();

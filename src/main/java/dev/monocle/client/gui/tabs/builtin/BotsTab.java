@@ -387,6 +387,7 @@ public class BotsTab extends Tab {
             String shape = workflowFolder + workflows.stream().map(w -> w.id() + ":" + w.folder() + ":" + w.name() + ":" + w.script().hashCode() + ":" + w.profiles() + ":" + w.dependencies() + ":" + w.steps()).toList() + bots.mode.get();
             if (shape.equals(workflowShape)) return;
             workflowShape = shape; workflowLibrary.clear();
+            if(bots.isHost())workflowLibrary.add(theme.button("Job presets · future defaults")).expandX().widget().action=()->mc.gui.setScreen(new dev.monocle.client.gui.screens.JobPresetsScreen(theme,bots));
             List<Choice> folders = new ArrayList<>(); folders.add(new Choice("", "All folders"));
             workflows.stream().map(BotWorkflows.Workflow::folder).distinct().sorted().forEach(folder -> folders.add(new Choice(folder, folder)));
             Choice selectedFolder = folders.stream().filter(f -> f.id().equals(workflowFolder)).findFirst().orElse(folders.getFirst());

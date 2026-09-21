@@ -24,9 +24,9 @@ workflow permits, and whether the latest live update was acknowledged.
 ## Stage 2 — 0.8.x: Operator controls and configuration editing
 
 - [x] Guided common-setting editors with explicit job/worker scope (0.8.1).
-- [ ] Guided editing of future-job defaults.
+- [x] Guided editing of future-job defaults (0.8.3).
 - [x] Compare received job profiles against personal/current settings; explicitly save local personal copies (0.8.2).
-- [ ] Compare and duplicate reusable host presets; preview changes before applying.
+- [x] Compare and duplicate reusable host presets; preview changes before applying (0.8.3).
 - [ ] Consistent Start/Pause/Resume/Cancel/Detach actions and ownership explanations.
 - [ ] Start and manage every ordinary highway job without API/assistant access.
 - [ ] Preserve drafts, expanded sections, selections, and scroll during updates.

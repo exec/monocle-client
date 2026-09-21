@@ -23,7 +23,7 @@
         <p id="login-error" class="error" role="alert"></p>
       </form>
       <button id="demo" class="text-button">Explore a read-only demo →</button>
-      <div class="login-footer"><span class="status-dot"></span> BUNDLED HOST UI <span>0.7.54</span></div>
+      <div class="login-footer"><span class="status-dot"></span> BUNDLED HOST UI <span>0.8.3</span></div>
     </div>
   </section>
   <div id="app" class="app-shell" hidden>
@@ -35,10 +35,11 @@
         <button data-page="crews" class="nav-button"><span aria-hidden="true">◇</span> Crews <span id="crew-count" class="nav-count">0</span></button>
         <button data-page="workers" class="nav-button"><span aria-hidden="true">⊙</span> Workers <span id="worker-count" class="nav-count">0</span></button>
         <button data-page="jobs" class="nav-button"><span aria-hidden="true">≡</span> Jobs <span id="job-count" class="nav-count">0</span></button>
+        <button data-page="presets" class="nav-button"><span aria-hidden="true">◇</span> Presets</button>
         <button data-page="stashes" class="nav-button"><span aria-hidden="true">▦</span> Stashes</button>
         <button data-page="history" class="nav-button"><span aria-hidden="true">↶</span> History</button>
       </nav>
-      <div class="sidebar-bottom"><p>Keep the train moving.</p><span>OPERATOR DESK · 0.7.54</span><button id="logout" class="text-button">Disconnect console ↗</button></div>
+      <div class="sidebar-bottom"><p>Keep the train moving.</p><span>OPERATOR DESK · 0.8.3</span><button id="logout" class="text-button">Disconnect console ↗</button></div>
     </aside>
     <main>
       <header class="topbar"><div><span class="eyebrow">MONOCLE /</span> <span id="breadcrumb">Overview</span></div><div class="top-actions"><span id="connection" class="pill">Connecting</span><button id="refresh" class="icon-button" aria-label="Refresh host status">↻</button><button id="new-job" class="primary">+ New job</button></div></header>
@@ -59,7 +60,9 @@
     <form id="job-form">
       <fieldset id="job-fields">
         <div class="form-grid"><div><label for="job-name">Job name</label><input id="job-name" required maxlength="48" value="Highway job"></div><div><label for="job-crew">Crew</label><select id="job-crew" required></select></div></div>
-        <label for="job-kind">Workflow source</label><select id="job-kind"><option value="highway">6b6t Highway Builder</option><option value="package">Exported workflow package</option><option value="stash">Inspect stash · Experimental</option><option value="wait">Wait (connection test)</option><option value="lua">Custom Lua workflow</option></select>
+        <label for="job-kind">Workflow source</label><select id="job-kind"><option value="highway">6b6t Highway Builder</option><option value="preset">Saved job preset</option><option value="package">Exported workflow package</option><option value="stash">Inspect stash · Experimental</option><option value="wait">Wait (connection test)</option><option value="lua">Custom Lua workflow</option></select>
+        <div id="preset-field" hidden><label for="job-preset">Preset</label><select id="job-preset"></select><p class="hint">Built-in or customized host snapshot. Inspect and edit defaults under Presets.</p></div>
+        <div id="follow-field" hidden><label for="follow-leader">Leader (not assigned this job)</label><select id="follow-leader"></select><label for="follow-radius">Following distance</label><input id="follow-radius" type="number" min="1" max="8" step="1" value="3"><p class="hint">Followers walk while the leader plays normally. No terrain edits, automatic combat or pursuit into unloaded terrain. Runs until cancelled.</p></div>
         <div id="highway-field">
           <div class="form-grid"><div><label for="highway-direction">Direction</label><select id="highway-direction"><option>North</option><option>East</option><option>South</option><option>West</option></select></div><div><label for="highway-length">Length</label><input id="highway-length" type="number" min="16" max="100000" step="1" required value="10000"></div></div>
           <div class="form-grid"><div><label for="highway-x">Start X</label><input id="highway-x" type="number" min="-29900000" max="29900000" step="1" required></div><div><label for="highway-y">Start Y</label><input id="highway-y" type="number" min="-2048" max="2048" step="1" required></div><div><label for="highway-z">Start Z</label><input id="highway-z" type="number" min="-29900000" max="29900000" step="1" required></div></div>
@@ -72,7 +75,8 @@
         <div class="form-grid"><div><label for="job-priority">Priority</label><input id="job-priority" type="number" min="-1000" max="1000" step="1" required value="0"></div><div id="args-field"><label for="job-args">Workflow arguments (JSON)</label><textarea id="job-args" rows="3" spellcheck="false">{}</textarea></div></div>
         <p class="hint">Higher priority can interrupt existing work after native cleanup. Highway length may be 16–100,000 blocks.</p>
       </fieldset>
-      <p id="job-error" class="error" role="alert"></p><div class="dialog-actions"><button id="job-submit" class="primary" type="submit">Dispatch job ↗</button></div>
+      <details id="job-preview" hidden><summary>Reviewed dispatch · captured configuration</summary><pre id="job-preview-text"></pre></details>
+      <p id="job-error" class="error" role="alert"></p><div class="dialog-actions"><button id="job-submit" class="primary" type="submit">Preview job</button></div>
     </form>
   </dialog>
 </body>

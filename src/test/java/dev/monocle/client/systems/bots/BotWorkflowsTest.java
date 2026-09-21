@@ -12,7 +12,8 @@ final class BotWorkflowsTest {
         try {
             var path = directory.resolve("workflows.json");
             var library = new BotWorkflows(path);
-            assert library.all().size() == 14;
+            assert library.all().size() == 15;
+            assert library.get("task-follow").script().contains("bot.follow");
             assert library.get("task-stash-scan").script().contains("bot.stash_scan");
             assert library.get("task-stash-resupply").script().contains("bot.stash_resupply");
             var original = library.compile(BotWorkflows.DEFAULT_ID);
@@ -59,7 +60,7 @@ final class BotWorkflowsTest {
             bad(() -> Bots.applyWorkflowDuties(job, Set.of(excavator, paver)));
 
             library.delete(copy.id()); library.delete(supplies.id());
-            assert new BotWorkflows(path).all().size() == 14;
+            assert new BotWorkflows(path).all().size() == 15;
             Files.writeString(path, "{broken");
             var broken = new BotWorkflows(path);
             bad(broken::all); bad(() -> broken.duplicate(BotWorkflows.DEFAULT_ID, "No overwrite", "Highway Builder"));

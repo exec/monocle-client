@@ -84,6 +84,9 @@ public final class BotLua {
                 LuaTable value = argument.checktable(); value.set("type", type); return value;
             }
         }));
+        bot.set("follow", new OneArgFunction() { @Override public LuaValue call(LuaValue argument) {
+            LuaTable value = argument.checktable(); value.set("type", "Travel"); value.set("follow", LuaValue.TRUE); return value;
+        } });
         bot.set("done", new OneArgFunction() { @Override public LuaValue call(LuaValue result) {
             LuaTable value = action("Done"); if (!result.isnil()) value.set("result", result); return value;
         } });

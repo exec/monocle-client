@@ -105,7 +105,12 @@ public final class BotActions {
                 optionalNumber(a, "flyBeyond", 8, 4, 32);
             }
             case "Travel" -> {
-                number(a, "x", -29_999_984, 29_999_984); number(a, "z", -29_999_984, 29_999_984); number(a, "y", -2048, 2048);
+                if (a.has("follow") && a.get("follow").getAsBoolean()) {
+                    UUID.fromString(string(a, "target", 36));
+                    optionalInteger(a, "ticks", 0, 0, 1_728_000);
+                } else {
+                    number(a, "x", -29_999_984, 29_999_984); number(a, "z", -29_999_984, 29_999_984); number(a, "y", -2048, 2048);
+                }
                 optionalNumber(a, "radius", 2, .15, 8);
                 optionalNumber(a, "flyBeyond", 6, 4, 32);
             }
@@ -465,6 +470,18 @@ public final class BotActions {
     }
 
     private void travel() {
+        if (action.has("follow") && action.get("follow").getAsBoolean()) {
+            if (!acquireMovement()) return;
+            input.stop(); brakeFlight(); runOnly = true;
+            if (action.get("ticks").getAsInt() > 0 && ++elapsed >= action.get("ticks").getAsInt()) { complete("Follow duration finished"); return; }
+            UUID target = UUID.fromString(action.get("target").getAsString());
+            if (target.equals(mc.player.getUUID())) { fail("A follower cannot follow itself"); return; }
+            Player leader = mc.level.players().stream().filter(p -> p.getUUID().equals(target) && p.isAlive()).findFirst().orElse(null);
+            if (leader == null) { if(mc.player.isFallFlying())landBeforeHandoff(); detail = "Waiting for the leader to be visible in this world; no stale position is chased"; return; }
+            travel(leader.position(), action.get("radius").getAsDouble(), 32, false);
+            if (leader.distanceToSqr(mc.player) <= Math.pow(action.get("radius").getAsDouble(), 2)) detail = "Following · beside " + leader.getName().getString();
+            return;
+        }
         travel(new Vec3(action.get("x").getAsDouble(), action.get("y").getAsDouble(), action.get("z").getAsDouble()), action.get("radius").getAsDouble(), action.get("flyBeyond").getAsDouble(), true);
     }
     private void travel(Vec3 goal, double radius, double flyBeyond, boolean finish) {

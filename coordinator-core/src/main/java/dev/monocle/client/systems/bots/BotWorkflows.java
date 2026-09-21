@@ -31,7 +31,7 @@ public final class BotWorkflows {
         addBuiltin(values, DEFAULT_ID, "6b6t Highway Builder", List.of(new Step(Action.Excavating, ""), new Step(Action.Paving, ""), new Step(Action.Call, "highway-supplies")));
         addBuiltin(values, "highway-excavate", "Excavation crew", List.of(new Step(Action.Excavating, ""), new Step(Action.Call, "highway-supplies")));
         addBuiltin(values, "highway-pave", "Paving crew", List.of(new Step(Action.Paving, ""), new Step(Action.Call, "highway-supplies")));
-        for (var entry : Map.of("travel", "Travel to coordinates", "drop", "Drop items", "tpa", "TPA rendezvous", "wait", "Wait", "modules", "Run configured modules", "profile", "Set profile").entrySet()) {
+        for (var entry : Map.of("follow", "Follow crewmate", "travel", "Travel to coordinates", "drop", "Drop items", "tpa", "TPA rendezvous", "wait", "Wait", "modules", "Run configured modules", "profile", "Set profile").entrySet()) {
             String argument = entry.getKey().equals("wait") ? "ctx.args.ticks or 20" : entry.getKey().equals("profile") ? "ctx.args.name or 'Current'" : "ctx.args";
             String script = "return function(ctx)\n  if ctx.state.started then return bot.done() end\n  ctx.state.started = true\n  return bot." + entry.getKey() + "(" + argument + ")\nend\n";
             String id = "task-" + entry.getKey();

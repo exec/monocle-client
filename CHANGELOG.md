@@ -2,6 +2,13 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.8.3 — Reusable job presets and passive following
+
+- Added preset-library controls in both host interfaces: inspect, duplicate, rename/move and preview guided changes to future-job defaults. Built-ins remain read-only; running jobs retain captured settings. Stale guided edits are rejected.
+- Added reviewed dispatch of saved presets, including the built-in 6b6t highway policy, Travel, Wait and Follow crewmate. Highway start coordinates/direction are rebound at launch without changing the saved preset.
+- Added reusable `bot.follow({target=UUID,radius=3,ticks=0})`: walking through loaded safe routes, live player positions, waiting when the leader disappears, and normal job cancellation. The leader receives no job. Combat/bodyguard behavior is intentionally not included.
+- Follow presets require 0.8.3 clients and matching host/UI; no changes to highway mining, paving or supply execution. Movement and visual UI still require operator smoke testing.
+
 ## 0.8.2 — Profile comparison and personal copies
 
 - Added on-demand, per-module comparison of personal settings, a selected host-captured overlay (or latest live request), and actual worker settings in both host interfaces. Snapshots show their age and do not pretend omitted settings are host overrides.

@@ -59,19 +59,20 @@ public final class BotTaskScreen extends WindowScreen {
 
     private void createEditor() {
         requireHost();
+        add(theme.button("Saved job presets · duplicate / edit defaults")).expandX().widget().action = () -> mc.gui.setScreen(new JobPresetsScreen(theme,bots));
         List<Choice> choices = new ArrayList<>();
         for (var value : bots.workflows().all()) if (!value.script().isEmpty() || !bots.workflows().compile(value.id()).get("duty").getAsString().equals("Supply"))
             choices.add(new Choice(value.id(), (value.script().isEmpty() ? "Native · " : "Lua · ") + value.folder() + " / " + value.name()));
         Choice[] crews = bots.presets().stream().map(p -> new Choice(p.name(), bots.crewLabel(p.name()))).toArray(Choice[]::new);
         for (var item : bots.operations().list()) {
-            JsonObject value=item.getAsJsonObject();if(!value.get("builtin").getAsBoolean())choices.add(new Choice("package:"+value.get("id").getAsString(),"Captured · "+value.get("folder").getAsString()+" / "+value.get("name").getAsString()));
+            JsonObject value=item.getAsJsonObject();choices.addFirst(new Choice("package:"+value.get("id").getAsString(),"Preset · "+value.get("folder").getAsString()+" / "+value.get("name").getAsString()));
         }
         if (choices.isEmpty() || crews.length == 0) throw new IllegalStateException("Create a crew and a runnable workflow first.");
         add(theme.label("Queue work for one worker or a whole crew. Higher priority requests a safe interruption; equal priority waits its turn. Completing an interruption resumes the suspended task.", contentWidth).color(theme.textSecondaryColor()));
         WTable fields = add(theme.table()).expandX().widget();
         fields.add(theme.label("Task name")); WTextBox name = fields.add(theme.textBox("Workflow task")).minWidth(220).expandX().widget();
         fields.row(); fields.add(theme.label("Workflow"));
-        workflow = fields.add(theme.dropdown(choices.toArray(Choice[]::new), choices.stream().filter(c -> c.id().equals(initialWorkflow)).findFirst().orElse(choices.getFirst()))).expandX().widget();
+        workflow = fields.add(theme.dropdown(choices.toArray(Choice[]::new), choices.stream().filter(c -> c.id().equals("package:"+initialWorkflow)).findFirst().orElseGet(()->choices.stream().filter(c->c.id().equals(initialWorkflow)).findFirst().orElseGet(()->choices.stream().filter(c->c.id().equals("package:highway-default")).findFirst().orElse(choices.getFirst()))))).expandX().widget();
         fields.row(); fields.add(theme.label("Crew"));
         crew = fields.add(theme.dropdown(crews, Arrays.stream(crews).filter(c -> c.id().equals(initialCrew == null ? bots.selectedCrew() : initialCrew)).findFirst().orElse(crews[0]))).expandX().widget();
         fields.row(); fields.add(theme.label("Priority")); priority = fields.add(theme.intEdit(0, -1000, 1000, true)).expandX().widget();
@@ -87,11 +88,20 @@ public final class BotTaskScreen extends WindowScreen {
         WSection inputs = add(theme.section("Workflow inputs", true)).expandX().widget();
         arguments = inputs.add(theme.verticalList()).expandX().widget();
         rebuildArguments();
-        add(theme.button("Queue workflow")).expandX().widget().action = () -> perform(() -> {
+        final String[] reviewed={null};
+        var captured=add(theme.section("Captured package preview",false)).expandX().widget();
+        var review=add(theme.label("Preview the selected workers, inputs and captured configuration before queuing.",contentWidth)).expandX().widget();
+        var queue=add(theme.button("Preview workflow")).expandX().widget();
+        queue.action = () -> perform(() -> {
             requireHost();
             if (targets.isEmpty()) throw new IllegalStateException("Choose at least one connected worker.");
             Map<UUID, Integer> selectedPriorities = new LinkedHashMap<>(overrides); selectedPriorities.keySet().retainAll(targets);
-            UUID created = bots.tasks().create(name.get(), workflow.get().id(), crew.get().id(), Set.copyOf(targets), parameters.get(), priority.get(), Map.copyOf(selectedPriorities));
+            JsonObject args=parameters.get();
+            String scope=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();
+            String source=workflow.get().id().startsWith("package:")?bots.operations().prepare(workflow.get().id().substring(8),scope,args).toString():bots.workflows().packageWorkflows(workflow.get().id()).toString();
+            String fingerprint=name.get()+workflow.get().id()+crew.get().id()+targets+selectedPriorities+priority.get()+args+source;
+            if(!fingerprint.equals(reviewed[0])) { reviewed[0]=fingerprint;review.set(name.get()+" · "+crew.get()+" · "+targets.size()+" followers/workers\nInputs: "+args+"\nCaptured preset settings are fixed for this job. Click Queue reviewed workflow to start. Changes require another preview.");captured.clear();captured.add(new WorkflowCodeBox(source,true,8)).expandX().widget();queue.set("Queue reviewed workflow");return; }
+            UUID created = bots.tasks().create(name.get(), workflow.get().id(), crew.get().id(), Set.copyOf(targets), args, priority.get(), Map.copyOf(selectedPriorities));
             mc.gui.setScreen(new BotTaskScreen(theme, bots, created));
         }, "Workflow queued with captured code, profiles and arguments.");
     }
@@ -99,7 +109,22 @@ public final class BotTaskScreen extends WindowScreen {
     private void rebuildArguments() {
         arguments.clear(); parameters = null;
         WTable fields = arguments.add(theme.table()).expandX().widget();
-        switch (workflow.get().id()) {
+        String selectedWorkflow=workflow.get().id();
+        if(selectedWorkflow.startsWith("package:"))selectedWorkflow=bots.operations().get(selectedWorkflow.substring(8)).getAsJsonObject("package").get("entry").getAsString();
+        else if(selectedWorkflow.startsWith("highway-"))selectedWorkflow=""; // Legacy definitions still use the host's native layout.
+        switch (selectedWorkflow) {
+            case "highway-default", "highway-excavate", "highway-pave" -> {
+                WIntEdit x=integer(fields,"Start X",mc.player.getBlockX(),-29_900_000,29_900_000),y=integer(fields,"Start Y",mc.player.getBlockY(),-2048,2048),z=integer(fields,"Start Z",mc.player.getBlockZ(),-29_900_000,29_900_000);
+                WIntEdit length=integer(fields,"Length",10000,16,100000);
+                fields.add(theme.label("Direction"));var direction=fields.add(theme.dropdown(new String[]{"North","East","South","West"},"North")).expandX().widget();
+                parameters=()->{JsonObject a=new JsonObject();a.addProperty("x",x.get());a.addProperty("y",y.get());a.addProperty("z",z.get());a.addProperty("length",length.get());a.addProperty("direction",direction.get());return a;};
+            }
+            case "task-follow" -> {
+                WTextBox leader=string(fields,"Leader username or UUID",mc.player.getName().getString());
+                WIntEdit radius=integer(fields,"Following distance (blocks)",3,1,8),ticks=integer(fields,"Duration (ticks; 0 = until cancelled)",0,0,1_728_000);
+                parameters=()->{String requested=leader.get().strip();String target=bots.allMembers().stream().filter(m->m.name().equalsIgnoreCase(requested)).map(m->m.id().toString()).findFirst().orElse(requested);if(mc.player.getName().getString().equalsIgnoreCase(requested))target=mc.player.getUUID().toString();UUID.fromString(target);JsonObject a=new JsonObject();a.addProperty("target",target);a.addProperty("radius",radius.get());a.addProperty("ticks",ticks.get());return a;};
+                arguments.add(theme.label("Select followers only. Walking, no terrain edits or automatic combat. The leader plays normally. Followers wait when the leader is not visible.",contentWidth-20));
+            }
             case "task-stash-scan" -> {
                 JsonObject selected;
                 try { selected=dev.monocle.client.systems.modules.Modules.get().get(dev.monocle.client.systems.modules.world.SchematicSelector.class).selectionBounds("Main stash"); }
@@ -167,7 +192,7 @@ public final class BotTaskScreen extends WindowScreen {
                 parameters = () -> { JsonObject a = new JsonObject(); a.addProperty("ticks", ticks.get()); return a; };
             }
             case "task-profile" -> {
-                List<String> names = BotProfiles.names(); fields.add(theme.label("Gameplay profile"));
+                List<String> names = workflow.get().id().startsWith("package:")?new ArrayList<>(bots.operations().get(workflow.get().id().substring(8)).getAsJsonObject("package").getAsJsonObject("profiles").keySet()):BotProfiles.names(); fields.add(theme.label("Gameplay profile"));
                 var profile = fields.add(theme.dropdown(names.toArray(String[]::new), names.getFirst())).expandX().widget();
                 parameters = () -> { JsonObject a = new JsonObject(); a.addProperty("name", profile.get()); return a; };
                 arguments.add(theme.label("A short-lived profile preview: personal settings return when this task ends. For useful work under a shared profile, call bot.profile inside your program before its actions. Connection keys and accounts are excluded.", contentWidth - 20).color(theme.textSecondaryColor()));

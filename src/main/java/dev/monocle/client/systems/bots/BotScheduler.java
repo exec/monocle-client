@@ -112,6 +112,7 @@ public final class BotScheduler {
         return new TaskView(id, text(t, "name"), text(t, "workflowName"), text(t, "crew"), workers(t), text(t, "status"), text(t, "detail"), t.get("priority").getAsInt(), Map.copyOf(overrides), terminal(text(t, "status")));
     }
     public UUID create(String name, String workflowId, String crewId, Set<UUID> targets, JsonObject args, int priority, Map<UUID, Integer> overrides) {
+        if(workflowId.equals("task-follow"))return createPackage(name,workflowId,crewId,targets,args,priority,overrides);
         if (workflowId.startsWith("package:")) return createPackage(name, workflowId.substring(8), crewId, targets, args, priority, overrides);
         hostOnly(); load();
         if (!bots.isHost() || !Utils.canUpdate()) throw new IllegalStateException("Start the host in a world before queuing work");
@@ -146,7 +147,12 @@ public final class BotScheduler {
         for(UUID worker:targets)if(!crewId.equals(bots.workerCrew(worker)))throw new IllegalArgumentException("Every target must be connected to this crew");
         checkedPriority(priority);overrides.values().forEach(BotScheduler::checkedPriority);
         if(args==null || args.toString().length()>BotLua.MAX_STATE)throw new IllegalArgumentException("Arguments too large");
-        JsonObject record=bots.operations().get(id),packet=checkedPackage(record.getAsJsonObject("package"));
+        JsonObject record=bots.operations().get(id),packet=checkedPackage(bots.operations().prepare(id,scope(),args));
+        if(text(packet,"entry").equals("task-follow")) {
+            UUID leader=UUID.fromString(text(args,"target"));
+            if(targets.contains(leader))throw new IllegalArgumentException("Select followers only, not the leader");
+            if(!leader.equals(mc.player.getUUID())&&bots.allMembers().stream().noneMatch(m->m.id().equals(leader)&&m.connected()&&crewId.equals(bots.workerCrew(m.id()))))throw new IllegalArgumentException("Choose a connected crewmate as leader");
+        }
         if(!packet.getAsJsonObject("highways").isEmpty() && (!text(packet.getAsJsonObject("geometry"),"scope").equals(scope()) || targets.size()>dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS))throw new IllegalArgumentException("Captured highway geometry must match this world, with at most 3 workers");
         return createCaptured(name,text(packet,"entry"),text(record,"name"),crewId,targets,args,priority,overrides,packet,scope());
     }
