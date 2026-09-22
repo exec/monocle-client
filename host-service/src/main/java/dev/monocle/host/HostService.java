@@ -45,7 +45,7 @@ public final class HostService implements AutoCloseable {
     private long rosterAt;
     private int historyDays;
     private boolean autoTpy;
-    private record AutoTpy(UUID requester, UUID target, String requesterName, String crew, String scope, long due, long expires) { }
+    private record AutoTpy(UUID requester, UUID target, String requesterName, String crew, String scope, long due, long expires,boolean required) { }
     private static final class Peer {
         boolean chatSupported;
         boolean stashCatalogSupported;
@@ -301,7 +301,7 @@ public final class HostService implements AutoCloseable {
     }
 
     private void requestAutoTpy(Peer requester,JsonObject message) {
-        if(!autoTpy)return;
+        boolean required=bodyguardRequest(requester,message);if(!autoTpy&&!required)return;
         UUID request=UUID.fromString(text(message,"request"));if(autoTpyRequests.containsKey(request))return;
         if(autoTpyRequests.size()>=64)throw new IllegalStateException("Too many pending Auto TPY requests");
         String targetName=text(message,"target"),scope=text(message,"scope");
@@ -309,14 +309,21 @@ public final class HostService implements AutoCloseable {
         if(requester.observation==null||!requester.observation.scope().equals(scope))return;
         long fresh=System.nanoTime();List<Peer> matches=peers.entrySet().stream().filter(e->e.getKey().connected()).map(Map.Entry::getValue)
             .filter(p->p.observation!=null&&p.observation.fresh(fresh)&&p.crew.equals(requester.crew)&&!p.id.equals(requester.id)&&p.observation.name().equalsIgnoreCase(targetName)).toList();
+        if(message.has("targetId")){UUID targetId=UUID.fromString(text(message,"targetId"));matches=matches.stream().filter(p->p.id.equals(targetId)).toList();}
         if(matches.size()!=1||!sameServer(scope,matches.getFirst().observation.scope()))return;
-        long now=System.currentTimeMillis();autoTpyRequests.put(request,new AutoTpy(requester.id,matches.getFirst().id,requester.observation.name(),requester.crew,scope,now+500,now+10_000));
+        long now=System.currentTimeMillis();autoTpyRequests.put(request,new AutoTpy(requester.id,matches.getFirst().id,requester.observation.name(),requester.crew,scope,now+500,now+10_000,required));
+    }
+
+    private boolean bodyguardRequest(Peer requester,JsonObject message) {
+        if(!flag(message,"bodyguard")||!message.has("targetId"))return false;UUID target=UUID.fromString(text(message,"targetId"));
+        return tasks.values().stream().anyMatch(t->!QueuePolicy.terminal(text(t,"status"))&&requester.crew.equals(text(t,"crew"))&&text(t.getAsJsonObject("package"),"entry").equals("task-bodyguard")
+            &&t.getAsJsonObject("runs").has(requester.id.toString())&&text(t.getAsJsonObject("args"),"target").equals(target.toString()));
     }
 
     private void tickAutoTpy() {
         long now=System.currentTimeMillis(),fresh=System.nanoTime();
         for(var entry:List.copyOf(autoTpyRequests.entrySet())) {
-            AutoTpy request=entry.getValue();if(!autoTpy||now>=request.expires()){autoTpyRequests.remove(entry.getKey());continue;}if(now<request.due())continue;
+            AutoTpy request=entry.getValue();if((!autoTpy&&!request.required())||now>=request.expires()){autoTpyRequests.remove(entry.getKey());continue;}if(now<request.due())continue;
             var requester=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().id.equals(request.requester())).findFirst().orElse(null);
             var target=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().id.equals(request.target())).findFirst().orElse(null);
             if(requester==null||target==null||requester.getValue().observation==null||target.getValue().observation==null
@@ -850,7 +857,8 @@ public final class HostService implements AutoCloseable {
         if (Set.of("task-follow","task-bodyguard").contains(text(packaged,"entry"))) {
             UUID leader=UUID.fromString(text(args,"target"));
             if(workers.asList().stream().anyMatch(w->w.getAsString().equals(leader.toString())))throw new IllegalArgumentException("Select followers only; the leader must not receive this job");
-            if(peers.entrySet().stream().noneMatch(e->e.getKey().connected()&&e.getValue().id.equals(leader)&&e.getValue().crew.equals(crew)&&e.getValue().reconciled))throw new IllegalArgumentException("Choose a connected leader in this crew");
+            Peer subject=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().id.equals(leader)&&e.getValue().crew.equals(crew)&&e.getValue().reconciled&&e.getValue().observation!=null).map(Map.Entry::getValue).findFirst().orElseThrow(()->new IllegalArgumentException("Choose a connected leader in this crew"));
+            if(text(packaged,"entry").equals("task-bodyguard"))args.addProperty("targetName",subject.observation.name());
             if(text(packaged,"entry").equals("task-bodyguard")&&workers.size()>3)throw new IllegalArgumentException("Bodyguard supports at most three workers");
         }
         JsonObject task = new JsonObject(), runs = new JsonObject();

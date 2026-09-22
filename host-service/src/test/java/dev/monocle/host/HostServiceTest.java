@@ -892,8 +892,13 @@ public final class HostServiceTest {
             await(()->!requester.autoTpy&&!target.autoTpy,requester,target,outsider);
             requester.requestTpa("Target");for(int i=0;i<80;i++){requester.pump();target.pump();outsider.pump();Thread.sleep(10);}
             assert target.tpaAccepts.size()==1&&!TaskFiles.read(directory.resolve("host-config.json")).get("autoTpy").getAsBoolean() : "Disabled host policy persists and sends no acceptance";
+            JsonObject args=new JsonObject();args.addProperty("target",target.id.toString());args.addProperty("radius",3);
+            JsonObject prepare=op("workflow-prepare");prepare.addProperty("id","task-bodyguard");prepare.addProperty("scope",requester.scope);prepare.add("args",args);
+            JsonObject submit=op("submit");submit.addProperty("id",UUID.randomUUID().toString());submit.addProperty("name","Protect Target");submit.addProperty("crew","Default");submit.addProperty("server","test.invalid");submit.addProperty("dimension","minecraft:the_nether");submit.addProperty("priority",0);submit.add("args",args);submit.add("package",host.control(prepare));JsonArray guards=new JsonArray();guards.add(requester.id.toString());submit.add("workers",guards);host.control(submit);
+            requester.requestBodyguardTpa("Target",target.id);await(()->target.tpaAccepts.size()==2,requester,target,outsider);
+            assert outsider.tpaAccepts.isEmpty():"Bodyguard recovery accepts only on the protected same-crew client, even with general Auto TPY disabled";
         }
-        System.out.println("Auto TPY checks passed: host-owned policy, ten-tick delay, exact same-crew routing and durable disable.");
+        System.out.println("Auto TPY checks passed: host-owned policy, exact same-crew routing, durable disable and authenticated bodyguard recovery.");
     }
 
     private static final class Worker implements AutoCloseable {
@@ -1010,7 +1015,7 @@ public final class HostServiceTest {
                                 decision = BotLua.next(text(envelope.getAsJsonObject("programs").getAsJsonObject(text(envelope, "entry")), "script"), decision.state(), metadata.getAsJsonObject("args"), new JsonObject(), null);
                             }
                             if(text(decision.action(),"type").equals("StashScan")){decision.action().addProperty("workerIndex",metadata.get("workerIndex").getAsInt());decision.action().addProperty("workerCount",metadata.get("workerCount").getAsInt());}
-                            assert Set.of("Wait","Highway","StashScan").contains(text(decision.action(), "type"));
+                            assert Set.of("Wait","Travel","Highway","StashScan").contains(text(decision.action(), "type"));
                             assert !checkpoints.containsKey(UUID.fromString(transfer));
                             JsonObject run = new JsonObject(); run.addProperty("run", transfer); run.addProperty("status", "Ready");run.add("action",decision.action());run.addProperty("token",UUID.randomUUID().toString()); checkpoints.put(UUID.fromString(transfer), run); installs++; sendStatus(run);
                         }
@@ -1092,6 +1097,7 @@ public final class HostServiceTest {
         }
         void detach(){nativeSend("request",true);}
         void requestTpa(String target){JsonObject request=new JsonObject();request.addProperty("type","worker-tpa-request");request.addProperty("request",UUID.randomUUID().toString());request.addProperty("target",target);request.addProperty("scope",scope);c.send(request.toString());}
+        void requestBodyguardTpa(String target,UUID targetId){JsonObject request=new JsonObject();request.addProperty("type","worker-tpa-request");request.addProperty("request",UUID.randomUUID().toString());request.addProperty("target",target);request.addProperty("targetId",targetId.toString());request.addProperty("scope",scope);request.addProperty("bodyguard",true);c.send(request.toString());}
         void reserve(){supplyLock="local-container";announce();}
         void release(){supplyLock="";returning=true;announce();}
         @Override public void close() { c.disconnect(); }

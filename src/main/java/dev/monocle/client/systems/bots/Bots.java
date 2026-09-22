@@ -149,6 +149,13 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         finally { workflowTpa = false; }
     }
 
+    public void requestBodyguardTpa(UUID target,String name) {
+        if(!isWorker()||!name.matches("[A-Za-z0-9_]{1,16}"))return;
+        sendWorkflowTpa(name);
+        JsonObject request=new JsonObject();request.addProperty("type","worker-tpa-request");request.addProperty("request",UUID.randomUUID().toString());
+        request.addProperty("target",name);request.addProperty("targetId",target.toString());request.addProperty("scope",worldScope());request.addProperty("bodyguard",true);worker.send(request.toString());
+    }
+
     public void onCommandSent(String command) {
         String target = tpaTarget(command);
         if (workflowTpa || target == null || !Utils.canUpdate()) return;

@@ -59,7 +59,7 @@ public final class BotActions {
     private final boolean highwayOwned;
     private JsonObject action, pending, originals = new JsonObject(), result;
     private String state = "Complete", detail = "Idle", dimension = "";
-    private int elapsed, remaining, dropWait, lastTick = -1, launchTick = -1, launchAttempts;
+    private int elapsed, remaining, dropWait, lastTick = -1, launchTick = -1, launchAttempts, bodyguardMissingTicks, bodyguardTpaAt;
     private boolean suspended, suspendRequested, checkpoint, armed, acknowledged, listening, modulesApplied, modulesArmed, restoredModuleLease, tpaSent, runOnly, enabledFly;
     private long homeReadyAt;
     private ClientInput previousInput;
@@ -113,6 +113,7 @@ public final class BotActions {
                     optionalInteger(a, "ticks", 0, 0, 1_728_000);
                     if (a.has("bodyguard") && a.get("bodyguard").getAsBoolean()) {
                         optionalInteger(a,"workerCount",1,1,3);optionalInteger(a,"workerIndex",0,0,a.get("workerCount").getAsInt()-1);
+                        if(!string(a,"targetName",16).matches("[A-Za-z0-9_]{1,16}"))throw new IllegalArgumentException("Invalid bodyguard subject name");
                     }
                 } else {
                     number(a, "x", -29_999_984, 29_999_984); number(a, "z", -29_999_984, 29_999_984); number(a, "y", -2048, 2048);
@@ -165,7 +166,7 @@ public final class BotActions {
         }
         recoveryReady = false;
         recovery = Set.of("RecoverSupplies", "Highway").contains(type()) ? new BotSupplyRecovery(bots, action.has("recovery") ? validateRecovery(action.getAsJsonObject("recovery")) : type().equals("RecoverSupplies") ? action : new JsonObject()) : null;
-        elapsed = dropWait = launchAttempts = 0; launchTick = lastTick = -1;
+        elapsed = dropWait = launchAttempts = bodyguardMissingTicks = bodyguardTpaAt = 0; launchTick = lastTick = -1;
         remaining = type().equals("DropItems") ? action.get("count").getAsInt() : action.has("ticks") ? action.get("ticks").getAsInt() : 0;
         homeReadyAt=0;
         suspended = suspendRequested = checkpoint = armed = acknowledged = modulesApplied = modulesArmed = restoredModuleLease = tpaSent = runOnly = false;
@@ -485,7 +486,12 @@ public final class BotActions {
             UUID target = UUID.fromString(action.get("target").getAsString());
             if (target.equals(mc.player.getUUID())) { fail("A follower cannot follow itself"); return; }
             Player leader = mc.level.players().stream().filter(p -> p.getUUID().equals(target) && p.isAlive()).findFirst().orElse(null);
-            if (leader == null) { if(mc.player.isFallFlying())landBeforeHandoff(); detail = "Waiting for the leader to be visible in this world; no stale position is chased"; return; }
+            if (leader == null) {
+                if(!bodyguard&&mc.player.isFallFlying())landBeforeHandoff();
+                if(bodyguard&&++bodyguardMissingTicks>=40&&mc.player.tickCount>=bodyguardTpaAt){bots.requestBodyguardTpa(target,action.get("targetName").getAsString());bodyguardTpaAt=mc.player.tickCount+400;}
+                detail=bodyguard?"Subject not visible · TPA recovery "+(bodyguardTpaAt>mc.player.tickCount?"requested":"arming"):"Waiting for the leader to be visible in this world; no stale position is chased";return;
+            }
+            bodyguardMissingTicks=0;
             Vec3 goal=bodyguard?formationGoal(leader.position(),leader.getYRot(),action.get("radius").getAsDouble(),action.get("workerIndex").getAsInt(),action.get("workerCount").getAsInt()):leader.position();
             travel(goal,bodyguard ? .75 : action.get("radius").getAsDouble(),32,false,bodyguard ? leader : null);
             if (goal.distanceToSqr(mc.player.position()) <= Math.pow(bodyguard ? .75 : action.get("radius").getAsDouble(),2)) detail = (bodyguard ? "Guarding · in formation with " : "Following · beside ") + leader.getName().getString();
