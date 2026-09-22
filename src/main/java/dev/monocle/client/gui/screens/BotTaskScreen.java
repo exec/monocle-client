@@ -129,11 +129,11 @@ public final class BotTaskScreen extends WindowScreen {
                 fields.add(theme.label("Direction"));var direction=fields.add(theme.dropdown(new String[]{"North","East","South","West"},launchInputs.getOrDefault(directionKey,"North"))).expandX().widget();direction.action=()->remember(directionKey,direction.get());
                 parameters=()->{JsonObject a=new JsonObject();a.addProperty("x",x.get());a.addProperty("y",y.get());a.addProperty("z",z.get());a.addProperty("length",length.get());a.addProperty("direction",direction.get());return a;};
             }
-            case "task-follow" -> {
+            case "task-follow", "task-bodyguard" -> {
                 WTextBox leader=string(fields,"Leader username or UUID",mc.player.getName().getString());
                 WIntEdit radius=integer(fields,"Following distance (blocks)",3,1,8),ticks=integer(fields,"Duration (ticks; 0 = until cancelled)",0,0,1_728_000);
                 parameters=()->{String requested=leader.get().strip();String target=bots.allMembers().stream().filter(m->m.name().equalsIgnoreCase(requested)).map(m->m.id().toString()).findFirst().orElse(requested);if(mc.player.getName().getString().equalsIgnoreCase(requested))target=mc.player.getUUID().toString();UUID.fromString(target);JsonObject a=new JsonObject();a.addProperty("target",target);a.addProperty("radius",radius.get());a.addProperty("ticks",ticks.get());return a;};
-                arguments.add(theme.label("Select followers only. Walking, no terrain edits or automatic combat. The leader plays normally. Followers wait when the leader is not visible.",contentWidth-20));
+                arguments.add(theme.label(selectedWorkflow.equals("task-bodyguard") ? "Select up to three guards, not the subject. Guards match the subject on foot or in Vanilla ElytraFly formation and use the captured combat profile." : "Select followers only. Walking, no terrain edits or automatic combat. The leader plays normally. Followers wait when the leader is not visible.",contentWidth-20));
             }
             case "task-stash-scan" -> {
                 JsonObject selected;

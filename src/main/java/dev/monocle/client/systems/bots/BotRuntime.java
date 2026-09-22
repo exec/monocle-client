@@ -419,7 +419,7 @@ final class BotRuntime {
             default -> {
                 if (run.has("supportedActions") && run.getAsJsonArray("supportedActions").asList().stream().noneMatch(value -> value.getAsString().equals(text(action, "type"))))
                     throw new IllegalArgumentException("This host does not support " + text(action, "type") + " tasks yet");
-                if (Set.of("StashHunt","StashScan").contains(text(action, "type"))) {
+                if (Set.of("StashHunt","StashScan").contains(text(action, "type")) || text(action,"type").equals("Travel") && action.has("bodyguard") && action.get("bodyguard").getAsBoolean()) {
                     action.addProperty("workerIndex", run.has("workerIndex") ? integer(run, "workerIndex", 0, 15) : 0);
                     action.addProperty("workerCount", run.has("workerCount") ? integer(run, "workerCount", 1, 16) : 1);
                     if (!action.has("dimension") && run.has("dimension")) action.add("dimension", run.get("dimension").deepCopy());

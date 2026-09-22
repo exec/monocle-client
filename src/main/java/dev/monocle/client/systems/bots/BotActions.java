@@ -12,6 +12,8 @@ import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.combat.KillAura;
 import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFly;
 import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFlightModes;
+import dev.monocle.client.systems.modules.movement.speed.Speed;
+import dev.monocle.client.systems.modules.movement.speed.SpeedModes;
 import dev.monocle.client.systems.modules.player.AutoEat;
 import dev.monocle.client.systems.modules.player.AutoGap;
 import dev.monocle.client.systems.modules.world.HighwayBuilder;
@@ -109,6 +111,9 @@ public final class BotActions {
                 if (a.has("follow") && a.get("follow").getAsBoolean()) {
                     UUID.fromString(string(a, "target", 36));
                     optionalInteger(a, "ticks", 0, 0, 1_728_000);
+                    if (a.has("bodyguard") && a.get("bodyguard").getAsBoolean()) {
+                        optionalInteger(a,"workerCount",1,1,3);optionalInteger(a,"workerIndex",0,0,a.get("workerCount").getAsInt()-1);
+                    }
                 } else {
                     number(a, "x", -29_999_984, 29_999_984); number(a, "z", -29_999_984, 29_999_984); number(a, "y", -2048, 2048);
                 }
@@ -474,19 +479,21 @@ public final class BotActions {
     private void travel() {
         if (action.has("follow") && action.get("follow").getAsBoolean()) {
             if (!acquireMovement()) return;
-            input.stop(); brakeFlight(); runOnly = true;
+            boolean bodyguard=action.has("bodyguard")&&action.get("bodyguard").getAsBoolean();
+            input.stop(); brakeFlight(); runOnly = !bodyguard;
             if (action.get("ticks").getAsInt() > 0 && ++elapsed >= action.get("ticks").getAsInt()) { complete("Follow duration finished"); return; }
             UUID target = UUID.fromString(action.get("target").getAsString());
             if (target.equals(mc.player.getUUID())) { fail("A follower cannot follow itself"); return; }
             Player leader = mc.level.players().stream().filter(p -> p.getUUID().equals(target) && p.isAlive()).findFirst().orElse(null);
             if (leader == null) { if(mc.player.isFallFlying())landBeforeHandoff(); detail = "Waiting for the leader to be visible in this world; no stale position is chased"; return; }
-            travel(leader.position(), action.get("radius").getAsDouble(), 32, false);
-            if (leader.distanceToSqr(mc.player) <= Math.pow(action.get("radius").getAsDouble(), 2)) detail = "Following · beside " + leader.getName().getString();
+            Vec3 goal=bodyguard?formationGoal(leader.position(),leader.getYRot(),action.get("radius").getAsDouble(),action.get("workerIndex").getAsInt(),action.get("workerCount").getAsInt()):leader.position();
+            travel(goal,bodyguard ? .75 : action.get("radius").getAsDouble(),32,false,bodyguard ? leader : null);
+            if (goal.distanceToSqr(mc.player.position()) <= Math.pow(bodyguard ? .75 : action.get("radius").getAsDouble(),2)) detail = (bodyguard ? "Guarding · in formation with " : "Following · beside ") + leader.getName().getString();
             return;
         }
-        travel(new Vec3(action.get("x").getAsDouble(), action.get("y").getAsDouble(), action.get("z").getAsDouble()), action.get("radius").getAsDouble(), action.get("flyBeyond").getAsDouble(), true);
+        travel(new Vec3(action.get("x").getAsDouble(), action.get("y").getAsDouble(), action.get("z").getAsDouble()), action.get("radius").getAsDouble(), action.get("flyBeyond").getAsDouble(), true,null);
     }
-    private void travel(Vec3 goal, double radius, double flyBeyond, boolean finish) {
+    private void travel(Vec3 goal, double radius, double flyBeyond, boolean finish,Player match) {
         if (!acquireMovement()) return;
         input.stop(); brakeFlight();
         if (mc.player.isPassenger() || mc.player.isInWater() || mc.player.isInLava()) { detail = "Travel needs an unmounted player outside fluid"; return; }
@@ -497,10 +504,10 @@ public final class BotActions {
         ItemStack glider = mc.player.getItemBySlot(EquipmentSlot.CHEST);
         boolean equipped = glider.has(DataComponents.GLIDER) && (!glider.isDamageableItem() || glider.getMaxDamage() - glider.getDamageValue() > 10);
         Vec3 waypoint = localGoal(from, goal, 8);
-        boolean useFlight = !runOnly && equipped && fly.flightMode.get() == ElytraFlightModes.Vanilla && distance > Math.max(radius + 2, flyBeyond);
+        boolean useFlight = !runOnly && equipped && fly.flightMode.get() == ElytraFlightModes.Vanilla && (match!=null&&match.isFallFlying() || distance > Math.max(radius + 2, flyBeyond));
         if (mc.player.isFallFlying()) {
             if (!fly.isActive()) { fail("ElytraFly was disabled in flight; control returned to the player"); return; }
-            if (distance <= radius + 3 || !useFlight) {
+            if ((match==null||!match.isFallFlying())&&(distance <= radius + 3 || !useFlight)) {
                 BlockPos floor = safeLandingBelow(from, 16);
                 if (floor != null) {
                     Vec3 landing = new Vec3(from.x, floor.getY() + 1, from.z);
@@ -508,6 +515,12 @@ public final class BotActions {
                     fly.requestAutopilot(PrinterFlight.safeVelocity(from, landing, .3, mc.player.getBbWidth() + .12, Math.max(.7, mc.player.getBbHeight()), this::clearBody));
                     detail = "Descending to safe footing"; return;
                 }
+            }
+            if(match!=null&&match.isFallFlying()) {
+                double maximum=Math.min(6,fly.horizontalSpeed.get());if(maximum<=0){detail="Bodyguard flight needs a positive ElytraFly speed";return;}
+                Vec3 velocity=formationVelocity(from,goal,match.getDeltaMovement(),maximum);
+                if(!PrinterFlight.segmentClear(from,from.add(velocity),mc.player.getBbWidth()+.12,Math.max(.7,mc.player.getBbHeight()),this::clearBody)){detail="Waiting for a clear formation flight path";return;}
+                fly.requestFastAutopilot(velocity);detail="Flying in formation";return;
             }
             List<Vec3> route = PrinterFlight.route(from, waypoint, mc.player.getBbWidth() + .12, Math.max(.7, mc.player.getBbHeight()), this::clearBody);
             if (route.isEmpty()) { detail = "Waiting for a loaded, clear flight route"; return; }
@@ -529,6 +542,11 @@ public final class BotActions {
             }
         }
         if (!mc.player.onGround()) { detail = "Waiting to land before walking"; return; }
+        if(match!=null) {
+            Speed speed=Modules.get().get(Speed.class);
+            if(speed.isActive()&&speed.speedMode.get()==SpeedModes.Vanilla) speed.vanillaSpeed.set(formationWalkSpeed(match.getDeltaMovement(),distance));
+            if(distance<=radius){detail="Holding formation";return;}
+        }
         // The existing builder's bounded walking search supplies stairs; no mining, paving or portals.
         BlockPos start = BlockPos.containing(from), local = BlockPos.containing(waypoint);
         List<BlockPos> candidates = new ArrayList<>();
@@ -551,6 +569,20 @@ public final class BotActions {
         mc.player.setYRot((float) Rotations.getYaw(point)); input.jump(lift > .1); input.forward(true);
         mc.player.setSprinting(distance > radius + 2 && mc.player.getFoodData().getFoodLevel() > 6);
         detail = "Walking toward destination";
+    }
+
+    static Vec3 formationGoal(Vec3 subject,float yaw,double spacing,int index,int count) {
+        if(count<1||count>3||index<0||index>=count||!Double.isFinite(spacing)||spacing<=0)throw new IllegalArgumentException("Invalid formation");
+        double angle=count==1?0:(index-(count-1)/2d)*Math.toRadians(60);
+        Vec3 forward=Vec3.directionFromRotation(0,yaw),right=Vec3.directionFromRotation(0,yaw+90);
+        return subject.add(forward.scale(-Math.cos(angle)*spacing)).add(right.scale(Math.sin(angle)*spacing));
+    }
+    static Vec3 formationVelocity(Vec3 from,Vec3 goal,Vec3 subjectVelocity,double maximum) {
+        Vec3 velocity=subjectVelocity.add(goal.subtract(from).scale(.22));double length=velocity.length();
+        return length<=maximum?velocity:velocity.scale(maximum/length);
+    }
+    static double formationWalkSpeed(Vec3 subjectVelocity,double distance) {
+        return Math.max(.1,Math.min(20,subjectVelocity.horizontalDistance()*20+Math.max(0,distance-.75)*2));
     }
 
     @EventHandler private void correction(PacketEvent.Receive event) {
@@ -598,7 +630,7 @@ public final class BotActions {
             }
             double speed = survey.speed(Math.min(6, fly.horizontalSpeed.get()), false);
             Vec3 velocity = delta.length() <= speed ? delta : delta.normalize().scale(speed);
-            if (PrinterFlight.segmentClear(from, from.add(velocity), width, height, this::clearBody)) fly.requestSurveyAutopilot(velocity);
+            if (PrinterFlight.segmentClear(from, from.add(velocity), width, height, this::clearBody)) fly.requestFastAutopilot(velocity);
             detail = "Surveying · " + survey.detail(); return;
         }
         brakeFlight();

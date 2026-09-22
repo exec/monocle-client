@@ -1781,7 +1781,7 @@ public class HighwayBuilder extends Module {
                     RepairScan nextScan = repairScan();
                     if (!repairFlightLanding && nextScan != null && awaitRepairChunks(nextScan.cleanRows(), nextScan.issue() != null, nextScan.jobEnd())) {
                         repairFlightProgress = from; repairFlightProgressTick = mc.player.tickCount;
-                        fly.requestSurveyAutopilot(Vec3.ZERO);
+                        fly.requestFastAutopilot(Vec3.ZERO);
                         status = "Holding altitude while the next repair chunks load";
                         return true;
                     }
@@ -1799,7 +1799,7 @@ public class HighwayBuilder extends Module {
             Vec3 velocity = new Vec3(horizontal.x, repairFlightDrop(mc.player.getDeltaMovement().y, fly.fallMultiplier.get()), horizontal.z);
             if (!PrinterFlight.segmentClear(from, from.add(velocity), mc.player.getBbWidth() + .12,
                 Math.max(.7, mc.player.getBbHeight()), this::repairFlightClear)) repairFlightLanding = true;
-            else fly.requestSurveyAutopilot(velocity);
+            else fly.requestFastAutopilot(velocity);
             status = pavingPending ? "Placing and verifying paving without landing" : "Flying over " + repairFlightRows + " verified repair blocks"; return true;
         }
         fly.requestAutopilot(Vec3.ZERO);

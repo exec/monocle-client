@@ -27,6 +27,9 @@ final class OperationsLibraryTest {
         String merged=SettingsOverlay.merge("{groups:[{name:'Other',settings:[{name:'nested',value:{a:[1,2],b:'hello,world'}}]},{name:'General',sectionExpanded:1b,settings:[{name:'vanilla-speed',value:5d},{name:'mode',value:'Vanilla'}]}]}","{groups:[{name:'General',settings:[{name:'vanilla-speed',value:6d}]}]}");
         assert merged.contains("{a:[1,2],b:'hello,world'}")&&merged.contains("sectionExpanded")&&merged.contains("value:6d")&&merged.contains("Vanilla");
         assert library.get("task-follow").getAsJsonObject("package").getAsJsonObject("programs").getAsJsonObject("task-follow").get("script").getAsString().contains("bot.follow");
+        JsonObject bodyguard=library.get("task-bodyguard").getAsJsonObject("package");
+        assert bodyguard.getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("kill-aura").get("active").getAsBoolean();
+        assert bodyguard.getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("elytra-fly").get("active").getAsBoolean();
         boolean rejected=false;try{library.delete("highway-default");}catch(IllegalArgumentException e){rejected=true;}assert rejected;
         JsonObject invalid=original.getAsJsonObject("package").deepCopy();invalid.getAsJsonObject("programs").getAsJsonObject("highway-default").addProperty("script","not lua !");
         rejected=false;try{library.save(id,"Changed","Highways/Nether",invalid);}catch(RuntimeException e){rejected=true;}assert rejected;assert library.get(id).get("name").getAsString().equals("My highway");

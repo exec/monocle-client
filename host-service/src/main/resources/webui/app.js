@@ -692,7 +692,7 @@ function useWorkerPosition() {
 }
 function updateScope() { const worker = selectedWorkers()[0]; if (worker) { const [server, dimension] = worker.scope.split('\n'); $('job-server').value = server; $('job-dimension').value = dimension; if($('job-kind').value==='highway')useWorkerPosition(); } }
 function updateSource() {
-  const kind = $('job-kind').value,preset=presetList.find(p=>p.id===$('job-preset').value),highway=kind==='highway'||kind==='preset'&&preset?.highway,follow=kind==='preset'&&preset?.entry==='task-follow';
+  const kind = $('job-kind').value,preset=presetList.find(p=>p.id===$('job-preset').value),highway=kind==='highway'||kind==='preset'&&preset?.highway,follow=kind==='preset'&&['task-follow','task-bodyguard'].includes(preset?.entry);
   $('preset-field').hidden=kind!=='preset';$('follow-field').hidden=!follow;$('highway-field').hidden=!highway;$('package-field').hidden=kind!=='package';$('lua-field').hidden=kind!=='lua';$('args-field').hidden=highway||follow;
   for(const input of $('highway-field').querySelectorAll('input'))input.required=highway;
   if(kind==='preset'){if(preset)$('job-name').value=preset.name;if(preset?.entry==='task-travel'){const w=selectedWorkers()[0];$('job-args').value=JSON.stringify({x:Math.floor(w?.x||0),y:Math.floor(w?.y??116),z:Math.floor(w?.z||0),radius:2});}if(preset?.entry==='task-wait')$('job-args').value='{"ticks":200}';}
@@ -731,9 +731,9 @@ $('job-form').addEventListener('submit', async event => {
       if(kind==='highway'||kind==='preset') {
         const preset=kind==='highway'?{id:'highway-default',highway:true}:presetList.find(p=>p.id===$('job-preset').value);
         if(!preset)throw Error('Choose a preset.');
-        let args=preset.highway||preset.entry==='task-follow'?{}:JSON.parse($('job-args').value);
+        let args=preset.highway||['task-follow','task-bodyguard'].includes(preset.entry)?{}:JSON.parse($('job-args').value);
         if(preset.highway){if(workers.length>3)throw Error('Native highway jobs support at most three workers.');args={direction:$('highway-direction').value,length:Number($('highway-length').value),x:Number($('highway-x').value),y:Number($('highway-y').value),z:Number($('highway-z').value)};}
-        if(preset.entry==='task-follow'){args={target:$('follow-leader').value,radius:Number($('follow-radius').value),ticks:0};if(workers.some(w=>w.id===args.target))throw Error('Uncheck the leader; select followers only.');}
+        if(['task-follow','task-bodyguard'].includes(preset.entry)){args={target:$('follow-leader').value,radius:Number($('follow-radius').value),ticks:0};if(workers.some(w=>w.id===args.target))throw Error('Uncheck the subject; select workers only.');if(preset.entry==='task-bodyguard'&&workers.length>3)throw Error('Bodyguard supports at most three workers.');}
         const packet=await api('control',{op:'workflow-prepare',id:preset.id,scope,args});
         pendingSubmission={op:'submit',...common,args,package:packet};
       } else {

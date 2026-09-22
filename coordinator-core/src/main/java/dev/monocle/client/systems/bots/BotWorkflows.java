@@ -37,6 +37,8 @@ public final class BotWorkflows {
             String id = "task-" + entry.getKey();
             values.put(id, new Workflow(id, entry.getValue(), "Common Tasks", true, List.of(), script, List.of(), List.of("Current")));
         }
+        values.put("task-bodyguard", new Workflow("task-bodyguard", "Bodyguard", "Common Tasks", true, List.of(),
+            "return function(ctx)\n  if ctx.state.started then return bot.done() end\n  ctx.state.started = true\n  ctx.args.bodyguard = true\n  return bot.follow(ctx.args)\nend\n", List.of(), List.of("Current")));
         values.put("task-stash-hunt", new Workflow("task-stash-hunt", "Distributed stash hunt", "Stash Hunting", true, List.of(),
             "return function(ctx)\n  if ctx.state.started then return bot.done() end\n  ctx.state.started = true\n  return bot.stash_hunt(ctx.args)\nend\n", List.of(), List.of("Current")));
         values.put("task-stash-scan", new Workflow("task-stash-scan", "Inspect stash", "Stash Management", true, List.of(),

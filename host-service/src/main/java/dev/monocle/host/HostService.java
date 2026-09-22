@@ -847,10 +847,11 @@ public final class HostService implements AutoCloseable {
             program.addProperty("name", name); program.addProperty("script", script); programs.add("main", program); profiles.add("Current", new JsonObject());
             packaged.add("programs", programs); packaged.add("profiles", profiles); packaged.add("highways", new JsonObject());
         }
-        if (text(packaged,"entry").equals("task-follow")) {
+        if (Set.of("task-follow","task-bodyguard").contains(text(packaged,"entry"))) {
             UUID leader=UUID.fromString(text(args,"target"));
             if(workers.asList().stream().anyMatch(w->w.getAsString().equals(leader.toString())))throw new IllegalArgumentException("Select followers only; the leader must not receive this job");
             if(peers.entrySet().stream().noneMatch(e->e.getKey().connected()&&e.getValue().id.equals(leader)&&e.getValue().crew.equals(crew)&&e.getValue().reconciled))throw new IllegalArgumentException("Choose a connected leader in this crew");
+            if(text(packaged,"entry").equals("task-bodyguard")&&workers.size()>3)throw new IllegalArgumentException("Bodyguard supports at most three workers");
         }
         JsonObject task = new JsonObject(), runs = new JsonObject();
         if(request.has("nativeDefinition")) {

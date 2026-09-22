@@ -444,8 +444,8 @@ public class ElytraFly extends Module {
         return requestAutopilot(velocity, 1);
     }
 
-    /** Survey-only higher ceiling; printing, restocking and ordinary travel keep their existing limits. */
-    public boolean requestSurveyAutopilot(Vec3 velocity) {
+    /** High-speed tracking inherits the user's tuned ceiling; ordinary travel keeps its conservative limit. */
+    public boolean requestFastAutopilot(Vec3 velocity) {
         return requestAutopilot(velocity, Math.min(6, horizontalSpeed.get()));
     }
 

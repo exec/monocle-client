@@ -18,10 +18,12 @@ public final class OperationsLibrary {
             if (definition.id().equals("task-stash-hunt") || definition.id().equals("highway-supplies")) continue;
             JsonObject packet = nativeLibrary.packageWorkflows(definition.id()), profiles = new JsonObject();
             profiles.add("Current", definition.id().equals(BotWorkflows.DEFAULT_ID) ? sixB6tHighwayProfile() : new JsonObject()); packet.add("profiles", profiles); packet.remove("profileNames");
-            if (definition.id().equals("task-follow")) {
+            if (Set.of("task-follow","task-bodyguard").contains(definition.id())) {
                 JsonObject profile=profiles.getAsJsonObject("Current");
-                for(String module:List.of("speed","elytra-fly","kill-aura","crystal-aura"))addProfile(profile,module,false,"{}");
+                boolean guard=definition.id().equals("task-bodyguard");
+                for(String module:List.of("speed","elytra-fly","kill-aura","crystal-aura"))addProfile(profile,module,guard,"{}");
                 addProfile(profile,"auto-eat",true,"{}");
+                if(guard)for(String module:List.of("auto-gap","auto-totem","auto-armor","auto-tool"))addProfile(profile,module,true,"{}");
             }
             if (!packet.getAsJsonObject("highways").isEmpty()) {
                 JsonObject geometry = new JsonObject(); geometry.addProperty("scope", "unconfigured\nminecraft:the_nether");
@@ -113,7 +115,7 @@ public final class OperationsLibrary {
             int dx=0,dz=0;switch(direction){case "North"->dz=-1;case "South"->dz=1;case "East"->dx=1;case "West"->dx=-1;default->throw new IllegalArgumentException("Choose a cardinal direction");}
             layout.addProperty("dx",dx);layout.addProperty("dz",dz);layout.addProperty("heading",direction);
         }
-        if(text(packet,"entry").equals("task-follow")) {
+        if(Set.of("task-follow","task-bodyguard").contains(text(packet,"entry"))) {
             UUID.fromString(text(args,"target"));
             if(args.has("radius")){double radius=args.get("radius").getAsDouble();if(!Double.isFinite(radius)||radius<1||radius>8)throw new IllegalArgumentException("Following distance must be 1–8 blocks");}
             if(args.has("ticks"))boundedInteger(args,"ticks",0,1_728_000);

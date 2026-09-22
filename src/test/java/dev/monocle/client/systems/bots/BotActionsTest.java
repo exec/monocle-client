@@ -24,6 +24,12 @@ public final class BotActionsTest {
         var travel = BotActions.validate(json("{\"type\":\"Travel\",\"x\":-12000,\"y\":64,\"z\":20000}"));
         var follow=BotActions.validate(json("{\"type\":\"Travel\",\"follow\":true,\"target\":\"00000000-0000-0000-0000-000000000001\"}"));
         assert follow.get("ticks").getAsInt()==0&&!follow.has("x");
+        var guard=BotActions.validate(json("{type:'Travel',follow:true,bodyguard:true,target:'00000000-0000-0000-0000-000000000001',workerIndex:1,workerCount:3,radius:3}"));
+        Vec3 center=BotActions.formationGoal(Vec3.ZERO,0,3,1,3),leftGuard=BotActions.formationGoal(Vec3.ZERO,0,3,0,3),rightGuard=BotActions.formationGoal(Vec3.ZERO,0,3,2,3);
+        assert guard.get("workerCount").getAsInt()==3&&Math.abs(center.z+3)<1e-9&&Math.abs(leftGuard.x+rightGuard.x)<1e-9&&Math.abs(leftGuard.z-rightGuard.z)<1e-9;
+        Vec3 inherited=new Vec3(.4,.1,.2);assert BotActions.formationVelocity(Vec3.ZERO,Vec3.ZERO,inherited,1).equals(inherited);
+        assert BotActions.formationVelocity(Vec3.ZERO,new Vec3(100,0,0),Vec3.ZERO,2).length()<=2.0000001;
+        assert BotActions.formationWalkSpeed(new Vec3(.2,0,0),.75)==4&&BotActions.formationWalkSpeed(new Vec3(2,0,0),20)==20;
         var recovery = BotActions.validate(json("{\"type\":\"RecoverSupplies\"}"));
         assert !BotActions.shouldRecover("Highway", false) : "A fresh native highway must not replay an unrelated supply journal";
         assert BotActions.shouldRecover("RecoverSupplies", false);
@@ -52,6 +58,7 @@ public final class BotActionsTest {
             "{\"type\":\"Wait\",\"ticks\":1.5}", "{\"type\":\"Wait\",\"ticks\":-1}",
             "{\"type\":\"Travel\",\"x\":30000001,\"y\":64,\"z\":0}",
             "{\"type\":\"Travel\",\"x\":0,\"y\":64,\"z\":0,\"radius\":0}",
+            "{\"type\":\"Travel\",\"follow\":true,\"bodyguard\":true,\"target\":\"00000000-0000-0000-0000-000000000001\",\"workerIndex\":3,\"workerCount\":3}",
             "{\"type\":\"Travel\",\"x\":\"0\",\"y\":64,\"z\":0}",
             "{\"type\":\"DropItems\",\"item\":\"obsidian\",\"count\":1}",
             "{\"type\":\"DropItems\",\"item\":\"minecraft:obsidian\",\"count\":0}",
