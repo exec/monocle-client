@@ -1168,8 +1168,8 @@ public class HighwayBuilder extends Module {
             Modules.get().get(Speed.class).enable();
             Modules.get().get(SpeedMine.class).enable();
         }
-        crewPrepared = crewInitialStorageChecked = false; crewPrepareResource = 0; crewPendingResource = -1; crewInventoryTick = 0; crewTrashSlot = -1; crewLedgerTick = -100;
-        EChestMemory.clear();
+        crewPrepared = false; crewInitialStorageChecked = !searchChestContents() || EChestMemory.isKnown(enderChestSearchSlots());
+        crewPrepareResource = 0; crewPendingResource = -1; crewInventoryTick = 0; crewTrashSlot = -1; crewLedgerTick = -100;
         if (CrewInventory.Policy.read(m).enabled()) {
             var fillers = new ArrayList<>(fillerBlocks.get());
             for (var block : CrewInventory.FILLER) if (!fillers.contains(block)) fillers.add(block);

@@ -1360,6 +1360,12 @@ public final class HighwaySupplyTest {
     }
 
     private static void cachedEnderChest() {
+        try (var bytes = HighwayBuilder.class.getResourceAsStream("HighwayBuilder.class")) {
+            var compiled = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes());
+            var calls = methodCalls(compiled, "beginCrew");
+            assert calls.contains("isKnown") && !calls.contains("clear")
+                : "Crew startup must reuse a complete session snapshot instead of invalidating and reopening it";
+        } catch (java.io.IOException e) { throw new AssertionError(e); }
         dev.monocle.client.utils.player.EChestMemory.clear();
         assert !dev.monocle.client.utils.player.EChestMemory.isKnown();
         assert !dev.monocle.client.utils.player.EChestMemory.isKnown(27);
