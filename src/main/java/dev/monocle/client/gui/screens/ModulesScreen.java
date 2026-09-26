@@ -10,6 +10,8 @@ import dev.monocle.client.gui.GuiTheme;
 import dev.monocle.client.gui.tabs.TabScreen;
 import dev.monocle.client.gui.tabs.Tabs;
 import dev.monocle.client.gui.utils.Cell;
+import dev.monocle.client.gui.utils.WorkspaceLayout;
+import dev.monocle.client.gui.widgets.WLabel;
 import dev.monocle.client.gui.widgets.containers.WContainer;
 import dev.monocle.client.gui.widgets.containers.WVerticalList;
 import dev.monocle.client.gui.widgets.containers.WWindow;
@@ -19,102 +21,112 @@ import dev.monocle.client.systems.modules.Category;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.utils.misc.NbtUtils;
-import dev.monocle.client.utils.render.DisplayItemUtils;
 import net.minecraft.client.input.KeyEvent;
-import net.minecraft.world.item.Items;
 import org.jspecify.annotations.NonNull;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
+import static com.mojang.blaze3d.platform.InputConstants.*;
 import static dev.monocle.client.utils.Utils.getWindowHeight;
 import static dev.monocle.client.utils.Utils.getWindowWidth;
-import static com.mojang.blaze3d.platform.InputConstants.*;
 
+/** The right-shift module workspace: fixed navigation and a responsive module library. */
 public class ModulesScreen extends TabScreen {
     private enum Filter { All, Active, Favorites }
-    private static String rememberedQuery = "";
+
+    private static String rememberedQuery = "", rememberedCategory = "";
     private static Filter rememberedFilter = Filter.All;
-    private static final java.util.Map<String, Double> rememberedScroll = new java.util.HashMap<>();
-    private WCategoryController controller;
-    private WWindow searchWindow;
+    private static double controlScroll, libraryScroll;
+
+    private WWindow controls, library;
+    private WVerticalList libraryBody;
     private WTextBox searchTextBox;
-    private WVerticalList searchResults;
-    private String searchShape = "";
+    private WLabel stats, ownership;
+    private String moduleShape = "";
     private int ticks;
-    private dev.monocle.client.gui.widgets.WLabel ownership;
 
     public ModulesScreen(GuiTheme theme) {
         super(theme, Tabs.get().getFirst());
     }
 
-    @Override
-    public void initWidgets() {
-        controller = add(new WCategoryController()).widget();
-
-        // Help
-        if (theme.modulesHelpText()) {
-            WVerticalList help = add(theme.verticalList()).pad(4).bottom().widget();
-            help.add(theme.label("Left click - Toggle module"));
-            help.add(theme.label("Right click - Open module settings"));
-        }
+    @Override public void initWidgets() {
+        add(new WModuleWorkspace());
     }
 
-    @Override
-    protected void init() {
+    @Override protected void init() {
         super.init();
-        controller.refresh();
-        for (WWindow window : controller.windows) window.view.restoreScroll(theme.scale(rememberedScroll.getOrDefault(window.id, 0.0)));
+        controls.view.restoreScroll(theme.scale(controlScroll));
+        library.view.restoreScroll(theme.scale(libraryScroll));
     }
 
     @Override protected void onClosed() {
         super.onClosed();
-        if (controller != null) for (WWindow window : controller.windows)
-            rememberedScroll.put(window.id, window.view.scrollPosition() / theme.scale(1));
+        if (controls != null) controlScroll = controls.view.scrollPosition() / theme.scale(1);
+        if (library != null) libraryScroll = library.view.scrollPosition() / theme.scale(1);
     }
 
-    // Category
+    private void fillControls() {
+        controls.clear();
+        stats = controls.add(theme.label("").color(theme.textSecondaryColor())).expandX().widget();
+        refreshStats();
 
-    protected WWindow createCategory(WContainer c, Category category, List<Module> moduleList) {
-        WWindow w = theme.window(category.name);
-        w.id = category.name;
-        w.padding = 0;
-        w.spacing = 0;
+        var filter = controls.add(theme.dropdown(rememberedFilter)).expandX().widget();
+        filter.tooltip = "Show every module, active modules, or favorites.";
+        filter.action = () -> { rememberedFilter = filter.get(); refreshLibrary(); refreshStats(); };
 
-        if (theme.categoryIcons()) {
-            w.beforeHeaderInit = wContainer -> wContainer.add(theme.item(category.icon.get())).pad(2);
+        searchTextBox = controls.add(theme.textBox(rememberedQuery, "Search modules…")).expandX().widget();
+        searchTextBox.tooltip = "Search names, descriptions and settings · Ctrl/Cmd+F";
+        searchTextBox.action = () -> { rememberedQuery = searchTextBox.get(); refreshLibrary(); refreshStats(); };
+
+        controls.add(theme.horizontalSeparator("Browse")).expandX();
+        addCategoryButton("", "All modules");
+        for (Category category : Modules.loopCategories()) {
+            boolean visible = Modules.get().getGroup(category).stream().anyMatch(module -> !Config.get().hiddenModules.get().contains(module));
+            if (visible) addCategoryButton(category.name, category.name);
         }
 
-        c.add(w);
-        w.view.scrollOnlyWhenMouseOver = true;
-        w.view.hasScrollBar = false;
-        w.view.spacing = 0;
-
-        for (Module module : moduleList) {
-            w.add(theme.module(module)).expandX();
-        }
-
-        return w;
+        controls.add(theme.horizontalSeparator("Control")).expandX();
+        ownership = controls.add(theme.label("", 220).color(theme.textSecondaryColor())).expandX().widget();
+        refreshOwnership();
+        controls.add(theme.button("Open Workers & jobs")).expandX().widget().action =
+            () -> Tabs.get(dev.monocle.client.gui.tabs.builtin.BotsTab.class).openScreen(theme);
+        controls.add(theme.label("Left click toggles · Right click configures", 220).color(theme.textSecondaryColor())).expandX();
     }
 
-    // Search
+    private void addCategoryButton(String key, String title) {
+        String label = rememberedCategory.equals(key) ? "◆  " + title : "   " + title;
+        var button = controls.add(theme.button(label)).expandX().widget();
+        button.action = () -> {
+            rememberedCategory = key;
+            fillControls();
+            refreshLibrary();
+        };
+    }
 
-    protected void createSearchW(WContainer w, String text) {
-        if (text.isBlank() && rememberedFilter == Filter.All) {
-            w.add(theme.label("Search names, descriptions\nand settings · Ctrl/Cmd+F").color(theme.textSecondaryColor()));
-            return;
-        }
-        List<Module> results = Modules.get().getAll().stream()
+    private void refreshLibrary() {
+        if (libraryBody == null) return;
+        libraryBody.clear();
+        List<Module> modules = matchingModules();
+        String scope = rememberedCategory.isBlank() ? "All modules" : rememberedCategory;
+        libraryBody.add(theme.label(scope + "  ·  " + modules.size() + (modules.size() == 1 ? " module" : " modules"), true));
+        if (!rememberedQuery.isBlank()) libraryBody.add(theme.label("Results for “" + rememberedQuery.strip() + "”").color(theme.textSecondaryColor()));
+        if (modules.isEmpty()) {
+            libraryBody.add(theme.horizontalSeparator()).expandX();
+            libraryBody.add(theme.label("Nothing matches this view. Try another category or clear the search.", 420).color(theme.textSecondaryColor()));
+        } else libraryBody.add(new WModuleGrid(modules)).expandX();
+    }
+
+    private List<Module> matchingModules() {
+        return Modules.get().getAll().stream()
             .filter(module -> !Config.get().hiddenModules.get().contains(module))
+            .filter(module -> rememberedCategory.isBlank() || module.category.name.equals(rememberedCategory))
             .filter(module -> rememberedFilter != Filter.Active || module.isActive())
             .filter(module -> rememberedFilter != Filter.Favorites || module.favorite)
-            .filter(module -> ModuleSearch.matches(text, searchDocument(module)))
-            .sorted(java.util.Comparator.comparing(module -> module.title, String.CASE_INSENSITIVE_ORDER))
+            .filter(module -> ModuleSearch.matches(rememberedQuery, searchDocument(module)))
+            .sorted(Comparator.comparing(module -> module.title, String.CASE_INSENSITIVE_ORDER))
             .toList();
-        int limit = Math.max(1, Config.get().moduleSearchCount.get());
-        w.add(theme.label(results.size() + " matches" + (results.size() > limit ? " · showing " + limit : ""))
-            .color(theme.textSecondaryColor()));
-        for (Module module : results.stream().limit(limit).toList()) w.add(theme.module(module)).expandX();
     }
 
     private String searchDocument(Module module) {
@@ -124,217 +136,142 @@ public class ModulesScreen extends TabScreen {
         return text.toString();
     }
 
-    protected WWindow createSearch(WContainer c) {
-        WWindow w = theme.window("Find modules");
-        w.id = "search";
-        searchWindow = w;
-
-        if (theme.categoryIcons()) {
-            w.beforeHeaderInit = wContainer -> wContainer.add(theme.item(DisplayItemUtils.toStack(Items.COMPASS))).pad(2);
-        }
-
-        c.add(w);
-        w.view.scrollOnlyWhenMouseOver = true;
-        w.view.hasScrollBar = false;
-        w.view.maxHeight -= 20;
-
-        var filter = w.add(theme.dropdown(rememberedFilter)).expandX().widget();
-        filter.action = () -> { rememberedFilter = filter.get(); refreshSearch(); };
-
-        WTextBox text = w.add(theme.textBox(rememberedQuery)).minWidth(190).expandX().widget();
-        text.setFocused(true);
-        searchTextBox = text;
-        text.action = () -> {
-            rememberedQuery = text.get();
-            refreshSearch();
-        };
-
-        searchResults = w.add(theme.verticalList()).expandX().widget();
-        refreshSearch();
-        w.add(theme.horizontalSeparator()).expandX();
-        ownership = w.add(theme.label("", 210).color(theme.textSecondaryColor())).expandX().widget();
-        refreshOwnership();
-        w.add(theme.button("Workers & job controls")).expandX().widget().action =
-            () -> Tabs.get(dev.monocle.client.gui.tabs.builtin.BotsTab.class).openScreen(theme);
-
-        return w;
-    }
-
-    private void refreshSearch() {
-        if (searchResults == null) return;
-        searchResults.clear();
-        createSearchW(searchResults, rememberedQuery);
+    private void refreshStats() {
+        if (stats == null) return;
+        long active = Modules.get().getAll().stream().filter(Module::isActive).count();
+        long favorites = Modules.get().getAll().stream().filter(module -> module.favorite).count();
+        stats.set(active + " active  ·  " + favorites + " favorite" + (favorites == 1 ? "" : "s"));
     }
 
     private void refreshOwnership() {
+        if (ownership == null) return;
         var bots = dev.monocle.client.systems.bots.Bots.get();
-        String controls = bots.tasks().workerBusy() ? "Worker task owns controls"
-            : bots.crew.assigned() ? "Highway crew assigned · inspect Workers" : "No worker task owns controls";
-        ownership.set(controls + (dev.monocle.client.systems.bots.BotProfiles.leased() ? "\nJob profile overlay active" : "\nNo workflow profile overlay"));
+        String controls = bots.tasks().workerBusy() ? "Worker task owns movement and inventory"
+            : bots.crew.assigned() ? "Highway crew owns movement and inventory" : "Personal controls active";
+        ownership.set(controls + (dev.monocle.client.systems.bots.BotProfiles.leased() ? "\nJob profile overlay active" : "\nPersonal profile active"));
     }
 
     @Override public void tick() {
         super.tick();
         if (++ticks % 20 != 0) return;
         refreshOwnership();
-        String shape = Modules.get().getAll().stream().filter(m -> m.isActive() || m.favorite)
-            .map(m -> m.name + m.isActive() + m.favorite).sorted().toList().toString();
-        if (!shape.equals(searchShape)) { searchShape = shape; refreshSearch(); }
+        refreshStats();
+        String shape = Modules.get().getAll().stream().filter(module -> module.isActive() || module.favorite)
+            .map(module -> module.name + module.isActive() + module.favorite).sorted().toList().toString();
+        if (!shape.equals(moduleShape)) { moduleShape = shape; refreshLibrary(); }
     }
 
-    @Override
-    public boolean keyPressed(@NonNull KeyEvent value) {
+    @Override public boolean keyPressed(@NonNull KeyEvent value) {
         if (locked) return false;
-
-        boolean cntrl = MacosUtil.IS_MACOS ? value.modifiers() == MOD_SUPER : value.modifiers() == MOD_CONTROL;
-
-        if (cntrl && value.key() == KEY_F) {
-            if (searchWindow != null) searchWindow.setExpanded(true);
-            if (searchTextBox != null) {
-                searchTextBox.setFocused(true);
-                searchTextBox.setCursorMax();
-            }
-
+        boolean control = MacosUtil.IS_MACOS ? (value.modifiers() & MOD_SUPER) != 0 : (value.modifiers() & MOD_CONTROL) != 0;
+        if (control && value.key() == KEY_F && searchTextBox != null) {
+            searchTextBox.setFocused(true);
+            searchTextBox.setCursorMax();
             return true;
         }
-
         return super.keyPressed(value);
     }
 
-    // Favorites
+    @Override public boolean toClipboard() { return NbtUtils.toClipboard(Modules.get()); }
+    @Override public boolean fromClipboard() { return NbtUtils.fromClipboard(Modules.get()); }
+    @Override public void reload() { fillControls(); refreshLibrary(); }
 
-    protected Cell<WWindow> createFavorites(WContainer c) {
-        boolean hasFavorites = Modules.get().getAll().stream().anyMatch(module -> module.favorite);
-        if (!hasFavorites) return null;
+    private final class WModuleWorkspace extends WContainer {
+        private Cell<WWindow> controlsCell, libraryCell;
 
-        WWindow w = theme.window("Favorites");
-        w.id = "favorites";
-        w.padding = 0;
-        w.spacing = 0;
+        @Override public void init() {
+            controls = theme.window("Module control");
+            controls.id = "modules-control";
+            controls.layoutLocked = true;
+            controls.padding = 6;
+            controlsCell = add(controls).expandWidgetX();
+            fillControls();
 
-        if (theme.categoryIcons()) {
-            w.beforeHeaderInit = wContainer -> wContainer.add(theme.item(DisplayItemUtils.toStack(Items.NETHER_STAR))).pad(2);
+            library = theme.window("Module library");
+            library.id = "modules-library";
+            library.layoutLocked = true;
+            library.padding = 6;
+            libraryCell = add(library).expandWidgetX();
+            libraryBody = library.add(theme.verticalList()).expandX().widget();
+            refreshLibrary();
         }
 
-        Cell<WWindow> cell = c.add(w);
-        w.view.scrollOnlyWhenMouseOver = true;
-        w.view.hasScrollBar = false;
-        w.view.spacing = 0;
-
-        createFavoritesW(w);
-        return cell;
-    }
-
-    protected boolean createFavoritesW(WWindow w) {
-        List<Module> modules = new ArrayList<>();
-
-        for (Module module : Modules.get().getAll()) {
-            if (module.favorite) {
-                modules.add(module);
-            }
+        @Override public void calculateSize() {
+            double top = navigation == null ? theme.scale(40) : navigation.height + theme.scale(8);
+            double available = Math.max(theme.scale(180), getWindowHeight() - top - theme.scale(10));
+            boolean stacked = WorkspaceLayout.stacked(getWindowWidth() / theme.scale(1), 720);
+            controls.view.maxHeight = stacked ? Math.min(theme.scale(280), available * .45) : available - theme.scale(28);
+            library.view.maxHeight = stacked ? Math.max(theme.scale(120), available - controls.view.maxHeight - theme.scale(38)) : available - theme.scale(28);
+            super.calculateSize();
         }
 
-        modules.sort((o1, o2) -> String.CASE_INSENSITIVE_ORDER.compare(o1.name, o2.name));
-
-        for (Module module : modules) {
-            w.add(theme.module(module)).expandX();
-        }
-
-        return !modules.isEmpty();
-    }
-
-    @Override
-    public boolean toClipboard() {
-        return NbtUtils.toClipboard(Modules.get());
-    }
-
-    @Override
-    public boolean fromClipboard() {
-        return NbtUtils.fromClipboard(Modules.get());
-    }
-
-    @Override
-    public void reload() {
-    }
-
-    // Stuff
-
-    protected class WCategoryController extends WContainer {
-        public final List<WWindow> windows = new ArrayList<>();
-        private Cell<WWindow> favorites;
-
-        @Override
-        public void init() {
-            List<Module> moduleList = new ArrayList<>();
-            for (Category category : Modules.loopCategories()) {
-                for (Module module : Modules.get().getGroup(category)) {
-                    if (!Config.get().hiddenModules.get().contains(module)) {
-                        moduleList.add(module);
-                    }
-                }
-
-                // Ensure empty categories are not shown
-                if (!moduleList.isEmpty()) {
-                    windows.add(createCategory(this, category, moduleList));
-                    moduleList.clear();
-                }
-            }
-
-            windows.add(createSearch(this));
-
-            refresh();
-        }
-
-        protected void refresh() {
-            if (favorites == null) {
-                favorites = createFavorites(this);
-                if (favorites != null) windows.add(favorites.widget());
+        @Override protected void onCalculateWidgetPositions() {
+            double pad = theme.scale(8), gap = theme.scale(8);
+            double top = Math.max(y, navigation == null ? theme.scale(40) : navigation.height + theme.scale(8));
+            double total = getWindowWidth();
+            boolean stacked = WorkspaceLayout.stacked(total / theme.scale(1), 720);
+            if (stacked) {
+                place(controlsCell, pad, top, total - pad * 2);
+                place(libraryCell, pad, top + controls.layoutHeight() + gap, total - pad * 2);
             } else {
-                favorites.widget().clear();
-
-                if (!createFavoritesW(favorites.widget())) {
-                    remove(favorites);
-                    windows.remove(favorites.widget());
-                    favorites = null;
-                }
+                double rail = Math.clamp(total * .23, theme.scale(220), theme.scale(280));
+                place(controlsCell, pad, top, rail);
+                place(libraryCell, pad + rail + gap, top, total - rail - gap - pad * 2);
             }
         }
 
-        @Override
-        protected void onCalculateWidgetPositions() {
-            double pad = theme.scale(4);
-            double h = theme.scale(40);
+        private void place(Cell<WWindow> cell, double x, double y, double width) {
+            cell.x = x;
+            cell.y = y;
+            cell.width = Math.max(theme.scale(160), width);
+            cell.height = cell.widget().height;
+            cell.alignWidget();
+        }
+    }
 
-            double x = this.x + pad;
-            double y = Math.max(this.y, navigation == null ? theme.scale(40) : navigation.height + theme.scale(8));
+    private final class WModuleGrid extends WContainer {
+        private final List<Module> modules;
+        private int columns;
+        private double gap, cellWidth;
 
-            for (Cell<?> cell : cells) {
-                double windowWidth = getWindowWidth();
-                double windowHeight = getWindowHeight();
+        private WModuleGrid(List<Module> modules) { this.modules = new ArrayList<>(modules); }
 
-                if (x + cell.width > windowWidth) {
-                    x = this.x + pad;
-                    y += h;
+        @Override public void init() {
+            for (Module module : modules) add(theme.module(module)).expandWidgetX();
+        }
+
+        @Override protected void onCalculateSize() {
+            gap = theme.scale(4);
+            double total = getWindowWidth();
+            double rail = total / theme.scale(1) < 720 ? 0 : Math.clamp(total * .23, theme.scale(220), theme.scale(280)) + theme.scale(8);
+            width = Math.max(theme.scale(160), total - rail - theme.scale(32));
+            columns = WorkspaceLayout.columns(width, theme.scale(170), gap, 4);
+            cellWidth = (width - gap * (columns - 1)) / columns;
+            height = 0;
+            for (int row = 0; row * columns < cells.size(); row++) {
+                double rowHeight = 0;
+                for (int column = 0; column < columns && row * columns + column < cells.size(); column++)
+                    rowHeight = Math.max(rowHeight, cells.get(row * columns + column).widget().height);
+                if (row > 0) height += gap;
+                height += rowHeight;
+            }
+        }
+
+        @Override protected void onCalculateWidgetPositions() {
+            double rowY = y;
+            for (int row = 0; row * columns < cells.size(); row++) {
+                double rowHeight = 0;
+                for (int column = 0; column < columns && row * columns + column < cells.size(); column++)
+                    rowHeight = Math.max(rowHeight, cells.get(row * columns + column).widget().height);
+                for (int column = 0; column < columns && row * columns + column < cells.size(); column++) {
+                    Cell<?> cell = cells.get(row * columns + column);
+                    cell.x = x + column * (cellWidth + gap);
+                    cell.y = rowY;
+                    cell.width = cellWidth;
+                    cell.height = rowHeight;
+                    cell.alignWidget();
                 }
-
-                if (x > windowWidth) {
-                    x = windowWidth / 2.0 - cell.width / 2.0;
-                    if (x < 0) x = 0;
-                }
-                if (y > windowHeight) {
-                    y = windowHeight / 2.0 - cell.height / 2.0;
-                    if (y < 0) y = 0;
-                }
-
-                cell.x = x;
-                cell.y = y;
-
-                cell.width = cell.widget().width;
-                cell.height = cell.widget().height;
-
-                cell.alignWidget();
-
-                x += cell.width + pad;
+                rowY += rowHeight + gap;
             }
         }
     }

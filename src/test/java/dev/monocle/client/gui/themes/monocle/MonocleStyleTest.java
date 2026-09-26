@@ -26,6 +26,10 @@ public final class MonocleStyleTest {
         assert dev.monocle.client.gui.utils.WorkspaceLayout.width(640,2,320,760)==320;
         assert dev.monocle.client.gui.utils.WorkspaceLayout.stacked(519,520);
         assert !dev.monocle.client.gui.utils.WorkspaceLayout.stacked(520,520);
+        assert dev.monocle.client.gui.utils.WorkspaceLayout.columns(700,170,4,4)==4;
+        assert dev.monocle.client.gui.utils.WorkspaceLayout.columns(340,170,4,4)==1;
+        assert dev.monocle.client.gui.utils.WorkspaceLayout.columns(1200,170,4,4)==4;
+        assert dev.monocle.client.gui.utils.WorkspaceLayout.columns(Double.NaN,170,4,4)==1;
         var view = new dev.monocle.client.gui.widgets.containers.WView() {};
         view.restoreScroll(120); assert view.scrollPosition() == 120;
         view.restoreScroll(-10); assert view.scrollPosition() == 0;

@@ -21,6 +21,7 @@ import static com.mojang.blaze3d.platform.InputConstants.MOUSE_BUTTON_RIGHT;
 
 public abstract class WWindow extends WVerticalList {
     public double padding = 8;
+    public boolean layoutLocked;
     public Consumer<WContainer> beforeHeaderInit;
     public String id;
 
@@ -79,11 +80,16 @@ public abstract class WWindow extends WVerticalList {
             WindowConfig config = theme.getWindowConfig(id);
             config.expanded = expanded;
         }
+        invalidate();
+    }
+
+    public double layoutHeight() {
+        return header == null || expanded ? height : header.height;
     }
 
     @Override
     protected void onCalculateWidgetPositions() {
-        if (id != null) {
+        if (id != null && !layoutLocked) {
             WindowConfig config = theme.getWindowConfig(id);
 
             if (config.x != -1) {
@@ -191,7 +197,7 @@ public abstract class WWindow extends WVerticalList {
         @Override
         public boolean onMouseClicked(MouseButtonEvent click, boolean doubled) {
             if (mouseOver && !doubled) {
-                if (click.button() == MOUSE_BUTTON_RIGHT) setExpanded(!expanded);
+                if (click.button() == MOUSE_BUTTON_RIGHT || layoutLocked) setExpanded(!expanded);
                 else {
                     dragging = true;
                     dragged = false;
