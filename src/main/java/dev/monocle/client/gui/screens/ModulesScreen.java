@@ -245,7 +245,7 @@ public class ModulesScreen extends TabScreen {
             double total = getWindowWidth();
             double rail = total / theme.scale(1) < 720 ? 0 : Math.clamp(total * .23, theme.scale(220), theme.scale(280)) + theme.scale(8);
             width = Math.max(theme.scale(160), total - rail - theme.scale(32));
-            columns = WorkspaceLayout.columns(width, theme.scale(170), gap, 4);
+            columns = WorkspaceLayout.columns(width, theme.scale(132), gap, 6);
             cellWidth = (width - gap * (columns - 1)) / columns;
             height = 0;
             for (int row = 0; row * columns < cells.size(); row++) {
