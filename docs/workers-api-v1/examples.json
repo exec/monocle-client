@@ -1,0 +1,81 @@
+{
+  "valid": [
+    {
+      "name": "portable travel action",
+      "schema": "common.schema.json#/$defs/action",
+      "value": {"type": "workers.travel.v1", "arguments": {"scope": {"server": "play.example.org", "dimension": "minecraft:the_nether"}, "x": 100, "y": 116, "z": -5000, "radius": 2}}
+    },
+    {
+      "name": "job submission",
+      "schema": "operator.schema.json#/$defs/jobSubmission",
+      "value": {"id": "34bc05e5-6973-4629-bd69-644d6fbf3a3b", "crewId": "7a034565-5b74-4658-9122-934690cdb05c", "workerIds": ["651be0b7-38fb-4756-a126-a7468d71aefe"], "scope": {"server": "play.example.org", "dimension": "minecraft:the_nether"}, "action": {"type": "workers.wait.v1", "arguments": {"ticks": 200}}, "priority": 10}
+    },
+    {
+      "name": "worker hello",
+      "schema": "worker-message.schema.json",
+      "value": {"apiVersion": "workers.monocle.dev/v1", "type": "session.hello", "messageId": "76fbf225-8d8c-43ae-a0a5-9c38c69eae37", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "sequence": 0, "sentAt": "2026-09-27T12:00:00Z", "payload": {"workerId": "651be0b7-38fb-4756-a126-a7468d71aefe", "supportedVersions": ["workers.monocle.dev/v1"], "capabilities": [{"id": "workers.wait.v1"}, {"id": "workers.travel.v1"}], "lastHostSequence": 0, "lastWorkerSequence": 0}}
+    },
+    {
+      "name": "assignment",
+      "schema": "worker-message.schema.json",
+      "value": {"apiVersion": "workers.monocle.dev/v1", "type": "execution.assign", "messageId": "0fbf946e-9190-4a65-9606-3e3f6001fbce", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "workerId": "651be0b7-38fb-4756-a126-a7468d71aefe", "sequence": 1, "sentAt": "2026-09-27T12:00:01Z", "payload": {"jobId": "34bc05e5-6973-4629-bd69-644d6fbf3a3b", "executionId": "c9547876-e3d8-4713-97d3-35a751718ccd", "generation": 1, "commandId": "2c553302-6e88-4ce1-af24-40eb6170131f", "scope": {"server": "play.example.org", "dimension": "minecraft:the_nether"}, "action": {"type": "workers.wait.v1", "arguments": {"ticks": 200}}}}
+    },
+    {
+      "name": "progress",
+      "schema": "worker-message.schema.json",
+      "value": {"apiVersion": "workers.monocle.dev/v1", "type": "execution.progress", "messageId": "d83d76db-3ab7-405e-9258-f893f16d8383", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "workerId": "651be0b7-38fb-4756-a126-a7468d71aefe", "sequence": 2, "sentAt": "2026-09-27T12:00:04Z", "payload": {"jobId": "34bc05e5-6973-4629-bd69-644d6fbf3a3b", "executionId": "c9547876-e3d8-4713-97d3-35a751718ccd", "generation": 1, "remainingTicks": 150}}
+    },
+    {
+      "name": "host cancellation command",
+      "schema": "worker-message.schema.json",
+      "value": {"apiVersion": "workers.monocle.dev/v1", "type": "execution.cancel", "messageId": "0147479f-3c55-430d-a43c-4a331ac8a41d", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "workerId": "651be0b7-38fb-4756-a126-a7468d71aefe", "sequence": 3, "sentAt": "2026-09-27T12:00:05Z", "payload": {"jobId": "34bc05e5-6973-4629-bd69-644d6fbf3a3b", "executionId": "c9547876-e3d8-4713-97d3-35a751718ccd", "generation": 1, "commandId": "e6bfb11a-8d63-4172-9efc-ff70e0c22b79"}}
+    },
+    {
+      "name": "worker cancellation acknowledgement with cleanup debt",
+      "schema": "worker-message.schema.json",
+      "value": {"apiVersion": "workers.monocle.dev/v1", "type": "execution.cancelled", "messageId": "1fa1d02a-2460-4420-af5d-b4898cf30366", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "workerId": "651be0b7-38fb-4756-a126-a7468d71aefe", "sequence": 4, "sentAt": "2026-09-27T12:00:06Z", "payload": {"jobId": "34bc05e5-6973-4629-bd69-644d6fbf3a3b", "executionId": "c9547876-e3d8-4713-97d3-35a751718ccd", "generation": 1, "cleanup": "inspection_required"}}
+    },
+    {
+      "name": "reconcile after uncertain drop",
+      "schema": "worker-message.schema.json",
+      "value": {"apiVersion": "workers.monocle.dev/v1", "type": "state.reconcile", "messageId": "ade09158-b7dd-4c45-bcc1-2806c67b8124", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "workerId": "651be0b7-38fb-4756-a126-a7468d71aefe", "sequence": 3, "sentAt": "2026-09-27T12:01:00Z", "payload": {"lastHostSequence": 1, "lastWorkerSequence": 2, "activeExecutions": [{"jobId": "34bc05e5-6973-4629-bd69-644d6fbf3a3b", "executionId": "c9547876-e3d8-4713-97d3-35a751718ccd", "generation": 1}], "unresolvedEffects": [{"kind": "item_drop", "status": "uncertain"}]}}
+    },
+    {
+      "name": "problem response",
+      "schema": "common.schema.json#/$defs/problem",
+      "value": {"type": "https://workers.monocle.dev/problems/unsupported-capability", "title": "Unsupported capability", "status": 409, "code": "unsupported_capability", "detail": "Worker does not advertise workers.drop-items.v1", "retryable": false, "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8"}
+    }
+  ],
+  "invalid": [
+    {
+      "name": "wrong major API version",
+      "schema": "worker-message.schema.json",
+      "reason": "unsupported_version",
+      "value": {"apiVersion": "workers.monocle.dev/v2", "type": "session.hello", "messageId": "76fbf225-8d8c-43ae-a0a5-9c38c69eae37", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "sequence": 0, "sentAt": "2026-09-27T12:00:00Z", "payload": {"workerId": "651be0b7-38fb-4756-a126-a7468d71aefe", "supportedVersions": ["workers.monocle.dev/v2"], "capabilities": [], "lastHostSequence": 0, "lastWorkerSequence": 0}}
+    },
+    {
+      "name": "assignment missing execution generation",
+      "schema": "worker-message.schema.json",
+      "reason": "invalid_message",
+      "value": {"apiVersion": "workers.monocle.dev/v1", "type": "execution.assign", "messageId": "0fbf946e-9190-4a65-9606-3e3f6001fbce", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "sequence": 1, "sentAt": "2026-09-27T12:00:01Z", "payload": {"jobId": "34bc05e5-6973-4629-bd69-644d6fbf3a3b", "executionId": "c9547876-e3d8-4713-97d3-35a751718ccd", "commandId": "2c553302-6e88-4ce1-af24-40eb6170131f", "scope": {"server": "play.example.org", "dimension": "minecraft:the_nether"}, "action": {"type": "workers.wait.v1", "arguments": {"ticks": 200}}}}
+    },
+    {
+      "name": "invalid drop count",
+      "schema": "common.schema.json#/$defs/action",
+      "reason": "invalid_action",
+      "value": {"type": "workers.drop-items.v1", "arguments": {"item": "minecraft:obsidian", "count": 0}}
+    },
+    {
+      "name": "unknown core action",
+      "schema": "common.schema.json#/$defs/action",
+      "reason": "unsupported_capability",
+      "value": {"type": "workers.fly.v1", "arguments": {"speed": 5}}
+    },
+    {
+      "name": "cancellation without idempotent command ID",
+      "schema": "worker-message.schema.json",
+      "reason": "invalid_message",
+      "value": {"apiVersion": "workers.monocle.dev/v1", "type": "execution.cancel", "messageId": "0147479f-3c55-430d-a43c-4a331ac8a41d", "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8", "workerId": "651be0b7-38fb-4756-a126-a7468d71aefe", "sequence": 3, "sentAt": "2026-09-27T12:00:05Z", "payload": {"jobId": "34bc05e5-6973-4629-bd69-644d6fbf3a3b", "executionId": "c9547876-e3d8-4713-97d3-35a751718ccd", "generation": 1}}
+    }
+  ]
+}

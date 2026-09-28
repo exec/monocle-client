@@ -1,5 +1,7 @@
 # Monocle Workers API
 
+The [v1 Phase 1 contract draft](workers-api-v1/README.md) is available for cross-platform review. It is a proposal; the private protocol described below remains the implemented behavior.
+
 The Monocle Workers API is the public contract for coordinating workers made by
 Monocle or another client. It will sit beside the current private protocol until
 the new contract has proven compatible in real jobs.
@@ -18,7 +20,7 @@ published as OpenAPI; WebSocket messages will use the shared schemas directly.
 
 ## Compatibility rules
 
-- Every message carries `api`, `version`, `type`, `id` and `payload`.
+- The proposed v1 envelope carries `apiVersion`, `type`, `messageId`, `correlationId`, `sequence`, `sentAt` and `payload`; the current private protocol has its own format.
 - Unknown optional fields are ignored; unknown required capabilities reject the
   task before it starts.
 - Commands are idempotent and identify both a task and its execution generation.

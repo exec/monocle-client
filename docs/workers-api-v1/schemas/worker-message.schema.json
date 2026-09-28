@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://workers.monocle.dev/schemas/v1/worker-message.schema.json",
+  "title": "Workers API v1 worker message",
+  "type": "object",
+  "required": ["apiVersion", "type", "messageId", "correlationId", "sequence", "sentAt", "payload"],
+  "properties": {
+    "apiVersion": {"const": "workers.monocle.dev/v1"},
+    "type": {"enum": ["session.hello", "session.accepted", "capabilities.report", "worker.observation", "execution.assign", "execution.accepted", "execution.rejected", "execution.started", "execution.progress", "execution.completed", "execution.failed", "execution.cancel", "execution.cancelled", "state.reconcile", "state.reconciled", "message.ack", "protocol.error"]},
+    "messageId": {"$ref": "common.schema.json#/$defs/uuid"},
+    "correlationId": {"$ref": "common.schema.json#/$defs/uuid"},
+    "workerId": {"$ref": "common.schema.json#/$defs/uuid"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "sentAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+    "payload": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"type": {"const": "session.hello"}}},
+      "then": {"properties": {"payload": {
+        "required": ["workerId", "supportedVersions", "capabilities", "lastHostSequence", "lastWorkerSequence"],
+        "properties": {
+          "workerId": {"$ref": "common.schema.json#/$defs/uuid"},
+          "supportedVersions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+          "capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/capability"}},
+          "lastHostSequence": {"type": "integer", "minimum": 0},
+          "lastWorkerSequence": {"type": "integer", "minimum": 0}
+        }
+      }}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "session.accepted"}}},
+      "then": {"properties": {"payload": {
+        "required": ["sessionId", "version", "maxFrameBytes", "heartbeatSeconds"],
+        "properties": {
+          "sessionId": {"$ref": "common.schema.json#/$defs/uuid"},
+          "version": {"const": "workers.monocle.dev/v1"},
+          "maxFrameBytes": {"type": "integer", "minimum": 1024},
+          "heartbeatSeconds": {"type": "integer", "minimum": 1}
+        }
+      }}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "execution.assign"}}},
+      "then": {"properties": {"payload": {"allOf": [
+        {"$ref": "common.schema.json#/$defs/executionRef"},
+        {"required": ["scope", "action", "commandId"], "properties": {
+          "scope": {"$ref": "common.schema.json#/$defs/scope"},
+          "action": {"$ref": "common.schema.json#/$defs/action"},
+          "commandId": {"$ref": "common.schema.json#/$defs/uuid"}
+        }}
+      ]}}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "capabilities.report"}}},
+      "then": {"properties": {"payload": {
+        "required": ["capabilities"],
+        "properties": {"capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/capability"}}}
+      }}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "worker.observation"}}},
+      "then": {"properties": {"payload": {
+        "required": ["observedAt", "scope"],
+        "properties": {
+          "observedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+          "scope": {"$ref": "common.schema.json#/$defs/scope"}
+        }
+      }}}
+    },
+    {
+      "if": {"properties": {"type": {"enum": ["execution.accepted", "execution.rejected", "execution.started", "execution.progress", "execution.completed", "execution.failed", "execution.cancel", "execution.cancelled"]}}},
+      "then": {"properties": {"payload": {"$ref": "common.schema.json#/$defs/executionRef"}}}
+    },
+    {
+      "if": {"properties": {"type": {"enum": ["execution.accepted", "execution.rejected", "execution.cancel"]}}},
+      "then": {"properties": {"payload": {"required": ["commandId"], "properties": {"commandId": {"$ref": "common.schema.json#/$defs/uuid"}}}}}
+    },
+    {
+      "if": {"properties": {"type": {"enum": ["execution.rejected", "execution.failed"]}}},
+      "then": {"properties": {"payload": {"required": ["code"], "properties": {"code": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}}}}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "execution.cancelled"}}},
+      "then": {"properties": {"payload": {"required": ["cleanup"], "properties": {"cleanup": {"enum": ["acknowledged", "inspection_required"]}}}}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "state.reconcile"}}},
+      "then": {"properties": {"payload": {
+        "required": ["lastHostSequence", "lastWorkerSequence", "activeExecutions"],
+        "properties": {
+          "lastHostSequence": {"type": "integer", "minimum": 0},
+          "lastWorkerSequence": {"type": "integer", "minimum": 0},
+          "activeExecutions": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/executionRef"}},
+          "unresolvedEffects": {"type": "array", "items": {"type": "object"}}
+        }
+      }}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "state.reconciled"}}},
+      "then": {"properties": {"payload": {
+        "required": ["decisions"],
+        "properties": {"decisions": {"type": "array", "items": {"allOf": [
+          {"$ref": "common.schema.json#/$defs/executionRef"},
+          {"required": ["decision"], "properties": {"decision": {"enum": ["continue", "cancel", "inspect", "wait"]}}}
+        ]}}}
+      }}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "message.ack"}}},
+      "then": {"properties": {"payload": {
+        "required": ["messageId", "result"],
+        "properties": {
+          "messageId": {"$ref": "common.schema.json#/$defs/uuid"},
+          "result": {"enum": ["accepted", "duplicate", "stale", "rejected"]}
+        }
+      }}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "protocol.error"}}},
+      "then": {"properties": {"payload": {
+        "required": ["code", "detail"],
+        "properties": {"code": {"type": "string"}, "detail": {"type": "string"}}
+      }}}
+    }
+  ],
+  "additionalProperties": true
+}

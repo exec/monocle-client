@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://workers.monocle.dev/schemas/v1/operator.schema.json",
+  "title": "Workers API v1 operator resources",
+  "$defs": {
+    "jobSubmission": {
+      "type": "object", "required": ["id", "crewId", "workerIds", "scope", "action"],
+      "properties": {
+        "id": {"$ref": "common.schema.json#/$defs/uuid"},
+        "crewId": {"$ref": "common.schema.json#/$defs/uuid"},
+        "workerIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/uuid"}},
+        "scope": {"$ref": "common.schema.json#/$defs/scope"},
+        "action": {"$ref": "common.schema.json#/$defs/action"},
+        "priority": {"type": "integer", "minimum": -1000, "maximum": 1000}
+      },
+      "additionalProperties": true
+    },
+    "job": {
+      "allOf": [
+        {"$ref": "#/$defs/jobSubmission"},
+        {"type": "object", "required": ["state", "revision", "createdAt", "updatedAt", "cleanup"],
+         "properties": {
+           "state": {"enum": ["queued", "running", "paused", "inspection_required", "completed", "failed", "cancelled"]},
+           "revision": {"type": "integer", "minimum": 0},
+           "createdAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+           "updatedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+           "cleanup": {"enum": ["none", "pending", "acknowledged", "inspection_required"]},
+           "executions": {"type": "array", "items": {"$ref": "#/$defs/execution"}}
+         }}
+      ]
+    },
+    "execution": {
+      "allOf": [
+        {"$ref": "common.schema.json#/$defs/executionRef"},
+        {"type": "object", "required": ["workerId", "state", "cleanup"],
+         "properties": {
+           "workerId": {"$ref": "common.schema.json#/$defs/uuid"},
+           "state": {"enum": ["offered", "accepted", "running", "suspending", "suspended", "inspection_required", "completed", "failed", "cancelled"]},
+           "cleanup": {"enum": ["none", "pending", "acknowledged", "inspection_required"]}
+         }}
+      ]
+    },
+    "worker": {
+      "type": "object", "required": ["id", "connection", "capabilities"],
+      "properties": {
+        "id": {"$ref": "common.schema.json#/$defs/uuid"},
+        "name": {"type": "string"},
+        "crewId": {"$ref": "common.schema.json#/$defs/uuid"},
+        "connection": {"enum": ["online", "offline", "reconciling"]},
+        "capabilities": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/capability"}},
+        "observedAt": {"$ref": "common.schema.json#/$defs/timestamp"}
+      },
+      "additionalProperties": true
+    },
+    "crew": {
+      "type": "object", "required": ["id", "name", "workerIds", "revision"],
+      "properties": {
+        "id": {"$ref": "common.schema.json#/$defs/uuid"},
+        "name": {"type": "string", "minLength": 1},
+        "workerIds": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/uuid"}},
+        "revision": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "operation": {
+      "type": "object", "required": ["id", "state", "acceptedAt", "correlationId"],
+      "properties": {
+        "id": {"$ref": "common.schema.json#/$defs/uuid"},
+        "state": {"enum": ["accepted", "delivered", "acknowledged", "completed", "uncertain", "failed"]},
+        "acceptedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+        "correlationId": {"$ref": "common.schema.json#/$defs/uuid"},
+        "gameServerConfirmation": {"type": "object", "required": ["source", "observedAt"], "properties": {"source": {"enum": ["server_packet", "worker_observation", "operator_assertion"]}, "observedAt": {"$ref": "common.schema.json#/$defs/timestamp"}}}
+      },
+      "additionalProperties": true
+    },
+    "page": {
+      "type": "object", "required": ["items"],
+      "properties": {"items": {"type": "array"}, "nextCursor": {"type": "string"}},
+      "additionalProperties": true
+    }
+  }
+}

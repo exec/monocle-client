@@ -1,0 +1,55 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Workers API v1 operator draft",
+    "version": "0.1.0-draft",
+    "description": "Proposed resource API for external review. These routes are not implemented by the current Monocle host. The existing /v1/status and /v1/control API remains separate."
+  },
+  "security": [{"bearerAuth": []}],
+  "components": {
+    "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}},
+    "schemas": {
+      "JobSubmission": {"$ref": "./schemas/operator.schema.json#/$defs/jobSubmission"},
+      "Job": {"$ref": "./schemas/operator.schema.json#/$defs/job"},
+      "Worker": {"$ref": "./schemas/operator.schema.json#/$defs/worker"},
+      "Crew": {"$ref": "./schemas/operator.schema.json#/$defs/crew"},
+      "Operation": {"$ref": "./schemas/operator.schema.json#/$defs/operation"},
+      "Page": {"$ref": "./schemas/operator.schema.json#/$defs/page"},
+      "Problem": {"$ref": "./schemas/common.schema.json#/$defs/problem"}
+    },
+    "parameters": {
+      "workerId": {"name": "workerId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "crewId": {"name": "crewId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "jobId": {"name": "jobId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "workflowId": {"name": "workflowId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "stashId": {"name": "stashId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "operationId": {"name": "operationId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "cursor": {"name": "cursor", "in": "query", "schema": {"type": "string"}, "description": "Opaque pagination cursor."}
+    },
+    "responses": {
+      "Problem": {"description": "Machine-readable rejection.", "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}},
+      "Accepted": {"description": "Command accepted; inspect the operation for delivery and outcome.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Operation"}}}}
+    }
+  },
+  "paths": {
+    "/v1/host": {"get": {"operationId": "getHost", "summary": "Read host identity and protocol versions", "responses": {"200": {"description": "Host details", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+    "/v1/health": {"get": {"operationId": "getHealth", "summary": "Read host health", "responses": {"200": {"description": "Health", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+    "/v1/capabilities": {"get": {"operationId": "getCapabilities", "summary": "List supported actions and versions", "responses": {"200": {"description": "Capabilities", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "./schemas/common.schema.json#/$defs/capability"}}}}}}}},
+    "/v1/workers": {"get": {"operationId": "listWorkers", "parameters": [{"$ref": "#/components/parameters/cursor"}], "responses": {"200": {"description": "Worker page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}}}},
+    "/v1/workers/{workerId}": {"parameters": [{"$ref": "#/components/parameters/workerId"}], "get": {"operationId": "getWorker", "responses": {"200": {"description": "Worker", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Worker"}}}}}}, "delete": {"operationId": "forgetWorker", "summary": "Forget an eligible offline worker", "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/crews": {"get": {"operationId": "listCrews", "parameters": [{"$ref": "#/components/parameters/cursor"}], "responses": {"200": {"description": "Crew page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}}}, "post": {"operationId": "createCrew", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Crew"}}}}, "responses": {"201": {"description": "Created crew", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Crew"}}}}, "409": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/crews/{crewId}": {"parameters": [{"$ref": "#/components/parameters/crewId"}], "get": {"operationId": "getCrew", "responses": {"200": {"description": "Crew", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Crew"}}}}}}, "patch": {"operationId": "updateCrew", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "Updated crew", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Crew"}}}}, "409": {"$ref": "#/components/responses/Problem"}}}, "delete": {"operationId": "deleteCrew", "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/crews/{crewId}/workers/{workerId}": {"parameters": [{"$ref": "#/components/parameters/crewId"}, {"$ref": "#/components/parameters/workerId"}], "put": {"operationId": "assignWorkerToCrew", "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}, "delete": {"operationId": "removeWorkerFromCrew", "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/jobs": {"get": {"operationId": "listJobs", "parameters": [{"$ref": "#/components/parameters/cursor"}], "responses": {"200": {"description": "Job page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}}}, "post": {"operationId": "submitJob", "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobSubmission"}}}}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/jobs/{jobId}": {"parameters": [{"$ref": "#/components/parameters/jobId"}], "get": {"operationId": "getJob", "responses": {"200": {"description": "Job", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Job"}}}}}}, "patch": {"operationId": "updateJob", "summary": "Update permitted job settings with a revision precondition", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "Updated job", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Job"}}}}, "409": {"$ref": "#/components/responses/Problem"}}}, "delete": {"operationId": "deleteJobHistory", "summary": "Remove eligible terminal history only", "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/jobs/{jobId}/pause": {"parameters": [{"$ref": "#/components/parameters/jobId"}], "post": {"operationId": "pauseJob", "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
+    "/v1/jobs/{jobId}/resume": {"parameters": [{"$ref": "#/components/parameters/jobId"}], "post": {"operationId": "resumeJob", "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/jobs/{jobId}/cancel": {"parameters": [{"$ref": "#/components/parameters/jobId"}], "post": {"operationId": "cancelJob", "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
+    "/v1/jobs/{jobId}/release": {"parameters": [{"$ref": "#/components/parameters/jobId"}], "post": {"operationId": "releaseJob", "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/workflows": {"get": {"operationId": "listWorkflows", "parameters": [{"$ref": "#/components/parameters/cursor"}], "responses": {"200": {"description": "Workflow page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}}}, "post": {"operationId": "createWorkflow", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
+    "/v1/workflows/{workflowId}": {"parameters": [{"$ref": "#/components/parameters/workflowId"}], "get": {"operationId": "getWorkflow", "responses": {"200": {"description": "Workflow", "content": {"application/json": {"schema": {"type": "object"}}}}}}, "put": {"operationId": "updateWorkflow", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "Updated workflow", "content": {"application/json": {"schema": {"type": "object"}}}}}}, "delete": {"operationId": "deleteWorkflow", "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
+    "/v1/stashes": {"get": {"operationId": "listStashes", "parameters": [{"$ref": "#/components/parameters/cursor"}], "responses": {"200": {"description": "Stash page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}}}},
+    "/v1/stashes/{stashId}": {"parameters": [{"$ref": "#/components/parameters/stashId"}], "get": {"operationId": "getStash", "responses": {"200": {"description": "Stash", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+    "/v1/operations/{operationId}": {"parameters": [{"$ref": "#/components/parameters/operationId"}], "get": {"operationId": "getOperation", "responses": {"200": {"description": "Operation receipt", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Operation"}}}}}}}
+  }
+}

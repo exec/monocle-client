@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://workers.monocle.dev/schemas/v1/common.schema.json",
+  "title": "Workers API v1 common types",
+  "$defs": {
+    "uuid": {"type": "string", "format": "uuid"},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "capabilityId": {"type": "string", "pattern": "^[a-z][a-z0-9.-]*\\.[a-z][a-z0-9-]*\\.v[1-9][0-9]*$", "maxLength": 128},
+    "scope": {
+      "type": "object",
+      "required": ["server", "dimension"],
+      "properties": {
+        "server": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "dimension": {"type": "string", "pattern": "^[a-z0-9_.-]+:[a-z0-9_./-]+$", "maxLength": 128}
+      },
+      "additionalProperties": true
+    },
+    "capability": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": {"$ref": "#/$defs/capabilityId"},
+        "limits": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "waitAction": {
+      "type": "object",
+      "required": ["type", "arguments"],
+      "properties": {
+        "type": {"const": "workers.wait.v1"},
+        "arguments": {
+          "type": "object", "required": ["ticks"],
+          "properties": {"ticks": {"type": "integer", "minimum": 0, "maximum": 1728000}},
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "travelAction": {
+      "type": "object",
+      "required": ["type", "arguments"],
+      "properties": {
+        "type": {"const": "workers.travel.v1"},
+        "arguments": {
+          "type": "object", "required": ["scope", "x", "y", "z"],
+          "properties": {
+            "scope": {"$ref": "#/$defs/scope"},
+            "x": {"type": "number", "minimum": -29999984, "maximum": 29999984},
+            "y": {"type": "number", "minimum": -2048, "maximum": 2048},
+            "z": {"type": "number", "minimum": -29999984, "maximum": 29999984},
+            "radius": {"type": "number", "minimum": 0.15, "maximum": 8}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "dropItemsAction": {
+      "type": "object",
+      "required": ["type", "arguments"],
+      "properties": {
+        "type": {"const": "workers.drop-items.v1"},
+        "arguments": {
+          "type": "object", "required": ["item", "count"],
+          "properties": {
+            "item": {"type": "string", "pattern": "^[a-z0-9_.-]+:[a-z0-9_./-]+$", "maxLength": 128},
+            "count": {"type": "integer", "minimum": 1, "maximum": 1048576},
+            "recipientWorkerId": {"$ref": "#/$defs/uuid"}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "setProfileAction": {
+      "type": "object",
+      "required": ["type", "arguments"],
+      "properties": {
+        "type": {"const": "workers.set-profile.v1"},
+        "arguments": {
+          "type": "object", "required": ["profileId", "revision"],
+          "properties": {
+            "profileId": {"$ref": "#/$defs/uuid"},
+            "revision": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "extensionAction": {
+      "type": "object",
+      "required": ["type", "arguments"],
+      "properties": {
+        "type": {"allOf": [{"$ref": "#/$defs/capabilityId"}, {"not": {"pattern": "^workers\\."}}]},
+        "arguments": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "action": {"oneOf": [
+      {"$ref": "#/$defs/waitAction"},
+      {"$ref": "#/$defs/travelAction"},
+      {"$ref": "#/$defs/dropItemsAction"},
+      {"$ref": "#/$defs/setProfileAction"},
+      {"$ref": "#/$defs/extensionAction"}
+    ]},
+    "executionRef": {
+      "type": "object", "required": ["jobId", "executionId", "generation"],
+      "properties": {
+        "jobId": {"$ref": "#/$defs/uuid"},
+        "executionId": {"$ref": "#/$defs/uuid"},
+        "generation": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": true
+    },
+    "problem": {
+      "type": "object", "required": ["type", "title", "status", "code", "retryable", "correlationId"],
+      "properties": {
+        "type": {"type": "string", "format": "uri"},
+        "title": {"type": "string"},
+        "status": {"type": "integer", "minimum": 400, "maximum": 599},
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "detail": {"type": "string"},
+        "instance": {"type": "string"},
+        "retryable": {"type": "boolean"},
+        "correlationId": {"$ref": "#/$defs/uuid"}
+      },
+      "additionalProperties": true
+    }
+  }
+}
