@@ -1,6 +1,6 @@
 # Monocle Workers API
 
-The [v1 Phase 1 contract draft](workers-api-v1/README.md) is available for cross-platform review. It is a proposal; the private protocol described below remains the implemented behavior.
+The [v1 Phase 1 contract draft](workers-api-v1/README.md) is available for cross-platform review. A [Phase 2 standalone-host operator adapter](workers-api-v1/phase2-operator.md) now implements a subset of the proposed HTTP resources; it is experimental and does not replace the private worker protocol described below.
 
 The Monocle Workers API is the public contract for coordinating workers made by
 Monocle or another client. It will sit beside the current private protocol until

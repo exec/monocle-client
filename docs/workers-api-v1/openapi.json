@@ -3,7 +3,7 @@
   "info": {
     "title": "Workers API v1 operator draft",
     "version": "0.1.0-draft",
-    "description": "Proposed resource API for external review. These routes are not implemented by the current Monocle host. The existing /v1/status and /v1/control API remains separate."
+    "description": "Target resource API for external review, not yet a description of the running host. A subset of route names is available in the experimental Phase 2 operator adapter; see phase2-operator.md for its current payloads and behavior. The existing /v1/status and /v1/control API remains separate."
   },
   "security": [{"bearerAuth": []}],
   "components": {

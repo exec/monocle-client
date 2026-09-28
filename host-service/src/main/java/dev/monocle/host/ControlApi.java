@@ -52,6 +52,28 @@ public final class ControlApi implements AutoCloseable {
             }
         };
         for (String path : new String[]{"/control", "/v1/control", "/v1/status", "/ui/api/status", "/ui/api/control"}) server.createContext(path, handler);
+        server.createContext("/v1/", exchange -> {
+            try (exchange) {
+                try {
+                if (exchange.getRequestHeaders().containsKey("Origin")) { respond(exchange, 403, "Forbidden"); return; }
+                String auth = exchange.getRequestHeaders().getFirst("Authorization");
+                if (auth == null || !MessageDigest.isEqual(expected, auth.getBytes(StandardCharsets.UTF_8))) { respond(exchange, 403, "Forbidden"); return; }
+                JsonObject body = new JsonObject();
+                if (ResourceApi.bodyRequired(exchange.getRequestMethod())) {
+                    String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+                    if (contentType == null || !contentType.equalsIgnoreCase("application/json")) { respond(exchange, 415, "application/json required"); return; }
+                    byte[] bytes = exchange.getRequestBody().readNBytes(TaskFiles.MAX_PACKAGE + 65_537);
+                    if (bytes.length > TaskFiles.MAX_PACKAGE + 65_536) { respond(exchange, 413, "Request too large"); return; }
+                    body = JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8)).getAsJsonObject();
+                } else if (exchange.getRequestHeaders().getFirst("Content-Length") != null && !exchange.getRequestHeaders().getFirst("Content-Length").equals("0")) {
+                    respond(exchange, 400, "Request body is not allowed"); return;
+                }
+                ResourceApi.Reply reply = ResourceApi.route(host, exchange.getRequestMethod(), exchange.getRequestURI(), body);
+                send(exchange, reply.code(), reply.body());
+                } catch (IllegalStateException e) { respond(exchange, 409, "Request rejected: " + e.getMessage()); }
+                  catch (RuntimeException | StackOverflowError e) { respond(exchange, 400, e instanceof StackOverflowError ? "JSON nesting exceeds limit" : "Request rejected: " + e.getMessage()); }
+            }
+        });
         server.start();
     }
     public int port() { return server.getAddress().getPort(); }

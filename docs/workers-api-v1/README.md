@@ -1,6 +1,6 @@
 # Workers API v1: Phase 1 contract draft
 
-Status: **proposal for cross-platform review, not implemented or frozen**. This package is the Phase 1 discussion artifact from [the roadmap](../../v1_API_ROADMAP.md). The current Monocle endpoints and `monocle-crew-6` protocol are described in [the existing API notes](../workers-api.md). None of the routes or messages below should be used against a running host yet.
+Status: **proposal for cross-platform review, not frozen**. This package is the Phase 1 discussion artifact from [the roadmap](../../v1_API_ROADMAP.md). The current Monocle endpoints and `monocle-crew-6` protocol are described in [the existing API notes](../workers-api.md). A [Phase 2 operator adapter](phase2-operator.md) implements a subset of the HTTP route names, but not yet the proposed schemas or worker messages.
 
 ## Vocabulary
 

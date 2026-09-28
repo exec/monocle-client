@@ -24,6 +24,7 @@ public final class HostServiceTest {
             rollingHistoryCheck(); System.out.println("Rolling history checks passed: oldest completion, active protection and rejected submissions."); return;
         }
         assert HostService.ACTIONS.contains("Tpa") : "Standalone workers must be able to use the trusted TPA action";
+        resourceApiCheck();
         operationsCheck();
         operatorDetachCheck();
         followPresetCheck();
@@ -707,6 +708,60 @@ public final class HostServiceTest {
             .header("Authorization", "Bearer " + token).header("Content-Type", "application/json");
         if (origin) builder.header("Origin", "https://example.invalid");
         return http.send(builder.POST(HttpRequest.BodyPublishers.ofString(command.toString())).build(), HttpResponse.BodyHandlers.ofString());
+    }
+    private static HttpResponse<String> resourceRequest(HttpClient http,ControlApi api,String method,String path,JsonObject body,String token) throws Exception {
+        var builder=HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+api.port()+path)).timeout(Duration.ofSeconds(5)).header("Authorization","Bearer "+token);
+        if(body!=null)builder.header("Content-Type","application/json");
+        return http.send(builder.method(method,body==null?HttpRequest.BodyPublishers.noBody():HttpRequest.BodyPublishers.ofString(body.toString())).build(),HttpResponse.BodyHandlers.ofString());
+    }
+    private static void resourceApiCheck() throws Exception {
+        Path directory=Files.createTempDirectory("monocle-resources-check-");
+        JsonObject config=new JsonObject();config.add("crews",new Gson().toJsonTree(CREWS));TaskFiles.write(directory.resolve("host-config.json"),config);
+        UUID workerId=UUID.randomUUID();
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
+            ControlApi api=new ControlApi(host,0,TOKEN);
+            HttpClient http=HttpClient.newHttpClient();
+            Worker worker=new Worker(host.port(),KEY,workerId,new LinkedHashMap<>())) {
+            await(()->connected(host)==1,worker);
+            assert resourceRequest(http,api,"GET","/v1/workers",null,"wrong").statusCode()==403;
+            var crossSite=HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+api.port()+"/v1/workers"))
+                .header("Authorization","Bearer "+TOKEN).header("Origin","https://example.invalid").GET().build();
+            assert http.send(crossSite,HttpResponse.BodyHandlers.ofString()).statusCode()==403;
+            assert resourceRequest(http,api,"GET","/v1/workers/%2e%2e",null,TOKEN).statusCode()==400;
+            JsonObject workers=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/workers?limit=1",null,TOKEN).body()).getAsJsonObject();
+            assert workers.getAsJsonArray("items").size()==1 && text(workers.getAsJsonArray("items").get(0).getAsJsonObject(),"id").equals(workerId.toString());
+            String crewId=text(workers.getAsJsonArray("items").get(0).getAsJsonObject(),"crewId");
+            assert UUID.fromString(crewId)!=null;
+            var defaultCrew=resourceRequest(http,api,"GET","/v1/crews/"+crewId,null,TOKEN);
+            assert defaultCrew.statusCode()==200 && text(JsonParser.parseString(defaultCrew.body()).getAsJsonObject(),"name").equals("Default");
+            assert resourceRequest(http,api,"GET","/v1/workers?connected=no",null,TOKEN).statusCode()==400;
+            JsonObject workflowPage=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/workflows",null,TOKEN).body()).getAsJsonObject();
+            String workflowId=text(workflowPage.getAsJsonArray("items").get(0).getAsJsonObject(),"id");
+            assert resourceRequest(http,api,"GET","/v1/workflows/"+workflowId,null,TOKEN).statusCode()==200;
+            JsonObject body=new JsonObject();body.addProperty("id",UUID.randomUUID().toString());body.addProperty("crewId",crewId);body.addProperty("name","Resource route wait");
+            JsonArray targets=new JsonArray();targets.add(workerId.toString());body.add("workerIds",targets);
+            JsonObject scope=new JsonObject();scope.addProperty("server","test.invalid");scope.addProperty("dimension","minecraft:the_nether");body.add("scope",scope);
+            JsonObject savedWorkflow=new JsonObject();savedWorkflow.addProperty("name","Wait");savedWorkflow.addProperty("folder","Tests");
+            savedWorkflow.add("package",JsonParser.parseString("{\"version\":1,\"entry\":\"main\",\"programs\":{\"main\":{\"name\":\"Wait\",\"script\":\"return function(ctx) return bot.wait(200) end\"}},\"profiles\":{\"Current\":{}},\"highways\":{}}").getAsJsonObject());
+            var createdWorkflow=resourceRequest(http,api,"POST","/v1/workflows",savedWorkflow,TOKEN);
+            assert createdWorkflow.statusCode()==201 : createdWorkflow.body();
+            body.addProperty("workflowId",text(JsonParser.parseString(createdWorkflow.body()).getAsJsonObject(),"id"));
+            var created=resourceRequest(http,api,"POST","/v1/jobs",body,TOKEN);
+            assert created.statusCode()==201 : created.body();
+            String jobId=text(JsonParser.parseString(created.body()).getAsJsonObject(),"id");
+            assert resourceRequest(http,api,"GET","/v1/jobs/"+jobId,null,TOKEN).statusCode()==200;
+            assert resourceRequest(http,api,"POST","/v1/jobs/"+jobId+"/cancel",new JsonObject(),TOKEN).statusCode()==200;
+            assert text(JsonParser.parseString(resourceRequest(http,api,"GET","/v1/jobs/"+jobId,null,TOKEN).body()).getAsJsonObject(),"state").equals("cancelled");
+            JsonObject createCrew=new JsonObject();createCrew.addProperty("id",UUID.randomUUID().toString());createCrew.addProperty("name","Resource API crew");
+            var createdCrew=resourceRequest(http,api,"POST","/v1/crews",createCrew,TOKEN);
+            assert createdCrew.statusCode()==201 : createdCrew.body();
+            String newCrewId=text(JsonParser.parseString(createdCrew.body()).getAsJsonObject(),"id");
+            JsonObject rename=new JsonObject();rename.addProperty("name","Renamed crew");
+            assert text(JsonParser.parseString(resourceRequest(http,api,"PATCH","/v1/crews/"+newCrewId,rename,TOKEN).body()).getAsJsonObject(),"name").equals("Renamed crew");
+            JsonObject crews=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/crews?limit=1",null,TOKEN).body()).getAsJsonObject();
+            assert crews.getAsJsonArray("items").size()==1 && crews.has("nextCursor");
+            assert resourceRequest(http,api,"GET","/v1/crews?limit=1&cursor="+text(crews,"nextCursor"),null,TOKEN).statusCode()==200;
+        }
     }
     @SuppressWarnings("unchecked")
     private static void rollingHistoryCheck() throws Exception {
