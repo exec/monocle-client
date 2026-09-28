@@ -12,7 +12,7 @@ const headings = {
   history: ['OFF THE WORKBENCH', 'Job history', 'Finished work stays here. Cleanup receipts are never silently erased.']
 };
 let token = '', demo = false, snapshot = null, page = 'overview', refreshedAt = 0, refreshing = false, polling;
-let busy = false, packaged = null, pendingSubmission = null, inspecting = null;
+let busy = false, packaged = null, pendingSubmission = null, pendingSubmissionKey = null, inspecting = null;
 let presetList=[],reviewedSubmission=null,lastLaunch=null,inspectionKey='';
 let generation = 0;
 const WAIT = 'return function(ctx)\n if ctx.state.waited then return bot.done() end\n ctx.state.waited=true\n return bot.wait(200)\nend';
@@ -53,8 +53,10 @@ async function api(path, request, method = request ? 'POST' : 'GET', extraHeader
   }
   return body;
 }
-function resource(method, path, body) {
-  return api('v1/' + path, body, method, method === 'GET' ? {} : { 'Idempotency-Key': crypto.randomUUID() });
+async function resource(method, path, body, commandId) {
+  const reply=await api('v1/' + path, body, method, method === 'GET' ? {} : { 'Idempotency-Key': commandId || crypto.randomUUID() });
+  if(reply.state==='outcome_uncertain') {const error=new Error('The host cannot confirm this command yet. Inspect its operation receipt before creating replacement work.');error.uncertain=true;throw error;}
+  return reply;
 }
 async function refresh() {
   if (refreshing || !token && !demo) return;
@@ -65,7 +67,7 @@ async function refresh() {
     const data = await api('status'); if (attempt !== generation) return;
     snapshot = data; refreshedAt = Date.now(); render(); refreshStashPanels();
     if (pendingSubmission && [...snapshot.tasks, ...snapshot.history].some(t => t.id === pendingSubmission.id)) {
-      pendingSubmission = null; $('job-dialog').close(); notice('Job accepted by the host.', true);
+      pendingSubmission = pendingSubmissionKey = null; $('job-dialog').close(); notice('Job accepted by the host.', true);
     }
   } catch (error) {
     if (attempt !== generation) return;
@@ -84,7 +86,7 @@ function unlock() {
 }
 function logout() {
   if (pendingSubmission && !confirm('A submission may have reached the host. Disconnect anyway? Inspect Jobs before submitting replacement work.')) return;
-  token = ''; demo = false; snapshot = null; packaged = null; pendingSubmission = null; inspecting = null; refreshedAt = 0;
+  token = ''; demo = false; snapshot = null; packaged = null; pendingSubmission = pendingSubmissionKey = null; inspecting = null; refreshedAt = 0;
   generation++;
   clearTimeout(polling); document.querySelectorAll('dialog[open]').forEach(d => d.close());
   $('token').value = ''; $('app').hidden = true; $('login').hidden = false; $('login-error').textContent = ''; notice('');
@@ -738,8 +740,10 @@ $('job-form').addEventListener('submit', async event => {
       const workers = selectedWorkers(); if (!workers.length) throw new Error('Select at least one connected worker.');
       const scope = $('job-server').value.trim() + '\n' + $('job-dimension').value.trim();
       if (workers.some(w => w.scope !== scope)) throw new Error('Selected workers must be on the specified server and dimension.');
+      const crew=await resource('GET','workers/'+workers[0].id);
+      if(crew.crew!==$('job-crew').value||!crew.connected)throw new Error('Crew membership changed. Refresh the roster and preview again.');
       const kind = $('job-kind').value; if (kind === 'package' && !packaged) throw new Error('Choose an exported workflow package first.');
-      const common={id:crypto.randomUUID(),name:$('job-name').value.trim(),crew:$('job-crew').value,workers:workers.map(w=>w.id),server:$('job-server').value.trim(),dimension:$('job-dimension').value.trim(),priority:Number($('job-priority').value)};
+      const common={id:crypto.randomUUID(),name:$('job-name').value.trim(),crewId:crew.crewId,workerIds:workers.map(w=>w.id),scope:{server:$('job-server').value.trim(),dimension:$('job-dimension').value.trim()},priority:Number($('job-priority').value)};
       if(kind==='highway'||kind==='preset') {
         const preset=kind==='highway'?{id:'highway-default',highway:true}:presetList.find(p=>p.id===$('job-preset').value);
         if(!preset)throw Error('Choose a preset.');
@@ -747,20 +751,23 @@ $('job-form').addEventListener('submit', async event => {
         if(preset.highway){if(workers.length>3)throw Error('Native highway jobs support at most three workers.');args={direction:$('highway-direction').value,length:Number($('highway-length').value),x:Number($('highway-x').value),y:Number($('highway-y').value),z:Number($('highway-z').value)};}
         if(['task-follow','task-bodyguard'].includes(preset.entry)){args={target:$('follow-leader').value,radius:Number($('follow-radius').value),ticks:0};if(workers.some(w=>w.id===args.target))throw Error('Uncheck the subject; select workers only.');if(preset.entry==='task-bodyguard'&&workers.length>3)throw Error('Bodyguard supports at most three workers.');}
         const packet=await api('control',{op:'workflow-prepare',id:preset.id,scope,args});
-        pendingSubmission={op:'submit',...common,args,package:packet};
+        pendingSubmission={...common,args,package:packet};
       } else {
         const args = JSON.parse($('job-args').value); if (!args || Array.isArray(args) || typeof args !== 'object') throw new Error('Workflow arguments must be a JSON object.');
-        pendingSubmission = {op:'submit',...common,args,...(kind === 'package' ? { package: packaged } : { script: kind === 'stash' ? STASH_SCAN : kind === 'wait' ? WAIT : $('job-script').value })};
+        const script=kind === 'stash' ? STASH_SCAN : kind === 'wait' ? WAIT : $('job-script').value;
+        const captured=kind === 'package' ? packaged : {version:1,entry:'main',programs:{main:{name:common.name,script}},profiles:{Current:{}},highways:{}};
+        pendingSubmission = {...common,args,package:captured};
       }
       reviewedSubmission=pendingSubmission;pendingSubmission=null;$('job-preview-text').textContent=JSON.stringify(reviewedSubmission,null,2);$('job-preview').hidden=false;$('job-preview').open=true;$('job-submit').textContent='Dispatch reviewed job ↗';return;
     }
     busy = true; $('job-fields').disabled = true; $('job-submit').disabled = true; render();
-    await api('control', pendingSubmission); pendingSubmission = null; $('job-dialog').close(); notice('Job dispatched. Follow delivery and worker readiness in Jobs.', true);
+    pendingSubmissionKey ||= crypto.randomUUID();
+    await resource('POST','jobs',pendingSubmission,pendingSubmissionKey); pendingSubmission = pendingSubmissionKey = null; $('job-dialog').close(); notice('Job dispatched. Follow delivery and worker readiness in Jobs.', true);
   } catch (error) {
     const uncertain = pendingSubmission && error.uncertain;
-    if (!uncertain) pendingSubmission = null;
+    if (!uncertain) pendingSubmission = pendingSubmissionKey = null;
     $('job-fields').disabled = !!pendingSubmission; $('job-submit').textContent = pendingSubmission ? 'Retry same submission ↗' : 'Preview job';
-    $('job-error').textContent = error.message + (pendingSubmission ? ' Outcome uncertain: retry uses the same submission ID. Inspect Jobs before creating replacement work.' : '');
+    $('job-error').textContent = error.message + (pendingSubmission ? ' Outcome uncertain: retry uses the same command and job IDs. Inspect Jobs before creating replacement work.' : '');
   } finally { busy = false; $('job-fields').disabled=!!pendingSubmission;$('job-submit').disabled = false; await refresh(); }
 });
 

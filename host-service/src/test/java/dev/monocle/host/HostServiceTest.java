@@ -821,6 +821,15 @@ public final class HostServiceTest {
             assert resourceRequest(http,api,"POST","/v1/jobs",invalidPortable,TOKEN).statusCode()==400 : "Unimplemented profile revisions cannot silently become local names";
             badAction.addProperty("type","workers.travel.v1");badArgs.add("scope",scope.deepCopy());badArgs.getAsJsonObject("scope").addProperty("dimension","minecraft:overworld");badArgs.addProperty("x",1);badArgs.addProperty("y",116);badArgs.addProperty("z",1);
             assert resourceRequest(http,api,"POST","/v1/jobs",invalidPortable,TOKEN).statusCode()==400 : "Portable travel cannot cross the declared world scope";
+            JsonObject scripted=body.deepCopy();scripted.addProperty("id",UUID.randomUUID().toString());scripted.remove("workflowId");
+            scripted.add("package",JsonParser.parseString("{\"version\":1,\"entry\":\"main\",\"programs\":{\"main\":{\"name\":\"UI wait\",\"script\":\"return function(ctx) return bot.wait(200) end\"}},\"profiles\":{\"Current\":{}},\"highways\":{}}").getAsJsonObject());
+            String scriptCommand=UUID.randomUUID().toString();
+            var scriptReply=resourceRequest(http,api,"POST","/v1/jobs",scripted,TOKEN,scriptCommand,null);
+            assert scriptReply.statusCode()==202 : "Wizard-captured scripts use the resource job route";
+            assert resourceRequest(http,api,"POST","/v1/jobs",scripted,TOKEN,scriptCommand,null).body().equals(scriptReply.body()) : "Uncertain UI submissions replay the same receipt";
+            String scriptedId=text(scripted,"id");await(()->state(host,UUID.fromString(scriptedId)).equals("Running"),worker);
+            assert resourceRequest(http,api,"POST","/v1/jobs/"+scriptedId+"/cancel",new JsonObject(),TOKEN).statusCode()==202;
+            await(()->worker.current.isEmpty()&&!flag(taskView(host,UUID.fromString(scriptedId)),"cleanupPending"),worker);
             JsonObject stashDefinition=new JsonObject(),bounds=new JsonObject();stashDefinition.addProperty("crewId",crewId);
             stashDefinition.addProperty("name","Test depot");stashDefinition.add("world",scope.deepCopy());
             for(String axis:List.of("X","Y","Z")) {
