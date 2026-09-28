@@ -7,11 +7,13 @@ Send `Authorization: Bearer <host API token>`. Browser `Origin` headers are reje
 | Resource | Implemented routes |
 | --- | --- |
 | Host | `GET /v1/host`, `/v1/health`, `/v1/capabilities` |
-| Workers | `GET /v1/workers`, `/v1/workers/{id}` |
+| Workers | `GET /v1/workers`, `GET/DELETE /v1/workers/{id}`, `GET /v1/workers/{id}/resources` |
 | Crews | `GET/POST /v1/crews`, `GET/PATCH/DELETE /v1/crews/{id}`, `PUT /v1/crews/{id}/workers/{workerId}` |
-| Jobs | `GET/POST /v1/jobs`, `GET/PATCH/DELETE /v1/jobs/{id}`, `POST /v1/jobs/{id}/{pause,resume,cancel,release}`, `POST /v1/jobs/{id}/workers/{workerId}/{detach,rejoin}` |
+| Jobs | `GET/POST /v1/jobs`, `GET/PATCH/DELETE /v1/jobs/{id}`, `GET/PATCH /v1/jobs/{id}/configuration`, `POST /v1/jobs/{id}/{pause,resume,cancel,release}`, `POST /v1/jobs/{id}/workers/{workerId}/{detach,rejoin}` |
+| Drafts | `GET/POST /v1/drafts`, `GET/DELETE /v1/drafts/{id}`, `POST /v1/drafts/{id}/dispatch` |
 | Workflows | `GET/POST /v1/workflows`, `GET/PUT/DELETE /v1/workflows/{id}` |
-| Stashes | `GET /v1/stashes`, `/v1/stashes/{id}` |
+| Stashes | `GET /v1/stashes`, `/v1/stashes/{id}`, `/v1/stashes/{id}/resources` |
+| Setting catalog | `GET /v1/configuration-controls` |
 
 List routes return `{"items":[...],"nextCursor":"..."}`. `limit` is 1–100 (default 50); `cursor` is opaque. `crewId` filters workers, jobs, and stashes; `status` filters jobs; `connected=true|false` filters workers. Pagination is over a live snapshot, so restart a listing if the collection changes during traversal. Worker records include `observedAt` and `observationAgeMs`; stash records include `observedAt` when a saved update time exists.
 
@@ -34,4 +36,12 @@ Submit a job from a saved workflow with `POST /v1/jobs`:
 
 The draft also accepts a captured Monocle `package` instead of `workflowId`; this is a vendor extension, not a portable action. The host captures the prepared package at submission. An identical submission ID/body remains idempotent through the existing host check. `PATCH /v1/jobs/{id}` currently accepts `{"priority": 5}`. Release accepts `{"newId":"<UUID>"}` and returns a draft job. Crew reassignment reports only that the instruction was sent; read the worker again to confirm reconnection. Cancellation reports the host decision, not worker cleanup or game-server confirmation.
 
-Still pending in Phase 2: portable-action submission, worker configuration/resources routes, stash definition and scan mutations, draft resources, independent in-game HTTP serving, and WebUI migration. Phase 3 adds command IDs, preconditions, operation receipts, stable problems, and events. Until then, external integrations should treat these endpoints as experimental and keep the legacy controls available.
+`GET /v1/workers/{id}/resources` returns `{"known":false}` unless a fresh native-highway report includes that worker's supply ledger. A known report separates carried inventory, ender-chest contents, and totals, and marks whether the ender-chest snapshot itself is known. `pavingBlocks` means the selected highway material, not necessarily obsidian. Stash resource counts are observations, not stock reservations; `complete` is false while containers are unscanned or inferred. Crew details include aggregate highway counts only while at least one worker has a fresh report.
+
+`GET /v1/jobs/{id}/configuration` shows captured job profiles and per-worker requests/acknowledgements, **not** a live read of every client setting. `PATCH` accepts an advertised control from `GET /v1/configuration-controls`, for example `{"control":"speed","active":true,"value":5.5,"workerId":"<UUID>"}`. Omit `workerId` to target every unfinished worker on the job. The host validates the control and queues the existing worker-configuration protocol; inspect the returned `updates` until acknowledged.
+
+Drafts are validated but unassigned job intents. `POST /v1/drafts` accepts the existing captured draft record (`id`, `name`, `server`, `dimension`, `priority`, `args`, `package`, and optional native definition). Dispatch accepts `{"crewId":"<UUID>","workerIds":["<UUID>"]}` and returns the created job. Its duplicate handling and safety gates are the same as legacy `draft-assign`.
+
+`DELETE /v1/workers/{id}` forgets only an offline worker with no outstanding job, highway recovery record, or cleanup acknowledgement. This guard also applies to the legacy `worker-forget` control.
+
+Still pending in Phase 2: portable-action submission, general (non-highway) worker resource/configuration reads, stash definition and scan mutations, independent in-game HTTP serving, and WebUI migration. Phase 3 adds command IDs, preconditions, operation receipts, stable problems, and events. Until then, external integrations should treat these endpoints as experimental and keep the legacy controls available.

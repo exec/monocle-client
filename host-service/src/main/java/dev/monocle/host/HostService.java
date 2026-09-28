@@ -645,6 +645,12 @@ public final class HostService implements AutoCloseable {
             UUID worker=UUID.fromString(text(request,"worker"));
             if(peers.entrySet().stream().anyMatch(e->e.getKey().connected()&&e.getValue().id.equals(worker)))
                 throw new IllegalStateException("Disconnect the worker before removing it from the roster");
+            if(tasks.values().stream().anyMatch(task->workerJobPending(task,worker)) || highways.values().stream().anyMatch(highway->{
+                JsonObject recovery=highway.recoveryRecord();
+                return highway.hasPendingEnds(Set.of(worker)) || recovery!=null && recovery.has("members")
+                    && recovery.getAsJsonArray("members").asList().stream().anyMatch(value->value.getAsString().equals(worker.toString()));
+            }))
+                throw new IllegalStateException("Wait for this worker's job cancellation and cleanup acknowledgements before forgetting it");
             roster.remove(worker);checkpointRoster();logEvent("worker-forgotten",worker.toString(),"","operator removed offline worker");return status();
         }
         if (op.equals("discard-stale-recovery")) {

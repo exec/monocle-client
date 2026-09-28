@@ -22,8 +22,9 @@ final class ResourceApi {
         JsonObject snapshot = host.control(op("status"));
         String resource = parts[2];
         if (method.equals("GET")) {
-            if (parts.length == 3 && Set.of("host", "health", "capabilities").contains(resource)) {
+            if (parts.length == 3 && Set.of("host", "health", "capabilities", "configuration-controls").contains(resource)) {
                 if (!query.isEmpty()) throw new IllegalArgumentException("Unexpected query parameter");
+                if(resource.equals("configuration-controls"))return new Reply(200,host.control(op("configuration-controls")));
                 JsonObject result = new JsonObject();
                 switch (resource) {
                     case "host" -> { result.addProperty("apiVersion", "workers.monocle.dev/v1-draft"); result.addProperty("status", text(snapshot,"status")); result.addProperty("operationsVersion", snapshot.get("operationsVersion").getAsInt()); }
@@ -35,11 +36,28 @@ final class ResourceApi {
             JsonArray items = items(snapshot, resource);
             if (items == null) return missing();
             if (parts.length == 3) return new Reply(200, page(items, query, resource));
+            if(parts.length==5 && query.isEmpty() && resource.equals("workers") && parts[4].equals("resources")) {
+                if(find(items,parts[3])==null)return missing();
+                return new Reply(200,workerResources(snapshot,parts[3]));
+            }
+            if(parts.length==5 && query.isEmpty() && resource.equals("stashes") && parts[4].equals("resources")) {
+                JsonObject stash=find(items,parts[3]);if(stash==null)return missing();
+                JsonObject result=new JsonObject();result.addProperty("stashId",parts[3]);result.add("items",stash.getAsJsonObject("items").deepCopy());
+                for(String key:List.of("observed","inferred","unscanned","observedAt"))if(stash.has(key))result.add(key,stash.get(key).deepCopy());
+                result.addProperty("complete",(!stash.has("unscanned") || stash.get("unscanned").getAsInt()==0)
+                    && (!stash.has("inferred") || stash.get("inferred").getAsInt()==0));
+                return new Reply(200,result);
+            }
+            if(parts.length==5 && query.isEmpty() && resource.equals("jobs") && parts[4].equals("configuration")) {
+                if(find(items,parts[3])==null)return missing();
+                return new Reply(200,jobConfiguration(host,parts[3]));
+            }
             if (parts.length != 4 || !query.isEmpty()) return missing();
             JsonObject item = find(items, parts[3]);
             if (item == null) return missing();
             if (resource.equals("jobs")) return new Reply(200, job(host.control(withId("task-get", parts[3]))));
             if (resource.equals("workflows")) return new Reply(200, workflow(host.control(withId("workflow-get", workflowKey(snapshot, parts[3])))));
+            if (resource.equals("drafts")) return new Reply(200, host.control(withId("draft-get", parts[3])));
             if (resource.equals("stashes")) {
                 JsonObject request = op("stash-get");
                 for (String key : List.of("crew", "scope", "name")) request.add(key, item.get(key).deepCopy());
@@ -48,9 +66,15 @@ final class ResourceApi {
             return new Reply(200, item);
         }
         if (!query.isEmpty()) throw new IllegalArgumentException("Mutation routes do not accept query parameters");
+        if (resource.equals("workers") && parts.length==4 && method.equals("DELETE")) {
+            if(find(items(snapshot,"workers"),parts[3])==null)return missing();
+            JsonObject request=op("worker-forget");request.addProperty("worker",uuid(parts[3]));host.control(request);
+            return new Reply(200,receipt(parts[3],"Forgotten"));
+        }
         if (resource.equals("crews")) return crews(host, snapshot, method, parts, body);
         if (resource.equals("jobs")) return jobs(host, snapshot, method, parts, body);
         if (resource.equals("workflows")) return workflows(host, snapshot, method, parts, body);
+        if (resource.equals("drafts")) return drafts(host, snapshot, method, parts, body);
         return missing();
     }
 
@@ -103,6 +127,16 @@ final class ResourceApi {
         if(parts.length<4)return missing();
         String id=uuid(parts[3]);
         if(find(items(snapshot,"jobs"),id)==null)return missing();
+        if(parts.length==5 && method.equals("PATCH") && parts[4].equals("configuration")) {
+            JsonObject preview=op("preview-configuration");
+            preview.addProperty("control",text(body,"control"));
+            if(body.has("active"))preview.add("active",body.get("active"));
+            if(body.has("value"))preview.add("value",body.get("value"));
+            JsonObject modules=host.control(preview).getAsJsonObject("modules");
+            JsonObject request=withId("configure",id);request.add("modules",modules);
+            if(body.has("workerId"))request.addProperty("worker",uuid(text(body,"workerId")));
+            host.control(request);return new Reply(200,jobConfiguration(host,id));
+        }
         if(parts.length==4 && method.equals("DELETE")) {host.control(withId("delete",id));return new Reply(200,receipt(id,"Deleted"));}
         if(parts.length==4 && method.equals("PATCH")) {
             JsonObject request=withId("priority",id);request.add("priority",body.get("priority"));
@@ -135,6 +169,23 @@ final class ResourceApi {
         JsonObject request=withId("workflow-save",id);request.addProperty("name",text(body,"name"));request.addProperty("folder",text(body,"folder"));
         request.add("package",body.getAsJsonObject("package"));return workflow(host.control(request));
     }
+    private static Reply drafts(HostService host,JsonObject snapshot,String method,String[] parts,JsonObject body) {
+        if(parts.length==3 && method.equals("POST")) {
+            JsonObject request=op("draft-save");request.add("draft",body);
+            return new Reply(201,host.control(request));
+        }
+        if(parts.length<4 || find(items(snapshot,"drafts"),parts[3])==null)return missing();
+        String id=uuid(parts[3]);
+        if(parts.length==4 && method.equals("DELETE")) {
+            host.control(withId("draft-delete",id));return new Reply(200,receipt(id,"Deleted"));
+        }
+        if(parts.length==5 && parts[4].equals("dispatch") && method.equals("POST")) {
+            JsonObject request=withId("draft-assign",id);request.addProperty("crew",crewKey(snapshot,text(body,"crewId")));
+            request.add("workers",body.getAsJsonArray("workerIds"));host.control(request);
+            return new Reply(201,job(host.control(withId("task-get",id))));
+        }
+        return missing();
+    }
 
     private static JsonArray items(JsonObject snapshot,String resource) {
         JsonArray source;JsonArray result=new JsonArray();
@@ -149,12 +200,14 @@ final class ResourceApi {
                 return result;
             }
             case "workflows" -> source=snapshot.getAsJsonArray("workflows");
+            case "drafts" -> source=snapshot.getAsJsonArray("drafts");
             case "stashes" -> source=snapshot.getAsJsonArray("stashes");
             default -> {return null;}
         }
         for(JsonElement value:source)result.add(switch(resource) {
             case "workers" -> worker(value.getAsJsonObject(),snapshot);
             case "workflows" -> workflow(value.getAsJsonObject());
+            case "drafts" -> value.getAsJsonObject().deepCopy();
             default -> stash(value.getAsJsonObject());
         });
         return result;
@@ -171,7 +224,14 @@ final class ResourceApi {
         JsonArray workers=new JsonArray(),jobs=new JsonArray();
         for(JsonElement value:snapshot.getAsJsonArray("workers"))if(text(value.getAsJsonObject(),"crew").equals(internal))workers.add(value.getAsJsonObject().get("id").deepCopy());
         for(JsonElement value:snapshot.getAsJsonArray("tasks"))if(text(value.getAsJsonObject(),"crew").equals(internal))jobs.add(value.getAsJsonObject().get("id").deepCopy());
-        view.add("workerIds",workers);view.add("jobIds",jobs);return view;
+        view.add("workerIds",workers);view.add("jobIds",jobs);
+        JsonObject highway=snapshot.getAsJsonObject("highways").getAsJsonObject(internal);
+        if(highway!=null&&highway.has("resourceCounts")&&highway.getAsJsonObject("resourceCounts").get("workers").getAsInt()>0) {
+            JsonObject counts=highway.getAsJsonObject("resourceCounts").deepCopy();
+            counts.getAsJsonObject("total").add("pavingBlocks",counts.getAsJsonObject("total").remove("obsidian"));
+            view.add("highwayResourceCounts",counts);
+        }
+        return view;
     }
     private static JsonObject job(JsonObject source) {
         JsonObject view=source.deepCopy();view.addProperty("crewId",publicCrew(text(source,"crew")));
@@ -190,6 +250,27 @@ final class ResourceApi {
         if(scope.length==2){JsonObject world=new JsonObject();world.addProperty("server",scope[0]);world.addProperty("dimension",scope[1]);view.add("world",world);}
         if(view.has("updatedAt"))view.addProperty("observedAt",Instant.ofEpochMilli(view.get("updatedAt").getAsLong()).toString());
         return view;
+    }
+    private static JsonObject jobConfiguration(HostService host,String id) {
+        JsonObject view=host.control(withId("task-configuration",id));view.addProperty("jobId",id);return view;
+    }
+    private static JsonObject workerResources(JsonObject snapshot,String id) {
+        JsonObject result=new JsonObject();result.addProperty("workerId",id);result.addProperty("known",false);
+        for(var highway:snapshot.getAsJsonObject("highways").entrySet()) {
+            JsonObject state=highway.getValue().getAsJsonObject();if(!state.has("workers"))continue;
+            for(JsonElement value:state.getAsJsonArray("workers")) {
+                JsonObject worker=value.getAsJsonObject();
+                if(!id.equals(text(worker,"id")) || !worker.has("resourceCounts") || !worker.get("fresh").getAsBoolean())continue;
+                JsonObject counts=worker.getAsJsonObject("resourceCounts").deepCopy();
+                for(String tier:List.of("inventory","enderChest","total")) {
+                    JsonObject values=counts.getAsJsonObject(tier);values.add("pavingBlocks",values.remove("obsidian"));
+                }
+                result.addProperty("known",true);result.addProperty("source","highway-worker-report");result.addProperty("jobId",text(state,"execution"));
+                result.addProperty("observedAt",Instant.ofEpochMilli(System.currentTimeMillis()-worker.get("reportAgeMs").getAsLong()).toString());
+                result.add("counts",counts);return result;
+            }
+        }
+        return result;
     }
     private static JsonObject page(JsonArray source,Map<String,String> query,String resource) {
         Set<String> allowed=Set.of("limit","cursor","crewId","status","connected");

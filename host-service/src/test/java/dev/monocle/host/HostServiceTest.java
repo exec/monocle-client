@@ -604,6 +604,8 @@ public final class HostServiceTest {
         Path directory=Files.createTempDirectory("monocle-native-host-check-");
         UUID a=UUID.randomUUID(),b=UUID.randomUUID();
         try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
+            ControlApi api=new ControlApi(host,0,TOKEN);
+            HttpClient http=HttpClient.newHttpClient();
             Worker first=new Worker(host.port(),KEY,a,new LinkedHashMap<>());
             Worker second=new Worker(host.port(),KEY,b,new LinkedHashMap<>())) {
             await(()->connected(host)==2,first,second);
@@ -627,6 +629,10 @@ public final class HostServiceTest {
             await(()->highwayStatus(host).getAsJsonObject("resourceCounts").getAsJsonObject("total").get("obsidian").getAsInt()==704,first,second);
             JsonObject firstResources=highwayStatus(host).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject).filter(w->text(w,"id").equals(first.id.toString())).findFirst().orElseThrow().getAsJsonObject("resourceCounts");
             assert firstResources.getAsJsonObject("inventory").get("pickaxes").getAsInt()==5 && firstResources.getAsJsonObject("enderChest").get("food").getAsInt()==64;
+            JsonObject resourceView=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/workers/"+a+"/resources",null,TOKEN).body()).getAsJsonObject();
+            assert resourceView.get("known").getAsBoolean() && resourceView.has("observedAt")
+                && resourceView.getAsJsonObject("counts").getAsJsonObject("total").get("pavingBlocks").getAsInt()==704
+                && !resourceView.getAsJsonObject("counts").getAsJsonObject("total").has("obsidian");
             first.roadForecast=JsonParser.parseString("{nextBlocks:16,blocksPerSecond:2.1,ageTicks:10}").getAsJsonObject();first.announce();
             await(()->highwayStatus(host).has("roadPrediction"),first,second);
             assert highwayStatus(host).getAsJsonObject("roadPrediction").get("blocksPerSecond").getAsDouble()==2.1;
@@ -735,6 +741,10 @@ public final class HostServiceTest {
             var defaultCrew=resourceRequest(http,api,"GET","/v1/crews/"+crewId,null,TOKEN);
             assert defaultCrew.statusCode()==200 && text(JsonParser.parseString(defaultCrew.body()).getAsJsonObject(),"name").equals("Default");
             assert resourceRequest(http,api,"GET","/v1/workers?connected=no",null,TOKEN).statusCode()==400;
+            JsonObject unknownResources=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/workers/"+workerId+"/resources",null,TOKEN).body()).getAsJsonObject();
+            assert !unknownResources.get("known").getAsBoolean() && !unknownResources.has("counts") : "No highway report is unknown, not zero stock";
+            assert resourceRequest(http,api,"DELETE","/v1/workers/"+workerId,null,TOKEN).statusCode()==409 : "Connected workers cannot be forgotten";
+            assert resourceRequest(http,api,"GET","/v1/configuration-controls",null,TOKEN).statusCode()==200;
             JsonObject workflowPage=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/workflows",null,TOKEN).body()).getAsJsonObject();
             String workflowId=text(workflowPage.getAsJsonArray("items").get(0).getAsJsonObject(),"id");
             assert resourceRequest(http,api,"GET","/v1/workflows/"+workflowId,null,TOKEN).statusCode()==200;
@@ -750,8 +760,32 @@ public final class HostServiceTest {
             assert created.statusCode()==201 : created.body();
             String jobId=text(JsonParser.parseString(created.body()).getAsJsonObject(),"id");
             assert resourceRequest(http,api,"GET","/v1/jobs/"+jobId,null,TOKEN).statusCode()==200;
+            assert resourceRequest(http,api,"GET","/v1/jobs/"+jobId+"/configuration",null,TOKEN).statusCode()==200;
+            await(()->state(host,UUID.fromString(jobId)).equals("Running"),worker);
+            JsonObject guided=new JsonObject();guided.addProperty("control","toggle-auto-eat");guided.addProperty("active",true);guided.addProperty("workerId",workerId.toString());
+            var configurationUpdate=resourceRequest(http,api,"PATCH","/v1/jobs/"+jobId+"/configuration",guided,TOKEN);
+            assert configurationUpdate.statusCode()==200 : configurationUpdate.body();
+            assert JsonParser.parseString(configurationUpdate.body()).getAsJsonObject().getAsJsonObject("updates").getAsJsonObject(workerId.toString()).get("requestedRevision").getAsInt()==1;
+            JsonObject invalidGuided=guided.deepCopy();invalidGuided.addProperty("control","unsafe-unknown-setting");
+            assert resourceRequest(http,api,"PATCH","/v1/jobs/"+jobId+"/configuration",invalidGuided,TOKEN).statusCode()==400;
+            await(()->text(host.control(inspectJobConfiguration(jobId)).getAsJsonObject("updates").getAsJsonObject(workerId.toString()),"status").equals("Accepted"),worker);
             assert resourceRequest(http,api,"POST","/v1/jobs/"+jobId+"/cancel",new JsonObject(),TOKEN).statusCode()==200;
             assert text(JsonParser.parseString(resourceRequest(http,api,"GET","/v1/jobs/"+jobId,null,TOKEN).body()).getAsJsonObject(),"state").equals("cancelled");
+            await(()->worker.current.isEmpty()&&!flag(taskView(host,UUID.fromString(jobId)),"cleanupPending"),worker);
+            JsonObject draft=new JsonObject();draft.addProperty("id",UUID.randomUUID().toString());draft.addProperty("name","Draft wait");
+            draft.addProperty("server","test.invalid");draft.addProperty("dimension","minecraft:the_nether");draft.addProperty("priority",0);
+            draft.add("args",new JsonObject());draft.add("package",savedWorkflow.get("package").deepCopy());
+            var savedDraft=resourceRequest(http,api,"POST","/v1/drafts",draft,TOKEN);
+            assert savedDraft.statusCode()==201 : savedDraft.body();
+            String draftId=text(draft,"id");
+            assert resourceRequest(http,api,"GET","/v1/drafts/"+draftId,null,TOKEN).statusCode()==200;
+            assert JsonParser.parseString(resourceRequest(http,api,"GET","/v1/drafts",null,TOKEN).body()).getAsJsonObject().getAsJsonArray("items").size()==1;
+            JsonObject dispatch=new JsonObject();dispatch.addProperty("crewId",crewId);dispatch.add("workerIds",targets.deepCopy());
+            var dispatched=resourceRequest(http,api,"POST","/v1/drafts/"+draftId+"/dispatch",dispatch,TOKEN);
+            assert dispatched.statusCode()==201 && text(JsonParser.parseString(dispatched.body()).getAsJsonObject(),"id").equals(draftId) : dispatched.body();
+            assert resourceRequest(http,api,"GET","/v1/drafts/"+draftId,null,TOKEN).statusCode()==404;
+            assert resourceRequest(http,api,"POST","/v1/jobs/"+draftId+"/cancel",new JsonObject(),TOKEN).statusCode()==200;
+            await(()->worker.current.isEmpty()&&!flag(taskView(host,UUID.fromString(draftId)),"cleanupPending"),worker);
             JsonObject createCrew=new JsonObject();createCrew.addProperty("id",UUID.randomUUID().toString());createCrew.addProperty("name","Resource API crew");
             var createdCrew=resourceRequest(http,api,"POST","/v1/crews",createCrew,TOKEN);
             assert createdCrew.statusCode()==201 : createdCrew.body();
@@ -761,8 +795,12 @@ public final class HostServiceTest {
             JsonObject crews=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/crews?limit=1",null,TOKEN).body()).getAsJsonObject();
             assert crews.getAsJsonArray("items").size()==1 && crews.has("nextCursor");
             assert resourceRequest(http,api,"GET","/v1/crews?limit=1&cursor="+text(crews,"nextCursor"),null,TOKEN).statusCode()==200;
+            worker.close();await(()->connected(host)==0);
+            assert resourceRequest(http,api,"DELETE","/v1/workers/"+workerId,null,TOKEN).statusCode()==200;
+            assert resourceRequest(http,api,"GET","/v1/workers/"+workerId,null,TOKEN).statusCode()==404;
         }
     }
+    private static JsonObject inspectJobConfiguration(String id) {JsonObject request=op("task-configuration");request.addProperty("id",id);return request;}
     @SuppressWarnings("unchecked")
     private static void rollingHistoryCheck() throws Exception {
         Path directory = Files.createTempDirectory("monocle-history-check-");
@@ -805,6 +843,12 @@ public final class HostServiceTest {
             await(()->host.control(op("status")).getAsJsonArray("stashes").size()==1,worker);
             JsonObject imported=message("stash-import");imported.addProperty("scope","test.invalid\nminecraft:the_nether");imported.add("stash",definition.get("stash").deepCopy());imported.add("observation",JsonParser.parseString("{\"x\":1,\"y\":116,\"z\":0,\"status\":\"observed\",\"block\":\"minecraft:chest\",\"reason\":\"\",\"items\":{\"minecraft:obsidian\":64},\"shulkers\":[]}").getAsJsonObject());worker.c.send(imported.toString());
             await(()->host.control(op("status")).getAsJsonArray("stashes").get(0).getAsJsonObject().getAsJsonObject("items").has("minecraft:obsidian"),worker);
+            try(ControlApi api=new ControlApi(host,0,TOKEN);HttpClient http=HttpClient.newHttpClient()) {
+                JsonObject catalog=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/stashes",null,TOKEN).body()).getAsJsonObject();
+                String stashId=text(catalog.getAsJsonArray("items").get(0).getAsJsonObject(),"id");
+                JsonObject resources=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/stashes/"+stashId+"/resources",null,TOKEN).body()).getAsJsonObject();
+                assert resources.getAsJsonObject("items").get("minecraft:obsidian").getAsInt()==64 && resources.has("observedAt");
+            }
             JsonObject request=submit(workerId,0);UUID task=UUID.fromString(text(request,"id"));request.addProperty("name","Inspect depot");request.addProperty("script","return function(ctx) return bot.stash_scan(ctx.args) end");
             request.add("args",JsonParser.parseString("{\"name\":\"Depot\",\"homeName\":\"depot\",\"minX\":0,\"maxX\":1,\"minY\":116,\"maxY\":116,\"minZ\":0,\"maxZ\":0}").getAsJsonObject());host.control(request);
             await(()->state(host,task).equals("Running"),worker);
@@ -1048,6 +1092,8 @@ public final class HostServiceTest {
             while ((wire = c.poll()) != null) {
                 JsonObject message = JsonParser.parseString(wire).getAsJsonObject();
                 switch (text(message, "type")) {
+                    case "task-configure" -> { JsonObject run=checkpoints.get(UUID.fromString(text(message,"run")));
+                        run.add("configRevision",message.get("revision").deepCopy());run.addProperty("configError","");sendStatus(run); }
                     case "task-configuration-read" -> {
                         JsonObject report=new JsonObject();report.addProperty("note","Test-only worker readback");report.add("rows",new JsonArray());
                         for(JsonObject reply:ConfigurationReadback.replies(message,report))c.send(reply.toString());
@@ -1144,7 +1190,7 @@ public final class HostServiceTest {
                 }
             }
         }
-        private void sendStatus(JsonObject run) { JsonObject message = run.deepCopy(); message.addProperty("type", "task-status"); message.addProperty("detail", "Simulated native worker"); message.addProperty("readbackVersion",1); c.send(message.toString()); }
+        private void sendStatus(JsonObject run) { JsonObject message = run.deepCopy(); message.addProperty("type", "task-status"); message.addProperty("detail", "Simulated native worker"); message.addProperty("readbackVersion",1); message.addProperty("configurationVersion",1); c.send(message.toString()); }
         void nativeSend(String type,boolean detach) {
             JsonObject m=new JsonObject();m.addProperty("type",type);m.addProperty("job",text(nativeJob,"job"));m.addProperty("generation",nativeJob.get("generation").getAsInt());
             m.addProperty("serviceRevision",HighwayCoordinator.serviceRevision(nativeJob,id));m.addProperty("detach",detach);

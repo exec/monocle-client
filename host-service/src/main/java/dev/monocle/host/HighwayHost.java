@@ -109,7 +109,8 @@ final class HighwayHost extends HighwayCoordinator<HighwayHost.Position> {
             JsonArray workers=new JsonArray(); int[] crewCounts=new int[3]; boolean chestKnown=true; int countedWorkers=0;
             for(UUID id:participants.keySet()) { JsonObject w=new JsonObject(); w.addProperty("id",id.toString()); JsonObject report=currentReport(id);
                 if(detachedMembers(assignment).contains(id)) w.addProperty("returnGate",serviceReturnGate(id));
-                w.addProperty("fresh",report!=null); if(report!=null) { for(String key:List.of("name","phase","status","currentRow","verifiedBase","verifiedMask","currentResolved","serviceReturning","serviceReady","regroupReady","ack","x","y","z","exchange","inventory","diagnostics")) if(report.has(key)) w.add(key,report.get(key).deepCopy());
+                w.addProperty("fresh",report!=null); if(report!=null) { w.addProperty("reportAgeMs",Math.max(0,(System.nanoTime()-reportTimes.get(id))/1_000_000));
+                    for(String key:List.of("name","phase","status","currentRow","verifiedBase","verifiedMask","currentResolved","serviceReturning","serviceReady","regroupReady","ack","x","y","z","exchange","inventory","diagnostics")) if(report.has(key)) w.add(key,report.get(key).deepCopy());
                     if(report.has("roadPrediction"))try {w.add("roadPrediction",RoadForecast.checked(report.getAsJsonObject("roadPrediction")));}catch(RuntimeException ignored) {}
                     if(report.has("inventory")) try { JsonObject counts=ResourceLedger.resourceCounts(report.getAsJsonObject("inventory")); w.add("resourceCounts",counts);JsonObject total=counts.getAsJsonObject("total");
                         crewCounts[0]+=total.get("obsidian").getAsInt();crewCounts[1]+=total.get("pickaxes").getAsInt();crewCounts[2]+=total.get("food").getAsInt();chestKnown&=counts.get("enderChestKnown").getAsBoolean();countedWorkers++;
