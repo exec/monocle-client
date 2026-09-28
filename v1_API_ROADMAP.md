@@ -52,7 +52,7 @@ Illustrative action, subject to Phase 1 review:
 
 Build a thin adapter over the existing host controls. Keep `GET /v1/status`, `POST /v1/control`, `/control`, and `/ui/api/*` working while the new resources gain coverage. Route names below are candidates for review, not a frozen standard.
 
-An initial standalone-host adapter is implemented for core reads, crew/job/workflow controls, and typed Wait/Travel/Drop Items submission; [its exact current routes and limits](docs/workers-api-v1/phase2-operator.md) are documented separately. The remaining deliverables below are still open.
+An initial standalone-host adapter is implemented for core reads, crew/job/workflow controls, typed Wait/Travel/Drop Items submission, and stash definition/scan dispatch; [its exact current routes and limits](docs/workers-api-v1/phase2-operator.md) are documented separately. The remaining deliverables below are still open.
 
 ### 2.1 Read surfaces
 

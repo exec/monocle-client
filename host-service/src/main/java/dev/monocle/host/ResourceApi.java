@@ -66,7 +66,8 @@ final class ResourceApi {
                 JsonObject stash=find(items,parts[3]);if(stash==null)return missing();
                 JsonObject result=new JsonObject();result.addProperty("stashId",parts[3]);result.add("items",stash.getAsJsonObject("items").deepCopy());
                 for(String key:List.of("observed","inferred","unscanned","observedAt"))if(stash.has(key))result.add(key,stash.get(key).deepCopy());
-                result.addProperty("complete",(!stash.has("unscanned") || stash.get("unscanned").getAsInt()==0)
+                result.addProperty("complete",stash.has("observed") && stash.get("observed").getAsInt()>0
+                    && (!stash.has("unscanned") || stash.get("unscanned").getAsInt()==0)
                     && (!stash.has("inferred") || stash.get("inferred").getAsInt()==0));
                 return new Reply(200,result);
             }
@@ -97,6 +98,7 @@ final class ResourceApi {
         if (resource.equals("jobs")) return jobs(host, snapshot, method, parts, body);
         if (resource.equals("workflows")) return workflows(host, snapshot, method, parts, body, ifMatch);
         if (resource.equals("drafts")) return drafts(host, snapshot, method, parts, body);
+        if (resource.equals("stashes")) return stashes(host, snapshot, method, parts, body);
         return missing();
     }
 
@@ -275,6 +277,35 @@ final class ResourceApi {
             return new Reply(201,job(host.control(withId("task-get",id))));
         }
         return missing();
+    }
+
+    private static Reply stashes(HostService host,JsonObject snapshot,String method,String[] parts,JsonObject body) {
+        if(parts.length==3 && method.equals("POST")) {
+            String crew=crewKey(snapshot,text(body,"crewId"));
+            JsonObject world=object(body,"world"),bounds=object(body,"bounds").deepCopy();
+            String server=string(world,"server"),dimension=string(world,"dimension");
+            bounds.addProperty("name",string(body,"name"));
+            JsonObject request=op("stash-define");request.addProperty("crew",crew);
+            request.addProperty("scope",server+"\n"+dimension);request.add("bounds",bounds);
+            return new Reply(201,stash(host.control(request)));
+        }
+        if(parts.length!=5 || !parts[4].equals("scan") || !method.equals("POST"))return missing();
+        JsonObject saved=find(items(snapshot,"stashes"),parts[3]);
+        if(saved==null)return missing();
+        String scope=text(saved,"scope");int split=scope.indexOf('\n');
+        if(split<1)throw new IllegalStateException("Saved stash has an invalid world scope");
+        String id=uuid(string(body,"id"));
+        JsonElement workers=body.get("workerIds");
+        if(workers==null || !workers.isJsonArray())throw new IllegalArgumentException("Specify workerIds");
+        JsonObject args=object(saved,"bounds").deepCopy();args.addProperty("name",text(saved,"name"));
+        JsonObject request=withId("submit",id);request.addProperty("crew",text(saved,"crew"));
+        request.addProperty("name","Scan "+text(saved,"name"));request.addProperty("server",scope.substring(0,split));
+        request.addProperty("dimension",scope.substring(split+1));request.add("workers",workers.deepCopy());
+        request.add("args",args);
+        if(body.has("priority"))request.add("priority",body.get("priority"));
+        JsonObject prepare=op("workflow-prepare");prepare.addProperty("id","task-stash-scan");prepare.addProperty("scope",scope);prepare.add("args",args);
+        request.add("package",host.control(prepare));host.control(request);
+        return new Reply(201,job(host.control(withId("task-get",id))));
     }
 
     private static JsonArray items(JsonObject snapshot,String resource) {

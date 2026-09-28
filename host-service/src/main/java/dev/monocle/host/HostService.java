@@ -626,6 +626,20 @@ public final class HostService implements AutoCloseable {
             if(!crews.containsKey(text(request,"crew")))throw new IllegalArgumentException("Unknown crew");
             return StashCatalog.get(directory,text(request,"crew"),text(request,"scope"),text(request,"name"));
         }
+        if (op.equals("stash-define")) {
+            String crew=text(request,"crew"),scope=text(request,"scope");
+            if(!crews.containsKey(crew))throw new IllegalArgumentException("Unknown crew");
+            int split=scope.indexOf('\n');
+            if(split<1 || split==scope.length()-1 || scope.length()>384 || scope.substring(0,split).chars().anyMatch(Character::isISOControl)
+                || !scope.substring(split+1).matches("[a-z0-9_.-]+:[a-z0-9_./-]+"))throw new IllegalArgumentException("Specify a server and dimension");
+            if(!request.has("bounds") || !request.get("bounds").isJsonObject())throw new IllegalArgumentException("Specify stash bounds and /home name");
+            JsonObject assignment=request.getAsJsonObject("bounds");
+            JsonObject plan=StashCatalog.plan(assignment);
+            if(!StashCatalog.get(directory,crew,scope,text(plan,"name")).isEmpty())throw new IllegalStateException("Stash already exists; inspect it before changing its definition");
+            JsonObject saved=StashCatalog.define(directory,crew,scope,plan);
+            for(var entry:peers.entrySet())if(entry.getKey().connected() && entry.getValue().reconciled && entry.getValue().crew.equals(crew))sendStashCatalog(entry.getKey(),entry.getValue());
+            logEvent("stash-defined","","",text(saved,"name"));return saved;
+        }
         if (op.equals("workflow-list")) { JsonObject r=new JsonObject();r.add("workflows",library.list());return r; }
         if (op.equals("workflow-get")) return library.get(text(request,"id"));
         if (op.equals("workflow-preview-control")) return library.previewControl(text(request,"id"),request);

@@ -126,7 +126,8 @@ public final class ControlApi implements AutoCloseable {
     private static boolean asynchronous(String method, String path) {
         return path.equals("/v1/jobs") || path.matches("/v1/jobs/[^/]+/(pause|resume|cancel|release|configuration)")
             || path.matches("/v1/jobs/[^/]+/workers/[^/]+/(detach|rejoin)")
-            || path.matches("/v1/crews/[^/]+/workers/[^/]+") || path.matches("/v1/drafts/[^/]+/dispatch");
+            || path.matches("/v1/crews/[^/]+/workers/[^/]+") || path.matches("/v1/drafts/[^/]+/dispatch")
+            || path.matches("/v1/stashes/[^/]+/scan");
     }
     private static void problem(HttpExchange exchange, int status, String code, String detail, String correlation) throws IOException {
         send(exchange, status, problemBody(status, code, detail, correlation, exchange.getRequestURI().getPath()));

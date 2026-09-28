@@ -12,7 +12,7 @@ Send `Authorization: Bearer <host API token>`. Browser `Origin` headers are reje
 | Jobs | `GET/POST /v1/jobs`, `GET/PATCH/DELETE /v1/jobs/{id}`, `GET/PATCH /v1/jobs/{id}/configuration`, `POST /v1/jobs/{id}/{pause,resume,cancel,release}`, `POST /v1/jobs/{id}/workers/{workerId}/{detach,rejoin}` |
 | Drafts | `GET/POST /v1/drafts`, `GET/DELETE /v1/drafts/{id}`, `POST /v1/drafts/{id}/dispatch` |
 | Workflows | `GET/POST /v1/workflows`, `GET/PUT/DELETE /v1/workflows/{id}` |
-| Stashes | `GET /v1/stashes`, `/v1/stashes/{id}`, `/v1/stashes/{id}/resources` |
+| Stashes | `GET/POST /v1/stashes`, `GET /v1/stashes/{id}`, `/v1/stashes/{id}/resources`, `POST /v1/stashes/{id}/scan` |
 | Setting catalog | `GET /v1/configuration-controls` |
 
 List routes return `{"items":[...],"nextCursor":"..."}`. `limit` is 1–100 (default 50); `cursor` is opaque. `crewId` filters workers, jobs, and stashes; `status` filters jobs; `connected=true|false` filters workers. Pagination is over a live snapshot, so restart a listing if the collection changes during traversal. Worker records include `observedAt` and `observationAgeMs`; stash records include `observedAt` when a saved update time exists.
@@ -38,10 +38,12 @@ Alternatively, supply exactly one typed `action` instead of `workflowId` or `pac
 
 `GET /v1/workers/{id}/resources` returns `{"known":false}` unless a fresh native-highway report includes that worker's supply ledger. A known report separates carried inventory, ender-chest contents, and totals, and marks whether the ender-chest snapshot itself is known. `pavingBlocks` means the selected highway material, not necessarily obsidian. Stash resource counts are observations, not stock reservations; `complete` is false while containers are unscanned or inferred. Crew details include aggregate highway counts only while at least one worker has a fresh report.
 
+`POST /v1/stashes` defines a new stash with `crewId`, `name`, `world:{server,dimension}`, and `bounds:{minX,maxX,minY,maxY,minZ,maxZ,homeName}`. The `/home` name is required; `lazyMode`, `homeWarmupTicks`, and `homeCooldownTicks` may also be set in `bounds`. Re-creating the same crew/world/name is rejected rather than overwriting observations. `POST /v1/stashes/{id}/scan` takes a caller-generated job `id`, `workerIds`, and optional `priority`, and dispatches the existing partitioned stash-scan workflow. The resulting job and its per-worker telemetry are read through the normal job routes. A newly defined stash with zero observations reports `complete:false`, not a known-empty inventory.
+
 `GET /v1/jobs/{id}/configuration` shows captured job profiles and per-worker requests/acknowledgements, **not** a live read of every client setting. `PATCH` accepts an advertised control from `GET /v1/configuration-controls`, for example `{"control":"speed","active":true,"value":5.5,"workerId":"<UUID>"}`. Omit `workerId` to target every unfinished worker on the job. The host validates the control and queues the existing worker-configuration protocol; inspect the returned `updates` until acknowledged.
 
 Drafts are validated but unassigned job intents. `POST /v1/drafts` accepts the existing captured draft record (`id`, `name`, `server`, `dimension`, `priority`, `args`, `package`, and optional native definition). Dispatch accepts `{"crewId":"<UUID>","workerIds":["<UUID>"]}` and returns the created job. Its duplicate handling and safety gates are the same as legacy `draft-assign`.
 
 `DELETE /v1/workers/{id}` forgets only an offline worker with no outstanding job, highway recovery record, or cleanup acknowledgement. This guard also applies to the legacy `worker-forget` control.
 
-Still pending in Phase 2: portable profile selection, general (non-highway) worker resource/configuration reads, stash definition and scan mutations, independent in-game HTTP serving, and WebUI migration. The Phase 3 reliability adapter is also incremental; external integrations should treat these endpoints as experimental and keep the legacy controls available.
+Still pending in Phase 2: portable profile selection, general (non-highway) worker resource/configuration reads, safe stash edits/deletion, independent in-game HTTP serving, and WebUI migration. The Phase 3 reliability adapter is also incremental; external integrations should treat these endpoints as experimental and keep the legacy controls available.

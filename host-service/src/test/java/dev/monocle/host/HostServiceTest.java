@@ -821,6 +821,31 @@ public final class HostServiceTest {
             assert resourceRequest(http,api,"POST","/v1/jobs",invalidPortable,TOKEN).statusCode()==400 : "Unimplemented profile revisions cannot silently become local names";
             badAction.addProperty("type","workers.travel.v1");badArgs.add("scope",scope.deepCopy());badArgs.getAsJsonObject("scope").addProperty("dimension","minecraft:overworld");badArgs.addProperty("x",1);badArgs.addProperty("y",116);badArgs.addProperty("z",1);
             assert resourceRequest(http,api,"POST","/v1/jobs",invalidPortable,TOKEN).statusCode()==400 : "Portable travel cannot cross the declared world scope";
+            JsonObject stashDefinition=new JsonObject(),bounds=new JsonObject();stashDefinition.addProperty("crewId",crewId);
+            stashDefinition.addProperty("name","Test depot");stashDefinition.add("world",scope.deepCopy());
+            for(String axis:List.of("X","Y","Z")) {
+                int coordinate=axis.equals("X")?10:axis.equals("Y")?116:100;
+                bounds.addProperty("min"+axis,coordinate);bounds.addProperty("max"+axis,coordinate);
+            }
+            bounds.addProperty("homeName","testhome");stashDefinition.add("bounds",bounds);
+            var createdStash=resourceRequest(http,api,"POST","/v1/stashes",stashDefinition,TOKEN);
+            assert createdStash.statusCode()==201 : createdStash.body();
+            String stashId=text(JsonParser.parseString(createdStash.body()).getAsJsonObject(),"id");
+            await(()->worker.stashCatalog.asList().stream().anyMatch(value->text(value.getAsJsonObject(),"name").equals("Test depot")),worker);
+            assert resourceRequest(http,api,"POST","/v1/stashes",stashDefinition,TOKEN).statusCode()==409 : "Creation cannot overwrite observed stash data";
+            JsonObject stashResources=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/stashes/"+stashId+"/resources",null,TOKEN).body()).getAsJsonObject();
+            assert !stashResources.get("complete").getAsBoolean() : "A newly defined, unscanned stash is not known empty";
+            JsonObject scan=new JsonObject();scan.addProperty("id",UUID.randomUUID().toString());scan.add("workerIds",targets.deepCopy());
+            var startedScan=resourceRequest(http,api,"POST","/v1/stashes/"+stashId+"/scan",scan,TOKEN);
+            assert startedScan.statusCode()==202 : startedScan.body();
+            String scanId=text(scan,"id");
+            await(()->state(host,UUID.fromString(scanId)).equals("Running"),worker);
+            JsonObject scanRun=taskView(host,UUID.fromString(scanId)).getAsJsonObject("runs").getAsJsonObject(workerId.toString());
+            assert text(scanRun.getAsJsonObject("action"),"type").equals("StashScan") : "Catalog scan dispatches the existing worker action";
+            assert resourceRequest(http,api,"POST","/v1/jobs/"+scanId+"/cancel",new JsonObject(),TOKEN).statusCode()==202;
+            await(()->worker.current.isEmpty()&&!flag(taskView(host,UUID.fromString(scanId)),"cleanupPending"),worker);
+            JsonObject missingHome=stashDefinition.deepCopy();missingHome.addProperty("name","Missing home");missingHome.getAsJsonObject("bounds").remove("homeName");
+            assert resourceRequest(http,api,"POST","/v1/stashes",missingHome,TOKEN).statusCode()==400 : "Stash definitions require /home routing";
             JsonObject draft=new JsonObject();draft.addProperty("id",UUID.randomUUID().toString());draft.addProperty("name","Draft wait");
             draft.addProperty("server","test.invalid");draft.addProperty("dimension","minecraft:the_nether");draft.addProperty("priority",0);
             draft.add("args",new JsonObject());draft.add("package",savedWorkflow.get("package").deepCopy());
@@ -1071,6 +1096,7 @@ public final class HostServiceTest {
         final List<JsonObject> tpaAccepts = new ArrayList<>();
         int count, installs, resumes;
         int stashAcks;
+        JsonArray stashCatalog=new JsonArray();
         long announceAt;
         JsonObject nativeJob;
         JsonObject ledger, exchangeState, offer;
@@ -1143,6 +1169,7 @@ public final class HostServiceTest {
         }
         private void heartbeat() {
             JsonObject message = message("worker"); message.addProperty("current", current);
+            message.addProperty("stashCatalogProtocol",1);
             JsonArray runs = new JsonArray(); checkpoints.values().forEach(r -> { JsonObject value = new JsonObject(); value.addProperty("run", text(r, "run")); value.addProperty("status", text(r, "status")); runs.add(value); });
             message.add("runs", runs); c.send(message.toString());
         }
@@ -1198,7 +1225,7 @@ public final class HostServiceTest {
                         sendStatus(run); heartbeat();
                     }
                     case "task-stash-ack" -> { assert message.get("delivery").getAsInt()==1;stashAcks++; }
-                    case "task-stash-catalog" -> { assert message.getAsJsonArray("stashes").size()<=64; }
+                    case "task-stash-catalog" -> { assert message.getAsJsonArray("stashes").size()<=64;stashCatalog=message.getAsJsonArray("stashes").deepCopy(); }
                     case "prepare", "reconfigure" -> { nativeJob=message.deepCopy();row=message.get("startRow").getAsInt();begun=nativePaused=false;announce(); }
                     case "restore" -> { assert recoveryOnly && recoveryReady; restores++; recoveryOnly=false; nativeJob=message.deepCopy(); row=message.get("startRow").getAsInt(); detached=HighwayCoordinator.detachedMembers(nativeJob).contains(id); returning=detached; announce(); }
                     case "begin" -> { begun=true;announce(); }
