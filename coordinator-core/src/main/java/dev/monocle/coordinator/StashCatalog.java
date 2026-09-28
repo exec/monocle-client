@@ -103,6 +103,26 @@ public final class StashCatalog {
         if(db.isEmpty()){db.addProperty("version",1);db.addProperty("name",TaskWire.text(p,"name"));db.addProperty("crew",crew);db.addProperty("scope",scope);db.add("containers",new JsonObject());}
         db.add("bounds",p);db.addProperty("updatedAt",System.currentTimeMillis());TaskFiles.write(path,db);return summary(db);
     }
+    public static JsonObject revise(Path root,String crew,String scope,String name,String expected,JsonObject changes) {
+        JsonObject db=get(root,crew,scope,name);
+        if(db.isEmpty())throw new IllegalArgumentException("Unknown stash");
+        if(changes.isEmpty())throw new IllegalArgumentException("Specify a stash setting to change");
+        if(!TaskWire.text(summary(db),"revision").equals(expected))throw new IllegalStateException("Stash revision changed; refresh before editing");
+        JsonObject bounds=db.getAsJsonObject("bounds").deepCopy();
+        for(var change:changes.entrySet()) {
+            if(!Set.of("minX","maxX","minY","maxY","minZ","maxZ","homeName","homeWarmupTicks","homeCooldownTicks","lazyMode").contains(change.getKey()))
+                throw new IllegalArgumentException("Unsupported stash setting: "+change.getKey());
+            bounds.add(change.getKey(),change.getValue().deepCopy());
+        }
+        JsonObject validated=plan(bounds);
+        for(String axis:List.of("X","Y","Z"))for(String edge:List.of("min","max"))
+            if(!Objects.equals(db.getAsJsonObject("bounds").get(edge+axis),validated.get(edge+axis)) && !db.getAsJsonObject("containers").isEmpty())
+                throw new IllegalStateException("Cannot change observed stash bounds; create a new stash to preserve its inventory history");
+        if(db.has("homes") && !db.getAsJsonObject("homes").isEmpty()
+            && List.of("homeName","homeWarmupTicks","homeCooldownTicks").stream().anyMatch(changes::has))
+            throw new IllegalStateException("This stash has worker-specific /home settings; update them in the worker before changing the default");
+        return define(root,crew,scope,validated);
+    }
     public static JsonObject summary(JsonObject db) {
         JsonObject s=new JsonObject(),totals=new JsonObject();int observed=0,unscanned=0,inferred=0;
         for(String key:List.of("version","name","crew","scope","bounds","homes","updatedAt"))if(db.has(key))s.add(key,db.get(key).deepCopy());
@@ -113,7 +133,8 @@ public final class StashCatalog {
             if(o.has("inferred")&&o.get("inferred").getAsBoolean())inferred++;
             o.getAsJsonObject("items").entrySet().forEach(i->totals.addProperty(i.getKey(),(totals.has(i.getKey())?totals.get(i.getKey()).getAsLong():0)+i.getValue().getAsLong()));
         }
-        s.remove("containers");s.add("items",totals);s.addProperty("observed",observed-inferred);s.addProperty("inferred",inferred);s.addProperty("unscanned",unscanned);return s;
+        s.remove("containers");s.add("items",totals);s.addProperty("observed",observed-inferred);s.addProperty("inferred",inferred);s.addProperty("unscanned",unscanned);
+        s.addProperty("revision",TaskFiles.hash(db.toString()));return s;
     }
     public static JsonArray list(Path root) {
         JsonArray result=new JsonArray();Path dir=root.resolve("stashes");if(!Files.exists(dir))return result;

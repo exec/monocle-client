@@ -640,6 +640,13 @@ public final class HostService implements AutoCloseable {
             for(var entry:peers.entrySet())if(entry.getKey().connected() && entry.getValue().reconciled && entry.getValue().crew.equals(crew))sendStashCatalog(entry.getKey(),entry.getValue());
             logEvent("stash-defined","","",text(saved,"name"));return saved;
         }
+        if (op.equals("stash-update")) {
+            String crew=text(request,"crew"),scope=text(request,"scope"),name=text(request,"name");
+            if(!crews.containsKey(crew) || !request.has("bounds") || !request.get("bounds").isJsonObject())throw new IllegalArgumentException("Invalid stash edit");
+            JsonObject saved=StashCatalog.revise(directory,crew,scope,name,text(request,"expected"),request.getAsJsonObject("bounds"));
+            for(var entry:peers.entrySet())if(entry.getKey().connected() && entry.getValue().reconciled && entry.getValue().crew.equals(crew))sendStashCatalog(entry.getKey(),entry.getValue());
+            logEvent("stash-updated","","",name);return saved;
+        }
         if (op.equals("workflow-list")) { JsonObject r=new JsonObject();r.add("workflows",library.list());return r; }
         if (op.equals("workflow-get")) return library.get(text(request,"id"));
         if (op.equals("workflow-preview-control")) return library.previewControl(text(request,"id"),request);

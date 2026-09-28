@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
 import dev.monocle.coordinator.TaskFiles;
+import dev.monocle.coordinator.StashCatalog;
 import static dev.monocle.coordinator.TaskWire.text;
 
 /** Draft v1 operator resources. All decisions and persistence remain in HostService.control. */
@@ -98,7 +99,7 @@ final class ResourceApi {
         if (resource.equals("jobs")) return jobs(host, snapshot, method, parts, body);
         if (resource.equals("workflows")) return workflows(host, snapshot, method, parts, body, ifMatch);
         if (resource.equals("drafts")) return drafts(host, snapshot, method, parts, body);
-        if (resource.equals("stashes")) return stashes(host, snapshot, method, parts, body);
+        if (resource.equals("stashes")) return stashes(host, snapshot, method, parts, body, ifMatch);
         return missing();
     }
 
@@ -279,7 +280,7 @@ final class ResourceApi {
         return missing();
     }
 
-    private static Reply stashes(HostService host,JsonObject snapshot,String method,String[] parts,JsonObject body) {
+    private static Reply stashes(HostService host,JsonObject snapshot,String method,String[] parts,JsonObject body,String ifMatch) {
         if(parts.length==3 && method.equals("POST")) {
             String crew=crewKey(snapshot,text(body,"crewId"));
             JsonObject world=object(body,"world"),bounds=object(body,"bounds").deepCopy();
@@ -289,9 +290,17 @@ final class ResourceApi {
             request.addProperty("scope",server+"\n"+dimension);request.add("bounds",bounds);
             return new Reply(201,stash(host.control(request)));
         }
-        if(parts.length!=5 || !parts[4].equals("scan") || !method.equals("POST"))return missing();
+        if(parts.length<4)return missing();
         JsonObject saved=find(items(snapshot,"stashes"),parts[3]);
         if(saved==null)return missing();
+        if(parts.length==4 && method.equals("PATCH")) {
+            checkRevision(saved,ifMatch);
+            JsonObject request=op("stash-update");
+            for(String key:List.of("crew","scope","name"))request.add(key,saved.get(key).deepCopy());
+            request.addProperty("expected",text(saved,"revision"));request.add("bounds",object(body,"bounds").deepCopy());
+            return new Reply(200,stash(host.control(request)));
+        }
+        if(parts.length!=5 || !parts[4].equals("scan") || !method.equals("POST"))return missing();
         String scope=text(saved,"scope");int split=scope.indexOf('\n');
         if(split<1)throw new IllegalStateException("Saved stash has an invalid world scope");
         String id=uuid(string(body,"id"));
@@ -373,6 +382,7 @@ final class ResourceApi {
     }
     private static JsonObject stash(JsonObject source) {
         JsonObject view=source.deepCopy();view.addProperty("id",stable("stash",text(source,"crew")+"\n"+text(source,"scope")+"\n"+text(source,"name")));
+        if(source.has("containers"))view.add("revision",StashCatalog.summary(source).get("revision").deepCopy());
         view.addProperty("crewId",publicCrew(text(source,"crew")));
         String[] scope=text(source,"scope").split("\n",2);
         if(scope.length==2){JsonObject world=new JsonObject();world.addProperty("server",scope[0]);world.addProperty("dimension",scope[1]);view.add("world",world);}
