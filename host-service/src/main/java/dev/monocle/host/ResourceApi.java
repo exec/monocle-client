@@ -48,7 +48,10 @@ final class ResourceApi {
                 switch (resource) {
                     case "host" -> { result.addProperty("apiVersion", "workers.monocle.dev/v1-draft"); result.addProperty("status", text(snapshot,"status")); result.addProperty("operationsVersion", snapshot.get("operationsVersion").getAsInt()); }
                     case "health" -> { for (String key : List.of("status", "lastConnectionError", "telemetryError", "telemetryDropped", "rosterError")) result.add(key, snapshot.get(key).deepCopy()); }
-                    default -> result.add("actions", snapshot.getAsJsonArray("capabilities").deepCopy());
+                    default -> {
+                        result.add("actions", snapshot.getAsJsonArray("capabilities").deepCopy());
+                        result.add("portableActions", new Gson().toJsonTree(List.of("workers.wait.v1", "workers.travel.v1", "workers.drop-items.v1")));
+                    }
                 }
                 return new Reply(200, result);
             }
@@ -126,21 +129,23 @@ final class ResourceApi {
     private static Reply jobs(HostService host, JsonObject snapshot, String method, String[] parts, JsonObject body) {
         if (parts.length == 3 && method.equals("POST")) {
             String id=uuid(text(body,"id")), crew=crewKey(snapshot,text(body,"crewId"));
-            JsonObject scope=body.getAsJsonObject("scope");
-            if(scope==null)throw new IllegalArgumentException("Specify scope");
+            JsonObject scope=object(body,"scope");
             String server=text(scope,"server"),dimension=text(scope,"dimension");
+            int sources=(body.has("workflowId")?1:0)+(body.has("package")?1:0)+(body.has("action")?1:0);
+            if(sources!=1)throw new IllegalArgumentException("Specify exactly one action, workflowId, or captured package");
             JsonObject request=withId("submit",id);
-            request.addProperty("crew",crew);request.addProperty("name",text(body,"name"));
+            request.addProperty("crew",crew);request.addProperty("name",body.has("name")?text(body,"name"):body.has("action")?"Portable action":"");
             request.addProperty("server",server);request.addProperty("dimension",dimension);
+            if(!body.has("workerIds") || !body.get("workerIds").isJsonArray())throw new IllegalArgumentException("Specify workerIds");
             request.add("workers",body.getAsJsonArray("workerIds"));
             if(body.has("priority"))request.add("priority",body.get("priority"));
-            JsonObject args=body.has("args")?body.getAsJsonObject("args"):new JsonObject();request.add("args",args);
-            if(body.has("workflowId")) {
-                JsonObject prepare=op("workflow-prepare");prepare.addProperty("id",workflowKey(snapshot,text(body,"workflowId")));
+            JsonObject args=body.has("action")?portableArgs(body,server,dimension):body.has("args")?body.getAsJsonObject("args"):new JsonObject();request.add("args",args);
+            if(body.has("workflowId") || body.has("action")) {
+                String workflow=body.has("action")?portableWorkflow(object(body,"action")):workflowKey(snapshot,text(body,"workflowId"));
+                JsonObject prepare=op("workflow-prepare");prepare.addProperty("id",workflow);
                 prepare.addProperty("scope",server+"\n"+dimension);prepare.add("args",args);
                 request.add("package",host.control(prepare));
-            } else if(body.has("package")) request.add("package",body.get("package"));
-            else throw new IllegalArgumentException("Specify workflowId or captured package");
+            } else request.add("package",body.get("package"));
             host.control(request);
             return new Reply(201,job(host.control(withId("task-get",id))));
         }
@@ -172,6 +177,68 @@ final class ResourceApi {
             return new Reply(200,host.control(request));
         }
         return missing();
+    }
+
+    private static String portableWorkflow(JsonObject action) {
+        if(action==null)throw new IllegalArgumentException("Specify a typed action");
+        return switch(string(action,"type")) {
+            case "workers.wait.v1" -> "task-wait";
+            case "workers.travel.v1" -> "task-travel";
+            case "workers.drop-items.v1" -> "task-drop";
+            default -> throw new IllegalArgumentException("Unsupported portable action");
+        };
+    }
+    private static JsonObject portableArgs(JsonObject submission,String server,String dimension) {
+        if(submission.has("args"))throw new IllegalArgumentException("Portable actions use action.arguments, not job args");
+        JsonObject action=object(submission,"action");
+        String workflow=portableWorkflow(action);
+        JsonObject source=object(action,"arguments");
+        JsonObject args=new JsonObject();
+        switch(workflow) {
+            case "task-wait" -> args.addProperty("ticks",whole(source,"ticks",0,1_728_000));
+            case "task-travel" -> {
+                JsonObject world=object(source,"scope");
+                if(!server.equals(string(world,"server")) || !dimension.equals(string(world,"dimension")))
+                    throw new IllegalArgumentException("Travel scope must match the job world");
+                args.addProperty("x",real(source,"x",-29_999_984,29_999_984));
+                args.addProperty("y",real(source,"y",-2048,2048));
+                args.addProperty("z",real(source,"z",-29_999_984,29_999_984));
+                if(source.has("radius"))args.addProperty("radius",real(source,"radius",.15,8));
+            }
+            case "task-drop" -> {
+                String item=string(source,"item");
+                if(!item.matches("[a-z0-9_.-]+:[a-z0-9_./-]+") || item.length()>128)throw new IllegalArgumentException("Invalid item ID");
+                args.addProperty("item",item);args.addProperty("count",whole(source,"count",1,1_048_576));
+                if(source.has("recipientWorkerId"))args.addProperty("recipient",uuid(string(source,"recipientWorkerId")));
+            }
+            default -> throw new AssertionError(workflow);
+        }
+        return args;
+    }
+    private static String string(JsonObject object,String key) {
+        JsonElement value=object.get(key);
+        if(value==null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString())throw new IllegalArgumentException("Expected string "+key);
+        return value.getAsString();
+    }
+    private static JsonObject object(JsonObject source,String key) {
+        JsonElement value=source.get(key);
+        if(value==null || !value.isJsonObject())throw new IllegalArgumentException("Expected object "+key);
+        return value.getAsJsonObject();
+    }
+    private static int whole(JsonObject object,String key,int min,int max) {
+        JsonElement value=object.get(key);
+        if(value==null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())throw new IllegalArgumentException("Expected integer "+key);
+        int number;
+        try {number=value.getAsBigDecimal().intValueExact();}catch(ArithmeticException e){throw new IllegalArgumentException("Expected integer "+key);}
+        if(number<min || number>max)throw new IllegalArgumentException(key+" must be "+min+"–"+max);
+        return number;
+    }
+    private static double real(JsonObject object,String key,double min,double max) {
+        JsonElement value=object.get(key);
+        if(value==null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())throw new IllegalArgumentException("Expected number "+key);
+        double number=value.getAsDouble();
+        if(!Double.isFinite(number) || number<min || number>max)throw new IllegalArgumentException(key+" must be "+min+"–"+max);
+        return number;
     }
 
     private static Reply workflows(HostService host, JsonObject snapshot, String method, String[] parts, JsonObject body, String ifMatch) {

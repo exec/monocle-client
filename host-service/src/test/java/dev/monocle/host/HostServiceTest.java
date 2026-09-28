@@ -795,6 +795,32 @@ public final class HostServiceTest {
             assert resourceRequest(http,api,"POST","/v1/jobs/"+jobId+"/cancel",new JsonObject(),TOKEN).statusCode()==202;
             assert text(JsonParser.parseString(resourceRequest(http,api,"GET","/v1/jobs/"+jobId,null,TOKEN).body()).getAsJsonObject(),"state").equals("cancelled");
             await(()->worker.current.isEmpty()&&!flag(taskView(host,UUID.fromString(jobId)),"cleanupPending"),worker);
+            assert JsonParser.parseString(resourceRequest(http,api,"GET","/v1/capabilities",null,TOKEN).body()).getAsJsonObject().getAsJsonArray("portableActions").size()==3;
+            for(String type:List.of("workers.wait.v1","workers.travel.v1","workers.drop-items.v1")) {
+                JsonObject portable=body.deepCopy();portable.addProperty("id",UUID.randomUUID().toString());portable.remove("workflowId");portable.remove("name");
+                JsonObject action=new JsonObject(),arguments=new JsonObject();action.addProperty("type",type);
+                switch(type) {
+                    case "workers.wait.v1" -> arguments.addProperty("ticks",20);
+                    case "workers.travel.v1" -> {arguments.add("scope",scope.deepCopy());arguments.addProperty("x",10);arguments.addProperty("y",116);arguments.addProperty("z",100);arguments.addProperty("radius",2);}
+                    case "workers.drop-items.v1" -> {arguments.addProperty("item","minecraft:obsidian");arguments.addProperty("count",1);arguments.addProperty("recipientWorkerId",workerId.toString());}
+                }
+                action.add("arguments",arguments);portable.add("action",action);
+                var accepted=resourceRequest(http,api,"POST","/v1/jobs",portable,TOKEN);
+                assert accepted.statusCode()==202 : accepted.body();
+                String portableId=text(portable,"id");
+                JsonObject inspect=op("task-get");inspect.addProperty("id",portableId);
+                JsonObject saved=host.control(inspect);
+                assert text(saved.getAsJsonObject("package"),"entry").equals(type.equals("workers.wait.v1")?"task-wait":type.equals("workers.travel.v1")?"task-travel":"task-drop");
+                assert saved.getAsJsonObject("args").has(type.equals("workers.wait.v1")?"ticks":type.equals("workers.travel.v1")?"x":"item");
+                await(()->state(host,UUID.fromString(portableId)).equals("Running"),worker);
+                assert resourceRequest(http,api,"POST","/v1/jobs/"+portableId+"/cancel",new JsonObject(),TOKEN).statusCode()==202;
+                await(()->worker.current.isEmpty()&&!flag(taskView(host,UUID.fromString(portableId)),"cleanupPending"),worker);
+            }
+            JsonObject invalidPortable=body.deepCopy();invalidPortable.addProperty("id",UUID.randomUUID().toString());invalidPortable.remove("workflowId");
+            JsonObject badAction=new JsonObject(),badArgs=new JsonObject();badAction.addProperty("type","workers.set-profile.v1");badAction.add("arguments",badArgs);invalidPortable.add("action",badAction);
+            assert resourceRequest(http,api,"POST","/v1/jobs",invalidPortable,TOKEN).statusCode()==400 : "Unimplemented profile revisions cannot silently become local names";
+            badAction.addProperty("type","workers.travel.v1");badArgs.add("scope",scope.deepCopy());badArgs.getAsJsonObject("scope").addProperty("dimension","minecraft:overworld");badArgs.addProperty("x",1);badArgs.addProperty("y",116);badArgs.addProperty("z",1);
+            assert resourceRequest(http,api,"POST","/v1/jobs",invalidPortable,TOKEN).statusCode()==400 : "Portable travel cannot cross the declared world scope";
             JsonObject draft=new JsonObject();draft.addProperty("id",UUID.randomUUID().toString());draft.addProperty("name","Draft wait");
             draft.addProperty("server","test.invalid");draft.addProperty("dimension","minecraft:the_nether");draft.addProperty("priority",0);
             draft.add("args",new JsonObject());draft.add("package",savedWorkflow.get("package").deepCopy());
@@ -1151,7 +1177,7 @@ public final class HostServiceTest {
                                 decision = BotLua.next(text(envelope.getAsJsonObject("programs").getAsJsonObject(text(envelope, "entry")), "script"), decision.state(), metadata.getAsJsonObject("args"), new JsonObject(), null);
                             }
                             if(text(decision.action(),"type").equals("StashScan")){decision.action().addProperty("workerIndex",metadata.get("workerIndex").getAsInt());decision.action().addProperty("workerCount",metadata.get("workerCount").getAsInt());}
-                            assert Set.of("Wait","Travel","Highway","StashScan").contains(text(decision.action(), "type"));
+                            assert Set.of("Wait","Travel","DropItems","Highway","StashScan").contains(text(decision.action(), "type"));
                             assert !checkpoints.containsKey(UUID.fromString(transfer));
                             JsonObject run = new JsonObject(); run.addProperty("run", transfer); run.addProperty("status", "Ready");run.add("action",decision.action());run.addProperty("token",UUID.randomUUID().toString()); checkpoints.put(UUID.fromString(transfer), run); installs++; sendStatus(run);
                         }
