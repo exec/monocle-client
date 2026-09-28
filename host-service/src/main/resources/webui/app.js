@@ -33,13 +33,13 @@ function tone(status) {
 }
 function writable() { return !demo && !!token && !!snapshot && snapshot.status === 'Running' && Date.now() - refreshedAt < 5000 && !busy; }
 function notice(message, success = false) { $('notice').textContent = message; $('notice').className = 'banner' + (success ? ' success' : ''); $('notice').hidden = !message; }
-async function api(path, request) {
+async function api(path, request, method = request ? 'POST' : 'GET', extraHeaders = {}) {
   const attempt = generation;
   let response, body;
   try {
   response = await fetch('/ui/api/' + path, {
-    method: request ? 'POST' : 'GET', credentials: 'omit', mode: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(8000),
-    headers: { Authorization: 'Bearer ' + token, ...(request ? { 'Content-Type': 'application/json' } : {}) },
+    method, credentials: 'omit', mode: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(8000),
+    headers: { Authorization: 'Bearer ' + token, ...(request ? { 'Content-Type': 'application/json' } : {}), ...extraHeaders },
     ...(request ? { body: JSON.stringify(request) } : {})
   });
   body = await response.json();
@@ -49,9 +49,12 @@ async function api(path, request) {
   }
   if (!response.ok) {
     if (response.status === 403) { if (attempt === generation) token = ''; throw new Error('Access rejected. Reconnect with the host API token from this allowed origin.'); }
-    throw new Error(body.error || 'Request rejected (HTTP ' + response.status + ')');
+    throw new Error(body.detail || body.error || 'Request rejected (HTTP ' + response.status + ')');
   }
   return body;
+}
+function resource(method, path, body) {
+  return api('v1/' + path, body, method, method === 'GET' ? {} : { 'Idempotency-Key': crypto.randomUUID() });
 }
 async function refresh() {
   if (refreshing || !token && !demo) return;
@@ -290,7 +293,16 @@ function eventList(events) {
 async function control(request, confirmation) {
   if (!writable() || confirmation && !confirm(confirmation)) return;
   busy = true; render();
-  try { await api('control', request); notice('Host accepted ' + request.op + '. Worker cleanup and delivery may continue independently.', true); }
+  try {
+    const {op,id,worker} = request;
+    if (['pause','resume','cancel'].includes(op)) await resource('POST', 'jobs/' + id + '/' + op, {});
+    else if (op === 'delete') await resource('DELETE', 'jobs/' + id);
+    else if (op === 'detach') await resource('POST', 'jobs/' + id + '/workers/' + worker + '/' + (request.detached ? 'detach' : 'rejoin'), {});
+    else if (op === 'priority' && !worker) await resource('PATCH', 'jobs/' + id, { priority: request.priority });
+    else if (op === 'crew-create') await resource('POST', 'crews', { id, name: request.name });
+    else await api('control', request);
+    notice('Host accepted ' + op + '. Worker cleanup and delivery may continue independently.', true);
+  }
   catch (error) { notice(error.message + ' Refresh status before retrying; the command may already have reached the host.'); }
   finally { busy = false; await refresh(); }
 }
@@ -304,7 +316,7 @@ function configurationInspector(task) {
   const load=async()=>{
     const refresh=button('Refresh configuration snapshot',load,demo);
     try {
-      const data=await api('control',{op:'task-configuration',id:task.id});
+      const data=await resource('GET','jobs/'+task.id+'/configuration');
       // Preserve the selected source on manual refresh; ordinary polling never rebuilds this panel.
       const previous=body.querySelector('select')?.value;
       body.replaceChildren(el('p','hint',data.explanation),refresh,el('p','hint','Snapshot '+new Date().toLocaleTimeString()));
@@ -383,7 +395,7 @@ function guidedSettings(task, initialWorker) {
     if(!panel.open||loaded)return;loaded=true;
     if(demo){body.append(el('p','hint','Connect to a host to edit settings.'));return;}
     try {
-      const catalog=await api('control',{op:'configuration-controls'});
+      const catalog=await resource('GET','configuration-controls');
       if(!panel.isConnected)return;
       body.append(el('p','hint','This job only. Values are proposed edits, not readings from workers. Future-job defaults and other settings are unchanged.'));
       const form=el('form'),target=el('select'),setting=el('select'),activation=el('select'),value=el('input');value.type='number';
@@ -400,7 +412,7 @@ function guidedSettings(task, initialWorker) {
       const apply=button('Apply previewed change',async()=>{
         if(!draft||!writable())return;
         const request=draft;draft=null;busy=true;panel.updateStatus();
-        try {await api('control',request);preview.textContent='Request saved. Await the worker acknowledgement below.';}
+        try {await resource('PATCH','jobs/'+task.id+'/configuration',request);preview.textContent='Request saved. Await the worker acknowledgement below.';}
         catch(error){preview.textContent='Request not confirmed: '+error.message+' Check acknowledgements before retrying.';}
         finally {busy=false;await refresh();panel.updateStatus();}
       },true);
@@ -428,7 +440,7 @@ function guidedSettings(task, initialWorker) {
           if(c.setting)request.value=Number(value.value);
           const result=await api('control',request);
           if(version!==revision||!panel.isConnected)return;
-          draft={op:'configure',id:task.id,...(worker?{worker}:{}),modules:result.modules};
+          draft={control:c.id,active:activation.value==='On',...(c.setting?{value:Number(value.value)}:{}),...(worker?{workerId:worker}:{})};
           preview.textContent='Target: '+target.selectedOptions[0].textContent+'\n'+result.description+'\n'+result.scope;
         }catch(error){if(version===revision)preview.textContent='Cannot preview: '+error.message;}
         finally{previewing=false;panel.updateStatus();}
@@ -618,7 +630,7 @@ async function presetLibrary() {
   dialog.addEventListener('close',()=>dialog.remove());dialog.showModal();
   const message=el('p','hint');
   try {
-    const list=await api('control',{op:'workflow-list'}),catalog=await api('control',{op:'configuration-controls'});
+    const list=await api('control',{op:'workflow-list'}),catalog=await resource('GET','configuration-controls');
     const selected=el('select'),name=el('input'),folder=el('input'),setting=el('select'),active=el('select'),value=el('input');value.type='number';
     for(const r of list.workflows){const o=el('option','',(r.builtin?'Built-in · ':'Custom · ')+r.folder+' / '+r.name);o.value=r.id;selected.append(o);}
     for(const c of catalog.controls){const o=el('option','',c.label);o.value=c.id;setting.append(o);}

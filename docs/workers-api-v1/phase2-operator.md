@@ -2,6 +2,8 @@
 
 The standalone host now serves an authenticated, loopback-only resource API alongside `/v1/status` and `/v1/control`. It delegates decisions to the same `HostService.control` path as the existing WebUI. These routes are an **incremental draft**, not yet the frozen v1 contract in `openapi.json`.
 
+The bundled control panel can call the same resource handlers at `/ui/api/v1/*`. This alias requires the API token and the panel's exact same-origin check; native `/v1/*` still rejects browser `Origin` headers. The panel now uses resource routes for job pause/resume/cancel, history deletion, worker detach/rejoin, job priority, guided job configuration, configuration reads, and crew creation. Its rich live snapshot, highway controls, workflow editor, and other features still use legacy `/ui/api/*` calls until equivalent resource views exist.
+
 Send `Authorization: Bearer <host API token>`. Browser `Origin` headers are rejected. Mutations with a body require `Content-Type: application/json`; command POSTs with no arguments send `{}`. Responses are JSON. Resource mutations now also require a UUID `Idempotency-Key`; see the [Phase 3 reliability notes](phase3-operator.md).
 
 | Resource | Implemented routes |
@@ -48,4 +50,4 @@ Drafts are validated but unassigned job intents. `POST /v1/drafts` accepts the e
 
 `DELETE /v1/workers/{id}` forgets only an offline worker with no outstanding job, highway recovery record, or cleanup acknowledgement. This guard also applies to the legacy `worker-forget` control.
 
-Still pending in Phase 2: portable profile selection, general (non-highway) worker resource/configuration reads, safe stash deletion and edits to previously observed bounds or worker-specific home settings, independent in-game HTTP serving, and WebUI migration. The Phase 3 reliability adapter is also incremental; external integrations should treat these endpoints as experimental and keep the legacy controls available.
+Still pending in Phase 2: portable profile selection, general (non-highway) worker resource/configuration reads, safe stash deletion and edits to previously observed bounds or worker-specific home settings, independent in-game HTTP serving, and the remaining WebUI migration. The Phase 3 reliability adapter is also incremental; external integrations should treat these endpoints as experimental and keep the legacy controls available.

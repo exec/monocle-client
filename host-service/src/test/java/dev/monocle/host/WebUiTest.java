@@ -1,17 +1,24 @@
 package dev.monocle.host;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import dev.monocle.coordinator.TaskFiles;
 import java.nio.charset.StandardCharsets;
 import java.net.*;
 import java.net.http.*;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Map;
+import java.util.UUID;
 import java.time.Duration;
 
 final class WebUiTest {
     private static final String TOKEN = "ui-test-operator-token-12345678901234567890";
     static void run() throws Exception {
-        try (HostService host = new HostService(Files.createTempDirectory("monocle-ui-check-"), "127.0.0.1", 0,
-                 Map.of("Default", "ui-test-crew-key-12345678901234567890"), 30);
+        Path directory=Files.createTempDirectory("monocle-ui-check-");
+        Map<String,String> crews=Map.of("Default", "ui-test-crew-key-12345678901234567890");
+        JsonObject config=new JsonObject();config.add("crews",new Gson().toJsonTree(crews));TaskFiles.write(directory.resolve("host-config.json"),config);
+        try (HostService host = new HostService(directory, "127.0.0.1", 0, crews, 30);
              ControlApi api = new ControlApi(host, 0, TOKEN);
              HttpClient http = HttpClient.newHttpClient()) {
             String origin = "http://127.0.0.1:" + api.port();
@@ -34,6 +41,19 @@ final class WebUiTest {
             assert send(http, origin + "/ui/api/control", TOKEN, "null", true).statusCode() == 403;
             assert send(http, origin + "/ui/api/control", TOKEN, "https://evil.invalid", true).statusCode() == 403;
             assert send(http, origin + "/ui/api/control", TOKEN, origin, true).statusCode() == 200;
+            assert send(http, origin + "/ui/api/v1/workers", TOKEN, origin, false).statusCode() == 200;
+            assert send(http, origin + "/ui/api/v1/workers", TOKEN, "https://evil.invalid", false).statusCode() == 403;
+            String crewBody="{\"id\":\""+UUID.randomUUID()+"\",\"name\":\"UI resource crew\"}",commandId=UUID.randomUUID().toString();
+            var uiCreate=HttpRequest.newBuilder(URI.create(origin+"/ui/api/v1/crews"))
+                .header("Authorization","Bearer "+TOKEN).header("Origin",origin).header("Content-Type","application/json")
+                .header("Idempotency-Key",commandId).POST(HttpRequest.BodyPublishers.ofString(crewBody)).build();
+            var created=http.send(uiCreate,HttpResponse.BodyHandlers.ofString());
+            assert created.statusCode()==201 : created.body();
+            var nativeReplay=HttpRequest.newBuilder(URI.create(origin+"/v1/crews"))
+                .header("Authorization","Bearer "+TOKEN).header("Content-Type","application/json")
+                .header("Idempotency-Key",commandId).POST(HttpRequest.BodyPublishers.ofString(crewBody)).build();
+            assert http.send(nativeReplay,HttpResponse.BodyHandlers.ofString()).body().equals(created.body()) : "UI and native resource routes share durable receipts";
+            assert send(http, origin + "/ui/api/v1/crews", TOKEN, null, true).statusCode() == 403 : "UI mutations require a matching Origin";
             assert send(http, origin + "/v1/control", TOKEN, origin, true).statusCode() == 403 : "Browser UI cannot weaken native endpoint policy";
             var crossSite = HttpRequest.newBuilder(URI.create(origin + "/ui/api/status")).header("Authorization", "Bearer " + TOKEN).header("Sec-Fetch-Site", "cross-site").build();
             assert http.send(crossSite, HttpResponse.BodyHandlers.ofString()).statusCode() == 403;

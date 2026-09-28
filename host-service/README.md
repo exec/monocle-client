@@ -51,7 +51,7 @@ The Overview page includes the host-only **Auto TPY** policy. When enabled, an o
 
 By default the TCP worker listener binds to `127.0.0.1`. For LAN TCP workers, stop the service and set `bind` to its specific private LAN address; wildcard/public bindings are rejected. Ordinary TCP worker traffic is authenticated but **not encrypted**; keep it on a trusted LAN or VPN. Only credential handoffs use encryption on TCP. `wss://` uses TLS for all traffic through the separately configured loopback web ingress. Additional crews are entries in `crews`, each with its own unique 24–128-character key. Configuration changes require a restart. An OS file lock prevents two processes from owning the same data directory.
 
-The administrative API always binds to **127.0.0.1:6970**, separately from worker traffic. It requires the API token; native routes reject browser-origin requests, while separate `/ui/api/*` routes enforce same-origin browser access. Do not port-forward it or publish the config file. Unix configuration files are created owner-only; use an appropriately protected user directory on Windows.
+The administrative API always binds to **127.0.0.1:6970**, separately from worker traffic. It requires the API token; native routes reject browser-origin requests, while separate `/ui/api/*` routes enforce same-origin browser access. The control panel uses `/ui/api/v1/*` for supported resource operations and keeps legacy controls for host-specific detail. Do not port-forward it or publish the config file. Unix configuration files are created owner-only; use an appropriately protected user directory on Windows.
 
 ## Inspect and test
 

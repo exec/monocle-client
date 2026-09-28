@@ -53,13 +53,18 @@ public final class ControlApi implements AutoCloseable {
             }
         };
         for (String path : new String[]{"/control", "/v1/control", "/v1/status", "/ui/api/status", "/ui/api/control"}) server.createContext(path, handler);
-        server.createContext("/v1/", exchange -> {
+        HttpHandler resources = exchange -> {
             try (exchange) {
                 String correlation = UUID.randomUUID().toString();
                 try {
-                if (exchange.getRequestHeaders().containsKey("Origin")) { problem(exchange, 403, "forbidden", "Origin is not accepted", correlation); return; }
+                boolean browser=exchange.getRequestURI().getRawPath().startsWith("/ui/api/v1/");
+                if(browser)WebUi.headers(exchange);
+                if(browser ? !ui.allowed(exchange,!exchange.getRequestMethod().equals("GET")) : exchange.getRequestHeaders().containsKey("Origin")) {
+                    problem(exchange, 403, "forbidden", browser?"UI origin is not accepted":"Origin is not accepted", correlation); return;
+                }
                 String auth = exchange.getRequestHeaders().getFirst("Authorization");
                 if (auth == null || !MessageDigest.isEqual(expected, auth.getBytes(StandardCharsets.UTF_8))) { problem(exchange, 403, "forbidden", "Forbidden", correlation); return; }
+                URI resourceUri=browser?URI.create(exchange.getRequestURI().toString().substring("/ui/api".length())):exchange.getRequestURI();
                 JsonObject body = new JsonObject();
                 if (ResourceApi.bodyRequired(exchange.getRequestMethod())) {
                     String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
@@ -72,14 +77,14 @@ public final class ControlApi implements AutoCloseable {
                 }
                 String method = exchange.getRequestMethod();
                 if (method.equals("GET")) {
-                    ResourceApi.Reply reply = ResourceApi.route(host, method, exchange.getRequestURI(), body, null);
-                    reply = standardize(reply, correlation, exchange.getRequestURI().getPath());
+                    ResourceApi.Reply reply = ResourceApi.route(host, method, resourceUri, body, null);
+                    reply = standardize(reply, correlation, resourceUri.getPath());
                     send(exchange, reply.code(), reply.body()); return;
                 }
                 String commandId = exchange.getRequestHeaders().getFirst("Idempotency-Key");
                 if (commandId == null) { problem(exchange, 428, "idempotency_key_required", "Supply a UUID Idempotency-Key", correlation); return; }
                 commandId = UUID.fromString(commandId).toString(); correlation = commandId;
-                String fingerprint = TaskFiles.hash(method + "\n" + exchange.getRequestURI() + "\n" + exchange.getRequestHeaders().getFirst("If-Match") + "\n" + body);
+                String fingerprint = TaskFiles.hash(method + "\n" + resourceUri + "\n" + exchange.getRequestHeaders().getFirst("If-Match") + "\n" + body);
                 ResourceApi.Reply reply;
                 synchronized (host) {
                     OperatorOperations operations = host.operatorOperations();
@@ -93,16 +98,16 @@ public final class ControlApi implements AutoCloseable {
                         } else reply = new ResourceApi.Reply(prior.get("httpStatus").getAsInt(), prior.getAsJsonObject("response"));
                     } else {
                         try {
-                            reply = ResourceApi.route(host, method, exchange.getRequestURI(), body, exchange.getRequestHeaders().getFirst("If-Match"));
+                            reply = ResourceApi.route(host, method, resourceUri, body, exchange.getRequestHeaders().getFirst("If-Match"));
                         } catch (ResourceApi.Precondition e) {
-                            reply = new ResourceApi.Reply(e.status, problemBody(e.status, e.status == 428 ? "precondition_required" : "revision_mismatch", e.getMessage(), commandId, exchange.getRequestURI().getPath()));
+                            reply = new ResourceApi.Reply(e.status, problemBody(e.status, e.status == 428 ? "precondition_required" : "revision_mismatch", e.getMessage(), commandId, resourceUri.getPath()));
                         } catch (IllegalStateException e) {
-                            reply = new ResourceApi.Reply(409, problemBody(409, "conflict", e.getMessage(), commandId, exchange.getRequestURI().getPath()));
+                            reply = new ResourceApi.Reply(409, problemBody(409, "conflict", e.getMessage(), commandId, resourceUri.getPath()));
                         } catch (RuntimeException | StackOverflowError e) {
-                            reply = new ResourceApi.Reply(400, problemBody(400, "invalid_request", e instanceof StackOverflowError ? "JSON nesting exceeds limit" : e.getMessage(), commandId, exchange.getRequestURI().getPath()));
+                            reply = new ResourceApi.Reply(400, problemBody(400, "invalid_request", e instanceof StackOverflowError ? "JSON nesting exceeds limit" : e.getMessage(), commandId, resourceUri.getPath()));
                         }
-                        reply = standardize(reply, commandId, exchange.getRequestURI().getPath());
-                        boolean async = reply.code() < 400 && asynchronous(method, exchange.getRequestURI().getPath());
+                        reply = standardize(reply, commandId, resourceUri.getPath());
+                        boolean async = reply.code() < 400 && asynchronous(method, resourceUri.getPath());
                         int code = async ? 202 : reply.code();
                         JsonObject result = reply.body().deepCopy();
                         result.addProperty("operationId", commandId); result.addProperty("correlationId", commandId);
@@ -116,7 +121,9 @@ public final class ControlApi implements AutoCloseable {
                   catch (IllegalStateException e) { problem(exchange, 409, "conflict", e.getMessage(), correlation); }
                   catch (IllegalArgumentException | StackOverflowError e) { problem(exchange, 400, "invalid_request", e instanceof StackOverflowError ? "JSON nesting exceeds limit" : e.getMessage(), correlation); }
             }
-        });
+        };
+        server.createContext("/v1/", resources);
+        server.createContext("/ui/api/v1/", resources);
         server.start();
     }
     public int port() { return server.getAddress().getPort(); }
