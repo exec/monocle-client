@@ -26,6 +26,9 @@ public final class HostService implements AutoCloseable {
     private final Map<UUID, Long> chatAt = new HashMap<>();
     private final Map<UUID, AutoTpy> autoTpyRequests = new LinkedHashMap<>();
     private final CrewTelemetry events;
+    private final OperatorOperations operatorOperations;
+    private final String eventSession = UUID.randomUUID().toString();
+    private long eventSequence;
     private final FileChannel lockChannel;
     private final FileLock lock;
     private final CrewListener listener;
@@ -85,6 +88,7 @@ public final class HostService implements AutoCloseable {
         try {
             lock = lockChannel.tryLock();
             if (lock == null) throw new IllegalStateException("Another host owns this data directory");
+            operatorOperations = new OperatorOperations(directory.resolve("operator-operations.json"));
             library = new OperationsLibrary(directory.resolve("bot-operations.json"));
             JsonObject config = TaskFiles.read(directory.resolve("host-config.json"));
             autoTpy = config.has("autoTpy") && config.get("autoTpy").isJsonPrimitive() && config.getAsJsonPrimitive("autoTpy").isBoolean() && config.get("autoTpy").getAsBoolean();
@@ -117,6 +121,35 @@ public final class HostService implements AutoCloseable {
 
     public int port() { return listener.port(); }
     public int webPort() { return listener.webPort(); }
+    OperatorOperations operatorOperations() { return operatorOperations; }
+    synchronized void operatorReceipt(String commandId, String state) { logEvent("operator-command", "", commandId, state); }
+    synchronized JsonObject operatorEvents(String after, int limit) {
+        if (limit < 1 || limit > 100) throw new IllegalArgumentException("limit must be 1–100");
+        long sequence = 0;
+        if (after != null) {
+            String[] cursor = after.split(":", -1);
+            if (cursor.length != 2 || !cursor[0].equals(eventSession)) return eventGap();
+            try { sequence = Long.parseLong(cursor[1]); }
+            catch (NumberFormatException e) { throw new IllegalArgumentException("Invalid event cursor"); }
+            if (sequence < 0 || sequence > eventSequence) throw new IllegalArgumentException("Invalid event cursor");
+        }
+        long oldest = activity.isEmpty() ? eventSequence + 1 : activity.getFirst().get("sequence").getAsLong();
+        if (sequence < oldest - 1 && after != null) return eventGap();
+        JsonArray items = new JsonArray();
+        long last = sequence;
+        for (JsonObject event : activity) if (event.get("sequence").getAsLong() > sequence && items.size() < limit) {
+            items.add(event.deepCopy()); last = event.get("sequence").getAsLong();
+        }
+        JsonObject result = new JsonObject(); result.add("items", items);
+        result.addProperty("nextCursor", eventSession + ":" + Math.max(last, eventSequence == 0 ? 0 : sequence));
+        result.addProperty("hasMore", last < eventSequence);
+        return result;
+    }
+    private JsonObject eventGap() {
+        JsonObject result = new JsonObject(); result.addProperty("snapshotRequired", true);
+        result.addProperty("code", "event_gap"); result.addProperty("nextCursor", eventSession + ":" + eventSequence);
+        return result;
+    }
     private void persist() {
         JsonObject root = new JsonObject(), records = new JsonObject(); root.addProperty("version", 1);
         tasks.forEach((id, task) -> records.add(id.toString(), task)); root.add("tasks", records); TaskFiles.write(journal, root);
@@ -752,6 +785,8 @@ public final class HostService implements AutoCloseable {
 
     private void logEvent(String type, String worker, String run, String detail) {
         JsonObject event = new JsonObject(); event.addProperty("event", type); event.addProperty("worker", worker);
+        event.addProperty("sequence", ++eventSequence); event.addProperty("id", eventSession + ":" + eventSequence);
+        if (type.equals("operator-command")) event.addProperty("correlationId", run);
         event.addProperty("at",System.currentTimeMillis());
         event.addProperty("runOrTask", run.substring(0, Math.min(run.length(), 96))); event.addProperty("detail", detail.substring(0, Math.min(detail.length(), 1024)));
         events.event(event);

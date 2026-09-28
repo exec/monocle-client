@@ -716,14 +716,20 @@ public final class HostServiceTest {
         return http.send(builder.POST(HttpRequest.BodyPublishers.ofString(command.toString())).build(), HttpResponse.BodyHandlers.ofString());
     }
     private static HttpResponse<String> resourceRequest(HttpClient http,ControlApi api,String method,String path,JsonObject body,String token) throws Exception {
+        return resourceRequest(http,api,method,path,body,token,UUID.randomUUID().toString(),null);
+    }
+    private static HttpResponse<String> resourceRequest(HttpClient http,ControlApi api,String method,String path,JsonObject body,String token,String commandId,String revision) throws Exception {
         var builder=HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+api.port()+path)).timeout(Duration.ofSeconds(5)).header("Authorization","Bearer "+token);
         if(body!=null)builder.header("Content-Type","application/json");
+        if(!method.equals("GET"))builder.header("Idempotency-Key",commandId);
+        if(revision!=null)builder.header("If-Match",revision);
         return http.send(builder.method(method,body==null?HttpRequest.BodyPublishers.noBody():HttpRequest.BodyPublishers.ofString(body.toString())).build(),HttpResponse.BodyHandlers.ofString());
     }
     private static void resourceApiCheck() throws Exception {
         Path directory=Files.createTempDirectory("monocle-resources-check-");
         JsonObject config=new JsonObject();config.add("crews",new Gson().toJsonTree(CREWS));TaskFiles.write(directory.resolve("host-config.json"),config);
         UUID workerId=UUID.randomUUID();
+        String workflowCommandId=UUID.randomUUID().toString();
         try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
             ControlApi api=new ControlApi(host,0,TOKEN);
             HttpClient http=HttpClient.newHttpClient();
@@ -741,6 +747,8 @@ public final class HostServiceTest {
             var defaultCrew=resourceRequest(http,api,"GET","/v1/crews/"+crewId,null,TOKEN);
             assert defaultCrew.statusCode()==200 && text(JsonParser.parseString(defaultCrew.body()).getAsJsonObject(),"name").equals("Default");
             assert resourceRequest(http,api,"GET","/v1/workers?connected=no",null,TOKEN).statusCode()==400;
+            JsonObject firstEvents=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/events",null,TOKEN).body()).getAsJsonObject();
+            String eventCursor=text(firstEvents,"nextCursor");
             JsonObject unknownResources=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/workers/"+workerId+"/resources",null,TOKEN).body()).getAsJsonObject();
             assert !unknownResources.get("known").getAsBoolean() && !unknownResources.has("counts") : "No highway report is unknown, not zero stock";
             assert resourceRequest(http,api,"DELETE","/v1/workers/"+workerId,null,TOKEN).statusCode()==409 : "Connected workers cannot be forgotten";
@@ -753,23 +761,38 @@ public final class HostServiceTest {
             JsonObject scope=new JsonObject();scope.addProperty("server","test.invalid");scope.addProperty("dimension","minecraft:the_nether");body.add("scope",scope);
             JsonObject savedWorkflow=new JsonObject();savedWorkflow.addProperty("name","Wait");savedWorkflow.addProperty("folder","Tests");
             savedWorkflow.add("package",JsonParser.parseString("{\"version\":1,\"entry\":\"main\",\"programs\":{\"main\":{\"name\":\"Wait\",\"script\":\"return function(ctx) return bot.wait(200) end\"}},\"profiles\":{\"Current\":{}},\"highways\":{}}").getAsJsonObject());
-            var createdWorkflow=resourceRequest(http,api,"POST","/v1/workflows",savedWorkflow,TOKEN);
+            var createdWorkflow=resourceRequest(http,api,"POST","/v1/workflows",savedWorkflow,TOKEN,workflowCommandId,null);
             assert createdWorkflow.statusCode()==201 : createdWorkflow.body();
+            assert resourceRequest(http,api,"POST","/v1/workflows",savedWorkflow,TOKEN,workflowCommandId,null).body().equals(createdWorkflow.body()) : "Lost reply replays the durable result";
+            JsonObject changedWorkflow=savedWorkflow.deepCopy();changedWorkflow.addProperty("name","Different intent");
+            assert resourceRequest(http,api,"POST","/v1/workflows",changedWorkflow,TOKEN,workflowCommandId,null).statusCode()==409 : "Reused command ID cannot mutate a different workflow";
+            var missingKey=HttpRequest.newBuilder(URI.create("http://127.0.0.1:"+api.port()+"/v1/workflows"))
+                .header("Authorization","Bearer "+TOKEN).header("Content-Type","application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(savedWorkflow.toString())).build();
+            assert http.send(missingKey,HttpResponse.BodyHandlers.ofString()).statusCode()==428;
+            String uncertainId=UUID.randomUUID().toString();
+            host.operatorOperations().begin(uncertainId,TaskFiles.hash("POST\n/v1/workflows\nnull\n"+changedWorkflow));
+            var uncertain=resourceRequest(http,api,"POST","/v1/workflows",changedWorkflow,TOKEN,uncertainId,null);
+            assert uncertain.statusCode()==202 && text(JsonParser.parseString(uncertain.body()).getAsJsonObject(),"state").equals("outcome_uncertain") : "Interrupted intent is not replayed";
+            JsonObject operation=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/operations/"+workflowCommandId,null,TOKEN).body()).getAsJsonObject();
+            assert text(operation,"state").equals("completed") && operation.get("httpStatus").getAsInt()==201 && !operation.has("fingerprint");
+            JsonObject newerEvents=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/events?cursor="+eventCursor,null,TOKEN).body()).getAsJsonObject();
+            assert newerEvents.getAsJsonArray("items").asList().stream().anyMatch(value->workflowCommandId.equals(text(value.getAsJsonObject(),"correlationId"))) : "Command receipt is visible in the change feed";
             body.addProperty("workflowId",text(JsonParser.parseString(createdWorkflow.body()).getAsJsonObject(),"id"));
             var created=resourceRequest(http,api,"POST","/v1/jobs",body,TOKEN);
-            assert created.statusCode()==201 : created.body();
+            assert created.statusCode()==202 : created.body();
             String jobId=text(JsonParser.parseString(created.body()).getAsJsonObject(),"id");
             assert resourceRequest(http,api,"GET","/v1/jobs/"+jobId,null,TOKEN).statusCode()==200;
             assert resourceRequest(http,api,"GET","/v1/jobs/"+jobId+"/configuration",null,TOKEN).statusCode()==200;
             await(()->state(host,UUID.fromString(jobId)).equals("Running"),worker);
             JsonObject guided=new JsonObject();guided.addProperty("control","toggle-auto-eat");guided.addProperty("active",true);guided.addProperty("workerId",workerId.toString());
             var configurationUpdate=resourceRequest(http,api,"PATCH","/v1/jobs/"+jobId+"/configuration",guided,TOKEN);
-            assert configurationUpdate.statusCode()==200 : configurationUpdate.body();
+            assert configurationUpdate.statusCode()==202 : configurationUpdate.body();
             assert JsonParser.parseString(configurationUpdate.body()).getAsJsonObject().getAsJsonObject("updates").getAsJsonObject(workerId.toString()).get("requestedRevision").getAsInt()==1;
             JsonObject invalidGuided=guided.deepCopy();invalidGuided.addProperty("control","unsafe-unknown-setting");
             assert resourceRequest(http,api,"PATCH","/v1/jobs/"+jobId+"/configuration",invalidGuided,TOKEN).statusCode()==400;
             await(()->text(host.control(inspectJobConfiguration(jobId)).getAsJsonObject("updates").getAsJsonObject(workerId.toString()),"status").equals("Accepted"),worker);
-            assert resourceRequest(http,api,"POST","/v1/jobs/"+jobId+"/cancel",new JsonObject(),TOKEN).statusCode()==200;
+            assert resourceRequest(http,api,"POST","/v1/jobs/"+jobId+"/cancel",new JsonObject(),TOKEN).statusCode()==202;
             assert text(JsonParser.parseString(resourceRequest(http,api,"GET","/v1/jobs/"+jobId,null,TOKEN).body()).getAsJsonObject(),"state").equals("cancelled");
             await(()->worker.current.isEmpty()&&!flag(taskView(host,UUID.fromString(jobId)),"cleanupPending"),worker);
             JsonObject draft=new JsonObject();draft.addProperty("id",UUID.randomUUID().toString());draft.addProperty("name","Draft wait");
@@ -782,22 +805,34 @@ public final class HostServiceTest {
             assert JsonParser.parseString(resourceRequest(http,api,"GET","/v1/drafts",null,TOKEN).body()).getAsJsonObject().getAsJsonArray("items").size()==1;
             JsonObject dispatch=new JsonObject();dispatch.addProperty("crewId",crewId);dispatch.add("workerIds",targets.deepCopy());
             var dispatched=resourceRequest(http,api,"POST","/v1/drafts/"+draftId+"/dispatch",dispatch,TOKEN);
-            assert dispatched.statusCode()==201 && text(JsonParser.parseString(dispatched.body()).getAsJsonObject(),"id").equals(draftId) : dispatched.body();
+            assert dispatched.statusCode()==202 && text(JsonParser.parseString(dispatched.body()).getAsJsonObject(),"id").equals(draftId) : dispatched.body();
             assert resourceRequest(http,api,"GET","/v1/drafts/"+draftId,null,TOKEN).statusCode()==404;
-            assert resourceRequest(http,api,"POST","/v1/jobs/"+draftId+"/cancel",new JsonObject(),TOKEN).statusCode()==200;
+            assert resourceRequest(http,api,"POST","/v1/jobs/"+draftId+"/cancel",new JsonObject(),TOKEN).statusCode()==202;
             await(()->worker.current.isEmpty()&&!flag(taskView(host,UUID.fromString(draftId)),"cleanupPending"),worker);
             JsonObject createCrew=new JsonObject();createCrew.addProperty("id",UUID.randomUUID().toString());createCrew.addProperty("name","Resource API crew");
             var createdCrew=resourceRequest(http,api,"POST","/v1/crews",createCrew,TOKEN);
             assert createdCrew.statusCode()==201 : createdCrew.body();
             String newCrewId=text(JsonParser.parseString(createdCrew.body()).getAsJsonObject(),"id");
             JsonObject rename=new JsonObject();rename.addProperty("name","Renamed crew");
-            assert text(JsonParser.parseString(resourceRequest(http,api,"PATCH","/v1/crews/"+newCrewId,rename,TOKEN).body()).getAsJsonObject(),"name").equals("Renamed crew");
+            String revision=text(JsonParser.parseString(createdCrew.body()).getAsJsonObject(),"revision");
+            assert text(JsonParser.parseString(resourceRequest(http,api,"PATCH","/v1/crews/"+newCrewId,rename,TOKEN,UUID.randomUUID().toString(),revision).body()).getAsJsonObject(),"name").equals("Renamed crew");
+            assert resourceRequest(http,api,"PATCH","/v1/crews/"+newCrewId,rename,TOKEN,UUID.randomUUID().toString(),revision).statusCode()==412 : "Stale edit must not overwrite another operator";
+            assert resourceRequest(http,api,"PATCH","/v1/crews/"+newCrewId,rename,TOKEN).statusCode()==428 : "Edits need an explicit revision";
             JsonObject crews=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/crews?limit=1",null,TOKEN).body()).getAsJsonObject();
             assert crews.getAsJsonArray("items").size()==1 && crews.has("nextCursor");
             assert resourceRequest(http,api,"GET","/v1/crews?limit=1&cursor="+text(crews,"nextCursor"),null,TOKEN).statusCode()==200;
             worker.close();await(()->connected(host)==0);
             assert resourceRequest(http,api,"DELETE","/v1/workers/"+workerId,null,TOKEN).statusCode()==200;
             assert resourceRequest(http,api,"GET","/v1/workers/"+workerId,null,TOKEN).statusCode()==404;
+            for(int i=0;i<130;i++)host.control(op("configuration-controls"));
+            var gap=resourceRequest(http,api,"GET","/v1/events?cursor="+eventCursor,null,TOKEN);
+            assert gap.statusCode()==409 && JsonParser.parseString(gap.body()).getAsJsonObject().get("snapshotRequired").getAsBoolean() : "Expired cursors require a fresh snapshot";
+        }
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
+            ControlApi api=new ControlApi(host,0,TOKEN);
+            HttpClient http=HttpClient.newHttpClient()) {
+            JsonObject operation=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/operations/"+workflowCommandId,null,TOKEN).body()).getAsJsonObject();
+            assert text(operation,"state").equals("completed") && operation.get("httpStatus").getAsInt()==201 : "Command receipt survives host restart";
         }
     }
     private static JsonObject inspectJobConfiguration(String id) {JsonObject request=op("task-configuration");request.addProperty("id",id);return request;}

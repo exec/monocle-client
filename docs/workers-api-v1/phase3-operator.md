@@ -1,0 +1,13 @@
+# Phase 3 operator reliability (draft)
+
+The standalone host's resource mutations require `Idempotency-Key: <UUID>`. Keep the same key, method, URI, `If-Match`, and JSON body when retrying after a timeout. The host journals the command before executing it. A repeated command returns the saved HTTP status and body; changing its intent under the same key returns `409`. Receipts survive a host restart at `GET /v1/operations/{key}`. The journal keeps at most 1,024 receipts and 16 MiB; do not treat a key evicted from that window as safe to replay.
+
+The response includes `operationId` and `correlationId` (both equal to the command UUID). Commands whose worker effect is asynchronous return `202` and a receipt in `host_accepted` state. That means the host accepted the command, **not** that a worker received it, acknowledged it, or that Minecraft confirmed an effect. Continue reading the job and worker resources for authoritative status and cleanup debt. Synchronous mutations and rejected commands have `completed` receipts. If the host is interrupted after journaling intent but before journaling the result, the receipt is `outcome_uncertain`; the host will not blindly replay it. Inspect the resource before choosing a new command ID.
+
+Crew renames (`PATCH /v1/crews/{id}`) and workflow replacements (`PUT /v1/workflows/{id}`) require `If-Match: <revision>` from the resource's `revision` field. Missing revisions return `428`; stale revisions return `412`. The precondition and mutation are serialized at the host. Other mutation routes do not yet offer revision guards.
+
+Resource-route errors use `application/problem+json` with `type`, `title`, `status`, stable `code`, `detail`, `instance`, `retryable`, and `correlationId`. The legacy `/v1/control` and `/ui/api/*` routes retain their earlier error form.
+
+`GET /v1/events?cursor=<cursor>&limit=100` is a bounded, read-only change feed of the host's operator activity, including command receipts and worker state transitions. `limit` is 1–100. Each event has `id` and `sequence`; the response's `nextCursor` resumes after the returned page. Events are in memory and limited to 128 records, so a host restart, an expired cursor, or a different host session returns `409 event_gap` with `snapshotRequired:true` and a new cursor. Refresh the resource snapshot before continuing. This is polling, not a long-lived SSE connection; job and worker resources remain the source of truth.
+
+Still open in Phase 3: correlate delivery/worker/game-server acknowledgements with operations, richer progress and resource-alert events, grant-scoped feeds, and a push stream for consumers that need one. The current host token grants the whole host; fine-grained grants are a later phase.

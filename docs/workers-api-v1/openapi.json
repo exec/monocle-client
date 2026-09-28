@@ -3,7 +3,7 @@
   "info": {
     "title": "Workers API v1 operator draft",
     "version": "0.1.0-draft",
-    "description": "Target resource API for external review, not yet a description of the running host. A subset of route names is available in the experimental Phase 2 operator adapter; see phase2-operator.md for its current payloads and behavior. The existing /v1/status and /v1/control API remains separate."
+    "description": "Target resource API for external review, not yet a description of the running host. A subset is available in the experimental standalone operator adapter; see phase2-operator.md and phase3-operator.md for actual routes and behavior. The existing /v1/status and /v1/control API remains separate."
   },
   "security": [{"bearerAuth": []}],
   "components": {
@@ -50,6 +50,7 @@
     "/v1/workflows/{workflowId}": {"parameters": [{"$ref": "#/components/parameters/workflowId"}], "get": {"operationId": "getWorkflow", "responses": {"200": {"description": "Workflow", "content": {"application/json": {"schema": {"type": "object"}}}}}}, "put": {"operationId": "updateWorkflow", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "Updated workflow", "content": {"application/json": {"schema": {"type": "object"}}}}}}, "delete": {"operationId": "deleteWorkflow", "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
     "/v1/stashes": {"get": {"operationId": "listStashes", "parameters": [{"$ref": "#/components/parameters/cursor"}], "responses": {"200": {"description": "Stash page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}}}},
     "/v1/stashes/{stashId}": {"parameters": [{"$ref": "#/components/parameters/stashId"}], "get": {"operationId": "getStash", "responses": {"200": {"description": "Stash", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
-    "/v1/operations/{operationId}": {"parameters": [{"$ref": "#/components/parameters/operationId"}], "get": {"operationId": "getOperation", "responses": {"200": {"description": "Operation receipt", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Operation"}}}}}}}
+    "/v1/operations/{operationId}": {"parameters": [{"$ref": "#/components/parameters/operationId"}], "get": {"operationId": "getOperation", "responses": {"200": {"description": "Operation receipt", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Operation"}}}}}}},
+    "/v1/events": {"get": {"operationId": "listOperatorEvents", "parameters": [{"name": "cursor", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}], "responses": {"200": {"description": "Bounded event page with nextCursor", "content": {"application/json": {"schema": {"type": "object"}}}}, "409": {"$ref": "#/components/responses/Problem"}}}}
   }
 }

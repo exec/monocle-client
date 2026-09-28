@@ -96,6 +96,8 @@ Command routes make lifecycle transitions explicit and auditable. A future `desi
 
 ## Phase 3 — Reliable controls and operator events
 
+An incremental standalone-host adapter now has durable idempotency receipts, revision-guarded crew/workflow edits, structured resource-route problems, and a bounded resumable polling feed. See [the current Phase 3 behavior and limits](docs/workers-api-v1/phase3-operator.md). Worker/game-server acknowledgement correlation, push delivery, grants, and the exit gate remain open.
+
 ### 3.1 Command semantics
 
 - Require an idempotency key or caller-generated command ID for mutating requests; the same command returns the same result, while reuse with different content fails.

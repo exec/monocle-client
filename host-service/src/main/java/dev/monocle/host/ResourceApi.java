@@ -5,22 +5,41 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
+import dev.monocle.coordinator.TaskFiles;
 import static dev.monocle.coordinator.TaskWire.text;
 
 /** Draft v1 operator resources. All decisions and persistence remain in HostService.control. */
 final class ResourceApi {
     record Reply(int code, JsonObject body) {}
+    static final class Precondition extends RuntimeException {
+        final int status;
+        Precondition(int status, String message) { super(message); this.status = status; }
+    }
     private ResourceApi() {}
     static boolean bodyRequired(String method) { return Set.of("POST", "PUT", "PATCH").contains(method); }
 
-    static Reply route(HostService host, String method, URI uri, JsonObject body) {
+    static Reply route(HostService host, String method, URI uri, JsonObject body, String ifMatch) {
         String path = uri.getPath();
         if (!uri.getRawPath().equals(path) || !path.startsWith("/v1/")) throw new IllegalArgumentException("Encoded resource paths are not supported");
         String[] parts = path.split("/", -1);
         if (parts.length < 3 || parts.length > 7 || !parts[1].equals("v1") || Arrays.stream(parts).skip(2).anyMatch(String::isBlank)) return missing();
         Map<String,String> query = query(uri);
-        JsonObject snapshot = host.control(op("status"));
         String resource = parts[2];
+        if (method.equals("GET")) {
+            if (parts.length == 4 && resource.equals("operations") && query.isEmpty()) {
+                JsonObject operation = host.operatorOperations().get(parts[3]);
+                if (operation == null) return missing();
+                operation.remove("fingerprint");
+                return new Reply(200, operation);
+            }
+            if (parts.length == 3 && resource.equals("events")) {
+                if (query.keySet().stream().anyMatch(key -> !Set.of("cursor", "limit").contains(key))) throw new IllegalArgumentException("Unsupported event filter");
+                int limit = query.containsKey("limit") ? Integer.parseInt(query.get("limit")) : 100;
+                JsonObject feed = host.operatorEvents(query.get("cursor"), limit);
+                return new Reply(feed.has("snapshotRequired") ? 409 : 200, feed);
+            }
+        }
+        JsonObject snapshot = host.control(op("status"));
         if (method.equals("GET")) {
             if (parts.length == 3 && Set.of("host", "health", "capabilities", "configuration-controls").contains(resource)) {
                 if (!query.isEmpty()) throw new IllegalArgumentException("Unexpected query parameter");
@@ -71,14 +90,14 @@ final class ResourceApi {
             JsonObject request=op("worker-forget");request.addProperty("worker",uuid(parts[3]));host.control(request);
             return new Reply(200,receipt(parts[3],"Forgotten"));
         }
-        if (resource.equals("crews")) return crews(host, snapshot, method, parts, body);
+        if (resource.equals("crews")) return crews(host, snapshot, method, parts, body, ifMatch);
         if (resource.equals("jobs")) return jobs(host, snapshot, method, parts, body);
-        if (resource.equals("workflows")) return workflows(host, snapshot, method, parts, body);
+        if (resource.equals("workflows")) return workflows(host, snapshot, method, parts, body, ifMatch);
         if (resource.equals("drafts")) return drafts(host, snapshot, method, parts, body);
         return missing();
     }
 
-    private static Reply crews(HostService host, JsonObject snapshot, String method, String[] parts, JsonObject body) {
+    private static Reply crews(HostService host, JsonObject snapshot, String method, String[] parts, JsonObject body, String ifMatch) {
         if (parts.length == 3 && method.equals("POST")) {
             String id = body.has("id") ? uuid(text(body,"id")) : UUID.randomUUID().toString();
             JsonObject request = withId("crew-create", id); request.addProperty("name", text(body,"name"));
@@ -87,6 +106,7 @@ final class ResourceApi {
         if (parts.length < 4) return missing();
         String internal = crewKey(snapshot, parts[3]);
         if (parts.length == 4 && method.equals("PATCH")) {
+            checkRevision(crew(snapshot, internal), ifMatch);
             JsonObject request=op("crew-rename");request.addProperty("crew",internal);request.addProperty("name",text(body,"name"));
             return new Reply(200,crew(host.control(request),internal));
         }
@@ -154,14 +174,17 @@ final class ResourceApi {
         return missing();
     }
 
-    private static Reply workflows(HostService host, JsonObject snapshot, String method, String[] parts, JsonObject body) {
+    private static Reply workflows(HostService host, JsonObject snapshot, String method, String[] parts, JsonObject body, String ifMatch) {
         if(parts.length==3 && method.equals("POST")) {
             String id=body.has("id")?uuid(text(body,"id")):UUID.randomUUID().toString();
             return new Reply(201,saveWorkflow(host,id,body));
         }
         if(parts.length!=4)return missing();
         String key=workflowKey(snapshot,parts[3]);
-        if(method.equals("PUT"))return new Reply(200,saveWorkflow(host,key,body));
+        if(method.equals("PUT")) {
+            checkRevision(workflow(host.control(withId("workflow-get", key))), ifMatch);
+            return new Reply(200,saveWorkflow(host,key,body));
+        }
         if(method.equals("DELETE")) {host.control(withId("workflow-delete",key));return new Reply(200,receipt(parts[3],"Deleted"));}
         return missing();
     }
@@ -221,6 +244,7 @@ final class ResourceApi {
     private static JsonObject crew(JsonObject snapshot,String internal) {
         JsonObject view=new JsonObject();view.addProperty("id",publicCrew(internal));
         String label=text(snapshot.getAsJsonObject("crewLabels"),internal);view.addProperty("name",label.isBlank()?internal:label);
+        view.addProperty("revision", TaskFiles.hash(internal + "\n" + text(view,"name")));
         JsonArray workers=new JsonArray(),jobs=new JsonArray();
         for(JsonElement value:snapshot.getAsJsonArray("workers"))if(text(value.getAsJsonObject(),"crew").equals(internal))workers.add(value.getAsJsonObject().get("id").deepCopy());
         for(JsonElement value:snapshot.getAsJsonArray("tasks"))if(text(value.getAsJsonObject(),"crew").equals(internal))jobs.add(value.getAsJsonObject().get("id").deepCopy());
@@ -241,7 +265,13 @@ final class ResourceApi {
         return view;
     }
     private static JsonObject workflow(JsonObject source) {
-        JsonObject view=source.deepCopy();view.addProperty("id",publicWorkflow(text(source,"id")));return view;
+        JsonObject view=source.deepCopy();view.addProperty("id",publicWorkflow(text(source,"id")));
+        view.addProperty("revision", TaskFiles.hash(text(source,"id") + "\n" + text(source,"name") + "\n" + text(source,"folder") + "\n" + source.get("package")));
+        return view;
+    }
+    private static void checkRevision(JsonObject current, String ifMatch) {
+        if (ifMatch == null) throw new Precondition(428, "If-Match revision is required");
+        if (!ifMatch.equals(text(current,"revision"))) throw new Precondition(412, "Resource revision changed; refresh before editing");
     }
     private static JsonObject stash(JsonObject source) {
         JsonObject view=source.deepCopy();view.addProperty("id",stable("stash",text(source,"crew")+"\n"+text(source,"scope")+"\n"+text(source,"name")));
