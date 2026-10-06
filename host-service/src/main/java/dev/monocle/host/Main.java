@@ -22,7 +22,7 @@ public final class Main {
             Files.createDirectories(directory);
             JsonObject config = new JsonObject(), crews = new JsonObject();
             config.addProperty("bind", "127.0.0.1"); config.addProperty("workerPort", 6969); config.addProperty("apiPort", 6970); config.addProperty("historyDays", 30);
-            config.addProperty("webPort", 0);
+            config.addProperty("webPort", 0); config.addProperty("interopPort", 0); config.add("interopWorkerTokens", new JsonObject());
             config.addProperty("autoTpy", false);
             config.addProperty("uiOrigin", "");
             config.addProperty("apiToken", secret()); crews.addProperty("Default", secret()); config.add("crews", crews);
@@ -51,13 +51,22 @@ public final class Main {
         }
         Map<String, String> crews = new LinkedHashMap<>(); config.getAsJsonObject("crews").entrySet().forEach(e -> crews.put(e.getKey(), e.getValue().getAsString()));
         int webPort = config.has("webPort") ? HostService.integer(config, "webPort", 0, 65535) : 0;
+        int interopPort = config.has("interopPort") ? HostService.integer(config, "interopPort", 0, 65535) : 0;
+        Map<UUID, String> interopWorkers = new LinkedHashMap<>();
+        if (interopPort != 0) {
+            JsonObject tokens = config.getAsJsonObject("interopWorkerTokens");
+            if (tokens == null) throw new IllegalArgumentException("Set interopWorkerTokens before enabling interopPort");
+            tokens.entrySet().forEach(e -> interopWorkers.put(UUID.fromString(e.getKey()), e.getValue().getAsString()));
+        }
         try (HostService host = new HostService(directory, text(config, "bind"), HostService.integer(config, "workerPort", 1, 65535), crews, HostService.integer(config, "historyDays", -1, 3650), webPort == 0 ? -1 : webPort);
+             PublicWorkerGateway interop = interopPort == 0 ? null : new PublicWorkerGateway(interopPort, interopWorkers, host);
              ControlApi api = new ControlApi(host, apiPort, text(config, "apiToken"), text(config, "uiOrigin"))) {
             CountDownLatch stopped = new CountDownLatch(1);
             Runtime.getRuntime().addShutdownHook(new Thread(() -> { api.close(); host.close(); stopped.countDown(); }, "Monocle host shutdown"));
             System.out.println("Monocle host listening at " + text(config, "bind") + ":" + host.port() + "; local control API 127.0.0.1:" + api.port());
             System.out.println("Operator WebUI: http://127.0.0.1:" + api.port() + "/ui/ (use the API token, not the crew key).");
             if (host.webPort() >= 0) System.out.println("Worker web ingress: ws://127.0.0.1:" + host.webPort() + "/v1/workers; remote workers require an HTTPS reverse proxy.");
+            if (interop != null) System.out.println("Draft public worker API: ws://127.0.0.1:" + interop.getPort() + PublicWorkerGateway.PATH + " (Wait, Travel, and advertised extension actions).");
             System.out.println("Capabilities: " + HostService.ACTIONS + ". Native highways use the shared coordinator; inspect status.highways for worker diagnostics.");
             stopped.await();
         }

@@ -3,10 +3,11 @@ import java.util.zip.ZipFile
 plugins { application }
 group = "dev.monocle"
 version = providers.gradleProperty("mod_version").get()
+tasks.jar { manifest.attributes["Implementation-Version"] = project.version.toString() }
 base { archivesName.set("monocle-host") }
 repositories { mavenCentral() }
 java { toolchain { languageVersion.set(JavaLanguageVersion.of(25)) } }
-dependencies { implementation(project(":coordinator-core")) }
+dependencies { implementation(project(":coordinator-core")); implementation("org.java-websocket:Java-WebSocket:1.6.0") }
 tasks.processResources {
     from(rootProject.file("src/main/resources/assets/monocle-client/fonts")) {
         include("GlacialIndifference-Regular.otf", "GlacialIndifference-OFL.txt", "GlacialIndifference-NOTICE.txt")
@@ -21,6 +22,7 @@ distributions { main { distributionBaseName.set("monocle-host"); contents {
     from("README.md"); from(rootProject.file("LICENSE"))
     from(rootProject.file("docs/bot-web-transport.md"))
     from(rootProject.file("docs/bot-webui.md"))
+    from(rootProject.file("docs/workers-api-v1/phase4-worker.md"))
     from(rootProject.file("licenses/Java-WebSocket-MIT.txt")) { into("licenses") }
 } } }
 val hostServiceCheck = tasks.register<JavaExec>("hostServiceCheck") {

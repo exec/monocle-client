@@ -38,7 +38,7 @@ public final class StashManagerScreen extends dev.monocle.client.gui.tabs.Window
         WContainer body=add(WorkspaceLayout.stacked(contentWidth,650)?theme.verticalList():theme.horizontalList()).expandX().widget();
         WVerticalList setup=body.add(theme.verticalList()).top().minWidth(WorkspaceLayout.stacked(contentWidth,650)?contentWidth:310).widget();
         setup.add(theme.horizontalSeparator("Definition & route")).expandX();
-        setup.add(theme.label("A /home name is required. Select the storage cuboid, validate it, then scan. Save and scan records this worker's route before opening any container.",300).color(theme.textSecondaryColor()));
+        setup.add(theme.label("A /home name is required. Save a cuboid without scanning, or choose Column Map to identify the bottom chest of each column. Upper contents are assumed, never counted as verified stock.",300).color(theme.textSecondaryColor()));
         setup.add(theme.settings(manager.settings)).expandX();
         setup.add(theme.horizontalSeparator("Workflow")).expandX();
         setup.add(theme.label("Scan now automatically validates and saves first. Host jobs substitute each selected worker's own saved /home route.",300));
@@ -46,7 +46,7 @@ public final class StashManagerScreen extends dev.monocle.client.gui.tabs.Window
         add(theme.horizontalSeparator()).expandX();
         WContainer footer=add(WorkspaceLayout.stacked(contentWidth,520)?theme.verticalList():theme.horizontalList()).expandX().widget();
         footer.add(theme.button("Refresh catalog")).widget().action=this::rebuild;
-        footer.add(theme.label("Observed is authoritative · inferred is estimated · unscanned is unknown")).expandCellX().right().widget().color(theme.textSecondaryColor());
+        footer.add(theme.label("Observed stock is authoritative · column identities are assumptions · unscanned quantities are unknown")).expandCellX().right().widget().color(theme.textSecondaryColor());
     }
     private void run(Runnable action){try{action.run();rebuild();status.set(manager.status());status.color(theme.textColor());}catch(RuntimeException e){status.set(e.getMessage()==null?"The stash action failed.":e.getMessage());status.color(new Color(230,95,90));}}
     private void rebuild(){
@@ -63,6 +63,15 @@ public final class StashManagerScreen extends dev.monocle.client.gui.tabs.Window
         WHorizontalList health=card.add(theme.horizontalList()).expandX().widget();health.add(theme.label(number(s,"observed")+" observed").color(new Color(100,220,145)));health.add(theme.label(number(s,"inferred")+" inferred").color(new Color(220,183,90)));health.add(theme.label(number(s,"unscanned")+" unscanned").color(number(s,"unscanned")>0?new Color(230,95,90):theme.textSecondaryColor()));
         if(s.has("homes")){WSection routes=card.add(theme.section("Worker routes",false)).expandX().widget();for(var route:s.getAsJsonObject("homes").entrySet()){JsonObject h=route.getValue().getAsJsonObject();routes.add(theme.label(shortId(route.getKey())+"  /home "+text(h,"name")+"  ·  "+number(h,"warmupTicks")/20+"s warmup  ·  "+number(h,"cooldownTicks")/1200+"m cooldown",380));}}
         JsonObject items=s.has("items")?s.getAsJsonObject("items"):new JsonObject();items.entrySet().stream().sorted((a,b2)->Long.compare(b2.getValue().getAsLong(),a.getValue().getAsLong())).limit(6).forEach(e->{var item=BuiltInRegistries.ITEM.getValue(Identifier.parse(e.getKey()));WHorizontalList line=card.add(theme.horizontalList()).expandX().widget();if(item!=null)line.add(theme.item(new ItemStack(item)));line.add(theme.label(e.getKey().replace("minecraft:","")+"  ×  "+format(e.getValue().getAsLong()))).expandCellX();});
+        if(s.has("columns")&&!s.getAsJsonObject("columns").isEmpty()){
+            JsonObject columns=s.getAsJsonObject("columns");WSection mapped=card.add(theme.section(columns.size()+" mapped columns · upper quantities unknown",false)).expandX().widget();
+            columns.entrySet().stream().limit(32).forEach(entry->{JsonObject column=entry.getValue().getAsJsonObject(),contents=column.getAsJsonObject("items");String dominant=contents.entrySet().stream().max(Comparator.comparingLong(e->e.getValue().getAsLong())).map(Map.Entry::getKey).orElse("unknown");mapped.add(theme.label(entry.getKey()+" · assumed "+dominant.replace("minecraft:",""),370));});
+        }
+        if(s.has("kitCounts"))for(var entry:s.getAsJsonObject("kitCounts").entrySet()){
+            JsonObject kit=s.getAsJsonObject("kitTypes").getAsJsonObject(entry.getKey()),counts=entry.getValue().getAsJsonObject();
+            card.add(theme.label((text(kit,"name").isBlank()?"Unnamed kit":text(kit,"name"))+" · "+text(kit,"item").replace("minecraft:","")+" · observed "+number(counts,"complete")+" complete / "+number(counts,"incomplete")+" incomplete · "+entry.getKey().substring(0,8),390));
+            card.add(theme.button("Copy Shulker Type ID")).widget().action=()->mc.keyboardHandler.setClipboard(entry.getKey());
+        }
         if(s.has("updatedAt"))card.add(theme.label("Updated "+Instant.ofEpochMilli(s.get("updatedAt").getAsLong()).atZone(ZoneId.systemDefault()).toLocalDateTime(),390).color(theme.textSecondaryColor()));
         WContainer edit=card.add(WorkspaceLayout.stacked(contentWidth,460)?theme.verticalList():theme.horizontalList()).expandX().widget();edit.add(theme.button("Edit definition")).expandX().widget().action=()->{manager.editDefinition(s,false);mc.gui.setScreen(new StashManagerScreen(theme,manager));};edit.add(theme.button("Reselect corners")).expandX().widget().action=()->manager.editDefinition(s,true);
     }

@@ -18,7 +18,7 @@
       <form id="login-form">
         <label for="token">Host API token</label>
         <input id="token" type="password" autocomplete="off" spellcheck="false" required minlength="32" maxlength="128" placeholder="Paste your host's API token">
-        <p class="hint">Full operator access. Use the API token from host-config.json, not a worker's crew key. Kept in this tab only.</p>
+        <p class="hint">Full operator access. Use the API token from host-config.json, not a worker's crew key. Remembered in this tab across reloads; Disconnect console clears it.</p>
         <button class="primary" type="submit">Enter control room <span aria-hidden="true">↗</span></button>
         <p id="login-error" class="error" role="alert"></p>
       </form>
@@ -48,7 +48,7 @@
       <div class="page-heading"><div><p class="eyebrow" id="page-kicker">THE BIG PICTURE</p><h1 id="page-title">Operations overview</h1><p id="page-subtitle" class="muted">A live pulse on your workers and the work ahead.</p></div><span id="updated" class="muted small-text">Waiting for host</span></div>
       <section id="metrics" class="metrics" aria-label="Host metrics"></section>
       <section id="content" aria-label="Operations content"></section>
-      <footer class="page-footer"><span>Monocle · a transparent Meteor fork</span><span>Full host control · token held in memory only</span></footer>
+      <footer class="page-footer"><span>Monocle · a transparent Meteor fork</span><span>Full host control · token stored for this tab only</span></footer>
     </main>
   </div>
   <dialog id="inspect-dialog" class="inspect-dialog">
@@ -62,7 +62,16 @@
         <div class="form-grid"><div><label for="job-name">Job name</label><input id="job-name" required maxlength="48" value="Highway job"></div><div><label for="job-crew">Crew</label><select id="job-crew" required></select></div></div>
         <label for="job-kind">Workflow source</label><select id="job-kind"><option value="highway">6b6t Highway Builder</option><option value="preset">Saved job preset</option><option value="package">Exported workflow package</option><option value="stash">Inspect stash · Experimental</option><option value="wait">Wait (connection test)</option><option value="lua">Custom Lua workflow</option></select>
         <div id="preset-field" hidden><label for="job-preset">Preset</label><select id="job-preset"></select><p class="hint">Built-in or customized host snapshot. Inspect and edit defaults under Presets.</p></div>
-        <div id="follow-field" hidden><label for="follow-leader">Subject (not assigned this job)</label><select id="follow-leader"></select><label for="follow-radius">Formation spacing</label><input id="follow-radius" type="number" min="1" max="8" step="1" value="3"><p class="hint">Workers track the subject's live model. Bodyguards walk or fly in formation and use the combat profile; Follow stays non-combat. Runs until cancelled.</p></div>
+        <div id="follow-field" hidden><label for="follow-leader">Subject (not assigned this job)</label><select id="follow-leader"></select><label for="follow-radius">Formation spacing</label><input id="follow-radius" type="number" min="1" max="8" step="1" value="3"><div id="crystal-target-field" hidden><label for="crystal-targets">Crystal targets (comma-separated usernames; blank = all non-friends)</label><input id="crystal-targets" type="text" maxlength="270" placeholder="All non-friends except subject and crew"></div><p class="hint">Workers track the subject's live model. Crystal Guard arms survival modules, auto-accepts its TPA, and uses Crystal Aura. Follow stays non-combat. Runs until cancelled.</p></div>
+        <div id="kit-field" hidden>
+          <div class="form-grid"><div><label for="kit-source">Source stash</label><select id="kit-source"></select></div><div><label for="kit-type">Shulker type</label><select id="kit-type"></select></div></div>
+          <div class="form-grid"><div><label id="kit-count-label" for="kit-count">Boxes</label><input id="kit-count" type="number" min="1" max="36" step="1" value="1"></div><div><label for="kit-destination">Destination</label><select id="kit-destination"><option>Player</option><option>Ender Chest</option><option>Stash</option><option>Carry</option></select></div></div>
+          <label><input id="kit-all" type="checkbox"> Transfer all to stash (full non-lazy source scan required)</label>
+          <label><input id="kit-include-incomplete" type="checkbox"> Include incomplete kits of this type</label>
+          <div id="kit-recipient-field"><label for="kit-recipient-worker">Known crew member</label><select id="kit-recipient-worker"><option value="">Enter another player manually</option></select><div class="form-grid"><div><label for="kit-recipient-name">Player username</label><input id="kit-recipient-name" maxlength="16" autocomplete="off"></div><div><label for="kit-recipient-id">Player UUID</label><input id="kit-recipient-id" maxlength="36" autocomplete="off"></div></div></div>
+          <div id="kit-target-field" hidden><label for="kit-target">Destination stash</label><select id="kit-target"></select></div>
+          <p id="kit-hint" class="hint">Choose one worker. Kit counts are observed stock only; unscanned upper chests are not guaranteed.</p>
+        </div>
         <div id="highway-field">
           <div class="form-grid"><div><label for="highway-direction">Direction</label><select id="highway-direction"><option>North</option><option>East</option><option>South</option><option>West</option></select></div><div><label for="highway-length">Length</label><input id="highway-length" type="number" min="16" max="100000" step="1" required value="10000"></div></div>
           <div class="form-grid"><div><label for="highway-x">Start X</label><input id="highway-x" type="number" min="-29900000" max="29900000" step="1" required></div><div><label for="highway-y">Start Y</label><input id="highway-y" type="number" min="-2048" max="2048" step="1" required></div><div><label for="highway-z">Start Z</label><input id="highway-z" type="number" min="-29900000" max="29900000" step="1" required></div></div>

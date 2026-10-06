@@ -3,6 +3,7 @@ package dev.monocle.host;
 import com.sun.net.httpserver.*;
 import java.io.*;
 import java.net.URI;
+import java.time.Instant;
 import java.util.*;
 
 /** Bundled same-origin operator UI. No cookie auth, remote bind or caller-selected files. */
@@ -52,9 +53,19 @@ final class WebUi {
         String authority = exchange.getRequestHeaders().getFirst("Host");
         String origin = exchange.getRequestHeaders().getFirst("Origin");
         String site = exchange.getRequestHeaders().getFirst("Sec-Fetch-Site");
-        return authority != null && authorities.contains(authority.toLowerCase(Locale.ROOT))
-            && (site == null || site.equals("same-origin") || site.equals("none"))
-            && (origin == null ? !mutation : origins.contains(origin) && URI.create(origin).getRawAuthority().equalsIgnoreCase(authority));
+        String reason = authority == null || !authorities.contains(authority.toLowerCase(Locale.ROOT)) ? "unrecognized Host"
+            : site != null && !site.equals("same-origin") && !site.equals("none") ? "cross-site fetch"
+            : origin == null && mutation ? "missing Origin on mutation"
+            : origin != null && !origins.contains(origin) ? "unrecognized Origin"
+            : origin != null && !URI.create(origin).getRawAuthority().equalsIgnoreCase(authority) ? "Origin/Host mismatch" : null;
+        if (reason == null) return true;
+        System.err.printf("[WebUI] %s rejected %s %s: %s (Host=%s, Origin=%s, Sec-Fetch-Site=%s)%n",
+            Instant.now(), safe(exchange.getRequestMethod()), safe(exchange.getRequestURI().getPath()), reason,
+            safe(authority), safe(origin), safe(site));
+        return false;
+    }
+    private static String safe(String value) {
+        return value == null ? "<missing>" : value.substring(0, Math.min(value.length(), 160)).replaceAll("\\p{Cntrl}", "?");
     }
     static void headers(HttpExchange exchange) {
         var headers = exchange.getResponseHeaders();

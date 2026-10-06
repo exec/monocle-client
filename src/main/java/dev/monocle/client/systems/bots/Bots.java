@@ -7,6 +7,7 @@ package dev.monocle.client.systems.bots;
 
 import com.google.gson.JsonObject;
 import dev.monocle.coordinator.HighwayJobs;
+import dev.monocle.coordinator.RwpWorkerConnection;
 import dev.monocle.client.MonocleClient;
 import dev.monocle.client.systems.Systems;
 import dev.monocle.client.systems.modules.misc.swarm.*;
@@ -32,7 +33,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public final Settings settings = new Settings();
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     public final Setting<String> crewKey = sgGeneral.add(new StringSetting.Builder().name("crew-key")
-        .description("Shared private Workers key, 24+ characters. Paste the same key on trusted workers. TCP LAN traffic is not encrypted; wss:// encrypts all traffic.")
+        .description("Private crew key, or the individual worker token for draft RWP Wait/Travel jobs. TCP LAN traffic is not encrypted; wss:// encrypts all traffic.")
         .defaultValue("").build());
     public final Setting<String> bindAddress = sgGeneral.add(new StringSetting.Builder().name("bind-address")
         .description("Host listener: loopback by default; use this computer's specific LAN IP for other machines.")
@@ -58,7 +59,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     public final Setting<String> ipAddress = sgGeneral.add(new StringSetting.Builder()
         .name("ip")
-        .description("LAN host address, or wss://HOST[:PORT]/v1/workers. A web URL includes its own port; the TCP port setting is ignored.")
+        .description("LAN host address, wss://HOST[:PORT]/v1/workers, or draft RWP /v1/interop/workers for Wait/Travel jobs. A URL includes its own port.")
         .defaultValue("localhost")
         .visible(() -> mode.get() == Mode.Worker)
         .build()
@@ -75,6 +76,9 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     public SwarmHost host;
     public SwarmWorker worker;
+    private RwpWorkerConnection rwpWorker;
+    private BotActions rwpTravel;
+    private String rwpTravelId;
     private final dev.monocle.coordinator.BotChat chat = new dev.monocle.coordinator.BotChat();
     public com.google.gson.JsonArray chatFeed() { return chat.json(); }
     public final Setting<Integer> webPort = sgGeneral.add(new IntSetting.Builder().name("web-port")
@@ -417,12 +421,12 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             JsonObject m=new JsonObject();m.addProperty("type","manage-chat");m.addProperty("id",UUID.randomUUID().toString());m.addProperty("text",text);m.addProperty("scope",worldScope());c.send(m.toString()); }
     }
     private void reportChat(String direction,String text) {
-        if(!active||mode.get()!=Mode.Worker||worker==null||!worker.connected())return;
+        if(!active||!isWorker())return;
         JsonObject m=new JsonObject();m.addProperty("type","worker-chat");m.addProperty("direction",direction);m.addProperty("text",text.substring(0,Math.min(text.length(),2048)));worker.send(m.toString());
     }
     @EventHandler
     private void onChat(dev.monocle.client.events.game.ReceiveMessageEvent event) {
-        if(!active||mode.get()!=Mode.Worker||worker==null||!worker.connected())return;
+        if(!active||!isWorker())return;
         String plain=event.getMessage().getString();
         if(plain.length()>2048) {reportChat("received",plain);return;}
         var parts=new com.google.gson.JsonArray();
@@ -876,6 +880,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     public void close() {
         hostAutoTpy = false;
+        clearRwpTravel();
         tasks.disconnected();
         if (mode.get() == Mode.Host) try { syncJobs(); if (catalogDirty) { catalog.save(); catalogDirty = false; } }
         catch (RuntimeException e) { MonocleClient.LOG.error("Could not checkpoint Workers jobs while closing", e); }
@@ -891,6 +896,10 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
                 worker = null;
             }
         } catch (Exception _) {
+        }
+        if (rwpWorker != null) {
+            rwpWorker.close();
+            rwpWorker = null;
         }
         workerWasConnected = false;
         retryAt = 0;
@@ -916,7 +925,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     }
 
     public boolean isWorker() {
-        return mode.get() == Mode.Worker && worker != null && worker.connected();
+        return mode.get() == Mode.Worker && workerWasConnected && worker != null && worker.connected();
     }
 
     @EventHandler
@@ -935,7 +944,36 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         } else tickCrew(crew);
         try { tasks.tick(); }
         catch (RuntimeException e) { tasks.disconnected(); reportConnectionFailure("Task execution stopped: " + e.getMessage()); }
+        if (rwpWorker != null) rwpWorker.gameTick();
+        tickRwpTravel();
         if (isWorker() && dev.monocle.client.utils.Utils.canUpdate()) worker.tick();
+    }
+    private void tickRwpTravel() {
+        JsonObject run = rwpWorker == null ? null : rwpWorker.activeTravel();
+        if (run == null || !Utils.canUpdate() || tasks.workerBusy()) { clearRwpTravel(); return; }
+        String id = run.get("executionId").getAsString() + ":" + run.get("generation").getAsInt();
+        try {
+            if (!id.equals(rwpTravelId)) {
+                clearRwpTravel();
+                JsonObject action = run.getAsJsonObject("action").getAsJsonObject("arguments").deepCopy();
+                action.remove("scope"); action.addProperty("type", "Travel");
+                action.addProperty("dimension", run.getAsJsonObject("scope").get("dimension").getAsString());
+                rwpTravel = new BotActions(this); rwpTravel.start(action); rwpTravelId = id;
+            }
+            JsonObject status = rwpTravel.tick();
+            if (status.get("state").getAsString().equals("Running")) rwpWorker.reportTravelProgress(status.get("detail").getAsString());
+            switch (status.get("state").getAsString()) {
+                case "Complete" -> { rwpWorker.completeTravel(rwpObservation()); clearRwpTravel(); }
+                case "Failed" -> { rwpWorker.failTravel(); clearRwpTravel(); }
+            }
+        } catch (RuntimeException error) {
+            if (rwpWorker != null) rwpWorker.failTravel();
+            clearRwpTravel(); reportConnectionFailure("RWP Travel stopped: " + error.getMessage());
+        }
+    }
+    private void clearRwpTravel() {
+        if (rwpTravel != null) { rwpTravel.stop(); rwpTravel = null; }
+        rwpTravelId = null;
     }
     private void tickCrew(SwarmCrew coordinator) {
         try { coordinator.tick(); }
@@ -971,6 +1009,17 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     private ConnectionConfig currentConfig() { return new ConnectionConfig(mode.get(), ipAddress.get().trim(), serverPort.get(), crewKey.get(), bindAddress.get().trim(), webPort.get()); }
     private String workerEndpoint() { return ipAddress.get().contains("://") ? ipAddress.get() : ipAddress.get() + ":" + serverPort.get(); }
+    private JsonObject rwpObservation() {
+        String world = worldScope();
+        JsonObject scope = new JsonObject(), position = new JsonObject(), observation = new JsonObject();
+        scope.addProperty("server", world.substring(0, world.indexOf('\n')));
+        scope.addProperty("dimension", world.substring(world.indexOf('\n') + 1));
+        position.addProperty("x", mc.player.getX()); position.addProperty("y", mc.player.getY()); position.addProperty("z", mc.player.getZ());
+        observation.addProperty("observedAt", java.time.Instant.now().toString());
+        observation.addProperty("name", mc.player.getName().getString());
+        observation.add("scope", scope); observation.add("position", position);
+        return observation;
+    }
     public static int retrySeconds(int failedAttempts) { return Math.min(10, 1 << Math.clamp(failedAttempts - 1, 0, 4)); }
 
     private void tickConnection() {
@@ -997,8 +1046,40 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             reportConnectionFailure(connectionDetail);
             return;
         }
+        if (RwpWorkerConnection.isEndpoint(config.ip())) {
+            if (!Utils.canUpdate()) { connectionDetail = "Join a world before connecting as an RWP worker"; return; }
+            if (rwpWorker != null && rwpWorker.connected()) {
+                if (!workerWasConnected) info("RWP worker connected to %s", workerEndpoint());
+                workerWasConnected = true; attempts = 0; connectionDetail = "RWP connected · " + rwpWorker.hostImplementation() + " · " + rwpWorker.work();
+                rwpWorker.poll(this::rwpObservation);
+                return;
+            }
+            if (rwpWorker != null && rwpWorker.active()) {
+                rwpWorker.poll(this::rwpObservation);
+                connectionDetail = "RWP connecting / reconciling";
+                return;
+            }
+            if (rwpWorker != null) {
+                connectionDetail = rwpWorker.failure().isEmpty() ? "RWP connection lost" : rwpWorker.failure();
+                reportConnectionFailure(connectionDetail);
+                rwpWorker.close(); rwpWorker = null; workerWasConnected = false;
+                retryAt = now + retrySeconds(Math.max(1, attempts)) * 1_000_000_000L;
+            }
+            if (now < retryAt) return;
+            attempts = Math.min(100, attempts + 1);
+            try { rwpWorker = new RwpWorkerConnection(config.ip(), mc.getUser().getProfileId(), config.key(), MonocleClient.FOLDER.toPath().resolve("rwp-execution.json"), MonocleClient.VERSION.toString()); rwpWorker.connect(); }
+            catch (RuntimeException e) {
+                connectionDetail = e.getMessage(); reportConnectionFailure(connectionDetail);
+                retryAt = now + retrySeconds(attempts) * 1_000_000_000L;
+            }
+            return;
+        }
         if (worker != null && worker.connected()) {
-            if (!workerWasConnected) info("Connected to Workers host at %s", workerEndpoint());
+            if (!workerWasConnected) {
+                crew.announce(); // Identity must be the first application message on every authenticated session.
+                workerWasConnected = true;
+                info("Connected to Workers host at %s", workerEndpoint());
+            }
             workerWasConnected = true; attempts = 0;
             connectionDetail = crew.assigned()
                 ? crew.canResume() ? "Authenticated; crew assigned" : "Authenticated; interrupted crew job requires inspection"
@@ -1035,6 +1116,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         if (!isActive()) return "Workers disabled";
         if (mode.get() == Mode.Host) return isHost() ? "Host listening · " + host.getConnectionCount() + " authenticated worker(s)" : "Host stopped";
         String endpoint = workerEndpoint();
+        if (rwpWorker != null && rwpWorker.connected()) return "RWP connected · " + rwpWorker.hostImplementation() + " · " + endpoint + " · " + rwpWorker.work();
+        if (RwpWorkerConnection.isEndpoint(ipAddress.get())) return connectionDetail + " · " + endpoint;
         if (isWorker()) return "Connected · " + endpoint;
         if (crewKey.get().length() < 24) return "Worker needs host key · " + endpoint;
         if (worker != null && worker.isAlive()) return "Connecting / authenticating · " + endpoint;

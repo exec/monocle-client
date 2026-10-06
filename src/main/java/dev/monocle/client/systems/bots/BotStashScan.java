@@ -4,16 +4,22 @@ import com.google.gson.*;
 import dev.monocle.client.MonocleClient;
 import dev.monocle.client.events.packets.InventoryEvent;
 import dev.monocle.client.systems.modules.misc.swarm.CrewInventory;
+import dev.monocle.client.utils.world.BlockUtils;
 import dev.monocle.coordinator.StashCatalog;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.entity.BaseContainerBlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.EnderChestBlockEntity;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.state.properties.ChestType;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.phys.*;
 import java.util.*;
 import static dev.monocle.client.MonocleClient.mc;
@@ -22,23 +28,26 @@ import static dev.monocle.client.MonocleClient.mc;
 public final class BotStashScan {
     public static final String WORKFLOW="task-stash-scan";
     private final JsonObject plan;
-    private int cursor,discovered,observed,inferred,unscanned,waitTicks,attempts,menu=-1,beforeMenu=-1,delivery=1;
+    private int cursor,discovered,observed,inferred,unscanned,waitTicks,openTicks,attempts,menu=-1,beforeMenu=-1,delivery=1;
     private final Set<Long> missingChunks=new HashSet<>();
     private BlockPos target,stance;
     private JsonObject pending;
     private List<ItemStack> captured;
     private int closeTicks;
+    private boolean openedAny;
     private JsonObject bottomTemplate,topTemplate,lazyTemplate;
     private boolean bottomUniform=true,topUniform=true;
     private String phase="Discovering",reason="Looking for containers",lastAction="Scan started";
     private long lastProgress=System.currentTimeMillis();
+    private double approachBest=Double.POSITIVE_INFINITY;
     private String scope="";
     private static String currentScope(){return mc.level==null?"":(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();}
-    private int previousSlot=-1,selectedSlot=-1,previousMissing;
+    private int previousMissing;
     public BotStashScan(JsonObject source){plan=StashCatalog.plan(source);}
-    private int volume(){return (plan.get("maxX").getAsInt()-plan.get("minX").getAsInt()+1)*(plan.get("maxY").getAsInt()-plan.get("minY").getAsInt()+1)*(plan.get("maxZ").getAsInt()-plan.get("minZ").getAsInt()+1);}
+    private boolean columnMap(){return plan.get("scanMode").getAsString().equals("Column Map");}
+    private int volume(){return (plan.get("maxX").getAsInt()-plan.get("minX").getAsInt()+1)*(columnMap()?1:plan.get("maxY").getAsInt()-plan.get("minY").getAsInt()+1)*(plan.get("maxZ").getAsInt()-plan.get("minZ").getAsInt()+1);}
     static int layerY(int layer,int layers){return layer==0?0:layer==1?layers-1:layers-layer;}
-    private BlockPos cell(int i){int w=plan.get("maxX").getAsInt()-plan.get("minX").getAsInt()+1,d=plan.get("maxZ").getAsInt()-plan.get("minZ").getAsInt()+1,layers=plan.get("maxY").getAsInt()-plan.get("minY").getAsInt()+1,layer=i/w/d;return new BlockPos(plan.get("minX").getAsInt()+i%w,plan.get("minY").getAsInt()+layerY(layer,layers),plan.get("minZ").getAsInt()+i/w%d);}
+    private BlockPos cell(int i){int w=plan.get("maxX").getAsInt()-plan.get("minX").getAsInt()+1,d=plan.get("maxZ").getAsInt()-plan.get("minZ").getAsInt()+1,layers=plan.get("maxY").getAsInt()-plan.get("minY").getAsInt()+1,layer=i/w/d;return new BlockPos(plan.get("minX").getAsInt()+i%w,plan.get("minY").getAsInt()+(columnMap()?0:layerY(layer,layers)),plan.get("minZ").getAsInt()+i/w%d);}
     private boolean loaded(BlockPos p){return mc.level.getChunkSource().hasChunk(p.getX()>>4,p.getZ()>>4);}
     static boolean includeContainer(boolean lazyMode,boolean hopper){return !lazyMode||!hopper;}
     public boolean done(){return cursor>=volume()&&target==null&&pending==null;}
@@ -47,7 +56,10 @@ public final class BotStashScan {
     public boolean approaching(){return phase.equals("Approaching")&&target!=null;}
     public boolean targetIsHopper(){return target!=null&&mc.level.getBlockEntity(target) instanceof HopperBlockEntity;}
     public BlockPos navigationTarget(){
-        if(!targetIsHopper())return target;
+        return navigationTarget(target);
+    }
+    static BlockPos navigationTarget(BlockPos target){
+        if(!(mc.level.getBlockEntity(target) instanceof HopperBlockEntity))return target;
         List<BlockPos> perches=new ArrayList<>();
         for(var direction:net.minecraft.core.Direction.Plane.HORIZONTAL){BlockPos chest=target.relative(direction);if(mc.level.getBlockState(chest).getBlock() instanceof ChestBlock&&mc.level.getBlockState(chest.above()).isAir()&&mc.level.getBlockState(chest.above(2)).isAir())perches.add(chest.above());}
         if(mc.level.getBlockState(target.below()).getBlock() instanceof ChestBlock&&mc.level.getBlockState(target.above()).isAir()&&mc.level.getBlockState(target.above(2)).isAir())perches.add(target.above());
@@ -55,6 +67,8 @@ public final class BotStashScan {
     }
     public boolean hasHopperPerch(){return targetIsHopper()&&!navigationTarget().equals(target);}
     public boolean suppressScreen(){return target!=null&&beforeMenu>=0&&pending==null;}
+    static boolean shouldCloseHiddenMenu(int current,int inventory,boolean opened,boolean visibleContainer){return opened&&current!=inventory&&!visibleContainer;}
+    private boolean hiddenScanMenu(){return mc.player!=null&&shouldCloseHiddenMenu(mc.player.containerMenu.containerId,mc.player.inventoryMenu.containerId,openedAny,mc.gui.screen() instanceof AbstractContainerScreen<?>);}
     public String detail(){return phase+": "+reason+" · "+observed+" observed, "+unscanned+" unscanned";}
     private void progress(String action){lastAction=action;lastProgress=System.currentTimeMillis();}
     public void tick(){
@@ -62,6 +76,7 @@ public final class BotStashScan {
         if(!scope.equals(currentScope()))throw new IllegalStateException("Stash scan belongs to another world");
         if(pending!=null){phase="Awaiting host save";reason="Observation "+delivery+" awaiting durable acknowledgement";return;}
         if(captured!=null){phase="Confirming";reason="Allowing the server menu to settle";if(++closeTicks>=2){List<ItemStack> items=captured;captured=null;finish(items,"");}return;}
+        if(beforeMenu<0&&hiddenScanMenu()){mc.player.closeContainer();phase="Closing";reason="Closing a delayed scan menu before the next container";return;}
         if(target==null){
             phase="Discovering";reason="Looking for containers";
             for(int budget=0;budget<512&&cursor<volume();budget++){
@@ -75,32 +90,52 @@ public final class BotStashScan {
                 }
                 if(!StashCatalog.owns(plan,p.getX(),p.getY(),p.getZ()))continue;
                 if(++discovered>4096)throw new IllegalStateException("Scan exceeded 4096 containers");
-                target=p;stance=null;waitTicks=attempts=0;menu=beforeMenu=-1;progress("Found container at "+p.toShortString());break;
+                target=p;stance=null;waitTicks=openTicks=attempts=0;menu=beforeMenu=-1;approachBest=Double.POSITIVE_INFINITY;progress("Found container at "+p.toShortString());break;
             }
-            if(target==null){if(cursor>=volume()){phase="Complete";reason=unscanned==0&&previousMissing+missingChunks.size()==0?"Every discovered container observed":"Scan finished with gaps; inspect unscanned containers and missing chunks";}return;}
+            if(target==null){if(cursor>=volume()){phase="Complete";reason=unscanned==0&&previousMissing+missingChunks.size()==0?(columnMap()?"Bottom layer mapped; upper columns are assumed, not counted":"Every discovered container observed"):"Scan finished with gaps; inspect unscanned containers and missing chunks";}return;}
         }
         if(infer()){return;}
-        if(++waitTicks>200){finish(null,"No reachable opening or server contents within ten seconds");return;}
+        if(waitingExpired()){finish(null,"No useful progress toward a reachable opening or no server contents within ten seconds");return;}
         if(!loaded(target)){phase="Waiting for chunks";reason="Container chunk is not received";return;}
         if(!(mc.level.getBlockEntity(target) instanceof BaseContainerBlockEntity)){finish(null,"Container disappeared or changed");return;}
         if(mc.player.containerMenu!=mc.player.inventoryMenu){if(beforeMenu>=0)menu=mc.player.containerMenu.containerId;phase="Reading";reason=menu>=0?"Waiting for server-confirmed container contents":"Waiting for another inventory screen to close";return;}
-        if(mc.player.getEyePosition().distanceToSqr(Vec3.atCenterOf(target))>4.5*4.5){
+        if(mc.player.getEyePosition().distanceToSqr(Vec3.atCenterOf(target))>4.5*4.5||!targetIsHopper()&&!visibleFrom(mc.player.getEyePosition(),target)){
             stance=target;
-            phase="Approaching";reason="Baritone finding a read-only route to "+target.toShortString();return;
+            phase="Approaching";reason="Finding a read-only route to "+target.toShortString();return;
         }
         stance=null;phase="Opening";reason="Requesting container contents";
-        if(waitTicks%40==1&&attempts++<3){
-            int safe=-1;
-            for(int i=0;i<9;i++){ItemStack held=mc.player.getInventory().getItem(i);if(held.isEmpty()||held.is(net.minecraft.tags.ItemTags.PICKAXES)){safe=i;break;}}
-            if(safe<0){finish(null,"Keep a pickaxe or empty slot in the hotbar to open containers without placing held blocks");return;}
-            if(previousSlot<0)previousSlot=mc.player.getInventory().getSelectedSlot();selectedSlot=safe;
-            mc.player.getInventory().setSelectedSlot(safe);
-            beforeMenu=mc.player.inventoryMenu.containerId;
-            mc.gameMode.useItemOn(mc.player,InteractionHand.MAIN_HAND,new BlockHitResult(Vec3.atCenterOf(target),net.minecraft.core.Direction.UP,target,false));
+        if(++openTicks%20==1&&attempts++<6){
+            beforeMenu=mc.player.inventoryMenu.containerId;openedAny=true;
+            openContainer(target);
             progress("Requested opening at "+target.toShortString());
         }
     }
-    public void moved(){waitTicks=0;progress("Approaching container");}
+    static boolean containerTarget(BlockEntity entity){return entity instanceof BaseContainerBlockEntity||entity instanceof EnderChestBlockEntity;}
+    static void openContainer(BlockPos target){
+        // Containers consume a normal, non-sneaking click before the held item's placement logic.
+        // Do not click a replaced/missing container, where a held kit could instead be placed.
+        if(!containerTarget(mc.level.getBlockEntity(target)))throw new IllegalStateException("Stash container disappeared before opening; no held item was placed");
+        BlockUtils.interact(openingHit(mc.player.getEyePosition(),target),InteractionHand.MAIN_HAND,false);
+    }
+    static BlockHitResult openingHit(Vec3 eye,BlockPos target){
+        Vec3 center=Vec3.atCenterOf(target),delta=eye.subtract(center);
+        Direction face=Math.abs(delta.x)>=Math.abs(delta.z)&&Math.abs(delta.x)>.75?delta.x>0?Direction.EAST:Direction.WEST
+            :Math.abs(delta.z)>.75?delta.z>0?Direction.SOUTH:Direction.NORTH:delta.y>0?Direction.UP:Direction.DOWN;
+        return new BlockHitResult(center.add(face.getStepX()*.5,face.getStepY()*.5,face.getStepZ()*.5),face,target,false);
+    }
+    static boolean visibleFrom(Vec3 eye,BlockPos target){
+        return mc.level.clip(new ClipContext(eye,Vec3.atCenterOf(target),ClipContext.Block.OUTLINE,ClipContext.Fluid.NONE,mc.player)).getBlockPos().equals(target);
+    }
+    boolean waitingExpired(){return ++waitTicks>200;}
+    /** Only a new closest approach resets the watchdog; oscillation and motion away do not count. */
+    public boolean approachProgress(Vec3 eye){
+        if(target==null||pending!=null||beforeMenu>=0||captured!=null)return false;
+        double distance=eye.distanceTo(Vec3.atCenterOf(target));
+        if(!Double.isFinite(distance))return false;
+        if(!Double.isFinite(approachBest)){approachBest=distance;return false;}
+        if(distance>approachBest-.25)return false;
+        approachBest=distance;waitTicks=0;progress("Closer to container ("+Math.round(distance*10)/10d+" blocks)");return true;
+    }
     public void inventory(InventoryEvent event){
         if(target==null||pending!=null||beforeMenu<0||mc.player==null||!scope.equals(currentScope())||mc.player.containerMenu==mc.player.inventoryMenu
             ||event.packet.containerId()!=mc.player.containerMenu.containerId||event.packet.containerId()==beforeMenu)return;
@@ -153,12 +188,20 @@ public final class BotStashScan {
         }
         return boxes;
     }
-    public void close(){captured=null;closeTicks=0;if(mc.player!=null){if(menu>=0&&mc.player.containerMenu.containerId==menu)mc.player.closeContainer();if(previousSlot>=0&&mc.player.getInventory().getSelectedSlot()==selectedSlot)mc.player.getInventory().setSelectedSlot(previousSlot);}menu=beforeMenu=previousSlot=selectedSlot=-1;}
+    static boolean matchesKit(ItemStack stack, JsonObject criteria){
+        JsonArray boxes=classify(List.of(stack));
+        if(boxes.isEmpty())return false;
+        JsonObject box=boxes.get(0).getAsJsonObject();
+        return criteria.get("kitTypeId").getAsString().equals(StashCatalog.kitTypeId(box))
+            &&(criteria.has("includeIncomplete")&&criteria.get("includeIncomplete").getAsBoolean()||!criteria.has("kitExemplar")||StashCatalog.kitIncomplete(criteria.getAsJsonObject("kitExemplar"),box.getAsJsonObject("items"))==criteria.get("incomplete").getAsBoolean());
+    }
+    public void close(){captured=null;closeTicks=0;if(mc.player!=null&&(menu>=0&&mc.player.containerMenu.containerId==menu||hiddenScanMenu()))mc.player.closeContainer();menu=beforeMenu=-1;}
     public JsonObject pending(){return pending==null?null:pending.deepCopy();}
     public int delivery(){return delivery;}
-    public void acknowledge(int id){if(pending!=null&&id==delivery){pending=null;target=stance=null;delivery++;progress("Host saved observation");}}
+    public void acknowledge(int id){if(pending!=null&&id==delivery){pending=null;target=stance=null;approachBest=Double.POSITIVE_INFINITY;delivery++;progress("Host saved observation");}}
     public JsonObject telemetry(){
         JsonObject t=new JsonObject();t.addProperty("name",plan.get("name").getAsString());t.addProperty("phase",phase);t.addProperty("reason",reason);t.addProperty("discovery",cursor);t.addProperty("volume",volume());
+        t.addProperty("noProgressTicks",waitTicks);if(Double.isFinite(approachBest))t.addProperty("closestOpeningDistance",approachBest);
         t.addProperty("discovered",discovered);t.addProperty("observed",observed-inferred);t.addProperty("inferred",inferred);t.addProperty("unscanned",unscanned);t.addProperty("missingChunks",previousMissing+missingChunks.size());
         t.addProperty("target",target==null?"":target.toShortString());t.addProperty("movementTarget",stance==null?"":stance.toShortString());t.addProperty("lastAction",lastAction);t.addProperty("lastProgressAt",lastProgress);t.addProperty("menu",menu);t.addProperty("attempts",attempts);return t;
     }

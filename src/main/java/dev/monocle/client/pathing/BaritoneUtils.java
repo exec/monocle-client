@@ -38,6 +38,10 @@ public class BaritoneUtils {
             if (goal != null && process.getGoal() != goal) throw new IllegalStateException("Another Baritone task took control; stash scan stopped");
             if (goal == null) { goal = mode==0?new GoalBlock(target):mode>0?new GoalNear(target,mode):new GoalGetToBlock(target); process.setGoalAndPath(goal); }
         }
+        public String status() {
+            var behavior = BaritoneAPI.getProvider().getPrimaryBaritone().getPathingBehavior();
+            return behavior.isPathing() ? "following path" : behavior.getInProgress().isPresent() ? "calculating path" : "no path active";
+        }
         @Override @SuppressWarnings({"rawtypes", "unchecked"}) public void close() {
             var baritone = BaritoneAPI.getProvider().getPrimaryBaritone();
             try {

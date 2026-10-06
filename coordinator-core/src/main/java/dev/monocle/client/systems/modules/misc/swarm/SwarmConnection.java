@@ -13,9 +13,9 @@ import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.UUID;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.function.Function;
 import dev.monocle.coordinator.CrewTransport;
+import dev.monocle.coordinator.CrewFrames;
 
 /** Shared authenticated, ordered, bounded protocol over LAN TCP or WebSocket. I/O threads never access game state. */
 public class SwarmConnection extends Thread {
@@ -24,8 +24,8 @@ public class SwarmConnection extends Thread {
     private final String configuredKey;
     private final Function<String, String> keyResolver;
     private final boolean hostSide;
-    private final ArrayBlockingQueue<String> outgoing = new ArrayBlockingQueue<>(128);
-    private final ArrayBlockingQueue<String> incoming = new ArrayBlockingQueue<>(128);
+    private final CrewFrames.Queue outgoing = new CrewFrames.Queue();
+    private final CrewFrames.Queue incoming = new CrewFrames.Queue();
     private volatile boolean ready;
     private volatile String failure = "";
     private volatile String credentialId = "";
@@ -88,12 +88,11 @@ public class SwarmConnection extends Thread {
     public String poll() { return incoming.poll(); }
     public boolean send(String message) {
         if (!connected()) return false;
-        if (message.length() > 16000 || !outgoing.offer(message)) {
-            failure = "Workers message queue exceeded its limit";
-            disconnect();
-            return false;
-        }
-        return true;
+        try {
+            if (outgoing.offer(message)) return true;
+            failure = "Workers send queue exceeded 1 MiB or 128 frames";
+        } catch (IllegalArgumentException e) { failure = e.getMessage(); }
+        disconnect(); return false;
     }
 
     static String mac(String key, String text) throws Exception {
@@ -117,12 +116,12 @@ public class SwarmConnection extends Thread {
             transport.open();
             String nonce = UUID.randomUUID().toString();
             String localSelector = hostSide ? "" : credentialSelector(configuredKey);
-            transport.write("monocle-crew-6:" + nonce + (hostSide ? "" : ":" + localSelector));
+            transport.write("monocle-crew-7:" + nonce + (hostSide ? "" : ":" + localSelector));
             transport.flush();
             String peer = transport.read();
-            if (!peer.matches("monocle-crew-6:[0-9a-f-]{36}" + (hostSide ? ":[0-9a-f]{64}" : "")))
+            if (!peer.matches("monocle-crew-7:[0-9a-f-]{36}" + (hostSide ? ":[0-9a-f]{64}" : "")))
                 throw new IOException("Incompatible Workers protocol; install the same build on every account");
-            String peerNonce = peer.substring("monocle-crew-6:".length(), "monocle-crew-6:".length() + 36);
+            String peerNonce = peer.substring("monocle-crew-7:".length(), "monocle-crew-7:".length() + 36);
             String selected = hostSide ? peer.substring(peer.length() - 64) : localSelector;
             final String key = hostSide && keyResolver != null ? keyResolver.apply(selected) : configuredKey;
             if (key == null || key.length() < 24 || !MessageDigest.isEqual(credentialSelector(key).getBytes(StandardCharsets.US_ASCII), selected.getBytes(StandardCharsets.US_ASCII)))
@@ -144,16 +143,20 @@ public class SwarmConnection extends Thread {
                         transport.write(mac(key, context + sendDirection + sequence++ + ":" + message));
                         transport.flush();
                     }
-                } catch (Exception e) { disconnect(); }
+                } catch (Exception e) {
+                    if (connected()) failure = e.getMessage() == null ? "Workers send failed" : "Workers send failed: " + e.getMessage();
+                    disconnect();
+                }
             }, "Monocle Workers writer");
             writer.setDaemon(true);
             writer.start();
             long sequence = 0;
             while (!closed()) {
                 String message = transport.read();
-                if (message.length() > 16000 || !authentic(key, context + receiveDirection + sequence++ + ":" + message, transport.read()))
+                CrewFrames.encode(message);
+                if (!authentic(key, context + receiveDirection + sequence++ + ":" + message, transport.read()))
                     throw new IOException("Invalid Workers message");
-                if (!incoming.offer(message)) throw new IOException("Workers receive queue full");
+                if (!incoming.offer(message)) throw new IOException("Workers receive queue exceeded 1 MiB or 128 frames");
             }
         } catch (Exception e) {
             // Socket.connect may close the socket itself on failure; only explicit cancellation suppresses errors.
@@ -163,6 +166,7 @@ public class SwarmConnection extends Thread {
     public void disconnect() {
         ready = false;
         handoffKey = null;
+        outgoing.clear();
         transport.close();
         if (writer != null) writer.interrupt();
         interrupt();

@@ -25,19 +25,41 @@ final class WebUiTest {
             var index = send(http, origin + "/ui/", null, null, false);
             assert index.statusCode() == 200 && index.body().contains("Control Room") && !index.body().contains(TOKEN);
             assert index.body().contains("value=\"highway\"") && index.body().contains("highway-worker-position");
+            assert index.body().contains("id=\"kit-field\"") && index.body().contains("id=\"kit-recipient-worker\"") : "Kit dispatch uses guided fields in the existing job review";
             assert index.headers().firstValue("content-security-policy").orElseThrow().contains("frame-ancestors 'none'")
                 && index.headers().firstValue("cache-control").orElseThrow().equals("no-store");
             String app = send(http, origin + "/ui/app.js", null, null, false).body();
             assert app.contains("textContent") && app.contains("workflow-prepare") && app.contains("Auto TPY") && app.contains("public-join") && !app.contains("localStorage");
+            assert app.contains("sessionStorage.getItem(tokenKey)") && app.contains("sessionStorage.setItem(tokenKey, token)")
+                && app.contains("sessionStorage.removeItem(tokenKey)") && app.contains("if (path === 'status' && body.error === 'Invalid API token' && attempt === generation) clearToken()")
+                : "Operator token survives a reload, but only status authentication failure or explicit disconnect erases it";
+            assert app.contains("mode: 'cors'") && !app.contains("mode: 'same-origin'")
+                : "No-referrer plus same-origin fetch mode can send Origin: null on a POST";
+            assert app.contains("loadInspection()") && app.contains("resource('GET',selected.kind+'s/'+selected.id)")
+                : "Job and worker inspectors must fetch resource records";
+            assert app.contains("stashResourceId(stash)") && !app.contains("op:'stash-get'")
+                : "Stash inspection must use its resource ID instead of legacy control";
+            assert app.contains("kitUsage(snapshot)") && app.contains("task-kit-remove-incomplete") && app.contains("updateKitSources()")
+                : "Stash view exposes kit stock, usage, and guided dispatch";
+            assert app.contains("transferAll:$('kit-all').checked")&&app.contains("count>36")&&app.contains("job.kitJob.delivered??")
+                : "Repeat kit jobs expose a 36-slot cap and count actual completed deliveries, not their per-trip cap";
+            assert app.indexOf("if(context.preset){$('job-kind').value='preset'") < app.indexOf("$('job-dialog').showModal()")
+                && app.contains("if(context.preset&&!presetList.some(p=>p.id===context.preset))throw Error")
+                && app.contains("$('job-submit').disabled=!loaded") : "Contextual kit jobs must not fall back to a dispatchable highway form";
+            assert app.contains("shulkerLabel(row,item)") && app.contains("shulkerLabel(row,type.item)")
+                && send(http, origin + "/ui/style.css", null, null, false).body().contains(".shulker-row{background:color-mix")
+                : "Shulker stock and kit rows have readable names and restrained color tints";
+            assert app.contains("'stashes/'+submission.stashId+'/scan'") && app.contains("scanJobId=submission.stashId?job.id:null")
+                : "Saved stash scans must dispatch through the resource route and open the resulting job";
             assert send(http, origin + "/ui/GlacialIndifference-Regular.otf", null, null, false).statusCode() == 200;
             assert send(http, origin + "/ui/GlacialIndifference-OFL.txt", null, null, false).body().contains("OPEN FONT LICENSE");
             for (String path : new String[]{"/ui/../host-config.json", "/ui/%2e%2e/host-config.json", "/ui/api/status?token=secret"})
                 assert send(http, origin + path, null, null, false).statusCode() != 200;
             assert send(http, origin + "/ui/api/status", null, null, false).statusCode() == 403;
-            assert send(http, origin + "/ui/api/status", "wrong", null, false).statusCode() == 403;
+            assert send(http, origin + "/ui/api/status", "wrong", null, false).body().contains("Invalid API token");
             assert send(http, origin + "/ui/api/status", TOKEN, origin, false).statusCode() == 200;
             assert send(http, origin + "/ui/api/status", TOKEN, "https://evil.invalid", false).statusCode() == 403;
-            assert send(http, origin + "/ui/api/control", TOKEN, null, true).statusCode() == 403;
+            assert send(http, origin + "/ui/api/control", TOKEN, null, true).body().contains("UI origin is not accepted");
             assert send(http, origin + "/ui/api/control", TOKEN, "null", true).statusCode() == 403;
             assert send(http, origin + "/ui/api/control", TOKEN, "https://evil.invalid", true).statusCode() == 403;
             assert send(http, origin + "/ui/api/control", TOKEN, origin, true).statusCode() == 200;
@@ -49,10 +71,24 @@ final class WebUiTest {
                 .header("Idempotency-Key",commandId).POST(HttpRequest.BodyPublishers.ofString(crewBody)).build();
             var created=http.send(uiCreate,HttpResponse.BodyHandlers.ofString());
             assert created.statusCode()==201 : created.body();
+            JsonObject crew=new Gson().fromJson(created.body(),JsonObject.class);
+            var detail=send(http,origin+"/ui/api/v1/crews/"+crew.get("id").getAsString(),TOKEN,origin,false);
+            assert detail.statusCode()==200 && new Gson().fromJson(detail.body(),JsonObject.class).get("revision").equals(crew.get("revision"))
+                : "Crew inspection uses the same resource identity and revision as the list";
             var nativeReplay=HttpRequest.newBuilder(URI.create(origin+"/v1/crews"))
                 .header("Authorization","Bearer "+TOKEN).header("Content-Type","application/json")
                 .header("Idempotency-Key",commandId).POST(HttpRequest.BodyPublishers.ofString(crewBody)).build();
             assert http.send(nativeReplay,HttpResponse.BodyHandlers.ofString()).body().equals(created.body()) : "UI and native resource routes share durable receipts";
+            var rename=HttpRequest.newBuilder(URI.create(origin+"/ui/api/v1/crews/"+crew.get("id").getAsString()))
+                .header("Authorization","Bearer "+TOKEN).header("Origin",origin).header("Content-Type","application/json")
+                .header("Idempotency-Key",UUID.randomUUID().toString()).header("If-Match",crew.get("revision").getAsString())
+                .method("PATCH",HttpRequest.BodyPublishers.ofString("{\"name\":\"Renamed UI crew\"}")).build();
+            assert http.send(rename,HttpResponse.BodyHandlers.ofString()).statusCode()==200 : "UI rename requires the same guarded resource semantics";
+            assert http.send(rename,HttpResponse.BodyHandlers.ofString()).statusCode()==200 : "Identical command replay keeps its receipt";
+            var delete=HttpRequest.newBuilder(URI.create(origin+"/ui/api/v1/crews/"+crew.get("id").getAsString()))
+                .header("Authorization","Bearer "+TOKEN).header("Origin",origin)
+                .header("Idempotency-Key",UUID.randomUUID().toString()).DELETE().build();
+            assert http.send(delete,HttpResponse.BodyHandlers.ofString()).statusCode()==200 : "Empty UI crew can be removed through its resource";
             assert send(http, origin + "/ui/api/v1/crews", TOKEN, null, true).statusCode() == 403 : "UI mutations require a matching Origin";
             assert send(http, origin + "/v1/control", TOKEN, origin, true).statusCode() == 403 : "Browser UI cannot weaken native endpoint policy";
             var crossSite = HttpRequest.newBuilder(URI.create(origin + "/ui/api/status")).header("Authorization", "Bearer " + TOKEN).header("Sec-Fetch-Site", "cross-site").build();

@@ -12,13 +12,13 @@ import org.java_websocket.handshake.ServerHandshake;
 /** One protocol record per text frame. No game state is accessed by WebSocket callbacks. */
 final class WebCrewTransport implements CrewTransport {
     static final String PATH = "/v1/workers";
-    private final ArrayBlockingQueue<String> frames = new ArrayBlockingQueue<>(128);
+    private final CrewFrames.Queue frames = new CrewFrames.Queue();
     private final String endpoint;
     private WebSocket socket;
     private WebSocketClient client;
     private volatile boolean stopped;
 
-    static Draft_6455 draft() { return new Draft_6455(List.of(), 64_000); }
+    static Draft_6455 draft() { return new Draft_6455(List.of(), CrewFrames.MAX_BYTES); }
     static URI uri(String address) {
         URI uri;
         try { uri = URI.create(address); }
@@ -49,7 +49,8 @@ final class WebCrewTransport implements CrewTransport {
     private WebCrewTransport(String endpoint) { this.endpoint = endpoint; }
     void receive(String frame) {
         if (stopped) return;
-        if (frame.length() > 16000 || !frames.offer(frame)) close();
+        try { if (!frames.offer(frame)) close(); }
+        catch (IllegalArgumentException e) { close(); }
     }
     public void open() throws Exception {
         if (stopped) throw new IOException("WebSocket connection closed");
@@ -63,6 +64,7 @@ final class WebCrewTransport implements CrewTransport {
         return frame;
     }
     public void write(String frame) throws Exception {
+        CrewFrames.encode(frame);
         // Keep the library's output queue bounded as well as SwarmConnection's queues.
         long deadline = System.nanoTime() + 10_000_000_000L;
         while (!stopped && socket.hasBufferedData() && System.nanoTime() < deadline) Thread.sleep(1);

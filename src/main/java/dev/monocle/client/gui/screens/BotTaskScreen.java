@@ -1,5 +1,6 @@
 package dev.monocle.client.gui.screens;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.monocle.client.gui.GuiTheme;
@@ -16,6 +17,7 @@ import dev.monocle.client.systems.bots.BotScheduler;
 import dev.monocle.client.systems.bots.BotProfiles;
 import dev.monocle.client.systems.bots.BotWorkflows;
 import dev.monocle.client.systems.bots.Bots;
+import dev.monocle.client.systems.modules.world.StashManager;
 import dev.monocle.client.utils.Utils;
 import dev.monocle.client.utils.render.color.Color;
 
@@ -129,11 +131,12 @@ public final class BotTaskScreen extends WindowScreen {
                 fields.add(theme.label("Direction"));var direction=fields.add(theme.dropdown(new String[]{"North","East","South","West"},launchInputs.getOrDefault(directionKey,"North"))).expandX().widget();direction.action=()->remember(directionKey,direction.get());
                 parameters=()->{JsonObject a=new JsonObject();a.addProperty("x",x.get());a.addProperty("y",y.get());a.addProperty("z",z.get());a.addProperty("length",length.get());a.addProperty("direction",direction.get());return a;};
             }
-            case "task-follow", "task-bodyguard" -> {
+            case "task-follow", "task-bodyguard", "task-crystal-guard" -> {
                 WTextBox leader=string(fields,"Leader username or UUID",mc.player.getName().getString());
                 WIntEdit radius=integer(fields,"Following distance (blocks)",3,1,8),ticks=integer(fields,"Duration (ticks; 0 = until cancelled)",0,0,1_728_000);
-                parameters=()->{String requested=leader.get().strip();String target=bots.allMembers().stream().filter(m->m.name().equalsIgnoreCase(requested)).map(m->m.id().toString()).findFirst().orElse(requested);if(mc.player.getName().getString().equalsIgnoreCase(requested))target=mc.player.getUUID().toString();UUID.fromString(target);JsonObject a=new JsonObject();a.addProperty("target",target);a.addProperty("radius",radius.get());a.addProperty("ticks",ticks.get());return a;};
-                arguments.add(theme.label(selectedWorkflow.equals("task-bodyguard") ? "Select up to three guards, not the subject. Guards match the subject on foot or in Vanilla ElytraFly formation and use the captured combat profile." : "Select followers only. Walking, no terrain edits or automatic combat. The leader plays normally. Followers wait when the leader is not visible.",contentWidth-20));
+                WTextBox combatTargets=selectedWorkflow.equals("task-crystal-guard")?string(fields,"Crystal targets (comma-separated; blank = everyone except friends/crew)",""):null;
+                parameters=()->{String requested=leader.get().strip();String target=bots.allMembers().stream().filter(m->m.name().equalsIgnoreCase(requested)).map(m->m.id().toString()).findFirst().orElse(requested);if(mc.player.getName().getString().equalsIgnoreCase(requested))target=mc.player.getUUID().toString();UUID.fromString(target);JsonObject a=new JsonObject();a.addProperty("target",target);a.addProperty("radius",radius.get());a.addProperty("ticks",ticks.get());if(combatTargets!=null){JsonArray names=new JsonArray();for(String name:combatTargets.get().split(","))if(!name.isBlank())names.add(name.strip());a.add("combatTargets",names);}return a;};
+                arguments.add(theme.label(selectedWorkflow.equals("task-crystal-guard") ? "Select up to three guards, not the subject. They arm Crystal Aura, Auto Totem, Auto Gap, Auto Eat, and Auto Armor, then request TPA if the subject is not visible." : selectedWorkflow.equals("task-bodyguard") ? "Select up to three guards, not the subject. Guards match the subject on foot or in Vanilla ElytraFly formation and use the captured combat profile." : "Select followers only. Walking, no terrain edits or automatic combat. The leader plays normally. Followers wait when the leader is not visible.",contentWidth-20));
             }
             case "task-stash-scan" -> {
                 JsonObject selected;
@@ -142,10 +145,36 @@ public final class BotTaskScreen extends WindowScreen {
                 fields.add(theme.label("Stash name"));WTextBox name=fields.add(theme.textBox("Main stash")).expandX().widget();fields.row();
                 fields.add(theme.label("Home name (required)"));WTextBox home=fields.add(theme.textBox("")).expandX().widget();fields.row();
                 WIntEdit warmup=integer(fields,"Home warmup (seconds)",15,0,3600),cooldown=integer(fields,"Home cooldown (minutes)",10,0,1440);
+                fields.add(theme.label("Scan type"));var scanMode=fields.add(theme.dropdown(new String[]{"Column Map","Full"},"Column Map")).expandX().widget();fields.row();
                 Map<String,WIntEdit> bounds=new LinkedHashMap<>();
                 for(String axis:List.of("X","Y","Z"))for(String end:List.of("min","max")){String key=end+axis;int limit=axis.equals("Y")?2048:29_900_000;bounds.put(key,integer(fields,key,selected.get(key).getAsInt(),-limit,limit));}
-                parameters=()->{JsonObject p=new JsonObject();p.addProperty("name",name.get());p.addProperty("homeName",home.get());p.addProperty("homeWarmupTicks",warmup.get()*20);p.addProperty("homeCooldownTicks",cooldown.get()*1200);bounds.forEach((key,value)->p.addProperty(key,value.get()));return dev.monocle.coordinator.StashCatalog.plan(p);};
-                arguments.add(theme.label("The stash's /home name is required. Bounds copy the current wooden-pickaxe selection. Workers inspect disjoint containers; no items or terrain are changed.",contentWidth-20));
+                parameters=()->{JsonObject p=new JsonObject();p.addProperty("name",name.get());p.addProperty("homeName",home.get());p.addProperty("homeWarmupTicks",warmup.get()*20);p.addProperty("homeCooldownTicks",cooldown.get()*1200);p.addProperty("scanMode",scanMode.get());bounds.forEach((key,value)->p.addProperty(key,value.get()));return dev.monocle.coordinator.StashCatalog.plan(p);};
+                arguments.add(theme.label("Column Map opens only the bottom chest layer and assumes upper chests match, without counting their stock. Full observes contents throughout the cuboid. Workers inspect disjoint containers; no items or terrain are changed.",contentWidth-20));
+            }
+            case "task-kit-delivery", "task-kit-remove-incomplete" -> {
+                boolean incompleteJob=selectedWorkflow.equals("task-kit-remove-incomplete");
+                WTextBox stash=string(fields,"Source stash name","Main stash"),typeId=string(fields,"Shulker Type ID","");
+                WIntEdit count=integer(fields,"Kit count / boxes per trip",1,1,36);
+                fields.add(theme.label("Transfer all (stash destination)"));var all=fields.add(theme.checkbox(false)).widget();fields.row();
+                fields.add(theme.label("Include incomplete kits"));var includeIncomplete=fields.add(theme.checkbox(false)).widget();fields.row();
+                fields.add(theme.label("Destination"));var destination=fields.add(theme.dropdown(new String[]{"Player","Ender Chest","Stash","Carry"},incompleteJob?"Carry":"Player")).expandX().widget();fields.row();
+                WTextBox recipient=string(fields,"Recipient UUID (Player only)",""),recipientName=string(fields,"Recipient username (Player only)","");
+                WTextBox targetStash=string(fields,"Destination stash (Stash only)","");
+                all.action=()->{if(all.checked){count.set(36);destination.set("Stash");}};
+                parameters=()->{
+                    JsonObject source=null;String world=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();
+                    for(var value:dev.monocle.client.systems.modules.Modules.get().get(StashManager.class).catalog()){
+                        JsonObject candidate=value.getAsJsonObject();if(candidate.get("name").getAsString().equals(stash.get())&&candidate.get("scope").getAsString().equals(world)){source=candidate;break;}
+                    }
+                    if(source==null)throw new IllegalArgumentException("Save or import the source stash definition first");
+                    JsonObject a=source.getAsJsonObject("bounds").deepCopy();a.addProperty("name",stash.get());a.addProperty("kitTypeId",typeId.get().strip());a.addProperty("count",count.get());a.addProperty("destination",destination.get());
+                    if(incompleteJob)a.addProperty("incomplete",true);
+                    a.addProperty("transferAll",all.checked);a.addProperty("includeIncomplete",includeIncomplete.checked);
+                    if(destination.get().equals("Player")){a.addProperty("recipient",recipient.get().strip());a.addProperty("recipientName",recipientName.get().strip());}
+                    if(destination.get().equals("Stash"))a.addProperty("targetStashName",targetStash.get().strip());
+                    return a;
+                };
+                arguments.add(theme.label("Observed boxes are selected first; the worker can search unscanned upper chests in mapped columns. Unknown upper stock is never counted as guaranteed.",contentWidth-20));
             }
             case "task-stash-hunt" -> {
                 int ox = mc.player == null ? 0 : mc.player.getBlockX(), oz = mc.player == null ? 0 : mc.player.getBlockZ();

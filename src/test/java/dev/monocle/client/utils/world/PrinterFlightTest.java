@@ -27,6 +27,7 @@ public final class PrinterFlightTest {
         Bootstrap.bootStrap();
         chunksAndSweeps();
         routes();
+        localRoutes();
         printPositions();
         landings();
         escapes();
@@ -50,6 +51,18 @@ public final class PrinterFlightTest {
         assert !PrinterFlight.segmentClear(a, b, .6, .6, clear(thinWall));
         assert !PrinterFlight.segmentClear(a, a.add(0, 1, 0), .6, 1.8, clear(new AABB(0, 2.9, 0, 1, 3, 1))) : "Ceiling must check the player's head, not just feet";
         assert PrinterFlight.segmentClear(a, a, .6, .6, clear(thinWall));
+        Vec3 diagonal = new Vec3(6.5, 1, 6.5);
+        assert PrinterFlight.segmentClear(a, diagonal, .6, .6, clear(new AABB(1, 0, 4, 2, 3, 5)))
+            : "A block beside a diagonal corridor must not block the whole flight rectangle";
+        assert !PrinterFlight.segmentClear(a, diagonal, .6, .6, clear(new AABB(3.001, 0, 3, 3.002, 3, 4)))
+            : "Every interval is swept; thin walls between endpoints cannot be skipped";
+        AtomicInteger sweeps = new AtomicInteger();
+        assert PrinterFlight.segmentClear(a, a.add(80, 0, 80), .6, .6, box -> {
+            sweeps.incrementAndGet();
+            assert box.maxX - box.minX <= 1.600001 && box.maxZ - box.minZ <= 1.600001;
+            return true;
+        });
+        assert sweeps.get() == 80 : "Long diagonal collision checks grow with distance, not the enclosing area";
         assert !PrinterFlight.segmentClear(a, a.add(129, 0, 0), .6, .6, box -> true);
         invalid(() -> PrinterFlight.body(Vec3.ZERO, 0, .6));
         invalid(() -> PrinterFlight.body(new Vec3(Double.NaN, 0, 0), .6, .6));
@@ -83,6 +96,7 @@ public final class PrinterFlightTest {
         Vec3 start = new Vec3(8.5, 3, .5);
         List<Vec3> route = PrinterFlight.routeToPlacement(start, target, .6, .6, .4, 4.5, box -> true);
         assert !route.isEmpty() && PrinterFlight.placementReach(route.getLast(), target, .4, 4.5);
+        assert route.size() == 2 : "An unobstructed placement flight should not follow one-block grid turns";
         assert !PrinterFlight.body(route.getLast(), .6, .6).intersects(new AABB(target));
         checkedRoute(route, .6, .6, box -> true);
         Vec3 perch = route.getLast();
@@ -90,10 +104,55 @@ public final class PrinterFlightTest {
             point -> point.distanceToSqr(perch) > .6 && point.y <= perch.y);
         assert !alternate.isEmpty() && alternate.getLast().distanceToSqr(perch) > .6 && alternate.getLast().y <= perch.y;
         checkedRoute(alternate, .6, .6, box -> true);
+        BlockPos highChest = new BlockPos(0, 255, 0);
+        Vec3 distantStart = new Vec3(9.5, 238, -21.5);
+        assert !PrinterFlight.routeToPlacement(distantStart, highChest, .72, .7, .4, 4.4, box -> true).isEmpty()
+            : "A reachable elevated chest must not exhaust the local flight search";
         assert PrinterFlight.routeToPlacement(start, new BlockPos(100, 3, 0), .6, .6, .4, 4.5, box -> true).isEmpty();
         // Caller can forbid a whole schematic interior; no direct or search shortcut may ignore that predicate.
         AABB reserved = new AABB(-6, -6, -6, 6, 10, 6);
         assert PrinterFlight.routeToPlacement(start, target, .6, .6, .4, 4.5, clear(reserved)).isEmpty();
+    }
+
+    private static void localRoutes() {
+        Vec3 start = new Vec3(-3.5, 2, .5), goal = new Vec3(3.5, 2, .5);
+        Predicate<AABB> world = clear(new AABB(-.1, 0, -2, .1, 5, 2));
+        AtomicInteger checks = new AtomicInteger();
+        Predicate<AABB> observed = box -> { checks.incrementAndGet(); return world.test(box); };
+        var navigation = new PrinterFlight.LocalRoute();
+        Vec3 first = navigation.next(start, goal, 0, .6, .6, observed);
+        assert first != null;
+        int planned = checks.get();
+        assert navigation.next(start, goal, 1, .6, .6, observed).equals(first);
+        assert checks.get() - planned <= 16 : "Following a cached detour must not run A* again every tick";
+        Vec3 position = start;
+        for (int tick = 2; tick < 300 && position.distanceToSqr(goal) >= .04; tick++) {
+            Vec3 step = navigation.next(position, goal, tick, .6, .6, world);
+            assert step != null : "A healthy detour must move every tick, not only on search ticks";
+            Vec3 velocity = PrinterFlight.safeVelocity(position, step, .25, .6, .6, world);
+            assert velocity.lengthSqr() > 0;
+            position = position.add(velocity);
+        }
+        assert position.distanceToSqr(goal) < .04 : "The cached route must reach the destination around the wall";
+        navigation.reset();
+        assert navigation.next(start, goal, 0, .6, .6, world) != null;
+        assert navigation.next(start, goal, 1, .6, .6, box -> false) == null : "A changed world invalidates cached steering immediately";
+        assert navigation.next(start, goal, 2, .6, .6, box -> true).equals(goal) : "A cleared corridor resumes immediately during the search cooldown";
+        navigation.reset();
+        checks.set(0);
+        Predicate<AABB> sealed = box -> { checks.incrementAndGet(); return false; };
+        for (int tick = 0; tick < 20; tick++) assert navigation.next(start, goal, tick, .6, .6, sealed) == null;
+        assert checks.get() == 21 : "Failed A* searches retry once per second while live corridors are still checked";
+        assert navigation.next(start, goal, 20, .6, .6, sealed) == null && checks.get() == 23;
+        navigation.reset();
+        assert navigation.next(start, goal, 0, .6, .6, sealed) == null && checks.get() == 25 : "Reconnecting resets the old world's retry clock";
+        navigation.reset();
+        Vec3 distantStart = new Vec3(.5, 2, .5), distantGoal = new Vec3(20.5, 2, .5);
+        Predicate<AABB> waypointWall = clear(new AABB(8, 0, -2, 10, 5, 2));
+        assert !waypointWall.test(PrinterFlight.body(distantStart.add(8, 0, 0), .6, .6));
+        Vec3 detour = navigation.next(distantStart, distantGoal, 0, .6, .6, waypointWall);
+        assert detour != null && PrinterFlight.segmentClear(distantStart, detour, .6, .6, waypointWall)
+            : "An intermediate waypoint inside a wall must not prevent a safe detour beyond it";
     }
 
     private static void landings() {
@@ -106,6 +165,14 @@ public final class PrinterFlightTest {
         assert PrinterFlight.routeToLanding(new Vec3(.5, 4, .5), floor, 1.4, 1.8, air, floor::equals).isEmpty() : "Wide footprints cannot land on one unsupported block";
         assert PrinterFlight.routeToLanding(new Vec3(.5, 4, .5), floor, .6, 1.8,
             clear(new AABB(2, 2, 2, 3, 3, 3)), floor::equals).isEmpty() : "Gliding clearance alone is not safe landing headroom";
+        assert PrinterFlight.supported(new Vec3(2.5, 1, 2.5), .6, 1.8, floor::equals);
+        assert !PrinterFlight.supported(new Vec3(2.9, 1, 2.5), .6, 1.8, floor::equals)
+            : "The centre's floor is insufficient when part of the player would land over a hole";
+        assert PrinterFlight.supported(new Vec3(2.9, 1, 2.5), .6, 1.8, p -> p.equals(floor) || p.equals(floor.east()));
+        assert !PrinterFlight.supported(new Vec3(2.9, 1, 2.9), .6, 1.8, p -> p.equals(floor) || p.equals(floor.east()) || p.equals(floor.south()))
+            : "A diagonal footprint must also verify the corner block";
+        assert PrinterFlight.supported(new Vec3(-.5, 1, -.5), .6, 1.8, new BlockPos(-1, 0, -1)::equals);
+        assert !PrinterFlight.supported(new Vec3(-.1, 1, -.5), .6, 1.8, new BlockPos(-1, 0, -1)::equals);
     }
 
     private static void escapes() {

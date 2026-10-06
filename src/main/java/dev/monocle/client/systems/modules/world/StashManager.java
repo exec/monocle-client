@@ -14,8 +14,9 @@ import dev.monocle.client.systems.modules.Module;
 import dev.monocle.coordinator.StashCatalog;
 import meteordevelopment.orbit.EventHandler;
 
-/** Experimental discovery only: no withdrawal, inventory management, container breaking or teleport commands. */
+/** Local stash definitions and read-only discovery. */
 public final class StashManager extends Module {
+    public enum ScanMode { Full, ColumnMap }
     private final SettingGroup definition=settings.getDefaultGroup(),route=settings.createGroup("Route"),scanning=settings.createGroup("Scanning");
     private final Setting<String> stashName=definition.add(new StringSetting.Builder().name("stash-name").description("Named stash in this world; later scans update observations at each container coordinate.").defaultValue("Main stash").build());
     private final Setting<String> homeName=route.add(new StringSetting.Builder().name("home-name").description("Required server /home name used to reach this stash. A definition cannot be saved or scanned without it.").defaultValue("").build());
@@ -23,6 +24,7 @@ public final class StashManager extends Module {
     private final Setting<Integer> homeCooldown=route.add(new IntSetting.Builder().name("home-cooldown").description("Minutes before this home may be requested again.").defaultValue(10).range(0,1440).sliderRange(0,60).build());
     private final Setting<Boolean> exportToHost=scanning.add(new BoolSetting.Builder().name("export-to-connected-host").description("Publish this stash definition and observations to the authenticated Workers host.").defaultValue(true).build());
     private final Setting<Boolean> lazyMode=scanning.add(new BoolSetting.Builder().name("lazy-mode").description("Scan the bottom and top storage layers first. If both are uniformly full and homogeneous, estimate matching containers between them. Inferred totals are labeled.").defaultValue(true).build());
+    private final Setting<ScanMode> scanMode=scanning.add(new EnumSetting.Builder<ScanMode>().name("scan-mode").description("Full scans contents and quantities. Column Map opens only the bottom layer to identify each column; upper quantities remain unknown.").defaultValue(ScanMode.Full).build());
     private BotActions scanner;
     private JsonObject exportedPlan;
     private String exportedScope="";
@@ -32,7 +34,7 @@ public final class StashManager extends Module {
     public boolean isScanning(){return scanner!=null;}
     private String scope(){if(mc.level==null)throw new IllegalStateException("Join the stash world first");return (mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();}
     private JsonObject definitionPlan(){
-        JsonObject p=Modules.get().get(SchematicSelector.class).selectionBounds(stashName.get());p.addProperty("type","StashScan");p.addProperty("lazyMode",lazyMode.get());p.addProperty("homeName",homeName.get());p.addProperty("homeWarmupTicks",homeWarmup.get()*20);p.addProperty("homeCooldownTicks",homeCooldown.get()*1200);return StashCatalog.plan(p);
+        JsonObject p=Modules.get().get(SchematicSelector.class).selectionBounds(stashName.get());p.addProperty("type","StashScan");p.addProperty("lazyMode",lazyMode.get());p.addProperty("scanMode",scanMode.get()==ScanMode.ColumnMap?"Column Map":"Full");p.addProperty("homeName",homeName.get());p.addProperty("homeWarmupTicks",homeWarmup.get()*20);p.addProperty("homeCooldownTicks",homeCooldown.get()*1200);return StashCatalog.plan(p);
     }
     public String definitionReadiness(){try{JsonObject p=definitionPlan();return "Ready · /home "+p.get("homeName").getAsString()+" · cuboid validated";}catch(RuntimeException e){return "Not ready · "+e.getMessage();}}
     private JsonObject saveDefinition(boolean sync){
@@ -61,7 +63,7 @@ public final class StashManager extends Module {
     public String status(){return status;}
     public JsonArray catalog(){JsonArray all=StashCatalog.list(MonocleClient.FOLDER.toPath());for(var value:StashCatalog.remote(MonocleClient.FOLDER.toPath()))all.add(value.deepCopy());return all;}
     public void editDefinition(JsonObject stash,boolean reselect){
-        JsonObject p=StashCatalog.bounds(stash.getAsJsonObject("bounds"));stashName.set(stash.get("name").getAsString());lazyMode.set(!p.has("lazyMode")||p.get("lazyMode").getAsBoolean());
+        JsonObject p=StashCatalog.bounds(stash.getAsJsonObject("bounds"));stashName.set(stash.get("name").getAsString());lazyMode.set(!p.has("lazyMode")||p.get("lazyMode").getAsBoolean());scanMode.set(p.has("scanMode")&&p.get("scanMode").getAsString().equals("Column Map")?ScanMode.ColumnMap:ScanMode.Full);
         JsonObject route=p;if(stash.has("homes")&&mc.player!=null&&stash.getAsJsonObject("homes").has(mc.player.getUUID().toString()))route=stash.getAsJsonObject("homes").getAsJsonObject(mc.player.getUUID().toString());
         homeName.set(route.has("name")?route.get("name").getAsString():route.has("homeName")?route.get("homeName").getAsString():"");homeWarmup.set((route.has("warmupTicks")?route.get("warmupTicks").getAsInt():p.has("homeWarmupTicks")?p.get("homeWarmupTicks").getAsInt():300)/20);homeCooldown.set((route.has("cooldownTicks")?route.get("cooldownTicks").getAsInt():p.has("homeCooldownTicks")?p.get("homeCooldownTicks").getAsInt():12_000)/1200);
         SchematicSelector selector=Modules.get().get(SchematicSelector.class);selector.selectionBounds(p);if(reselect){selector.clearSelection();selector.equipWand();}setStatus(reselect?"Reselect both corners, then save the definition.":"Definition loaded for editing.");
@@ -73,7 +75,7 @@ public final class StashManager extends Module {
             JsonObject s=scanner.tick();setStatus(s.get("detail").getAsString());
             // Solo observations already reached the same atomic local catalog; no remote receipt is required.
             if(scanner.stashPending()!=null){
-                if(exportedPlan!=null){JsonObject export=dev.monocle.coordinator.TaskWire.message("stash-import");export.addProperty("scope",exportedScope);export.add("stash",exportedPlan.deepCopy());export.add("observation",scanner.stashPending());Bots.get().sendToHost(export);}
+                if(exportedPlan!=null){JsonObject export=dev.monocle.coordinator.TaskWire.message("stash-import");export.addProperty("scope",exportedScope);export.add("stash",exportedPlan.deepCopy());StashCatalog.attachObservation(export,scanner.stashPending());Bots.get().sendToHost(export);}
                 scanner.acknowledgeStash(scanner.stashDelivery());
             }
             if(!s.get("state").getAsString().equals("Running")){scanner.stop();scanner=null;}

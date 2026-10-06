@@ -449,6 +449,11 @@ public class ElytraFly extends Module {
         return requestAutopilot(velocity, Math.min(6, horizontalSpeed.get()));
     }
 
+    /** Uses the configured speed ceiling; callers may apply the configured acceleration ramp. */
+    public boolean requestConfiguredAutopilot(Vec3 velocity) {
+        return requestAutopilot(velocity, horizontalSpeed.get());
+    }
+
     private boolean requestAutopilot(Vec3 velocity, double maximum) {
         if (!mc.isSameThread()) throw new IllegalStateException("Request flight from the client thread.");
         if (velocity == null || !Double.isFinite(velocity.x) || !Double.isFinite(velocity.y) || !Double.isFinite(velocity.z)
@@ -572,8 +577,8 @@ public class ElytraFly extends Module {
                 currentMode.handleVerticalSpeed(event);
             }
 
-            int chunkX = (int) ((mc.player.getX() + currentMode.velX) / 16);
-            int chunkZ = (int) ((mc.player.getZ() + currentMode.velZ) / 16);
+            int chunkX = Mth.floor((mc.player.getX() + currentMode.velX) / 16);
+            int chunkZ = Mth.floor((mc.player.getZ() + currentMode.velZ) / 16);
             if (dontGoIntoUnloadedChunks.get()) {
                 if (mc.level.getChunkSource().hasChunk(chunkX, chunkZ)) {
                     if (flightMode.get() != ElytraFlightModes.Bounce)

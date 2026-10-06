@@ -27,6 +27,9 @@ import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.Items;
 
 public class AutoTotem extends Module {
+    private boolean guardStrict;
+
+    public void guardStrict(boolean enabled) { guardStrict = enabled; }
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
 
     private final Setting<Mode> mode = sgGeneral.add(new EnumSetting.Builder<Mode>()
@@ -172,7 +175,7 @@ public class AutoTotem extends Module {
     }
 
     private boolean shouldHoldTotem() {
-        if (mode.get() == Mode.Strict) return true;
+        if (guardStrict || mode.get() == Mode.Strict) return true;
 
         float remainingHealth = mc.player.getHealth() + mc.player.getAbsorptionAmount()
             - PlayerUtils.possibleHealthReductions(explosion.get(), fall.get());

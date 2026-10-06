@@ -271,7 +271,7 @@ public class Nuker extends Module {
     );
 
     private final Setting<SettingColor> sideColor = sgRender.add(new ColorSetting.Builder()
-        .name("side-color")
+        .name("target-side-color")
         .description("The side color of the target block rendering.")
         .defaultValue(new SettingColor(255, 0, 0, 80))
         .visible(enableRenderBreaking::get)
@@ -279,7 +279,7 @@ public class Nuker extends Module {
     );
 
     private final Setting<SettingColor> lineColor = sgRender.add(new ColorSetting.Builder()
-        .name("line-color")
+        .name("target-line-color")
         .description("The line color of the target block rendering.")
         .defaultValue(new SettingColor(255, 0, 0, 255))
         .visible(enableRenderBreaking::get)

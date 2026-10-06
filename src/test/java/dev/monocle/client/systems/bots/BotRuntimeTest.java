@@ -60,6 +60,11 @@ public final class BotRuntimeTest {
         assert BotRuntime.top(restored).getAsJsonObject("result").getAsJsonObject("value").get("answer").getAsInt() == 14;
         BotRuntime.Transition done = decide(restored);
         assert done.finish().equals("Complete") && BotRuntime.top(restored) == null;
+        assert restored.get("workflowResult").getAsInt()==14 : "Root results must survive final cleanup and reach the host";
+        JsonObject receiptStatus=object("{action:{type:'StashDeposit'},token:'deposit-1'}");
+        assert BotRuntime.reportsNativeReceipt(receiptStatus,"deposit-1","StashDeposit");
+        assert !BotRuntime.reportsNativeReceipt(receiptStatus,"deposit-2","StashDeposit")&&!BotRuntime.reportsNativeReceipt(receiptStatus,"deposit-1","StashResupply");
+        receiptStatus.remove("action");assert !BotRuntime.reportsNativeReceipt(receiptStatus,"deposit-1","StashDeposit") : "Cleanup and idle workflow frames cannot resend a detached receipt";
         assert BotRuntime.savedFinish(restored).equals("Complete");
         BotRuntime.validateCheckpoint(id(restored), restored);
         restored.addProperty("requestedStatus", "Cancelled");
@@ -102,6 +107,9 @@ public final class BotRuntimeTest {
             var calls = tick.code().orElseThrow().elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
                 .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
             assert calls.indexOf("heartbeat") < calls.indexOf("canUpdate") : "World/menu readiness cannot suppress cancellation acknowledgments";
+            assert calls.indexOf("stashPending")>=0&&calls.indexOf("stashPending")<calls.indexOf("stashTelemetry")
+                &&calls.indexOf("sendStashFinding")<calls.indexOf("typeOfCurrentScan")
+                : "Deposit column requests must be sent independently of scan-only telemetry";
             assert !calls.contains("control") : "A worker tick must not authorize its own reconnect resume";
         }
         try (var bytes = BotScheduler.class.getResourceAsStream("BotScheduler.class")) {

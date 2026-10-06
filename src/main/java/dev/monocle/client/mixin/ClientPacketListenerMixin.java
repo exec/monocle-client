@@ -33,6 +33,7 @@ import dev.monocle.client.systems.modules.movement.Velocity;
 import dev.monocle.client.systems.modules.player.NoRotate;
 import dev.monocle.client.systems.modules.render.NoRender;
 import dev.monocle.client.systems.modules.world.HighwayBuilder;
+import dev.monocle.client.systems.modules.world.AutoWither;
 import dev.monocle.client.systems.modules.world.PrinterHelper;
 import dev.monocle.client.utils.player.ChatUtils;
 import net.minecraft.client.Minecraft;
@@ -128,6 +129,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
         // Vanilla has resolved block predictions on the client thread before this callback.
         Modules.get().get(HighwayBuilder.class).onServerBlockAck(packet.sequence());
         Modules.get().get(PrinterHelper.class).onServerBlockAck(packet.sequence());
+        Modules.get().get(AutoWither.class).onServerBlockAck(packet.sequence());
         Modules.get().get(CrystalAura.class).onServerBlockAck(packet.sequence());
         Modules.get().get(Surround.class).onServerBlockAck(packet.sequence());
         Modules.get().get(Scaffold.class).onServerBlockAck(packet.sequence());
@@ -137,6 +139,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
     private void onHandleBlockUpdate(ClientboundBlockUpdatePacket packet, CallbackInfo ci) {
         Modules.get().get(HighwayBuilder.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(PrinterHelper.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
+        Modules.get().get(AutoWither.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(CrystalAura.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(Surround.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(Scaffold.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
@@ -147,6 +150,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
         packet.runUpdates((pos, state) -> {
             Modules.get().get(HighwayBuilder.class).onServerBlockUpdate(pos, state);
             Modules.get().get(PrinterHelper.class).onServerBlockUpdate(pos, state);
+            Modules.get().get(AutoWither.class).onServerBlockUpdate(pos, state);
             Modules.get().get(CrystalAura.class).onServerBlockUpdate(pos, state);
             Modules.get().get(Surround.class).onServerBlockUpdate(pos, state);
             Modules.get().get(Scaffold.class).onServerBlockUpdate(pos, state);
@@ -176,6 +180,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
         Modules.get().get(HighwayBuilder.class).onSupplyItemPickup(packet.getItemId(), packet.getPlayerId(), packet.getAmount());
         dev.monocle.client.systems.bots.Bots.get().crew.pickup(packet.getItemId(), packet.getPlayerId(), packet.getAmount());
         Modules.get().get(PrinterHelper.class).onSupplyItemPickup(packet.getItemId(), packet.getPlayerId(), packet.getAmount());
+        Modules.get().get(AutoWither.class).onSupplyItemPickup(packet.getItemId(), packet.getPlayerId(), packet.getAmount());
         Entity itemEntity = minecraft.level.getEntity(packet.getItemId());
         Entity entity = minecraft.level.getEntity(packet.getPlayerId());
 

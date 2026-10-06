@@ -1,6 +1,7 @@
 package dev.monocle.client.systems.bots;
 
 import dev.monocle.client.systems.modules.misc.swarm.SwarmConnection;
+import dev.monocle.coordinator.CrewFrames;
 import java.io.DataInputStream;
 import java.lang.classfile.ClassFile;
 import java.lang.classfile.ClassModel;
@@ -31,6 +32,7 @@ public final class BotsTest {
         BotRuntimeTest.run();
         BotProfilesTest.run();
         BotActionsTest.main(args);
+        FightEventStoreTest.run();
         var banterLocal = UUID.randomUUID(); var banterOther = UUID.randomUUID();
         assert BotBanter.winner(banterLocal, java.util.Map.of(banterLocal, 3, banterOther, 5)).equals(banterOther);
         assert BotBanter.winner(banterOther, java.util.Map.of(banterLocal, 3, banterOther, 5)) == null;
@@ -167,6 +169,15 @@ public final class BotsTest {
             : "Crew reassignment must never accept plaintext credentials";
         assert calls(method(bots, "onTick")).contains("dev/monocle/client/systems/bots/Bots.tickConnection")
             : "Reconnect must run without a module subscription";
+        var reconnect = calls(method(bots, "tickConnection"));
+        assert reconnect.indexOf("dev/monocle/client/systems/modules/misc/swarm/SwarmCrew.announce") >= 0
+            && reconnect.indexOf("dev/monocle/client/systems/modules/misc/swarm/SwarmCrew.announce") < reconnect.indexOf("dev/monocle/client/systems/bots/Bots.sendPendingJoin")
+            : "Every reconnect must identify the worker before queued join requests";
+        assert method(bots, "isWorker").code().orElseThrow().elementList().stream()
+            .anyMatch(i -> i instanceof FieldInstruction field && field.field().name().equalsString("workerWasConnected"))
+            : "Do not send status/chat before the fresh hello";
+        for (String name : List.of("reportChat", "onChat", "sendToHost"))
+            assert calls(method(bots, name)).contains("dev/monocle/client/systems/bots/Bots.isWorker") : "Worker messages must wait for identity: " + name;
         for (String event : List.of("onGameLeft", "onGameJoin")) {
             assert calls(method(bots, event)).stream().noneMatch(call -> call.endsWith(".disable") || call.endsWith(".toggle"))
                 : "World transitions must not disable the worker's reconnect loop";
@@ -194,12 +205,16 @@ public final class BotsTest {
             worker.start();
             try (Socket rawHost = listener.accept()) {
                 rawHost.setSoTimeout(5000);
-                String hello = new DataInputStream(rawHost.getInputStream()).readUTF();
-                assert hello.matches("monocle-crew-6:[0-9a-f-]{36}:[0-9a-f]{64}");
+                String hello = CrewFrames.read(new DataInputStream(rawHost.getInputStream()));
+                assert hello.matches("monocle-crew-7:[0-9a-f-]{36}:[0-9a-f]{64}");
                 assert hello.endsWith(":" + selectorA) && !hello.contains(a) : "Never put the private key in the hello";
                 assert worker.credentialId().isEmpty() && !worker.connected() : "A selector alone is not authenticated membership";
                 unavailable(() -> worker.sealSecret(b));
                 unavailable(() -> worker.openSecret(previousSession));
+                var output = new java.io.DataOutputStream(rawHost.getOutputStream());
+                CrewFrames.write(output, "monocle-crew-6:" + UUID.randomUUID()); output.flush();
+                await(() -> !worker.isAlive());
+                assert !worker.connected() && worker.failure().contains("Incompatible Workers protocol") : "Old native protocol must fail explicitly, not enter a half-authenticated session";
             } finally { worker.disconnect(); worker.join(1000); }
         }
     }
@@ -220,6 +235,12 @@ public final class BotsTest {
                     await(() -> (received[0] != null || (received[0] = host.poll()) != null)
                         && (received[1] != null || (received[1] = worker.poll()) != null));
                     assert received[0].equals("crew report") && received[1].equals("crew assignment");
+                    String fullFrame = "🌸".repeat(CrewFrames.MAX_BYTES / 4);
+                    assert worker.send(fullFrame) && host.send(fullFrame);
+                    received[0] = received[1] = null;
+                    await(() -> (received[0] != null || (received[0] = host.poll()) != null)
+                        && (received[1] != null || (received[1] = worker.poll()) != null));
+                    assert received[0].equals(fullFrame) && received[1].equals(fullFrame) : "Authenticated TCP must pass 256 KiB UTF-8, beyond writeUTF's old 64 KiB limit";
                     String secret = "a-new-private-crew-key-not-sent-in-plaintext";
                     String sealed = host.sealSecret(secret);
                     assert sealed.length() <= 512 && !sealed.contains(secret);
@@ -234,6 +255,8 @@ public final class BotsTest {
                     invalid(() -> worker.openSecret("x".repeat(513)));
                     assert host.sealSecret("x".repeat(356)).length() == 512;
                     invalid(() -> host.sealSecret("x".repeat(357)));
+                    assert !worker.send(fullFrame + "x") && !worker.connected() && worker.failure().contains("256 KiB")
+                        : "Oversized output must retain an actionable failure, not silently drop receipts";
                     return sealed;
                 } else {
                     await(() -> !host.isAlive() && !worker.isAlive());

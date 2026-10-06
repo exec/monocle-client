@@ -98,6 +98,7 @@ dependencies {
 
     // Libraries (JAR-in-JAR)
     jij("org.luaj:luaj-jse:3.0.1") { isTransitive = false }
+    jij("org.xerial:sqlite-jdbc:3.53.4.0") { isTransitive = false }
     jij("org.java-websocket:Java-WebSocket:1.6.0") { isTransitive = false }
     jij(libs.orbit)
     jij(libs.starscript)
@@ -301,6 +302,7 @@ tasks {
         "printerFlightCheck" to "dev.monocle.client.utils.world.PrinterFlightTest",
         "printerIntegrationCheck" to "dev.monocle.client.modintegration.PrinterIntegrationTest",
         "printerRestockCheck" to "dev.monocle.client.systems.modules.world.PrinterRestockTest",
+        "autoWitherCheck" to "dev.monocle.client.systems.modules.world.AutoWitherTest",
         "playerProfileConcurrencyCheck" to "dev.monocle.client.mixin.PlayerProfileConcurrencyTest"
     ).map { (taskName, main) ->
         register<JavaExec>(taskName) {
@@ -315,6 +317,7 @@ tasks {
     }
 
     test {
+        failOnNoDiscoveredTests = false // Assertion-based checks run through their JavaExec tasks.
         exclude("**/BotsTest*.class", "**/BotJobsTest*.class", "**/BotWorkflowsTest*.class", "**/BotLuaTest*.class", "**/BotRuntimeTest*.class", "**/BotSchedulerTest*.class", "**/BotTaskDataTest*.class", "**/BotProfilesTest*.class", "**/BotActionsTest*.class", "**/BotStashHuntTest*.class", "**/WorkflowCodeBoxTest*.class") // Run by botsCheck.
         exclude("**/SwarmCrewTest*.class")
         exclude("**/CrewInventoryTest*.class") // Run by crewInventoryCheck.
@@ -343,6 +346,7 @@ tasks {
         exclude("**/LitematicExporterTest*.class", "**/SchematicSelectorTest*.class")
         exclude("**/HighwayMobTest*.class")
         exclude("**/Printer*Test*.class")
+        exclude("**/AutoWitherTest*.class")
         exclude("**/PlayerProfileConcurrencyTest*.class")
     }
 

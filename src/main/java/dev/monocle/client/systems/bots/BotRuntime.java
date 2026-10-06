@@ -17,6 +17,7 @@ import static dev.monocle.client.systems.bots.BotTaskData.*;
 final class BotRuntime {
     private final Bots bots;
     private final BotActions actions;
+    private CrystalFightRecorder fightRecorder;
     private final Path file = MonocleClient.FOLDER.toPath().resolve("bot-worker-tasks.json");
     private final Map<UUID, JsonObject> runs = new LinkedHashMap<>();
     private UUID current;
@@ -179,7 +180,7 @@ final class BotRuntime {
         if (run.has("supportedActions")) {
             JsonArray supported = run.getAsJsonArray("supportedActions");
             if (supported == null || supported.isEmpty() || supported.size() > 11) throw new IllegalArgumentException("Invalid host capabilities");
-            for (JsonElement action : supported) if (!Set.of("Travel", "StashHunt", "StashScan", "StashResupply", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies").contains(action.getAsString())) throw new IllegalArgumentException("Unknown host capability");
+            for (JsonElement action : supported) if (!Set.of("Travel", "StashHunt", "StashScan", "StashResupply", "StashDeposit", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies").contains(action.getAsString())) throw new IllegalArgumentException("Unknown host capability");
         }
         String pending = savedFinish(run);
         JsonArray stack = run.getAsJsonArray("stack");
@@ -228,9 +229,21 @@ final class BotRuntime {
                     run.addProperty("status", "Running"); run.addProperty("detail", "Resuming workflow");
                     try {
                         BotProfiles.begin(); save();
-                        BotProfiles.apply(run.has("effectiveProfile") ? run.getAsJsonObject("effectiveProfile") : run.getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current"));
+                        JsonObject profile=(run.has("effectiveProfile") ? run.getAsJsonObject("effectiveProfile") : run.getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current")).deepCopy();
+                        if(text(run.getAsJsonObject("package"),"entry").equals("task-crystal-guard"))for(String module:List.of("crystal-aura","kill-aura","anchor-aura","bed-aura")){
+                            JsonObject value=profile.has(module)?profile.getAsJsonObject(module):new JsonObject();value.addProperty("active",false);
+                            if(!value.has("settings"))value.addProperty("settings","{}");profile.add(module,value);
+                        }
+                        BotProfiles.apply(profile);
                     }
                     catch (RuntimeException e) { finish("Failed", "Profile could not be applied: " + e.getMessage()); return; }
+                }
+                if (fightRecorder == null && text(run.getAsJsonObject("package"), "entry").equals("task-crystal-guard")) {
+                    try {
+                        fightRecorder = CrystalFightRecorder.start(UUID.fromString(text(run, "task")), text(run, "server"), text(run, "dimension"), run.getAsJsonObject("args"));
+                        run.addProperty("fightLog", fightRecorder.path().toString()); save();
+                        bots.info("Crystal Guard fight log: %s", fightRecorder.path());
+                    } catch (Exception | LinkageError e) { finish("Failed", "Crystal fight recorder could not start: " + e.getMessage()); return; }
                 }
                 if (requested.equals("Suspended")) {
                     connectionSuspended = false;
@@ -260,6 +273,7 @@ final class BotRuntime {
     }
     void disconnected() {
         if (current == null) return;
+        closeFightRecorder();
         actions.disconnected();
         if (requested.isEmpty()) {
             connectionSuspended = top() != null && top().has("action") && text(top().getAsJsonObject("action"), "type").equals("Highway");
@@ -298,22 +312,26 @@ final class BotRuntime {
                 return; // Do not reconcile an old server's pending drop against a different inventory.
             }
             try {
+                if (fightRecorder != null) fightRecorder.sample();
                 // A live connection is not permission to resume. Wait for the host to reconcile
                 // this saved execution and explicitly resume it (or deliver its cancellation).
                 JsonObject f = top();
                 // An action with no native checkpoint has not acquired controls or emitted
                 // packets. Cancelling it must not start it just to immediately stop it.
-                if (f != null && f.has("action") && !text(f, "token").equals(actionLoaded) && (requested.isEmpty() || f.has("native"))) loadAction(f);
+                if (f != null && f.has("action") && !text(f, "token").equals(actionLoaded) && (requested.isEmpty() || f.has("native"))&&!loadAction(f)){
+                    run().addProperty("detail","Landing before the next action's movement/profile handoff");
+                    if(ticks%20==0){checkpointAction();sendStatus(current);}return;
+                }
                 if (!requested.isEmpty()) {
                     settleFinish();
                 } else if (f == null) finish("Complete", "Workflow complete");
                 else if (f.has("action")) tickAction(f);
-                else decide(f);
+                else {if(actions.stashHandoff())actions.tick();decide(f);}
                 if (current != null && ticks % 20 == 0) { checkpointAction(); sendStatus(current); }
+                if (current != null && actions.stashPending()!=null && ticks % 10 == 0) sendStashFinding();
                 if (current != null && actions.stashTelemetry() != null && typeOfCurrentScan()) {
                     JsonObject t=actions.stashTelemetry(); String signature=text(t,"phase")+text(t,"reason")+text(t,"target")+t.get("observed")+t.get("unscanned");
                     if (!signature.equals(lastStashStatus)) { checkpointAction(); sendStatus(current); lastStashStatus=signature; }
-                    if (actions.stashPending()!=null && ticks % 10 == 0) sendStashFinding();
                 }
             } catch (RuntimeException e) {
                 if (current != null) {
@@ -335,11 +353,13 @@ final class BotRuntime {
             sendSurveyFindings();
         }
     }
-    private void loadAction(JsonObject frame) {
+    private boolean loadAction(JsonObject frame) {
+        if(!actions.prepareNext(frame.getAsJsonObject("action")))return false;
         if (anchorRecovery(frame, mc.player.position())) save(); // Save the fixed search area before any movement, including legacy resumes.
         if (frame.has("native")) actions.restore(frame.getAsJsonObject("native")); else actions.start(frame.getAsJsonObject("action"));
         actions.resume(); actionLoaded = text(frame, "token");
         if (uncertainTeleport(frame)) actions.markTpaSent(); // Observe the outcome; never resend a checkpointed command intent.
+        return true;
     }
     static boolean anchorRecovery(JsonObject frame, net.minecraft.world.phys.Vec3 position) {
         JsonObject action = frame.getAsJsonObject("action");
@@ -366,19 +386,19 @@ final class BotRuntime {
             actions.externalResult(true, "Applied bundled profile " + text(action, "name"), new JsonObject());
         }
         if(type.equals("Highway")&&!bots.crew.resourceFailure().isEmpty()) actions.externalResult(false,bots.crew.resourceFailure(),new JsonObject());
-        JsonObject status = actions.tick();
+        JsonObject status = actions.tick(true);
         run().addProperty("detail", type.equals("Highway") && actions.recoveryReady() && !nativeFinished(status)
             ? bots.crew.localAssigned() ? "Highway: " + bots.crew.localStatus()
                 : "Highway profile ready; waiting for host assignment and the other targeted workers"
             : text(status, "detail"));
         if (actions.checkpointRequired()) { checkpointAction(); actions.checkpointSaved(); }
         if (nativeFinished(status)) {
-            if (Set.of("StashScan","StashResupply").contains(type)) { checkpointAction(); sendStatus(current); }
+            if (Set.of("StashScan","StashResupply","StashDeposit").contains(type)) { checkpointAction(); sendStatus(current); }
             boolean success = text(status, "state").equals("Complete");
             JsonObject result = status.has("result") ? status.getAsJsonObject("result").deepCopy() : new JsonObject();
             result.addProperty("ok", success); result.addProperty("detail", text(status, "detail"));
             if (!success && !(action.has("allowFailure") && action.get("allowFailure").getAsBoolean())) { finish("Failed", text(status, "detail")); return; }
-            if (!actions.requestSuspend() || !grounded()) { run().addProperty("detail", "Action finished; awaiting safe cleanup before the next step"); return; }
+            if (!actions.stashHandoff()&&(!actions.requestSuspend() || !grounded())) { run().addProperty("detail", "Action finished; awaiting safe cleanup before the next step"); return; }
             frame.add("result", result); frame.remove("action"); frame.remove("native"); frame.remove("profileApplied"); frame.remove("commandSent"); frame.remove("token"); actionLoaded = ""; save();
         }
     }
@@ -403,6 +423,7 @@ final class BotRuntime {
             case "Done" -> {
                 JsonArray stack = run.getAsJsonArray("stack"); stack.remove(stack.size() - 1);
                 if (stack.isEmpty()) {
+                    if(action.has("result"))run.add("workflowResult",action.get("result").deepCopy());
                     run.addProperty("requestedStatus", "Complete"); run.addProperty("requestedDetail", "Workflow complete");
                     return new Transition("Complete", "Workflow complete", false);
                 }
@@ -451,7 +472,8 @@ final class BotRuntime {
     private void finish(String state, String detail) {
         if (current == null) return;
         if (state.equals("Suspended") && terminal(requested)) return; // Pause cannot turn a pending failure/completion back into resumable work.
-        actions.disconnected(); // Revoke held travel input before checkpointing or waiting for native cleanup.
+        if (actions.stashFlightActive()) actions.requestSuspend(); // Keep controlled flight until a stash worker lands.
+        else actions.disconnected(); // Revoke ground travel before checkpointing or waiting for native cleanup.
         requested = finishOutcome(requested, state); requestedDetail = bounded(detail == null || detail.isBlank() ? state : detail);
         run().addProperty("status", "Suspending"); run().addProperty("requestedStatus", requested); run().addProperty("requestedDetail", requestedDetail);
         run().addProperty("detail", "Awaiting safe cleanup: " + requestedDetail);
@@ -476,10 +498,17 @@ final class BotRuntime {
         if (top() != null && top().has("action") && text(top(), "token").equals(actionLoaded)) top().add("native", actions.snapshot());
         run.add("effectiveProfile", BotProfiles.captureEffective());
         actions.stop(); BotProfiles.restore();
+        closeFightRecorder();
         run.addProperty("status", requested); run.addProperty("detail", bounded(requestedDetail)); run.remove("requestedStatus"); run.remove("requestedDetail");
         BotHistory.stamp(run, terminal(requested) && !hasUncertainAction(run), System.currentTimeMillis());
         save(); // Do not release runtime ownership until the final checkpoint is durable.
         UUID id = current; current = null; requested = requestedDetail = actionLoaded = ""; sendStatus(id);
+    }
+    private void closeFightRecorder() {
+        if (fightRecorder == null) return;
+        try { fightRecorder.close(); }
+        catch (RuntimeException error) { bots.error("Crystal Guard fight log could not finish cleanly: %s", error.getMessage()); }
+        finally { fightRecorder = null; }
     }
     private static String bounded(String value) { return value == null ? "" : value.substring(0, Math.min(900, value.length())); }
     void external(UUID id, String token, boolean success, String detail, JsonObject result) {
@@ -487,7 +516,7 @@ final class BotRuntime {
         String type = text(top().getAsJsonObject("action"), "type");
         if (type.equals("Tpa") && !success && uncertainTeleport(top())) return; // A sent request still has to be observed through completion/timeout.
         if (!Set.of("Highway", "SetProfile").contains(type) && !(type.equals("Tpa") && !success)) throw new IllegalArgumentException("This action is not host-managed");
-        if (!token.equals(actionLoaded)) loadAction(top());
+        if (!token.equals(actionLoaded)&&!loadAction(top()))return;
         if (nativeFinished(actions.snapshot())) return; // Retransmitted results cannot overwrite the first terminal outcome.
         actions.externalResult(success, detail, result); checkpointAction();
     }
@@ -495,6 +524,7 @@ final class BotRuntime {
     void teleport(UUID id, String token, String targetName, UUID targetId, String dimension) {
         if (!requested.isEmpty() || !matches(id, token) || !text(top().getAsJsonObject("action"), "type").equals("Tpa") || uncertainTeleport(top())) return;
         if (!targetName.matches("[A-Za-z0-9_]{1,16}")) throw new IllegalArgumentException("Invalid TPA player name");
+        if(!token.equals(actionLoaded)&&!loadAction(top()))return;
         // Persist intent before issuing: uncertain restart never repeats an already-issued teleport request.
         JsonObject action = top().getAsJsonObject("action"); action.addProperty("target", targetId.toString()); action.addProperty("dimension", dimension);
         actions.stop(); actions.start(action); actionLoaded = token;
@@ -524,21 +554,30 @@ final class BotRuntime {
         m.addProperty("readbackVersion", 1);
         for (String key : List.of("configRevision", "configError")) if (run.has(key)) m.add(key, run.get(key).deepCopy());
         if (run.has("requestedStatus")) m.addProperty("requestedStatus", text(run, "requestedStatus"));
+        if (run.has("workflowResult")) m.add("workflowResult",run.get("workflowResult").deepCopy());
         JsonArray stack = run.getAsJsonArray("stack");
         if (!stack.isEmpty()) { JsonObject f = stack.get(stack.size() - 1).getAsJsonObject(); if (f.has("action")) { m.add("action", f.get("action").deepCopy()); m.addProperty("token", text(f, "token")); m.addProperty("commandSent", f.has("commandSent")); } }
         if (id.equals(current) && typeOfCurrentScan() && actions.stashTelemetry()!=null) m.add("stashScan",actions.stashTelemetry());
-        if(id.equals(current)&&actions.stashWithdrawal()!=null)m.add("stashWithdrawal",actions.stashWithdrawal());
+        if(id.equals(current)&&reportsNativeReceipt(m,actionLoaded,"StashResupply")&&actions.stashWithdrawal()!=null)m.add("stashWithdrawal",actions.stashWithdrawal());
+        if(id.equals(current)&&reportsNativeReceipt(m,actionLoaded,"StashDeposit")&&actions.stashDeposit()!=null)m.add("stashDeposit",actions.stashDeposit());
         send(m);
+    }
+    static boolean reportsNativeReceipt(JsonObject message,String loadedToken,String type){
+        return message.has("action")&&!loadedToken.isEmpty()&&loadedToken.equals(text(message,"token"))&&type.equals(text(message.getAsJsonObject("action"),"type"));
     }
     private boolean typeOfCurrentScan(){return top()!=null&&top().has("action")&&text(top().getAsJsonObject("action"),"type").equals("StashScan");}
     private void sendStashFinding(){
-        if(current==null||!typeOfCurrentScan())return;
+        if(current==null||top()==null||!top().has("action")||!Set.of("StashScan","StashDeposit").contains(text(top().getAsJsonObject("action"),"type")))return;
         JsonObject m=message("stash-findings");m.addProperty("run",current.toString());m.add("task",run().get("task"));m.add("token",top().get("token"));m.add("action",top().get("action").deepCopy());
-        m.addProperty("delivery",actions.stashDelivery());m.add("observation",actions.stashPending());send(m);
+        m.addProperty("delivery",actions.stashDelivery());JsonObject pending=actions.stashPending();
+        if(typeOfCurrentScan())dev.monocle.coordinator.StashCatalog.attachObservation(m,pending);
+        else{if(pending.has("observation"))dev.monocle.coordinator.StashCatalog.attachObservation(m,pending.getAsJsonObject("observation"));if(pending.has("exhaustedColumn"))m.add("exhaustedColumn",pending.get("exhaustedColumn").deepCopy());}
+        send(m);
     }
-    void acknowledgeStash(UUID id,String token,int delivery,String owner){
-        load();JsonObject r=runs.get(id);if(!ownedBy(r,owner)||!id.equals(current)||!token.equals(actionLoaded)||!typeOfCurrentScan())return;
-        actions.acknowledgeStash(delivery);checkpointAction();
+    void acknowledgeStash(UUID id,String token,JsonObject ack,String owner){
+        load();JsonObject r=runs.get(id);if(!ownedBy(r,owner)||!id.equals(current)||!token.equals(actionLoaded))return;
+        if(typeOfCurrentScan())actions.acknowledgeStash(integer(ack,"delivery",1,4096));else if(top()!=null&&top().has("action")&&text(top().getAsJsonObject("action"),"type").equals("StashDeposit"))actions.acknowledgeStashDeposit(ack);else return;
+        checkpointAction();
     }
 
     private void sendSurveyFindings() {

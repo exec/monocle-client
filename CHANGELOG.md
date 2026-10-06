@@ -2,6 +2,116 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.13.27 — Take off beside stash chests without phantom collisions
+
+- Stash takeoff sweeps use the player's actual bounding box instead of widening it into an adjacent chest. Stash flight routes also use the real player width, so the same phantom collision cannot return immediately after launch. Real ceiling, block, chunk and hazard checks remain in place; obstructed takeoffs report the launch and target coordinates.
+- A regression reproduces the live chest-edge position near the world border, checks takeoff and initial flight, and still rejects real ceilings and chest overlap. Host changes are not required.
+- Live 0.13.26 validation recovered the nine retained V4 kits and deposited another 65 before the next chest-layer approach exposed this takeoff issue. Fourteen confirmed pickups remain carried in the paused transfer.
+
+## 0.13.26 — Hopper-aware withdrawals and recoverable source searches
+
+- The failed V4 transfer targeted a scanned hopper, not a missing chest. Withdrawals now accept scanned storage containers and reuse the scanner's hopper perch/through-chest opening approach. Source diagnostics include coordinates, observed block type and confirmed pickup count.
+- Missing containers receive a 40-tick settling window; openings, missing chunks and stalled approaches have bounded progress-aware waits. Recoverable source failures deliver an already-confirmed partial stash load before reporting failure. Uncertain clicks remain inspection-required and are never replayed.
+- Updated built-in repeat-transfer workflows revisit sources after productive passes and require two empty passes separated by 20 ticks before declaring exhaustion. Hopper refills reset verification. Known source locations invalidated by our own withdrawals remain live search targets, without restoring stale stock counts or accepting unknown scan gaps.
+- Same-world local stash travel skips `/home` within 256 blocks, using the selected withdrawal target when available. An unloaded destination does not itself force a teleport; navigation can approach it while waiting for chunks. Long-distance flight preference remains queued separately.
+- Worker and shared-core regression checks cover hopper acceptance, partial failure checkpoints, final rechecks, refill detection and local travel thresholds. Update the host for the new built-in workflow when creating new jobs; existing job packages keep their original script. Live validation is still pending.
+
+## 0.13.25 — Confirm deposits before hopper-fed storage moves them
+
+- Live changed-slot diagnostics showed previously filled destination slots becoming empty while the inventory remained reduced. Kit deposits now use two ordered, explicit-slot clicks without local prediction, each requesting vanilla's immediate post-click full snapshot. Intermediate kit-on-cursor snapshots do not acknowledge placement.
+- Each exact kit is verified at its explicit destination with an empty cursor and one fewer carried kit. A later hopper transfer no longer invalidates that completed receipt; delayed batch reopen checks have been removed. Stash and kit ender-chest deposits share the confirmed move helper, retain bounded waits and never replay an uncertain click.
+- Regression checks cover intermediate pickup snapshots, wrong/pre-existing kits, duplicate receipts, hopper movement of previously confirmed kits, immutable baselines and 36 deposits crossing chest layers.
+
+## 0.13.24 — Record changed chest slots on uncertain receipts
+
+- Unconfirmed deposits retain the actual changed-slot manifests and their component differences from the carried kit, including before/after contents. This distinguishes merges or changed kit metadata from a missing insertion without weakening receipt checks or replaying clicks.
+
+## 0.13.23 — Verify actual server-side kit insertion
+
+- Live diagnostics found an exact kit in slot 1 while local prediction expected slot 2. Stash and kit ender-chest deposits now capture an immutable server-confirmed baseline, require one empty-to-exact-kit slot change plus one carried kit removed, and verify the actual insertion slot rather than a predicted one. Existing identical kits, concurrent chest edits and nonempty cursors cannot acknowledge a deposit.
+- New clicks wait for local inventory to reconcile with the server snapshot. Batch reopen checks, bounded waits and no replay of uncertain moves remain in place. Regression checks cover displaced insertion slots, pre-existing identical kits, concurrent edits and immutable baselines.
+- Live testing recovered all 27 carried kits and confirmed an empty inventory. A fresh 36-kit transfer verified 26 deposits across chest layers before a different receipt mismatch; the second pickup was withheld.
+
+## 0.13.22 — Diagnose exact deposit-slot mismatches
+
+- Unconfirmed kit deposits retain the server menu/state ID, cursor count, expected and actual kit manifests, exact-match slot locations and differing component keys in the worker checkpoint. Timeout details also identify the actual item/quantity and match locations. No uncertain move is replayed and no verification requirement is relaxed.
+
+## 0.13.21 — Reconcile stale deposit slots before the next move
+
+- Live 0.13.20 testing reached an upper stash chest, then stopped when an already-acknowledged destination slot appeared empty again. A stale slot or carried-inventory rollback now enters the existing close/reopen verification path before any new move, rather than tripping the duplicate-slot guard.
+- Exact per-slot batch verification, bounded timeouts and no replay of uncertain moves remain unchanged. Regression checks cover stale acknowledged slots, inventory rollback, full chests and releasing slots after verification.
+- Live retesting still stopped safely on an upper-chest destination-slot mismatch (carried kits 31 → 30, expected slot 1). Automated checks pass, but this does not yet resolve the full live transfer failure; the second pickup was withheld.
+
+## 0.13.20 — Atomic kit deposits across stash chest layers
+
+- Stash and ender-chest deposits use a single shift-click instead of picking a kit up onto the cursor and placing it with a second click. Exact destination-slot confirmation and final chest-reopen verification remain required.
+- A mismatched in-flight stash snapshot triggers bounded refreshes without replaying the move or counting it as deposited. Unresolved verification still stops safely, now reporting the target chest, menu, stage, inventory count change and destination slot.
+- Regression checks reproduce the old immediate rejection and verify a 36-kit load filling 18 remaining bottom-chest slots before depositing 18 kits into the next chest. Existing 0.13.18 hosts remain compatible.
+
+## 0.13.19 — Send destination reservation requests outside scan telemetry
+
+- Fix the live 0.13.18 deposit failure: native destination-column requests were still sent only from the scan telemetry branch. Deposits have no scan telemetry, so the host never received their requests. Pending stash findings now use the independent shared retry path, retaining the existing host acknowledgement and contents-verification requirements.
+- Worker regression checks cover the scan-independent send path. A failed reservation attempt that withdrew kits but deposited none can be recovered with a deposit-only workflow using the carried kits; do not withdraw the same load again. Existing 0.13.18 hosts support the fix.
+
+## 0.13.18 — Kit column reservations and live destination checks
+
+- Both host modes persist kit ownership of destination columns. Matching-kit columns are preferred; otherwise a directly observed empty column is reserved. Mixed, loose-item, unknown and foreign-reserved columns are not free space.
+- Workers restrict deposit searches to the assigned vertical/diagonal column, report live contents before moving a kit, and revalidate contents between clicks. Changed contents update the host catalog and redirect to another column before any new deposit. Verified batch observations keep destination counts current instead of being erased by late status receipts.
+- The WebUI stash view shows observed free, reserved and conflicted column counts. A huge nearby stash checks its nearest loaded chunk rather than its distant minimum corner before deciding to use `/home`.
+- Stash-to-stash deposits require **0.13.18 on both the host and worker**. Automated shared-core, client and socket checks cover durable reservations, changed contents, retries, exact kit matching and stale ownership; live transfers still need testing.
+
+## 0.13.17 — Repeat kit transfers and full inventory batches
+
+- Kit Delivery can transfer all selected kits between separate stashes, returning after each verified deposit until every selected source chest is confirmed empty. A partial final load is deposited; unavailable chests and uncertain inventory moves remain failures, not empty-stock evidence.
+- Kit batches now allow all 36 inventory slots. Existing personal contents are retained; batches use only free slots. Optional inclusion of incomplete boxes matches the same kit type, not unrelated shulkers.
+- Repeat transfers require full, non-lazy source observations and refuse truncated source lists (54 matching source chests maximum). Workflow receipts are compact while full withdrawal telemetry remains available; completed usage totals report actual deliveries.
+- Native stash receipts are sent only alongside their matching active action/token, avoiding stale-receipt rejection after completion or between trips.
+- Nearby loaded stash actions can navigate locally within 128 blocks without an unnecessary `/home` command/cooldown. Both the WebUI and in-game host task editor expose the new transfer controls. Update the worker to 0.13.17 before using repeat transfers.
+
+## 0.13.16 — Full-inventory stash interaction
+
+- Host dispatch prepares kit withdrawals only for kit-delivery/removal presets; custom deposit-only workflows carrying a kit type ID no longer stop coordination by being reinterpreted as withdrawals. Client-based hosting uses the same selection rule.
+- Stash scans, withdrawals, and deposits open containers using the existing non-sneaking block interaction instead of requiring an empty hotbar slot or pickaxe. A full inventory can now reach the deposit phase without failing at the opener.
+- All three paths share a current-container check, so a missing/replaced container is not clicked with a held kit. The opener does not move items or change the selected hotbar slot; server-confirmed transfer and batch verification remain unchanged.
+- Native protocol 7 is unchanged; 0.13.15 hosts remain compatible. Automated checks cover shared opener routing and container validation; live full-hotbar deposits still need testing.
+
+## 0.13.15 — Larger bounded native worker messages
+
+- Native TCP and WebSocket worker records accept up to 256 KiB of UTF-8 text, allowing full inventory kit-transfer receipts without the old 16,000-character disconnect. TCP uses a checked four-byte byte-length prefix instead of Java's 65,535-byte `writeUTF` format.
+- Each native incoming/outgoing queue is limited to 1 MiB of encoded text and 128 records. Oversized, malformed, truncated, and congested frames fail explicitly; writer failures retain their reason.
+- Reconnected clients send their identity before task status, chat, or crew join requests, preventing secondary identity-rejection loops.
+- Native protocol 7 requires updating both hosts and workers together. Existing chunked 4 MiB workflow packages and the separate public RWP draft limits are unchanged.
+
+## 0.13.14 — Stash flight handoffs and useful-progress watchdog
+
+- Consecutive nearby stash actions in a worker workflow retain controlled flight rather than landing between every scan, withdrawal, or deposit. Nested workflow calls retain the same handoff; teleport, profile changes, cancellation, and final cleanup still wait for safe landing.
+- A bounded trail of actual flown positions survives compatible handoffs and gives final cleanup a return path. Server corrections and disconnects discard stale routes; landing still checks the current world for collisions and support.
+- Scan approach timeouts reset only after a new closest approach of at least a quarter block. Jitter, movement away, and retracing the same approach no longer hide stalls. Scan telemetry includes no-progress ticks and closest opening distance.
+- Automated worker and flight checks cover compatibility boundaries, handoff ordering, bounded return trails, and scan watchdog expiry. Live multi-step stash behavior still needs testing.
+
+## 0.13.13 — Batched kit deposits
+
+- Destination stash deposits keep a chest open between individually server-confirmed moves, reopening once when the chest fills or the requested batch is complete.
+- The final reopen verifies every deposited box's exact slot, contents, name, and quantity together with the full carried-inventory change. Unverified batches remain pending and cannot be replayed after a restart.
+- Unexpected menu changes cannot take over an unfinished batch; live pause/disconnect handoffs verify that batch before continuing.
+- Worker checks cover multi-box and multi-chest batches, duplicate updates, incorrect or missing boxes, inventory changes, and interrupted checkpoints. Live deposit behavior still needs testing.
+
+## 0.13.12 — Worker flight and stash efficiency
+
+- Landing checks use the actual player footprint, including block edges. Restarted flights search all nearby landing columns, checking at most 16 candidates per tick instead of performing a large search on one frame.
+- Local flight detours can route beyond an intermediate waypoint buried inside an obstacle.
+- Confirmed withdrawals keep the source chest open when subsequent boxes come from the same chest. Kit inventory counting checks the requested kit once per stack instead of repeating it for every mapped source.
+- Destination chest selection uses existing loaded block entities rather than scanning every block in the stash cuboid. Verified deposits reuse the reopened chest's contents immediately without an extra synchronization wait.
+- Withdrawals wait for server container contents before selecting a box; cancellation and disconnect cleanup no longer dereference a missing player while restoring the hotbar slot. Carry-mode completion reports the correct destination.
+- Automated flight, stash-boundary, worker, and printer integration checks pass. Live transfer and landing behavior still needs testing.
+
+## 0.13.11 — Flight route reliability
+
+- Flight routes skip unnecessary grid turns and check short overlapping body sweeps, so nearby blocks outside a diagonal corridor no longer reject the whole route.
+- Travel and stash hunting reuse local detours between ticks, retry failed searches once per second, and discard cached routes after server corrections or reconnects.
+- Elevated stash work replans after displacement and reports failed flight searches instead of claiming to be holding near an unreachable chest. Normal ElytraFly checks the correct chunks at negative coordinates.
+- Geometry, route-following, printer integration, settings, and worker checks pass without a running game; live flight still needs testing.
+
 ## 0.11.3 — Render-distance repair survey
 
 - Repair HUD now scans the complete loaded road out to render distance and reports the next defect type, distance, and coordinates, or the verified clean horizon.

@@ -1133,7 +1133,12 @@ public final class SwarmCrewTest {
                 for (int i = 0; i < 100; i++) {
                     assert next(worker).equals("assignment:" + i); assert next(host).equals("report:" + i);
                 }
-                assert !host.send("x".repeat(16001));
+                String largest = "x".repeat(dev.monocle.coordinator.CrewFrames.MAX_BYTES);
+                assert host.send(largest) && next(worker).equals(largest) : "Native TCP supports the full 256 KiB frame budget";
+                String unicode = "🌸".repeat(dev.monocle.coordinator.CrewFrames.MAX_BYTES / 4);
+                assert worker.send(unicode) && next(host).equals(unicode) : "Limits count UTF-8 bytes, not characters or writeUTF's old ceiling";
+                assert !host.send(unicode + "x");
+                assert host.failure().contains("256 KiB") : "An oversized frame retains its rejection reason";
                 await(worker::closed);
             } finally { host.disconnect(); worker.disconnect(); host.join(1000); worker.join(1000); }
         }

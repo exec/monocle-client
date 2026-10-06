@@ -1031,7 +1031,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         positioningInput.forward(true);
     }
 
-    private void announce() {
+    public void announce() {
         if (swarm.host != null) {
             Set<SwarmConnection> current = new HashSet<>(connections());
             peers.keySet().removeIf(c -> !current.contains(c));
@@ -1096,7 +1096,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         }
         hello.addProperty("positionCheck", lastScreenFreeDetail);
         hello.addProperty("status", !Utils.canUpdate() ? "Connected; waiting to join Minecraft" : assigned() ? localParticipant ? localStatus() : phase : recovered != null ? "Saved job needs inspection in Workers" : "Ready for assignment");
-        if (swarm.isWorker()) swarm.worker.send(JSON.toJson(hello));
+        if (swarm.mode.get() == Bots.Mode.Worker && swarm.worker != null && swarm.worker.connected()) swarm.worker.send(JSON.toJson(hello));
         if (swarm.isHost()) {
             if (localParticipant) reports.put(me(), hello);
             JsonObject heartbeat = new JsonObject(); heartbeat.addProperty("type", "heartbeat"); heartbeat.addProperty("autoTpy", swarm.autoTpy.get());heartbeat.add("crews",swarm.crewDiscovery());

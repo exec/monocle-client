@@ -15,6 +15,62 @@ public final class CoordinatorCoreTest {
     private static final UUID OTHER = UUID.fromString("00000000-0000-0000-0000-000000000002");
     private static final UUID THIRD = UUID.fromString("00000000-0000-0000-0000-000000000003");
 
+    private static void workerFrames() throws Exception {
+        String full = "🌸".repeat(CrewFrames.MAX_BYTES / 4);
+        assert CrewFrames.encode(full).length == CrewFrames.MAX_BYTES;
+        rejects(() -> CrewFrames.encode(full + "x"));
+        rejects(() -> CrewFrames.encode("x".repeat(CrewFrames.MAX_BYTES + 1)));
+        rejects(() -> CrewFrames.encode("\ud800"));
+        var buffer = new java.io.ByteArrayOutputStream();
+        var out = new java.io.DataOutputStream(buffer);
+        CrewFrames.write(out, full); CrewFrames.write(out, "next 🌸 record");
+        var in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(buffer.toByteArray()));
+        assert in.readInt() == CrewFrames.MAX_BYTES;
+        in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(buffer.toByteArray()));
+        assert CrewFrames.read(in).equals(full) && CrewFrames.read(in).equals("next 🌸 record");
+        for (int length : new int[]{-1, 0, CrewFrames.MAX_BYTES + 1, Integer.MAX_VALUE}) {
+            buffer.reset(); out.writeInt(length);
+            invalidFrame(buffer.toByteArray()); // Reject the prefix without allocating or reading its payload.
+        }
+        buffer.reset(); out.writeInt(3); out.writeByte(1); invalidFrame(buffer.toByteArray());
+        buffer.reset(); out.writeInt(2); out.write(new byte[]{(byte) 0xc3, 0x28}); invalidFrame(buffer.toByteArray());
+        invalidFrame(new byte[]{1, 2});
+
+        var queue = new CrewFrames.Queue();
+        for (int i = 0; i < 4; i++) assert queue.offer(full);
+        assert !queue.offer("x") : "Queues must enforce bytes, not just number of messages";
+        assert queue.take().equals(full) && queue.offer(full);
+        queue.clear(); assert queue.poll() == null;
+        assert queue.poll(1, java.util.concurrent.TimeUnit.MILLISECONDS) == null;
+        for (int i = 0; i < 128; i++) assert queue.offer("x");
+        assert !queue.offer("x") : "Small messages must still respect the frame-count bound";
+        for (int i = 0; i < 128; i++) assert queue.poll().equals("x");
+        for (int i = 0; i < 4; i++) assert queue.offer(full) : "Draining must restore the byte budget exactly";
+        queue.clear();
+        rejects(() -> queue.offer(full + "x"));
+        assert queue.offer("after rejected frame") && queue.poll().equals("after rejected frame");
+
+        JsonObject status = new JsonObject(); status.addProperty("type", "task-status");
+        JsonArray receipts = new JsonArray();
+        for (int i = 0; i < 27; i++) {
+            JsonObject receipt = new JsonObject(); receipt.addProperty("id", UUID.randomUUID().toString());
+            receipt.addProperty("state", "Confirmed"); receipt.addProperty("stack", "x".repeat(700)); receipts.add(receipt);
+        }
+        status.add("withdrawals", receipts);
+        assert status.toString().length() > 16_000;
+        buffer.reset(); CrewFrames.write(out, status.toString());
+        assert JsonParser.parseString(CrewFrames.read(new java.io.DataInputStream(new java.io.ByteArrayInputStream(buffer.toByteArray())))).equals(status)
+            : "A full kit-inventory receipt set must fit in one native status frame";
+        assert TaskFiles.MAX_PACKAGE == 4 * 1024 * 1024 : "Large workflow packages retain their existing chunked path";
+    }
+
+    private static void invalidFrame(byte[] bytes) {
+        try {
+            CrewFrames.read(new java.io.DataInputStream(new java.io.ByteArrayInputStream(bytes)));
+            throw new AssertionError("Invalid frame accepted");
+        } catch (java.io.IOException expected) { }
+    }
+
     private static void teleportRecovery() {
         JsonObject requester = recoveryReport("Requester", "requested", 500, 20);
         JsonObject healthy = recoveryReport("Healthy", "", 2, 12);
@@ -162,11 +218,13 @@ public final class CoordinatorCoreTest {
     public static void main(String[] args) throws Exception {
         boolean enabled = false; assert enabled = true;
         if (!enabled) throw new IllegalStateException("Run with assertions enabled");
+        workerFrames();
         liveConfiguration();
         configurationInspection();
         guidedConfiguration();
         configurationReadback();
         stashScan();
+        stashColumns();
         supplyRecovery();
         teleportRecovery();
         highwayStartup();
@@ -224,16 +282,81 @@ public final class CoordinatorCoreTest {
         StashCatalog.define(root,"A","server\nnether",p);
         StashCatalog.define(root,"A","server\nnether",home,"00000000-0000-0000-0000-000000000001");
         JsonObject routed=StashCatalog.route(root,"A","server\nnether",p,"00000000-0000-0000-0000-000000000001");assert routed.get("homeName").getAsString().equals("main-stash_1")&&StashCatalog.list(root).get(0).getAsJsonObject().getAsJsonObject("homes").size()==1;
+        long now=System.nanoTime();
+        var near=new PlayerObservation(WORKER,"Near","server\nnether",new PlayerObservation.Position(0,116,0),now);
+        var far=new PlayerObservation(OTHER,"Far","server\nnether",new PlayerObservation.Position(100,116,0),now);
+        assert StashCatalog.nearby(p,near.position())&&!StashCatalog.nearby(p,far.position());
+        assert StashCatalog.nearby(p,far.position(),128)&&!StashCatalog.nearby(p,new PlayerObservation.Position(200,116,0),128);
+        assert StashCatalog.nearby(p,new PlayerObservation.Position(200,116,0),256)&&!StashCatalog.nearby(p,new PlayerObservation.Position(300,116,0),256);
+        JsonObject joined=StashCatalog.scanRoute(root,"A","server\nnether",p,OTHER.toString(),List.of(near,far),now);
+        assert joined.get("scanAnchor").getAsString().equals(WORKER.toString()) : "Remote scanners rendezvous with a nearby worker";
+        assert !StashCatalog.scanRoute(root,"A","server\nnether",p,WORKER.toString(),List.of(near,far),now).has("scanAnchor");
+        assert !StashCatalog.scanRoute(root,"A","server\nnether",p,OTHER.toString(),List.of(new PlayerObservation(WORKER,"Near","server\nnether",near.position(),now-PlayerObservation.MAX_AGE),far),now).has("scanAnchor") : "Stale anchors fall back to /home";
+        String scanScript=new dev.monocle.client.systems.bots.BotWorkflows(null).get("task-stash-scan").script();
+        var rendezvous=BotLua.next(scanScript,new JsonObject(),joined,null,null);
+        assert rendezvous.action().get("type").getAsString().equals("Tpa")&&rendezvous.action().get("allowFailure").getAsBoolean();
+        assert BotLua.next(scanScript,rendezvous.state(),joined,new JsonObject(),null).action().get("type").getAsString().equals("StashScan") : "Failed TPA must continue to /home fallback";
         StashCatalog.cacheRemote(root,StashCatalog.list(root));assert StashCatalog.remote(root).size()==1;
         assert StashCatalog.list(root).size()==1&&StashCatalog.list(root).get(0).getAsJsonObject().get("observed").getAsInt()==0 : "Exported definitions are visible before scanning";
         JsonObject observation=JsonParser.parseString("{\"x\":0,\"y\":116,\"z\":0,\"status\":\"observed\",\"block\":\"minecraft:chest\",\"reason\":\"\",\"items\":{\"minecraft:stone\":1728},\"shulkers\":[]}").getAsJsonObject();
         StashCatalog.save(root,"A","server\nnether",p,observation);StashCatalog.save(root,"A","server\nnether",p,observation);
         assert StashCatalog.list(root).size()==1 && StashCatalog.list(root).get(0).getAsJsonObject().getAsJsonObject("items").get("minecraft:stone").getAsInt()==1728 : "Retries never add stock twice";
+        JsonObject mapped=StashCatalog.list(root).get(0).getAsJsonObject();
+        assert mapped.getAsJsonObject("columns").getAsJsonObject("0,0").getAsJsonObject("items").get("minecraft:stone").getAsInt()==1728;
+        JsonObject columnPlan=p.deepCopy();columnPlan.addProperty("scanMode","Column Map");assert StashCatalog.plan(columnPlan).get("scanMode").getAsString().equals("Column Map");
+        JsonObject box=JsonParser.parseString("{slot:0,item:'minecraft:purple_shulker_box',quantity:1,name:'Raid kit',contentsKnown:true,items:{'minecraft:obsidian':64,'minecraft:totem_of_undying':2}}").getAsJsonObject();
+        JsonObject dense=observation.deepCopy(), contents=box.getAsJsonObject("items").deepCopy();
+        for(int i=0;i<24;i++)contents.addProperty("minecraft:kit_item_"+i,64);
+        JsonArray boxes=new JsonArray();for(int i=0;i<54;i++){JsonObject packed=box.deepCopy();packed.addProperty("slot",i);packed.add("items",contents.deepCopy());boxes.add(packed);}dense.add("shulkers",boxes);
+        assert dense.toString().length()>32_000;
+        StashCatalog.observation(p,dense);
+        JsonObject wire=TaskWire.message("stash-findings");StashCatalog.attachObservation(wire,dense);
+        assert wire.has("observationGzip") && TaskFiles.jsonBytes(wire,16_000).length<16_000 && StashCatalog.readObservation(wire).equals(dense);
+        JsonObject kits=observation.deepCopy();kits.getAsJsonArray("shulkers").add(box);StashCatalog.save(root,"A","server\nnether",p,kits);
+        String kitId=StashCatalog.kitTypeId(box);assert !kitId.isBlank();
+        JsonObject partial=box.deepCopy();partial.getAsJsonObject("items").addProperty("minecraft:obsidian",32);
+        JsonObject partialObservation=kits.deepCopy();partialObservation.addProperty("x",1);partialObservation.getAsJsonArray("shulkers").set(0,partial);StashCatalog.save(root,"A","server\nnether",p,partialObservation);
+        JsonObject kitSummary=StashCatalog.list(root).get(0).getAsJsonObject();
+        assert kitSummary.getAsJsonObject("kitCounts").getAsJsonObject(kitId).get("complete").getAsInt()==1&&kitSummary.getAsJsonObject("kitCounts").getAsJsonObject(kitId).get("incomplete").getAsInt()==1;
+        assert kitSummary.getAsJsonObject("kitTypes").getAsJsonObject(kitId).getAsJsonObject("items").get("minecraft:obsidian").getAsInt()==64;
+        assert StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nnether","Depot"),kitId,1,false).size()>=1;
+        assert StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nnether","Depot"),kitId,1,true).get(0).getAsJsonObject().get("x").getAsInt()==1;
+        JsonArray mappedKits=StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nnether","Depot"),kitId,2,false);
+        assert mappedKits.size()>=2&&mappedKits.get(0).getAsJsonObject().get("dynamic").getAsBoolean()&&mappedKits.get(1).getAsJsonObject().get("y").getAsInt()==117 : "Observed and unscanned chests are searched live, not bound to stale slots";
+        JsonObject crowded=StashCatalog.get(root,"A","server\nnether","Depot");JsonArray crowdedBoxes=crowded.getAsJsonObject("containers").getAsJsonObject("0,116,0").getAsJsonArray("shulkers");
+        for(int i=1;i<27;i++){JsonObject packed=box.deepCopy();packed.addProperty("slot",i);crowdedBoxes.add(packed);}
+        JsonArray crowdedPicks=StashCatalog.kitPicks(crowded,kitId,27,false);
+        assert crowdedPicks.get(0).getAsJsonObject().get("dynamic").getAsBoolean()
+            &&java.util.stream.StreamSupport.stream(crowdedPicks.spliterator(),false).filter(e->e.getAsJsonObject().get("x").getAsInt()==0&&e.getAsJsonObject().get("y").getAsInt()==116).count()==1 : "A full chest is one live search target, not 27 stale slot promises";
+        JsonArray upperReceipt=new JsonArray();upperReceipt.add(mappedKits.get(1).deepCopy());StashCatalog.invalidateWithdrawn(root,"A","server\nnether","Depot",upperReceipt);
+        assert StashCatalog.get(root,"A","server\nnether","Depot").getAsJsonObject("containers").getAsJsonObject("0,117,0").get("status").getAsString().equals("unscanned") : "A discovered upper chest is recorded without rejecting the worker receipt";
+        JsonObject overflow=p.deepCopy();overflow.addProperty("name","Overflow");overflow.addProperty("minX",100);overflow.addProperty("maxX",100);StashCatalog.define(root,"A","server\nnether",overflow);
+        JsonObject kitRequest=p.deepCopy();kitRequest.addProperty("kitTypeId",kitId);kitRequest.addProperty("count",1);kitRequest.addProperty("destination","Stash");kitRequest.addProperty("targetStashName","Overflow");
+        JsonObject kitAction=StashCatalog.kitAction(root,"A","server\nnether",kitRequest,WORKER.toString());
+        assert kitAction.getAsJsonObject("targetStash").get("name").getAsString().equals("Overflow")&&kitAction.getAsJsonArray("picks").size()>=1;
+        assert kitAction.getAsJsonObject("targetStash").getAsJsonObject("kitExemplar").get("minecraft:obsidian").getAsInt()==64&&!kitAction.getAsJsonObject("targetStash").get("incomplete").getAsBoolean();
+        String kitScript=new dev.monocle.client.systems.bots.BotWorkflows(null).get("task-kit-delivery").script();
+        BotLua.Decision pickup=BotLua.next(kitScript,new JsonObject(),kitAction,null,null);
+        assert pickup.action().get("type").getAsString().equals("StashResupply");
+        JsonObject firstReceipt=JsonParser.parseString("{picked:1,nextPick:1,ok:true}").getAsJsonObject();
+        assert BotLua.next(kitScript,pickup.state(),kitAction,firstReceipt,null).action().get("type").getAsString().equals("StashDeposit");
+        JsonObject multiRequest=kitRequest.deepCopy();multiRequest.addProperty("count",3);JsonObject multiKit=StashCatalog.kitAction(root,"A","server\nnether",multiRequest,WORKER.toString());
+        BotLua.Decision first=BotLua.next(kitScript,new JsonObject(),multiKit,null,null),store=BotLua.next(kitScript,first.state(),multiKit,firstReceipt,null),again=BotLua.next(kitScript,store.state(),multiKit,new JsonObject(),null);
+        assert store.action().get("count").getAsInt()==1&&again.action().get("type").getAsString().equals("StashResupply")&&again.action().get("count").getAsInt()==2&&again.action().get("pickIndex").getAsInt()==1 : "The next batch resumes after the confirmed source pick";
+        BotLua.Decision finalStore=BotLua.next(kitScript,again.state(),multiKit,JsonParser.parseString("{picked:2,nextPick:1,ok:true}").getAsJsonObject(),null);
+        assert finalStore.action().get("count").getAsInt()==2&&BotLua.next(kitScript,finalStore.state(),multiKit,new JsonObject(),null).action().get("type").getAsString().equals("Done");
+        JsonObject playerRequest=kitRequest.deepCopy();playerRequest.addProperty("destination","Player");playerRequest.addProperty("recipient",OTHER.toString());playerRequest.addProperty("recipientName","KitRecipient");playerRequest.addProperty("incomplete",true);
+        JsonObject playerKit=StashCatalog.kitAction(root,"A","server\nnether",playerRequest,WORKER.toString());
+        BotLua.Decision playerPickup=BotLua.next(kitScript,new JsonObject(),playerKit,null,null),teleport=BotLua.next(kitScript,playerPickup.state(),playerKit,firstReceipt,null),drop=BotLua.next(kitScript,teleport.state(),playerKit,new JsonObject(),null);
+        assert drop.action().get("type").getAsString().equals("DropItems")&&drop.action().get("incomplete").getAsBoolean()&&drop.action().getAsJsonObject("kitExemplar").get("minecraft:obsidian").getAsInt()==64;
+        JsonArray deposited=new JsonArray();deposited.add(JsonParser.parseString("{x:100,y:116,z:0}"));StashCatalog.invalidateDeposited(root,"A","server\nnether","Overflow",deposited);
+        assert StashCatalog.get(root,"A","server\nnether","Overflow").getAsJsonObject("containers").getAsJsonObject("100,116,0").get("status").getAsString().equals("unscanned");
+        assert StashCatalog.get(root,"A","server\nnether","Overflow").getAsJsonObject("containers").getAsJsonObject("100,116,0").get("reason").getAsString().contains("attempted") : "An attempted transfer cannot be reported as a verified deposit";
         JsonObject missed=observation.deepCopy();missed.addProperty("status","unscanned");missed.add("items",new JsonObject());missed.addProperty("reason","Opening timed out");
         StashCatalog.save(root,"A","server\nnether",p,missed);
-        assert StashCatalog.list(root).get(0).getAsJsonObject().get("unscanned").getAsInt()==1;
+        assert StashCatalog.list(root).get(0).getAsJsonObject().get("unscanned").getAsInt()==2;
         JsonObject inferred=observation.deepCopy();inferred.addProperty("inferred",true);StashCatalog.save(root,"A","server\nnether",p,inferred);
-        assert StashCatalog.list(root).get(0).getAsJsonObject().get("inferred").getAsInt()==1&&StashCatalog.list(root).get(0).getAsJsonObject().get("observed").getAsInt()==0 : "Estimates never masquerade as observed containers";
+        assert StashCatalog.list(root).get(0).getAsJsonObject().get("inferred").getAsInt()==1&&StashCatalog.list(root).get(0).getAsJsonObject().get("observed").getAsInt()==1 : "Estimates never masquerade as observed containers";
         assert StashCatalog.get(root,"B","server\nnether","Depot").isEmpty();
         JsonObject invalid=observation.deepCopy();invalid.addProperty("x",3);JsonObject assignment=p;
         rejects(()->StashCatalog.save(root,"A","server\nnether",assignment,invalid));
@@ -249,6 +372,114 @@ public final class CoordinatorCoreTest {
         JsonObject telemetry=JsonParser.parseString("{\"name\":\"Depot\",\"phase\":\"Reading\",\"reason\":\"Awaiting contents\",\"target\":\"0,116,0\",\"movementTarget\":\"\",\"lastAction\":\"Requested opening\",\"discovery\":1,\"volume\":30,\"discovered\":1,\"observed\":0,\"unscanned\":0,\"missingChunks\":0,\"attempts\":1}").getAsJsonObject();
         JsonObject run=new JsonObject();for(int i=0;i<100;i++){telemetry.addProperty("reason","Retry "+i);StashCatalog.telemetry(run,telemetry);}assert run.getAsJsonArray("stashEvents").size()==64;
         StashCatalog.telemetry(run,telemetry);assert run.getAsJsonArray("stashEvents").size()==64;
+        JsonObject wide=p.deepCopy();wide.addProperty("name","WideDepot");wide.addProperty("minX",0);wide.addProperty("maxX",60);wide.addProperty("scanMode","Full");wide.addProperty("lazyMode",false);
+        StashCatalog.define(root,"A","server\nnether",wide);
+        for(int x=0;x<54;x++){JsonObject chest=kits.deepCopy();chest.addProperty("x",x);StashCatalog.save(root,"A","server\nnether",wide,chest);}
+        JsonObject wideRequest=wide.deepCopy();wideRequest.addProperty("kitTypeId",kitId);wideRequest.addProperty("count",2);wideRequest.addProperty("destination","Stash");wideRequest.addProperty("targetStashName","Overflow");
+        JsonObject boundedAction=StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());
+        assert boundedAction.toString().length()<=7_500&&boundedAction.getAsJsonArray("picks").size()<54 : "Crowded kit catalogs must fit the native-action wire limit";
+        wideRequest.addProperty("transferAll",true);wideRequest.addProperty("includeIncomplete",true);wideRequest.addProperty("count",36);
+        JsonObject all=StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());
+        assert all.getAsJsonArray("picks").size()==54&&all.toString().length()<=24_000&&all.getAsJsonObject("targetStash").get("includeIncomplete").getAsBoolean() : "Transfer all never truncates its selected source chests";
+        JsonObject allRun=JsonParser.parseString("{id:'"+WORKER+"',status:'Running'}").getAsJsonObject(),allTask=new JsonObject();
+        JsonObject allReport=JsonParser.parseString("{run:'"+WORKER+"',status:'Running',token:'"+OTHER+"'}").getAsJsonObject();allReport.add("action",all);
+        assert TaskWire.applyStatus(allTask,allRun,allReport,true) : "The complete source list fits the shared status wire limit";
+        BotLua.Decision takeAll=BotLua.next(kitScript,new JsonObject(),all,null,null);
+        BotLua.Decision storeAll=BotLua.next(kitScript,takeAll.state(),all,JsonParser.parseString("{picked:36,nextPick:0,sourceExhausted:false}").getAsJsonObject(),null);
+        BotLua.Decision returnAll=BotLua.next(kitScript,storeAll.state(),all,new JsonObject(),null);
+        assert returnAll.action().get("count").getAsInt()==36&&returnAll.action().get("pickIndex").getAsInt()==0 : "Revisit a source chest if the previous batch filled before it emptied";
+        BotLua.Decision lastAll=BotLua.next(kitScript,returnAll.state(),all,JsonParser.parseString("{picked:5,nextPick:54,sourceExhausted:true}").getAsJsonObject(),null);
+        assert lastAll.action().get("type").getAsString().equals("StashDeposit")&&lastAll.action().get("count").getAsInt()==5;
+        BotLua.Decision recheckAll=BotLua.next(kitScript,lastAll.state(),all,new JsonObject(),null);
+        assert recheckAll.action().get("type").getAsString().equals("StashResupply")&&recheckAll.action().get("pickIndex").getAsInt()==0&&recheckAll.state().get("total").getAsInt()==41 : "Hoppers may have refilled previously visited chests";
+        JsonObject emptyPass=JsonParser.parseString("{picked:0,nextPick:54,sourceExhausted:true}").getAsJsonObject();
+        BotLua.Decision waitAll=BotLua.next(kitScript,recheckAll.state(),all,emptyPass,null);
+        assert waitAll.action().get("type").getAsString().equals("Wait")&&waitAll.action().get("ticks").getAsInt()==20;
+        BotLua.Decision verifyAll=BotLua.next(kitScript,waitAll.state(),all,new JsonObject(),null);
+        BotLua.Decision doneAll=BotLua.next(kitScript,verifyAll.state(),all,emptyPass,null);
+        assert doneAll.action().get("type").getAsString().equals("Done")&&doneAll.action().getAsJsonObject("result").get("delivered").getAsInt()==41;
+        BotLua.Decision refilled=BotLua.next(kitScript,verifyAll.state(),all,JsonParser.parseString("{picked:3,nextPick:54,sourceExhausted:true}").getAsJsonObject(),null);
+        assert refilled.action().get("type").getAsString().equals("StashDeposit")&&refilled.state().get("emptyPasses").getAsInt()==0 : "A refill resets empty verification and is delivered";
+        BotLua.Decision partialIssue=BotLua.next(kitScript,returnAll.state(),all,JsonParser.parseString("{picked:9,nextPick:1,sourceExhausted:false,sourceIssue:'Expected storage container, found air at 1,116,0'}").getAsJsonObject(),null);
+        assert partialIssue.action().get("type").getAsString().equals("StashDeposit")&&partialIssue.action().get("count").getAsInt()==9;
+        BotLua.Decision afterIssue=BotLua.next(kitScript,partialIssue.state(),all,new JsonObject(),null);
+        assert afterIssue.action().get("type").getAsString().equals("Fail")&&afterIssue.action().toString().contains("Delivered 45 kits") : "Report source failure only after delivering the confirmed partial load";
+        assert BotLua.next(kitScript,takeAll.state(),all,JsonParser.parseString("{picked:0,nextPick:0,sourceExhausted:false}").getAsJsonObject(),null).action().get("type").getAsString().equals("Fail");
+        assert BotLua.next(kitScript,takeAll.state(),all,JsonParser.parseString("{picked:5,nextPick:0,sourceExhausted:true}").getAsJsonObject(),null).action().get("type").getAsString().equals("Fail");
+        JsonObject withdrawnSearch=StashCatalog.get(root,"A","server\nnether","WideDepot"),known=withdrawnSearch.getAsJsonObject("containers").getAsJsonObject("0,116,0");
+        known.addProperty("status","unscanned");known.addProperty("reason","Contents changed by a confirmed stash withdrawal; rescan required");known.add("shulkers",new JsonArray());known.add("items",new JsonObject());
+        // Exercise the shared selection through a temporary persisted catalog, not an alternate planner.
+        StashCatalog.save(root,"A","server\nnether",wide,known);
+        assert StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString()).getAsJsonArray("picks").size()==54 : "Our own withdrawals invalidate quantities but retain live search targets";
+        known.addProperty("reason","Opening timed out");StashCatalog.save(root,"A","server\nnether",wide,known);
+        try{StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());throw new AssertionError("Unknown scan gaps are not known withdrawn sources");}catch(IllegalStateException expected){}
+        known.addProperty("status","observed");known.add("shulkers",kits.getAsJsonArray("shulkers").deepCopy());known.add("items",kits.getAsJsonObject("items").deepCopy());StashCatalog.save(root,"A","server\nnether",wide,known);
+        JsonObject extra=kits.deepCopy();extra.addProperty("x",54);StashCatalog.save(root,"A","server\nnether",wide,extra);
+        try{StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());throw new AssertionError("Transfer all cannot silently omit source 55");}catch(IllegalStateException expected){}
+        wideRequest.addProperty("destination","Carry");
+        try{StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());throw new AssertionError("Repeat pickup needs somewhere to unload");}catch(IllegalArgumentException expected){}
+        wideRequest.addProperty("destination","Stash");extra.addProperty("status","unscanned");extra.add("shulkers",new JsonArray());extra.add("items",new JsonObject());StashCatalog.save(root,"A","server\nnether",wide,extra);
+        try{StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());throw new AssertionError("Unscanned sources cannot establish exhaustion");}catch(IllegalStateException expected){}
+    }
+
+    private static void stashColumns() throws Exception {
+        var root=java.nio.file.Files.createTempDirectory("monocle-column-check-");String scope="server\nnether";
+        JsonObject p=StashCatalog.plan(JsonParser.parseString("{name:'Columns',homeName:'vault',minX:0,maxX:10,minY:116,maxY:119,minZ:0,maxZ:3}").getAsJsonObject());
+        JsonObject box=JsonParser.parseString("{slot:0,item:'minecraft:blue_shulker_box',quantity:1,name:'Alpha',contentsKnown:true,items:{'minecraft:obsidian':64}}").getAsJsonObject();
+        JsonObject other=box.deepCopy();other.addProperty("name","Beta");String kit=StashCatalog.kitTypeId(box),foreign=StashCatalog.kitTypeId(other);
+        JsonObject empty=JsonParser.parseString("{x:0,y:116,z:0,status:'observed',block:'minecraft:chest',reason:'',items:{},shulkers:[]}").getAsJsonObject();
+        StashCatalog.define(root,"A",scope,p);
+        for(int x=0;x<=10;x+=2){JsonObject cell=empty.deepCopy();cell.addProperty("x",x);
+            if(x==0||x==10){cell.getAsJsonObject("items").addProperty("minecraft:blue_shulker_box",1);cell.getAsJsonObject("items").addProperty("minecraft:obsidian",64);cell.getAsJsonArray("shulkers").add(x==0?box:other);}
+            if(x==6)cell.getAsJsonObject("items").addProperty("minecraft:stone",1);
+            if(x==8)cell.addProperty("status","unscanned");
+            StashCatalog.save(root,"A",scope,p,cell);
+        }
+        JsonObject column=StashCatalog.reserveColumn(root,"A",scope,"Columns",kit,java.util.Set.of());
+        assert column.get("x").getAsInt()==0&&column.get("axis").getAsString().equals("X") : "Existing matching kits precede new empty columns";
+        assert StashCatalog.columnContains(column,0,118,2)&&StashCatalog.columnContains(column,0,118,0)&&!StashCatalog.columnContains(column,2,118,2);
+        assert StashCatalog.reserveColumn(root,"A",scope,"Columns",foreign,java.util.Set.of()).get("x").getAsInt()==10;
+        assert StashCatalog.get(root,"A",scope,"Columns").getAsJsonObject("columnReservations").getAsJsonObject("0,0").get("kitTypeId").getAsString().equals(kit);
+        JsonObject badColumn=column.deepCopy();badColumn.addProperty("y",117);rejects(()->StashCatalog.checkedColumn(p,badColumn));
+        JsonObject run=new JsonObject();run.addProperty("id",WORKER.toString());run.addProperty("token",OTHER.toString());
+        JsonObject action=p.deepCopy();action.addProperty("type","StashDeposit");action.addProperty("kitTypeId",kit);action.addProperty("count",1);run.add("action",action);
+        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'nether',id:'columns-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
+        JsonObject message=TaskWire.message("stash-findings");message.addProperty("task","columns-task");message.addProperty("run",WORKER.toString());message.addProperty("token",OTHER.toString());message.add("action",action.deepCopy());message.addProperty("delivery",1);
+        JsonObject ack=StashCatalog.accept(root,task,run,WORKER.toString(),"A",message);
+        assert !ack.get("permit").getAsBoolean()&&ack.getAsJsonObject("column").equals(column);
+        assert StashCatalog.accept(root,task,run,WORKER.toString(),"A",message).equals(ack) : "Retry returns the same durable reservation";
+        JsonObject staleRun=run.deepCopy(),gap=message.deepCopy();gap.addProperty("delivery",3);rejects(()->StashCatalog.accept(root,task,run,WORKER.toString(),"A",gap));
+        JsonObject conflict=empty.deepCopy();conflict.getAsJsonObject("items").addProperty("minecraft:blue_shulker_box",1);conflict.getAsJsonObject("items").addProperty("minecraft:obsidian",64);conflict.getAsJsonArray("shulkers").add(other);
+        message.addProperty("delivery",2);message.add("observation",conflict);
+        ack=StashCatalog.accept(root,task,run,WORKER.toString(),"A",message);
+        assert !ack.get("permit").getAsBoolean()&&ack.getAsJsonObject("column").get("x").getAsInt()==2 : "Live foreign kit observations change the column before any deposit";
+        JsonObject db=StashCatalog.get(root,"A",scope,"Columns");
+        assert StashCatalog.columnOccupant(db.getAsJsonObject("containers").getAsJsonObject("0,116,0")).equals(foreign);
+        assert !StashCatalog.summary(db).getAsJsonObject("columns").getAsJsonObject("2,0").get("available").getAsBoolean();
+        assert StashCatalog.reserveColumn(root,"A",scope,"Columns",foreign,java.util.Set.of("0,0","10,0")).get("x").getAsInt()==4 : "Another kit cannot take the newly reserved empty column";
+        JsonObject changedRetry=message.deepCopy();changedRetry.add("observation",empty);rejects(()->StashCatalog.accept(root,task,run,WORKER.toString(),"A",changedRetry));
+        JsonObject staleMessage=message.deepCopy();staleMessage.add("observation",empty);
+        JsonObject staleAck=StashCatalog.accept(root,task,staleRun,WORKER.toString(),"A",staleMessage);
+        assert !staleAck.get("permit").getAsBoolean()&&staleAck.getAsJsonObject("column").get("x").getAsInt()==2 : "An old worker cannot regain a column reserved for another kit even if it is now empty";
+        JsonObject observed=conflict.deepCopy();observed.addProperty("x",2);observed.getAsJsonArray("shulkers").set(0,box);
+        message.addProperty("delivery",3);message.add("observation",observed);
+        assert StashCatalog.accept(root,task,run,WORKER.toString(),"A",message).get("permit").getAsBoolean();
+        JsonObject receipt=message.deepCopy();receipt.add("stashDeposit",JsonParser.parseString("{stash:'Columns',touched:[{x:2,y:116,z:0}]}").getAsJsonObject());
+        StashCatalog.depositReceipt(root,"A",scope,run,receipt);
+        assert StashCatalog.get(root,"A",scope,"Columns").getAsJsonObject("containers").getAsJsonObject("2,116,0").get("status").getAsString().equals("observed") : "Late status receipts must preserve verified live observations";
+        message.remove("observation");message.addProperty("delivery",4);message.addProperty("exhaustedColumn",true);
+        assert StashCatalog.accept(root,task,run,WORKER.toString(),"A",message).has("error") : "Foreign reservations, loose items and unknown columns are never treated as available";
+        assert !run.has("depositColumn");
+        JsonObject spoof=message.deepCopy();spoof.addProperty("task","another-task");rejects(()->StashCatalog.accept(root,task,run,WORKER.toString(),"A",spoof));
+        JsonObject betaRun=new JsonObject();betaRun.addProperty("id",WORKER.toString());betaRun.addProperty("token",THIRD.toString());JsonObject betaAction=action.deepCopy();betaAction.addProperty("kitTypeId",foreign);betaRun.add("action",betaAction);
+        JsonObject betaMessage=message.deepCopy();betaMessage.remove("exhaustedColumn");betaMessage.add("action",betaAction);betaMessage.addProperty("token",THIRD.toString());betaMessage.addProperty("delivery",1);
+        assert StashCatalog.accept(root,task,betaRun,WORKER.toString(),"A",betaMessage).getAsJsonObject("column").get("x").getAsInt()==10;
+        JsonObject upper=observed.deepCopy();upper.addProperty("x",10);upper.addProperty("y",117);upper.addProperty("z",1);betaMessage.add("observation",upper);betaMessage.addProperty("delivery",2);
+        assert !StashCatalog.accept(root,task,betaRun,WORKER.toString(),"A",betaMessage).get("permit").getAsBoolean();
+        assert StashCatalog.get(root,"A",scope,"Columns").getAsJsonObject("columnReservations").getAsJsonObject("10,0").get("blocked").getAsBoolean() : "A conflicting upper chest blocks the mixed column, not merely that chest";
+        JsonObject legacy=conflict.deepCopy();
+        legacy.getAsJsonArray("shulkers").get(0).getAsJsonObject().addProperty("legacy",true);legacy.getAsJsonObject("items").remove("minecraft:obsidian");
+        assert StashCatalog.columnOccupant(legacy).equals(foreign);
     }
 
     private static void independentSupplies() {
@@ -388,7 +619,8 @@ public final class CoordinatorCoreTest {
         assert HighwayCoordinator.serviceFrontRow(0, 128) == 1 : "A new job must publish its first work row, not the excluded origin";
         QueuePolicy.resume(urgent); report.addProperty("status", "Running");
         assert TaskWire.applyStatus(urgent, run(urgent), report, true) && !run(urgent).has("resumeInspection");
-        report.addProperty("status", "Complete"); TaskWire.applyStatus(urgent, run(urgent), report, true);
+        report.addProperty("status", "Complete");report.add("workflowResult",JsonParser.parseString("{delivered:41,sourceExhausted:true}")); TaskWire.applyStatus(urgent, run(urgent), report, true);
+        assert run(urgent).getAsJsonObject("workflowResult").get("delivered").getAsInt()==41;
         report.addProperty("status", "Running"); assert !TaskWire.applyStatus(urgent, run(urgent), report, true);
     }
 

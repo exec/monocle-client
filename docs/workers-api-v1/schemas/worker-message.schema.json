@@ -5,7 +5,7 @@
   "type": "object",
   "required": ["apiVersion", "type", "messageId", "correlationId", "sequence", "sentAt", "payload"],
   "properties": {
-    "apiVersion": {"const": "workers.monocle.dev/v1"},
+    "apiVersion": {"enum": ["rwp/1-draft", "workers.monocle.dev/v1"]},
     "type": {"enum": ["session.hello", "session.accepted", "capabilities.report", "worker.observation", "execution.assign", "execution.accepted", "execution.rejected", "execution.started", "execution.progress", "execution.completed", "execution.failed", "execution.cancel", "execution.cancelled", "state.reconcile", "state.reconciled", "message.ack", "protocol.error"]},
     "messageId": {"$ref": "common.schema.json#/$defs/uuid"},
     "correlationId": {"$ref": "common.schema.json#/$defs/uuid"},
@@ -23,6 +23,7 @@
           "workerId": {"$ref": "common.schema.json#/$defs/uuid"},
           "supportedVersions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
           "capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/capability"}},
+          "implementation": {"type": "object", "required": ["id", "version"], "properties": {"id": {"type": "string"}, "version": {"type": "string"}}},
           "lastHostSequence": {"type": "integer", "minimum": 0},
           "lastWorkerSequence": {"type": "integer", "minimum": 0}
         }
@@ -34,9 +35,11 @@
         "required": ["sessionId", "version", "maxFrameBytes", "heartbeatSeconds"],
         "properties": {
           "sessionId": {"$ref": "common.schema.json#/$defs/uuid"},
-          "version": {"const": "workers.monocle.dev/v1"},
+          "version": {"enum": ["rwp/1-draft", "workers.monocle.dev/v1"]},
+          "implementation": {"type": "object", "required": ["id", "version"], "properties": {"id": {"type": "string"}, "version": {"type": "string"}}},
           "maxFrameBytes": {"type": "integer", "minimum": 1024},
-          "heartbeatSeconds": {"type": "integer", "minimum": 1}
+          "heartbeatSeconds": {"type": "integer", "minimum": 1},
+          "extensionRouting": {"type": "boolean"}
         }
       }}}
     },
@@ -64,6 +67,7 @@
         "required": ["observedAt", "scope"],
         "properties": {
           "observedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+          "name": {"type": "string", "pattern": "^[A-Za-z0-9_]{1,16}$"},
           "scope": {"$ref": "common.schema.json#/$defs/scope"}
         }
       }}}
@@ -71,6 +75,13 @@
     {
       "if": {"properties": {"type": {"enum": ["execution.accepted", "execution.rejected", "execution.started", "execution.progress", "execution.completed", "execution.failed", "execution.cancel", "execution.cancelled"]}}},
       "then": {"properties": {"payload": {"$ref": "common.schema.json#/$defs/executionRef"}}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "execution.progress"}}},
+      "then": {"properties": {"payload": {"required": ["detail"], "properties": {
+        "detail": {"type": "string", "minLength": 1, "maxLength": 240},
+        "remainingTicks": {"type": "integer", "minimum": 0, "maximum": 1728000}
+      }}}}
     },
     {
       "if": {"properties": {"type": {"enum": ["execution.accepted", "execution.rejected", "execution.cancel"]}}},
