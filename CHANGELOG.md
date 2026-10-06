@@ -2,6 +2,12 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.13.28 — Public release checkpoint
+
+- Includes the 0.13.27 stash takeoff fix and preceding worker API, stash/kit transfer and flight resilience work. Regression fixtures use synthetic coordinates rather than an operator's live stash location.
+- Stash-summary assertions select the named stash rather than assuming filesystem directory order, so the release checks behave consistently on macOS and Linux.
+- Update hosts and workers together when upgrading from native protocol versions before 0.13.15. The full automated release build covers the client, coordinator, host, documentation and bundled notices; the latest takeoff change still needs a live retest.
+
 ## 0.13.27 — Take off beside stash chests without phantom collisions
 
 - Stash takeoff sweeps use the player's actual bounding box instead of widening it into an adjacent chest. Stash flight routes also use the real player width, so the same phantom collision cannot return immediately after launch. Real ceiling, block, chunk and hazard checks remain in place; obstructed takeoffs report the launch and target coordinates.
