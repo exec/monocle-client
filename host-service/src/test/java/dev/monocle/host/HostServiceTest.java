@@ -1150,6 +1150,9 @@ public final class HostServiceTest {
                 assert first.work().contains("38 ticks remaining") : "Wait ticks must be saved before disconnect";
                 await(() -> text(taskView(host, job).getAsJsonObject("runs").getAsJsonObject(worker.toString()), "detail").contains("ticks remaining"));
             }
+            // WebSocket close is asynchronous; do not race the gateway's live-owner duplicate protection.
+            await(() -> host.control(op("status")).getAsJsonArray("workers").asList().stream()
+                .map(JsonElement::getAsJsonObject).anyMatch(w -> text(w,"id").equals(worker.toString()) && !flag(w,"connected")));
             try (RwpWorkerConnection resumed = new RwpWorkerConnection(address, worker, token, journal)) {
                 assert resumed.work().contains("38 ticks remaining") : "Wait checkpoint must survive client restart";
                 resumed.connect();
@@ -1176,6 +1179,8 @@ public final class HostServiceTest {
                 UUID cancelled = submitPublicWait(host, worker, 40);
                 await(() -> { resumed.poll(() -> observation); return state(host, cancelled).equals("Running") && resumed.work().startsWith("running"); });
             }
+            await(() -> host.control(op("status")).getAsJsonArray("workers").asList().stream()
+                .map(JsonElement::getAsJsonObject).anyMatch(w -> text(w,"id").equals(worker.toString()) && !flag(w,"connected")));
             UUID cancelled = UUID.fromString(text(TaskFiles.read(journal).getAsJsonObject("run"), "jobId"));
             JsonObject cancel = op("cancel"); cancel.addProperty("id", cancelled.toString()); host.control(cancel);
             try (RwpWorkerConnection returned = new RwpWorkerConnection(address, worker, token, journal)) {

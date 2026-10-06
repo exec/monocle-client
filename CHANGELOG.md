@@ -2,6 +2,10 @@
 
 This file records major Monocle milestones. Detailed development and failure analysis lives in the linked guides, incident records, and Git history.
 
+## 0.13.29 — Wait for disconnect acknowledgement in reconnect tests
+
+- RWP reconnect checks wait for the host to observe socket closure before replacing the worker. This avoids racing the gateway's duplicate-live-worker protection on slower CI runners; production authentication and reconnect retry behavior are unchanged.
+
 ## 0.13.28 — Public release checkpoint
 
 - Includes the 0.13.27 stash takeoff fix and preceding worker API, stash/kit transfer and flight resilience work. Regression fixtures use synthetic coordinates rather than an operator's live stash location.
