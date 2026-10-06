@@ -69,7 +69,8 @@ public final class BotProfiles {
             JsonObject value = entry.getValue().getAsJsonObject();
             if (value.size() != 2 || !value.has("active") || !value.get("active").isJsonPrimitive() || !value.getAsJsonPrimitive("active").isBoolean()) throw new IllegalArgumentException("Invalid module activation state.");
             if (!value.has("settings") || !value.get("settings").isJsonPrimitive() || !value.getAsJsonPrimitive("settings").isString()) throw new IllegalArgumentException("Expected settings SNBT string.");
-            validateSettings(parse(value.get("settings").getAsString()));
+            try { validateSettings(parse(value.get("settings").getAsString())); }
+            catch (IllegalArgumentException e) { throw new IllegalArgumentException(entry.getKey() + ": " + e.getMessage(), e); }
             if (executorOwned(entry.getKey()) && value.get("active").getAsBoolean()) throw new IllegalArgumentException("Native executors are started by tasks, not by profiles.");
         }
         return copy;
@@ -88,7 +89,7 @@ public final class BotProfiles {
             Set<String> names = new HashSet<>();
             for (Tag value : entries) {
                 if (!(value instanceof CompoundTag setting) || !(setting.get("name") instanceof StringTag)) throw new IllegalArgumentException("Invalid setting entry.");
-                if (!names.add(setting.getStringOr("name", ""))) throw new IllegalArgumentException("Duplicate setting entry.");
+                if (!names.add(setting.getStringOr("name", ""))) throw new IllegalArgumentException("Duplicate setting " + group.getStringOr("name", "") + " / " + setting.getStringOr("name", ""));
             }
         }
     }

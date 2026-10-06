@@ -112,7 +112,7 @@ public final class BotScheduler {
         return new TaskView(id, text(t, "name"), text(t, "workflowName"), text(t, "crew"), workers(t), text(t, "status"), text(t, "detail"), t.get("priority").getAsInt(), Map.copyOf(overrides), terminal(text(t, "status")));
     }
     public UUID create(String name, String workflowId, String crewId, Set<UUID> targets, JsonObject args, int priority, Map<UUID, Integer> overrides) {
-        if(Set.of("task-follow","task-bodyguard").contains(workflowId))return createPackage(name,workflowId,crewId,targets,args,priority,overrides);
+        if(Set.of("task-follow","task-bodyguard","task-crystal-guard").contains(workflowId))return createPackage(name,workflowId,crewId,targets,args,priority,overrides);
         if (workflowId.startsWith("package:")) return createPackage(name, workflowId.substring(8), crewId, targets, args, priority, overrides);
         hostOnly(); load();
         if (!bots.isHost() || !Utils.canUpdate()) throw new IllegalStateException("Start the host in a world before queuing work");
@@ -129,6 +129,11 @@ public final class BotScheduler {
         if (!workflow.script().isEmpty() && workflowId.startsWith("task-")) {
             String type = switch (workflowId) { case "task-stash-scan" -> "StashScan"; case "task-stash-hunt" -> "StashHunt"; case "task-travel" -> "Travel"; case "task-drop" -> "DropItems"; case "task-tpa" -> "Tpa"; case "task-wait" -> "Wait"; case "task-modules" -> "Modules"; case "task-profile" -> "SetProfile"; default -> ""; };
             if (!type.isEmpty()) { JsonObject action = args.deepCopy(); action.addProperty("type", type); BotActions.validate(action); }
+        }
+        if(Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(workflowId)){
+            if(targets.size()!=1)throw new IllegalArgumentException("Kit jobs use one worker so the same boxes cannot be claimed twice");
+            JsonObject kit=args.deepCopy();if(workflowId.equals("task-kit-remove-incomplete"))kit.addProperty("incomplete",true);
+            dev.monocle.coordinator.StashCatalog.kitAction(MonocleClient.FOLDER.toPath(),crewId,scope(),kit,targets.iterator().next().toString());
         }
         if (!packaged.getAsJsonObject("highways").isEmpty()) {
             if (targets.size() > dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS) throw new IllegalArgumentException("Native highway workflows support at most 3 workers");
@@ -148,12 +153,22 @@ public final class BotScheduler {
         checkedPriority(priority);overrides.values().forEach(BotScheduler::checkedPriority);
         if(args==null || args.toString().length()>BotLua.MAX_STATE)throw new IllegalArgumentException("Arguments too large");
         JsonObject record=bots.operations().get(id),packet=checkedPackage(bots.operations().prepare(id,scope(),args));
-        if(Set.of("task-follow","task-bodyguard").contains(text(packet,"entry"))) {
+        if(Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(text(packet,"entry"))){
+            if(targets.size()!=1)throw new IllegalArgumentException("Kit jobs use one worker so the same boxes cannot be claimed twice");
+            JsonObject kit=args.deepCopy();if(text(packet,"entry").equals("task-kit-remove-incomplete"))kit.addProperty("incomplete",true);
+            dev.monocle.coordinator.StashCatalog.kitAction(MonocleClient.FOLDER.toPath(),crewId,scope(),kit,targets.iterator().next().toString());
+        }
+        if(Set.of("task-follow","task-bodyguard","task-crystal-guard").contains(text(packet,"entry"))) {
             UUID leader=UUID.fromString(text(args,"target"));
             if(targets.contains(leader))throw new IllegalArgumentException("Select followers only, not the leader");
             String leaderName=leader.equals(mc.player.getUUID())?mc.player.getName().getString():bots.allMembers().stream().filter(m->m.id().equals(leader)&&m.connected()&&crewId.equals(bots.workerCrew(m.id()))).map(SwarmCrew.MemberView::name).findFirst().orElseThrow(()->new IllegalArgumentException("Choose a connected crewmate as leader"));
-            if(text(packet,"entry").equals("task-bodyguard"))args.addProperty("targetName",leaderName);
-            if(text(packet,"entry").equals("task-bodyguard")&&targets.size()>3)throw new IllegalArgumentException("Bodyguard supports at most three workers");
+            if(!text(packet,"entry").equals("task-follow"))args.addProperty("targetName",leaderName);
+            if(!text(packet,"entry").equals("task-follow")&&targets.size()>3)throw new IllegalArgumentException("Bodyguard supports at most three workers");
+            if(text(packet,"entry").equals("task-crystal-guard")) {
+                JsonArray protectedPlayers=new JsonArray();protectedPlayers.add(leader.toString());
+                for(var member:bots.allMembers())if(crewId.equals(bots.workerCrew(member.id()))&&!member.id().equals(leader))protectedPlayers.add(member.id().toString());
+                args.add("protectedPlayers",protectedPlayers);
+            }
         }
         if(!packet.getAsJsonObject("highways").isEmpty() && (!text(packet.getAsJsonObject("geometry"),"scope").equals(scope()) || targets.size()>dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS))throw new IllegalArgumentException("Captured highway geometry must match this world, with at most 3 workers");
         return createCaptured(name,text(packet,"entry"),text(record,"name"),crewId,targets,args,priority,overrides,packet,scope());
@@ -348,7 +363,8 @@ public final class BotScheduler {
                 case "task-stash-findings" -> {
                     JsonObject task=tasks.get(UUID.fromString(text(m,"task")));
                     if(task==null||!task.getAsJsonObject("runs").has(worker.toString()))throw new IllegalArgumentException("Unknown stash task");
-                    JsonObject ack=dev.monocle.coordinator.StashCatalog.accept(MonocleClient.FOLDER.toPath(),task,run(task,worker),worker.toString(),bots.workerCrew(worker),m);
+                    JsonObject finding=m.deepCopy();if(m.has("observation")||m.has("observationGzip"))finding.add("observation",dev.monocle.coordinator.StashCatalog.readObservation(m));finding.remove("observationGzip");
+                    JsonObject ack=dev.monocle.coordinator.StashCatalog.accept(MonocleClient.FOLDER.toPath(),task,run(task,worker),worker.toString(),bots.workerCrew(worker),finding);
                     if(ack!=null){dirty=true;save();connection.send(ack.toString());}
                 }
                 case "task-stash-definition" -> {
@@ -357,7 +373,7 @@ public final class BotScheduler {
                 }
                 case "task-stash-import" -> {
                     String scope=text(m,"scope");if(scope.length()>384||!scope.contains("\n"))throw new IllegalArgumentException("Invalid stash scope");
-                    dev.monocle.coordinator.StashCatalog.save(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,m.getAsJsonObject("stash"),m.getAsJsonObject("observation"));
+                    dev.monocle.coordinator.StashCatalog.save(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,m.getAsJsonObject("stash"),dev.monocle.coordinator.StashCatalog.readObservation(m));
                 }
                 default -> throw new IllegalArgumentException("Worker cannot send task commands: " + type);
             }
@@ -383,7 +399,7 @@ public final class BotScheduler {
             case "task-configure" -> runtime.configure(UUID.fromString(text(m, "run")), m.getAsJsonObject("modules"), integer(m, "revision", 1, Integer.MAX_VALUE), owner);
             case "task-configuration-read" -> runtime.readConfiguration(m,owner);
             case "task-survey-ack" -> runtime.acknowledgeSurvey(UUID.fromString(text(m, "run")), text(m, "token"), integer(m, "delivery", 1, 1_048_576), owner);
-            case "task-stash-ack" -> runtime.acknowledgeStash(UUID.fromString(text(m,"run")),text(m,"token"),integer(m,"delivery",1,4096),owner);
+            case "task-stash-ack" -> runtime.acknowledgeStash(UUID.fromString(text(m,"run")),text(m,"token"),m,owner);
             case "task-stash-catalog" -> dev.monocle.coordinator.StashCatalog.cacheRemote(MonocleClient.FOLDER.toPath(),m.getAsJsonArray("stashes"));
             case "task-result" -> runtime.external(UUID.fromString(text(m, "run")), text(m, "token"), flag(m, "success"), text(m, "detail"), m.has("result") ? m.getAsJsonObject("result") : new JsonObject());
             case "task-tpa-send" -> runtime.teleport(UUID.fromString(text(m, "run")), text(m, "token"), text(m, "name"), UUID.fromString(text(m, "target")), text(m, "dimension"));
@@ -393,13 +409,14 @@ public final class BotScheduler {
         }
         return true;
     }
-    private void sendStashCatalog(SwarmConnection connection,String crew){JsonObject m=TaskWire.message("stash-catalog");JsonArray list=new JsonArray();for(JsonElement value:dev.monocle.coordinator.StashCatalog.list(MonocleClient.FOLDER.toPath())){JsonObject s=value.getAsJsonObject();if(text(s,"crew").equals(crew))list.add(s.deepCopy());if(list.size()==64)break;}m.add("stashes",list);connection.send(m.toString());}
+    private void sendStashCatalog(SwarmConnection connection,String crew){JsonObject m=TaskWire.message("stash-catalog");JsonArray list=new JsonArray();for(JsonElement value:dev.monocle.coordinator.StashCatalog.list(MonocleClient.FOLDER.toPath())){JsonObject s=value.getAsJsonObject();if(!text(s,"crew").equals(crew))continue;JsonObject compact=dev.monocle.coordinator.StashCatalog.wireSummary(s);if(m.toString().length()+list.toString().length()+compact.toString().length()>14_000)break;list.add(compact);if(list.size()==64)break;}m.add("stashes",list);connection.send(m.toString());}
     private void updateStatus(UUID worker, JsonObject message, boolean full) {
         String id = text(message, "run"), state = text(message, "status"); UUID.fromString(id);
         if (!Set.of("Ready", "Running", "Suspending", "Suspended", "Inspection required", "Complete", "Failed", "Cancelled").contains(state)) throw new IllegalArgumentException("Invalid task execution state");
         for (JsonObject t : tasks.values()) if (t.getAsJsonObject("runs").has(worker.toString())) {
             JsonObject r = run(t, worker); if (!text(r, "id").equals(id)) continue;
-            if(full&&message.has("stashWithdrawal")&&!text(r,"stashWithdrawalToken").equals(text(message,"token"))){JsonObject receipt=message.getAsJsonObject("stashWithdrawal");dev.monocle.coordinator.StashCatalog.invalidateWithdrawn(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),text(receipt,"stash"),receipt.getAsJsonArray("withdrawn"));r.addProperty("stashWithdrawalToken",text(message,"token"));}
+            if(full&&message.has("stashWithdrawal")&&!text(r,"stashWithdrawalToken").equals(text(message,"token"))){JsonObject receipt=message.getAsJsonObject("stashWithdrawal");String catalogCrew=text(receipt,"catalogCrew");if(catalogCrew.isEmpty())catalogCrew=text(t,"crew");if(!catalogCrew.equals(text(t,"crew"))&&!catalogCrew.equals("Local"))throw new IllegalArgumentException("Withdrawal belongs to another crew");dev.monocle.coordinator.StashCatalog.invalidateWithdrawn(MonocleClient.FOLDER.toPath(),catalogCrew,text(t,"server")+"\n"+text(t,"dimension"),text(receipt,"stash"),receipt.getAsJsonArray("withdrawn"));r.addProperty("stashWithdrawalToken",text(message,"token"));}
+            if(full)dev.monocle.coordinator.StashCatalog.depositReceipt(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),r,message);
             if (!text(t, "crew").equals(bots.workerCrew(worker))) { if (terminal(text(r, "status"))) return; throw new IllegalArgumentException("Task status arrived through another crew"); }
             JsonObject checked = message.deepCopy();
             if (full && checked.has("action")) checked.add("action", BotActions.validate(checked.getAsJsonObject("action")));
@@ -596,7 +613,20 @@ public final class BotScheduler {
         SwarmConnection c = connection(worker); if (c == null || !c.connected()) return;
         Transfer existing = transfers.get(worker); if (existing != null && existing.connection == c || transferred.get(runId(r)) == c) return;
         JsonObject envelope = TaskWire.envelope(t, worker), metadata = envelope.getAsJsonObject("dispatch"),args=metadata.getAsJsonObject("args");
-        if(args.has("needs")&&args.has("primary"))metadata.add("args",dev.monocle.coordinator.StashCatalog.refillAction(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),args,worker.toString()));else if(args.has("name")&&args.has("minX"))metadata.add("args",dev.monocle.coordinator.StashCatalog.route(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),args,worker.toString()));
+        String scope=text(t,"server")+"\n"+text(t,"dimension");
+        if(Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(text(envelope,"entry"))){
+            JsonObject kit=args.deepCopy();if(text(envelope,"entry").equals("task-kit-remove-incomplete"))kit.addProperty("incomplete",true);
+            metadata.add("args",dev.monocle.coordinator.StashCatalog.kitAction(MonocleClient.FOLDER.toPath(),text(t,"crew"),scope,kit,worker.toString()));
+        }
+        else if(args.has("needs")&&args.has("primary"))metadata.add("args",dev.monocle.coordinator.StashCatalog.refillAction(MonocleClient.FOLDER.toPath(),text(t,"crew"),scope,args,worker.toString()));
+        else if(args.has("name")&&args.has("minX")){
+            if(text(envelope,"entry").equals("task-stash-scan")){
+                long now=System.nanoTime();Map<UUID,PlayerObservation> current=observations(text(t,"crew"));
+                PlayerObservation local=localObservation();if(local!=null&&workers(t).contains(local.id()))current.put(local.id(),local);
+                List<PlayerObservation> participants=workers(t).stream().map(current::get).filter(Objects::nonNull).toList();
+                metadata.add("args",dev.monocle.coordinator.StashCatalog.scanRoute(MonocleClient.FOLDER.toPath(),text(t,"crew"),scope,args,worker.toString(),participants,now));
+            }else metadata.add("args",dev.monocle.coordinator.StashCatalog.route(MonocleClient.FOLDER.toPath(),text(t,"crew"),scope,args,worker.toString()));
+        }
         String data = BotTaskData.encode(envelope);
         Transfer transfer = new Transfer(runId(r), data, hash(data), metadata, c, 0); transfers.put(worker, transfer);
         JsonObject begin = TaskWire.begin(transfer.run, data);
@@ -866,9 +896,11 @@ public final class BotScheduler {
         PlayerObservation requester = observation(worker);
         if (requester == null) return;
         JsonObject action = r.getAsJsonObject("action");
-        PlayerObservation target = PlayerObservation.target(text(action, "target"), localObservation(), observations(text(task, "crew")).values(), System.nanoTime());
-        UUID targetId = target == null ? null : target.id(); String targetName = target == null ? "" : target.name(), targetScope = target == null ? "" : target.scope();
-        if (targetId == null || targetId.equals(worker) || !targetName.matches("[A-Za-z0-9_]{1,16}")) { result(worker, r, false, "TPA target must be an online crewmate or the host"); return; }
+        boolean external=flag(action,"external");
+        PlayerObservation target = external?null:PlayerObservation.target(text(action, "target"), localObservation(), observations(text(task, "crew")).values(), System.nanoTime());
+        UUID targetId = external?UUID.fromString(text(action,"target")):target == null ? null : target.id();
+        String targetName = external?text(action,"targetName"):target == null ? "" : target.name(), targetScope = external?requester.scope():target == null ? "" : target.scope();
+        if (targetId == null || targetId.equals(worker) || !targetName.matches("[A-Za-z0-9_]{1,16}")) { result(worker, r, false, "TPA target needs an exact player identity"); return; }
         if (!sameTeleportServer(requester.scope(), targetScope)) { result(worker, r, false, "TPA requester and target must be on the same Minecraft server"); return; }
         String requesterName = requester.name();
         if (!requesterName.matches("[A-Za-z0-9_]{1,16}")) { result(worker, r, false, "TPA requester has no valid player identity"); return; }
@@ -878,7 +910,7 @@ public final class BotScheduler {
         tpa.addProperty("warmup", integer(action, "warmupTicks", 0, 72_000));
         tpa.addProperty("acceptDelay",integer(action,"acceptDelayTicks",0,200));
         tpa.addProperty("deadline", System.currentTimeMillis() + integer(action, "timeoutTicks", 1, 1_728_000) * 50L);
-        tpa.addProperty("sendIntent", true); r.add("tpa", tpa);
+        tpa.addProperty("sendIntent", true);if(external)tpa.addProperty("external",true); r.add("tpa", tpa);
         save(); // Intent first: a crash between the checkpoint and packet is safe, not replayable.
         teleports.put(key, tpa);
         JsonObject command = tpa.deepCopy(); command.addProperty("type", "task-tpa-send"); send(worker, command);
@@ -894,7 +926,7 @@ public final class BotScheduler {
                 teleports.remove(entry.getKey()); continue;
             }
             if (flag(active, "cancelled") || Set.of("Cancelled", "Failed").contains(text(r, "requestedStatus"))) continue;
-            if (flag(t, "recovered") || flag(t, "accepted") || !flag(r, "commandSent")) continue;
+            if (flag(t, "recovered") || flag(t, "accepted") || flag(t,"external") || !flag(r, "commandSent")) continue;
             if (!t.has("acknowledgedAt")) { t.addProperty("acknowledgedAt", now); save(); }
             if (!teleportWarmupReady(t, now)) continue;
             UUID target = UUID.fromString(text(t, "target"));
@@ -944,7 +976,7 @@ public final class BotScheduler {
 
     private boolean bodyguardRequest(UUID requester,String crew,JsonObject message) {
         if(!flag(message,"bodyguard")||!message.has("targetId"))return false;UUID target=UUID.fromString(text(message,"targetId"));
-        return tasks.values().stream().anyMatch(t->!terminal(text(t,"status"))&&crew.equals(text(t,"crew"))&&text(t.getAsJsonObject("package"),"entry").equals("task-bodyguard")
+        return tasks.values().stream().anyMatch(t->!terminal(text(t,"status"))&&crew.equals(text(t,"crew"))&&Set.of("task-bodyguard","task-crystal-guard").contains(text(t.getAsJsonObject("package"),"entry"))
             &&t.getAsJsonObject("runs").has(requester.toString())&&text(t.getAsJsonObject("args"),"target").equals(target.toString()));
     }
 

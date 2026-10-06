@@ -12,11 +12,13 @@ final class BotWorkflowsTest {
         try {
             var path = directory.resolve("workflows.json");
             var library = new BotWorkflows(path);
-            assert library.all().size() == 16;
+            assert library.all().size() == 19;
             assert library.get("task-follow").script().contains("bot.follow");
             assert library.get("task-bodyguard").script().contains("bodyguard = true");
+            assert library.get("task-crystal-guard").script().contains("crystalGuard = true");
             assert library.get("task-stash-scan").script().contains("bot.stash_scan");
             assert library.get("task-stash-resupply").script().contains("bot.stash_resupply");
+            assert library.get("task-kit-delivery").script().contains("bot.stash_store");
             var original = library.compile(BotWorkflows.DEFAULT_ID);
             assert original.get("duty").getAsString().equals("Build");
             assert original.getAsJsonArray("actions").get(2).getAsString().equals("InventoryShulkers");
@@ -61,7 +63,7 @@ final class BotWorkflowsTest {
             bad(() -> Bots.applyWorkflowDuties(job, Set.of(excavator, paver)));
 
             library.delete(copy.id()); library.delete(supplies.id());
-            assert new BotWorkflows(path).all().size() == 16;
+            assert new BotWorkflows(path).all().size() == 19;
             Files.writeString(path, "{broken");
             var broken = new BotWorkflows(path);
             bad(broken::all); bad(() -> broken.duplicate(BotWorkflows.DEFAULT_ID, "No overwrite", "Highway Builder"));

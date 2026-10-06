@@ -216,7 +216,8 @@ public class Scaffold extends Module {
     @Override public void onDeactivate() { pending.clear(); attempted.clear(); }
 
     private boolean anotherBuilder() {
-        return Modules.get().get(HighwayBuilder.class).controlsPlayer() || Modules.get().get(PrinterHelper.class).controlsInventory();
+        return Modules.get().get(HighwayBuilder.class).controlsPlayer() || Modules.get().get(PrinterHelper.class).controlsInventory()
+            || Modules.get().get(dev.monocle.client.systems.modules.world.AutoWither.class).controlsPlayer();
     }
 
     private boolean inventoryReady() {

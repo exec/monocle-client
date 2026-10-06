@@ -126,7 +126,8 @@ public class AutoMend extends Module {
         HighwayBuilder highway = Modules.get().get(HighwayBuilder.class);
         boolean highwayJob = highway.isActive() && highway.hasJob();
         if (highwayJob && (!highwayCycle || !highway.autoMendYielding())
-            || Modules.get().get(PrinterHelper.class).controlsInventory() || mc.player.isFallFlying()) {
+            || Modules.get().get(PrinterHelper.class).controlsInventory()
+            || Modules.get().get(dev.monocle.client.systems.modules.world.AutoWither.class).controlsInventory() || mc.player.isFallFlying()) {
             status = "Waiting for building / flight to stop";
             return;
         }

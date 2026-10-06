@@ -122,7 +122,8 @@ public class ChestSwap extends Module {
                 cancelRequest();
                 return;
             }
-            if (Modules.get().get(ElytraFly.class).hasAutopilotRequest()) return;
+            if (Modules.get().get(ElytraFly.class).hasAutopilotRequest()
+                || Modules.get().get(dev.monocle.client.systems.modules.world.AutoWither.class).controlsPlayer()) return;
             if (waitForGround && (!mc.player.onGround() || mc.player.isFallFlying())) {
                 status = "Waiting for landing";
                 settled = 0;

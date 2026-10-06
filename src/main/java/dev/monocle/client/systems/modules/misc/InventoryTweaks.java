@@ -833,7 +833,8 @@ public class InventoryTweaks extends Module {
             || Modules.get().get(dev.monocle.client.systems.modules.combat.KillAura.class).attacking
             || Modules.get().get(dev.monocle.client.systems.modules.player.ChestSwap.class).controlsChest()
             || Modules.get().isActive(AutoMend.class) || builder.hasJob() && !builder.isJobPaused()
-            || Modules.get().get(dev.monocle.client.systems.modules.world.PrinterHelper.class).controlsInventory();
+            || Modules.get().get(dev.monocle.client.systems.modules.world.PrinterHelper.class).controlsInventory()
+            || Modules.get().get(dev.monocle.client.systems.modules.world.AutoWither.class).controlsInventory();
     }
 
     public static boolean storageMenu(AbstractContainerMenu menu) {

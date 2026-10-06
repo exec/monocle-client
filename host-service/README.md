@@ -1,5 +1,7 @@
 # Monocle standalone Workers host
 
+**0.13.15 native transport update:** install 0.13.15+ on both this service and every native Monocle worker. Native protocol 7 uses four-byte UTF-8 length framing on TCP, 256 KiB records on TCP/WebSocket, and 1 MiB/128-record queue budgets. Older native builds cannot connect; the separate public RWP draft binding is unchanged. Pause work before updating, then resume the same saved execution to preserve carried kits and transfer receipts.
+
 Live gameplay configuration requires workers on 0.7.50+. POST `/v1/control` using the existing bearer token:
 
 ```json
@@ -11,6 +13,8 @@ Add `worker: "WORKER-UUID"` to target one worker; omit it for all assigned unfin
 The operator WebUI is available at **http://127.0.0.1:6970/ui/**. Use the API token, not a crew key. Worker/crew views, job controls, workflow upload, priorities, history and inspection share the existing coordinator. No Node or separate frontend process is required. See the [WebUI guide](https://github.com/exec/monocle-client/blob/master/docs/bot-webui.md).
 
 Optional loopback WebSocket ingress and `GET /v1/status` / `POST /v1/control` run alongside the existing local API and LAN TCP. Set `webPort` to 6971 to opt in; 0 or an absent field keeps it disabled. Remote worker URLs use `wss://HOST[:PORT]/v1/workers` through an operator-managed TLS reverse proxy. See [web transport setup and limits](https://github.com/exec/monocle-client/blob/master/docs/bot-web-transport.md). Crew keys still grant trusted execution, not scoped account-based sharing. The admin API token remains full host control; do not share it with workers or clanmates.
+
+The optional `interopPort` is a separate loopback-only **v1 draft public-worker endpoint**, disabled by default. Configure individual `interopWorkerTokens` to test third-party registration, observations, reconnect reconciliation, built-in Wait/Travel, and bounded relay of exact worker-advertised extension actions. The host does not interpret or game-verify extension results. See the bundled [Phase 4 worker notes](../docs/workers-api-v1/phase4-worker.md) for its limits. Do not publish this endpoint as a production worker API.
 
 0.7.20 keeps standalone coordination unchanged; its fresh-highway supply-journal gate is worker-side.
 

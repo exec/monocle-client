@@ -1,24 +1,42 @@
-# Monocle Workers API v1 roadmap
+# Redstone Worker Protocol (RWP) core roadmap
 
 ## Goal and current state
 
-Make Monocle's worker coordination usable by other Minecraft clients and bot platforms without requiring them to copy Monocle's Lua runtime or highway internals. The public contract should describe observable behavior, portable actions, acknowledgements, and recovery. Its final shape should be reviewed with prospective implementers before it is frozen.
+Turn Monocle's existing host, crew, job, and per-worker execution model into an implementation-neutral protocol that other Minecraft clients and bot platforms can use without copying Monocle's Lua runtime or highway internals. RWP/1 standardizes capability negotiation, assignment, observable state changes, acknowledgements, cancellation, and recovery—not a mandatory job catalog. Monocle is the first implementation, not the required host. The final contract needs review by another implementer before it is frozen.
 
-Today the standalone host offers `GET /v1/status`, RPC-style `POST /v1/control`, and the private `WS /v1/workers` protocol (plus raw TCP). The WebUI uses same-origin `/ui/api/*` equivalents. The in-game host shares coordinator policy but does not expose the standalone administrative HTTP server. Crew keys grant trusted execution rather than scoped sharing. See [the current API notes](docs/workers-api.md) and [transport guide](docs/bot-web-transport.md).
+The core is **coordination, not a labor market**. A trusted operator or host submitting and assigning a job is enough for v1. Public offers, claims, prices, reputation, and escrow are optional later layers, not prerequisites for making independent workers interoperate. The public worker binding now uses `rwp/1-draft` and temporarily accepts `workers.monocle.dev/v1` for existing workers; neither identifier implies a frozen RWP/1 contract. Monocle's separate operator API and persistent ID namespace retain their own names.
 
-The proposed public surface has three parts:
+Today the standalone host has a substantial draft resource API alongside `GET /v1/status`, RPC-style `POST /v1/control`, and the private `WS /v1/workers` protocol (plus raw TCP). The WebUI uses same-origin `/ui/api/*` and `/ui/api/v1/*` equivalents. The in-game host shares coordinator policy but does not expose the standalone administrative HTTP server. Crew keys grant trusted execution rather than scoped sharing. See [the current API notes](docs/workers-api.md) and [transport guide](docs/bot-web-transport.md).
+
+## Implementation status (2026-09-30)
+
+| Phase | Shipped | Still required for v1 |
+| --- | --- | --- |
+| 1 — contract | Monocle-derived vocabulary, schemas, examples, initial OpenAPI, scenarios, decision log and checker are drafted. | Separate the neutral RWP core from Monocle-specific bindings and extensions, settle names/versioning with an external implementer, and then freeze schemas. |
+| 2 — operator HTTP | Authenticated resource routes for host/health/capabilities, workers, crews, jobs, drafts, workflows, stashes, configuration controls, and bounded list pagination. The panel uses resource routes for common dispatch/control and inspections. | Portable profile selection, general worker resource/configuration reads, safe stash deletion, remaining legacy UI flows, and documented host parity. |
+| 3 — reliability/events | Durable idempotency receipts, selected revision guards, structured resource errors, and a bounded resumable polling feed with native/public worker connection transitions. | Correlate receipts to delivery/worker/server outcomes, richer events, push delivery if needed, and failure/reconnect conformance. |
+| 4 — public worker protocol | An **optional, loopback-only, standalone-host prototype** at `/v1/interop/workers` authenticates per-worker tokens, tracks observations, reconciles execution generations, and runs built-in Wait and Travel through the durable host queue. It also relays bounded namespaced extension actions to workers advertising the exact capability, without interpreting their gameplay semantics. Execution reports have bounded durable retry receipts; transport keepalives, an outbound queue cap, and a per-session inbound rate limit bound traffic. Socket tests and a separate dependency-free Node mock worker cover completion, cancellation, reconnect, and opaque extension delivery. The independent [`exec/rwp`](https://github.com/exec/rwp) Java Wait example has also completed a real job against the standalone host. Monocle now advertises and executes **Wait and Travel** with a durable local checkpoint, report retries, reconnect reconciliation, and offline cancellation. Travel reuses its safe native movement action and reports a fresh position on safe-footing arrival. Replaceable progress and optional worker names now appear in the operator roster/panel. | Run a game-backed Monocle Wait/Travel trial; add trusted remote `wss://` deployment and safe coexistence with native crew sessions; then broaden capability negotiation, pause/preemption, and add an in-game-host adapter. Drop Items is a proposed optional action profile, not a core protocol gate. **Only Wait and Travel have built-in public semantics; no public highway/stash adapter exists yet.** |
+| 5 — identity/grants | Separate per-worker credentials exist only for the Phase 4 prototype. | Operator identities, scoped grants, rotation/revocation, sharing, and audit enforcement. |
+| 6 — interoperability/release | Local schema and socket checks, a separate-process mock worker, and a dependency-free draft-host probe. | Independent platform review, game-backed third-party worker trials against both hosts, broader conformance fixtures/report, and v1 freeze. |
+
+Monocle's first RWP implementation has three surfaces:
 
 1. An operator HTTP API for workers, crews, jobs, workflows, stashes, configuration, and access grants.
 2. A worker WebSocket API for capabilities, assignments, observations, progress, acknowledgements, and reconciliation.
 3. An operator event stream for dashboards and integrations that need updates without polling the entire host snapshot.
 
-The current coordinator and private protocol remain usable during migration. New routes should initially adapt to the same coordinator operations and durable records, so client-based hosting and standalone hosting keep matching job behavior.
+These HTTP and WebSocket routes are **bindings/adapters**, not required transports for RWP itself. The core JSON messages and state rules must remain meaningful over a future low-bandwidth `/msg` binding or another host link. The current coordinator and private protocol remain usable during migration. New routes should initially adapt to the same coordinator operations and durable records, so client-based hosting and standalone hosting keep matching job behavior.
+
+**Boundary decision:** RWP understands a job's identity, authority, lifecycle, and versioned action capability, but does not interpret every action payload or prescribe a client's algorithm. A host may carry a Monocle highway or stash job as a namespaced action only to a worker advertising that exact capability. The host still validates the common envelope, authorization, bounds, and lifecycle; the action's owner defines argument validation and completion semantics. Optional standard action profiles can make selected tasks reproducible across clients, but no worker must implement them merely to speak RWP.
+
+**Next core milestone:** take the documented [minimal execution messages](docs/workers-api-v1/phase4-worker.md) to an external client implementer, test a game-backed worker against the host, and resolve differences before freezing RWP/1. The local dependency-free mock proves the wire path, not Minecraft behavior or independent review. Do not build listing, payments, or escrow into this milestone.
 
 ## Phase 1 — Agree on the contract
 
 ### 1.1 Vocabulary and state model
 
 - Define `Host`, `Worker`, `Crew`, `Job`, `Execution`, `Action`, `Workflow`, `Capability`, `Observation`, `ResourceInventory`, `Stash`, `Event`, `Operation`, and `Grant` in plain language.
+- Mark `Crew`, `Stash`, and Monocle workflow packaging as optional host capabilities rather than requirements for every RWP worker. A minimal worker needs only identity, capability negotiation, typed assignment, reports, and reconciliation.
 - Distinguish a reusable job definition from one execution attempt; give each execution an ID and generation so stale reports cannot revive cancelled work.
 - Publish allowed job and execution states, transitions, terminal states, and what survives host or worker restart.
 - Specify authority for each field: host intent, worker observation, game-server confirmation, or operator assertion. An observation must never silently become confirmation.
@@ -26,9 +44,10 @@ The current coordinator and private protocol remain usable during migration. New
 ### 1.2 Common formats
 
 - Specify stable IDs, UTC timestamps, revisions, world scope (`server` and `dimension`), cursors, pagination, and structured errors.
-- Define one versioned JSON envelope for worker messages with message ID, correlation ID, sequence, type, timestamp, and payload. Define which fields are required and how unknown optional fields are handled.
-- Define namespaced, versioned capability and action IDs, such as proposed core `workers.travel.v1` and extension `dev.monocle.highway.build.v1`; missing required capabilities reject an assignment before execution.
-- Define portable typed actions and arguments. Start with `Wait`, `Travel`, `DropItems`, and `SetProfile`; document what can be verified, cancelled, or retried for each. Highway, stash, and client-specific actions may begin as namespaced extensions.
+- Define one versioned JSON envelope for worker messages with message ID, correlation ID, actor, type, timestamp, and payload. Define which fields are required and how unknown optional fields are handled.
+- Make event IDs and execution generations durable across transports; session sequence numbers belong to ordered bindings such as WebSocket, not to the transport-neutral core.
+- Define namespaced, versioned capability and action IDs, such as optional standard profile `workers.travel.v1` and extension `dev.monocle.highway.build.v1`; missing exact capabilities reject an assignment before execution. RWP has no closed list of job types.
+- Define a small optional standard-action profile set—initial candidates are `Wait`, `Travel`, and `DropItems`—with arguments, observable success/failure, cancellation, and retry rules. Standardize outcomes and permitted effects, not pathfinding or mining algorithms. `SetProfile` remains a separate candidate until portable profile identity and revision semantics are settled. Highway, stash, and client-specific actions stay namespaced extensions.
 - Describe the behavior of duplicate messages, conflicting IDs, timeouts, reordered reports, unsupported versions, and oversized payloads.
 
 Illustrative action, subject to Phase 1 review:
@@ -132,9 +151,9 @@ Example error shape:
 - Test lost responses, duplicate submissions, stale revisions, offline cancellation, reconnect, slow event consumers, and stream gaps.
 - **Exit gate:** an operator can issue a command once, recover its result after a disconnect, and distinguish an acknowledged effect from an uncertain one.
 
-## Phase 4 — Public worker WebSocket protocol
+## Phase 4 — Public worker WebSocket binding
 
-Add a new versioned worker endpoint alongside the private `WS /v1/workers` transport. Do not silently reinterpret the existing endpoint's `monocle-crew-6` frames.
+Add a new versioned worker endpoint alongside the private `WS /v1/workers` transport. Do not silently reinterpret the existing endpoint's `monocle-crew-6` frames. The initial standalone-host Wait adapter is described in [its operator notes](docs/workers-api-v1/phase4-worker.md); it does not yet satisfy the Phase 4 exit gate.
 
 ### 4.1 Session and negotiation
 
@@ -148,13 +167,13 @@ Add a new versioned worker endpoint alongside the private `WS /v1/workers` trans
 - Define assignment, acceptance/rejection, start, progress, event, result, failure, cancel, cancellation acknowledgement, and generic acknowledgement messages.
 - Every command identifies job, execution ID, generation, and command ID. Every report identifies the execution it describes and its monotonic worker sequence.
 - Define which actions are safe to retry, which require an idempotency token, and which become uncertain after a disconnect (for example, dropping items or issuing a teleport command).
-- Send only resolved portable actions supported by the worker; Lua execution and native highway control remain optional namespaced capabilities.
+- Send only actions whose exact versioned capability the worker advertises. Monocle Lua packages and native highway/stash control remain namespaced capabilities; RWP carries their assignments and results without interpreting their internal steps.
 
 Illustrative worker message:
 
 ```json
 {
-  "apiVersion": "workers.monocle.dev/v1",
+  "apiVersion": "rwp/1-draft",
   "type": "execution.progress",
   "messageId": "d83d76db-3ab7-405e-9258-f893f16d8383",
   "correlationId": "d8ab7143-6414-4cf2-a42d-8c072983f4a8",
@@ -171,6 +190,12 @@ Illustrative worker message:
 - Have the host answer with an explicit reconciliation result: continue, cancel, inspect, or wait. Never replay a non-idempotent effect solely because its acknowledgement was lost.
 - Implement adapters for both standalone and in-game hosts against the same coordinator policy. Let Monocle workers use either protocol during the migration window.
 - **Exit gate:** a third-party test worker can register, run a portable job, cancel while offline, reconnect, and converge on the host's final state without Lua or Monocle classes.
+
+### 4.4 Secure remote access and Monocle coexistence
+
+- Keep the RWP backend bound to loopback. Support remote workers through a documented TLS-terminating proxy and `wss://` with normal certificate-chain and hostname validation; choose either an operator-owned domain/certificate or an explicitly trusted LAN CA. Never send bearer tokens over remote `ws://`, disable TLS verification, or publish the admin API as part of worker ingress. WebSocket is an HTTP upgrade; replacing it with plain HTTP would not add encryption.
+- Let a Monocle game client connect to RWP alongside its native crew connection, with separate endpoint/token settings and reconnect state. Define how the host represents two sessions for one Minecraft account without duplicating the worker or granting conflicting movement authority: native highway/stash work must not be interrupted by an RWP Wait/Travel assignment.
+- Verify from a second machine that valid WSS connects, untrusted/wrong-host certificates and remote plaintext URLs fail, credentials stay out of URLs/logs, and RWP disconnect/reconnect leaves an active native crew job intact.
 
 ## Phase 5 — Identity, permissions, and sharing
 
@@ -193,7 +218,7 @@ Illustrative worker message:
 
 ### 6.1 Reference material
 
-- Publish the OpenAPI document, JSON Schemas, state diagrams, action catalog, error codes, size limits, examples, and version negotiation/deprecation policy.
+- Publish the OpenAPI document, JSON Schemas, state diagrams, optional standard-action profiles, extension rules, error codes, size limits, examples, and version negotiation/deprecation policy. Do not publish a closed RWP job catalog.
 - Provide a small simulated host and worker plus conformance fixtures for valid and malformed registration, assignment, duplicate delivery, cancellation, reconnect, and uncertain effects.
 - Provide a minimal Java and TypeScript example or SDK only where it removes repeated protocol work for adopters.
 
@@ -212,8 +237,13 @@ Illustrative worker message:
 
 ## What v1 should preserve
 
-Durable cancellation for offline workers; execution generations; idempotent submissions; capability checks before assignment; the difference between host acceptance, worker acknowledgement, and game-server confirmation; resource-recovery debt; reconnect reconciliation; per-worker priorities; safe detach/rejoin; and a standalone host that needs no Minecraft account or rendering context.
+RWP core must preserve durable cancellation for offline workers, execution generations, idempotent submissions, capability checks before assignment, the difference between host acceptance, worker acknowledgement, and game-server confirmation, and reconnect reconciliation. The Monocle adapter must additionally preserve its resource-recovery debt, per-worker priorities, safe detach/rejoin, and standalone host that needs no Minecraft account or rendering context; these are not mandatory features for every RWP implementation.
 
 ## Vendor extensions for now
 
-Monocle's Lua dialect, native highway lane/window protocol, shulker and ender-chest recovery internals, server-specific `/home` and `/tpa` syntax, serialized Meteor/Monocle module settings, launcher account management, IRC or whisper federation, and presentation features such as Banter Mode should remain namespaced extensions. Other platforms can advertise support for an extension without making it a requirement for every v1 worker.
+Monocle highway building, stash hunting/scanning/resupply, follow/bodyguard jobs, its Lua dialect and native highway lane/window protocol, shulker and ender-chest recovery internals, server-specific `/home` and `/tpa` syntax, serialized Meteor/Monocle module settings, launcher account management, and presentation features such as Banter Mode should remain namespaced extensions. Other platforms can advertise support for an extension without making it a requirement for every v1 worker. Chat and IRC are possible transport bindings, not gameplay capabilities; neither should change the core job state machine.
+
+## Long-term optional layers — not on the RWP/1 critical path
+
+- **RWP-Market/1:** public listings/discovery, worker claims, issuer selection, prices, reviews, and federated reputation. An accepted claim would create an ordinary RWP assignment; a claim alone grants no execution authority. Clan or group affiliation and payment terms remain optional metadata rather than required core job fields.
+- **RWP-Escrow/1:** provider-specific custody terms, observed deposits, fees, releases, cancellations, and disputes. Worker-reported completion must not itself trigger payment; escrow requires its own agreed verification and trust model. Do not implement this until the core has independent interoperability trials and there is an actual provider willing to operate it.

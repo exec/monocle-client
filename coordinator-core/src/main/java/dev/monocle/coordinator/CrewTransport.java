@@ -28,10 +28,11 @@ public interface CrewTransport {
                     socket.connect(new InetSocketAddress(host, port), 3000);
                 }
                 socket.setSoTimeout(10000); socket.setTcpNoDelay(true);
-                in = new DataInputStream(socket.getInputStream()); out = new DataOutputStream(socket.getOutputStream());
+                in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+                out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             }
-            public String read() throws IOException { return in.readUTF(); }
-            public void write(String frame) throws IOException { out.writeUTF(frame); }
+            public String read() throws IOException { return CrewFrames.read(in); }
+            public void write(String frame) throws IOException { CrewFrames.write(out, frame); }
             public void flush() throws IOException { out.flush(); }
             public boolean closed() { return socket.isClosed(); }
             public void close() { try { socket.close(); } catch (IOException ignored) { } }

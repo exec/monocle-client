@@ -33,12 +33,53 @@ public final class PrinterFlight {
             feet.x + width / 2, feet.y + height, feet.z + width / 2);
     }
 
-    /** Conservative swept full-body box: never samples past thin walls or clips a diagonal corner. */
+    /** Overlapping full-body sweeps cover the whole segment without reserving an entire diagonal rectangle. */
     public static boolean segmentClear(Vec3 from, Vec3 to, double width, double height, Predicate<AABB> clear) {
         requirePosition(from);
         requirePosition(to);
         if (from.distanceToSqr(to) > MAX_SEGMENT * MAX_SEGMENT) return false;
-        return clear.test(body(from, width, height).minmax(body(to, width, height)));
+        Vec3 delta = to.subtract(from);
+        int steps = Math.max(1, (int) Math.ceil(Math.max(Math.abs(delta.x), Math.max(Math.abs(delta.y), Math.abs(delta.z)))));
+        AABB previous = body(from, width, height);
+        for (int step = 1; step <= steps; step++) {
+            AABB next = body(step == steps ? to : from.add(delta.scale((double) step / steps)), width, height);
+            if (!clear.test(previous.minmax(next))) return false;
+            previous = next;
+        }
+        return true;
+    }
+
+    /** Follow a verified local detour each tick; failed searches retry once per second. */
+    public static final class LocalRoute {
+        private Vec3 target;
+        private List<Vec3> path = List.of();
+        private int step, retryTick;
+
+        public void reset() { target = null; path = List.of(); step = retryTick = 0; }
+
+        public Vec3 next(Vec3 from, Vec3 goal, int tick, double width, double height, Predicate<AABB> clear) {
+            requirePosition(from);
+            requirePosition(goal);
+            if (target == null) { target = copy(goal); retryTick = tick; }
+            else if (target.distanceToSqr(goal) > 1) { target = copy(goal); path = List.of(); }
+            Vec3 delta = goal.subtract(from);
+            Vec3 waypoint = delta.lengthSqr() <= 64 ? goal : from.add(delta.normalize().scale(8));
+            if (segmentClear(from, waypoint, width, height, clear)) { path = List.of(); return waypoint; }
+            while (step < path.size() && from.distanceToSqr(path.get(step)) < .04) step++;
+            if (!path.isEmpty() && step == path.size()) { path = List.of(); retryTick = tick; }
+            if (!path.isEmpty() && !segmentClear(from, path.get(step), width, height, clear)) path = List.of();
+            if (path.isEmpty()) {
+                if (tick - retryTick < 0) return null;
+                retryTick = tick + 20;
+                // A local waypoint can fall inside the obstacle we need to go around.
+                if (delta.lengthSqr() > 64 && !clear.test(body(waypoint, width, height)))
+                    waypoint = from.add(delta.normalize().scale(Math.min(24, delta.length())));
+                path = route(from, waypoint, width, height, clear);
+                step = 1;
+                if (path.size() < 2) { path = List.of(); return null; }
+            }
+            return path.get(step);
+        }
     }
 
     /** Check every touched chunk, including the negative side of zero and both sides of a boundary. */
@@ -88,7 +129,7 @@ public final class PrinterFlight {
         if (path.isEmpty()) return path;
         List<Vec3> result = new ArrayList<>(path);
         if (!result.getLast().equals(goal)) result.add(copy(goal));
-        return List.copyOf(result);
+        return shorten(result, width, height, clear);
     }
 
     /** Finds a reachable printing position, not the block that the printer will fill. */
@@ -109,8 +150,9 @@ public final class PrinterFlight {
         AABB reserved = new AABB(target);
         Predicate<Vec3> goal = p -> placementReach(p, target, eyeHeight, reach) && !body(p, width, height).intersects(reserved)
             && acceptableGoal.test(p);
-        return search(start, width, height, clear, goal,
-            p -> Math.max(0, p.add(0, eyeHeight, 0).distanceTo(center) - reach));
+        return shorten(search(start, width, height, clear, goal,
+            p -> { Vec3 eye = p.add(0, eyeHeight, 0);
+                return Math.max(0, Math.abs(eye.x - center.x) + Math.abs(eye.y - center.y) + Math.abs(eye.z - center.z) - reach * Math.sqrt(3)); }), width, height, clear);
     }
 
     /** Caller chooses a real, safe full-block floor; route keeps standing-height clearance for landing. */
@@ -118,13 +160,19 @@ public final class PrinterFlight {
                                            Predicate<AABB> clear, Predicate<BlockPos> safeFloor) {
         if (floor == null) return List.of();
         Vec3 feet = Vec3.atBottomCenterOf(floor.above());
+        return supported(feet, width, standingHeight, safeFloor) ? route(start, feet, width, standingHeight, clear) : List.of();
+    }
+
+    /** Every block beneath the actual footprint must provide safe support, including across block edges. */
+    public static boolean supported(Vec3 feet, double width, double standingHeight, Predicate<BlockPos> safeFloor) {
         AABB body = body(feet, width, standingHeight);
+        int floorY = (int) Math.floor(feet.y) - 1;
         for (int x = (int) Math.floor(body.minX); x <= (int) Math.floor(Math.nextDown(body.maxX)); x++) {
             for (int z = (int) Math.floor(body.minZ); z <= (int) Math.floor(Math.nextDown(body.maxZ)); z++) {
-                if (!safeFloor.test(new BlockPos(x, floor.getY(), z))) return List.of();
+                if (!safeFloor.test(new BlockPos(x, floorY, z))) return false;
             }
         }
-        return route(start, feet, width, standingHeight, clear);
+        return true;
     }
 
     /** A real, collision-checked escape to wholly outside the build plus a one-block margin. Never drills. */
@@ -156,11 +204,25 @@ public final class PrinterFlight {
 
     private record Node(BlockPos cell, double cost, double score) {}
 
+    /** Remove grid turns only when the complete straight corridor is still safe. */
+    private static List<Vec3> shorten(List<Vec3> path, double width, double height, Predicate<AABB> clear) {
+        if (path.size() < 3) return path;
+        List<Vec3> result = new ArrayList<>();
+        result.add(path.getFirst());
+        for (int from = 0; from < path.size() - 1;) {
+            int next = Math.min(path.size() - 1, from + 32);
+            while (next > from + 1 && !segmentClear(path.get(from), path.get(next), width, height, clear)) next--;
+            result.add(path.get(next));
+            from = next;
+        }
+        return List.copyOf(result);
+    }
+
     private static List<Vec3> search(Vec3 start, double width, double height, Predicate<AABB> clear,
                                      Predicate<Vec3> goal, ToDoubleFunction<Vec3> heuristic) {
         if (!clear.test(body(start, width, height))) return List.of();
         if (goal.test(start)) return List.of(copy(start));
-        PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingDouble(Node::score).thenComparingDouble(Node::cost)
+        PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingDouble(Node::score).thenComparingDouble(n -> -n.cost)
             .thenComparingInt(n -> n.cell.getY()).thenComparingInt(n -> n.cell.getX()).thenComparingInt(n -> n.cell.getZ()));
         var costs = new HashMap<BlockPos, Double>();
         var previous = new HashMap<BlockPos, BlockPos>();

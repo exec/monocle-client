@@ -189,6 +189,23 @@ public class InvUtils {
         return ACTION;
     }
 
+    /** Place in an explicit empty menu slot, asking for authoritative snapshots after both ordered clicks. */
+    public static void moveConfirmed(int inventoryIndex, int destination) {
+        var menu=mc.player.containerMenu;
+        int source=SlotUtils.indexToId(inventoryIndex);
+        if(source<0||destination<0||destination>=menu.slots.size()||!menu.getCarried().isEmpty()
+            ||menu.getSlot(source).getItem().isEmpty()||menu.getSlot(destination).hasItem())
+            throw new IllegalStateException("Confirmed inventory move requires a carried item, empty destination and empty cursor");
+        // No local prediction: each mismatched state ID makes vanilla send the post-click full contents
+        // within that handler, before a subsequent hopper tick can drain the destination.
+        for(int slot:new int[]{source,destination})mc.getConnection().send(confirmedClick(menu.containerId,slot));
+    }
+
+    public static net.minecraft.network.protocol.game.ServerboundContainerClickPacket confirmedClick(int menu,int slot) {
+        return new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(menu,-1,(short)slot,(byte)0,
+            ContainerInput.PICKUP,it.unimi.dsi.fastutil.ints.Int2ObjectMaps.emptyMap(),net.minecraft.network.HashedStack.EMPTY);
+    }
+
     public static Action drop() {
         ACTION.type = ContainerInput.THROW;
         ACTION.data = 1;

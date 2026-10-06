@@ -91,8 +91,9 @@ public final class TaskWire {
         }
         if (full) {
             if (text(checked, "detail").length() > 1024) throw new IllegalArgumentException("Task status is too large");
+            if(checked.has("workflowResult")&&checked.get("workflowResult").toString().length()>32_768)throw new IllegalArgumentException("Workflow result is too large");
             if (checked.has("action")) {
-                if (!checked.get("action").isJsonObject() || checked.get("action").toString().length() > 8000) throw new IllegalArgumentException("Native action is too large");
+                if (!checked.get("action").isJsonObject() || checked.get("action").toString().length() > 32_768) throw new IllegalArgumentException("Native action is too large");
                 UUID.fromString(text(checked, "token"));
             }
         }
@@ -114,6 +115,7 @@ public final class TaskWire {
         if (!state.equals("Inspection required")) run.remove("resumeInspection");
         if (full) {
             run.addProperty("detail", text(checked, "detail"));
+            if(checked.has("workflowResult"))run.add("workflowResult",checked.get("workflowResult").deepCopy());
             if (checked.has("stashScan")) {
                 if (!checked.has("action") || !text(checked.getAsJsonObject("action"),"type").equals("StashScan")) throw new IllegalArgumentException("Stash telemetry requires its active scan action");
                 StashCatalog.telemetry(run,checked.getAsJsonObject("stashScan"));

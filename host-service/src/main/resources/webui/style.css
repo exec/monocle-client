@@ -8,5 +8,7 @@ dialog{background:var(--panel);color:var(--text);border:1px solid #665537;border
 @media(prefers-reduced-motion:no-preference){button{transition:border-color .15s,background .15s}}
 .speed{font-variant-numeric:tabular-nums}.speed-slow{color:#f18b86}.speed-steady{color:#e6c86a}.speed-fast{color:#81d6a1}.speed-rapid{color:#78cee2}.speed-exceptional{color:#c4a0ff}.speed-unknown{color:var(--muted)}
 .resources{margin-top:12px;font-size:12px;color:var(--gold);overflow-wrap:anywhere}.table-panel .resources{margin:0;min-width:190px}
+.job-card .table-panel{margin-top:12px}.job-card .table-panel+h3{margin-top:22px}
+.shulker-row{background:color-mix(in srgb,var(--panel) 80%,var(--shulker-color) 20%)}
 .management-section{margin-top:24px;border-top:1px solid var(--line);padding-top:18px}.management-section>h3{margin-bottom:14px}.chat-feed{height:260px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:12px}.chat-line{display:flex;gap:8px;align-items:baseline;font-size:13px;margin-bottom:7px;overflow-wrap:anywhere}.chat-line time{color:var(--muted);font-size:10px;flex-shrink:0}.chat-line strong{color:var(--gold);flex-shrink:0;font-weight:400}.chat-line.sent span{color:var(--green)}.chat-line.error span{color:var(--red)}.chat-compose{display:flex;gap:10px;margin-top:10px}.chat-compose input{min-width:0}.management-section .actions select{width:auto;max-width:100%}
 .chat-recipient{color:var(--muted);font-size:10px;flex-shrink:0}.chat-message{white-space:pre-wrap}

@@ -30,7 +30,14 @@ final class OperationsLibraryTest {
         JsonObject bodyguard=library.get("task-bodyguard").getAsJsonObject("package");
         assert bodyguard.getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("kill-aura").get("active").getAsBoolean();
         assert bodyguard.getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("elytra-fly").get("active").getAsBoolean();
-        boolean rejected=false;try{library.delete("highway-default");}catch(IllegalArgumentException e){rejected=true;}assert rejected;
+        JsonObject crystalGuard=library.get("task-crystal-guard").getAsJsonObject("package");
+        assert !crystalGuard.getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("crystal-aura").get("active").getAsBoolean()
+            : "The aura is armed only after the worker observes its protected subject";
+        JsonObject crystalArgs=JsonParser.parseString("{target:'00000000-0000-0000-0000-000000000001',combatTargets:['Enemy']}").getAsJsonObject();
+        assert library.prepare("task-crystal-guard","test.invalid\nminecraft:the_nether",crystalArgs).get("entry").getAsString().equals("task-crystal-guard");
+        crystalArgs.getAsJsonArray("combatTargets").add("bad name");
+        boolean rejected=false;try{library.prepare("task-crystal-guard","test.invalid\nminecraft:the_nether",crystalArgs);}catch(IllegalArgumentException e){rejected=true;}assert rejected;
+        rejected=false;try{library.delete("highway-default");}catch(IllegalArgumentException e){rejected=true;}assert rejected;
         JsonObject invalid=original.getAsJsonObject("package").deepCopy();invalid.getAsJsonObject("programs").getAsJsonObject("highway-default").addProperty("script","not lua !");
         rejected=false;try{library.save(id,"Changed","Highways/Nether",invalid);}catch(RuntimeException e){rejected=true;}assert rejected;assert library.get(id).get("name").getAsString().equals("My highway");
         JsonObject draft=new JsonObject();draft.addProperty("id",UUID.randomUUID().toString());draft.addProperty("name","West highway");draft.addProperty("server","test.invalid");draft.addProperty("dimension","minecraft:the_nether");draft.addProperty("priority",0);draft.add("args",new JsonObject());draft.add("package",original.get("package"));

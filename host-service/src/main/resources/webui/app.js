@@ -13,11 +13,15 @@ const headings = {
 };
 let token = '', demo = false, snapshot = null, page = 'overview', refreshedAt = 0, refreshing = false, polling;
 let busy = false, packaged = null, pendingSubmission = null, pendingSubmissionKey = null, inspecting = null;
+let scanStash = null, kitContext = null;
 let presetList=[],reviewedSubmission=null,lastLaunch=null,inspectionKey='';
 let generation = 0;
+const tokenKey = 'monocle-operator-token';
+try { token = sessionStorage.getItem(tokenKey) || ''; } catch (_) { /* Storage may be disabled. */ }
+function saveToken() { try { sessionStorage.setItem(tokenKey, token); } catch (_) { /* Keep this tab usable without storage. */ } }
+function clearToken() { token = ''; try { sessionStorage.removeItem(tokenKey); } catch (_) { /* Storage may be disabled. */ } }
 const WAIT = 'return function(ctx)\n if ctx.state.waited then return bot.done() end\n ctx.state.waited=true\n return bot.wait(200)\nend';
 const STASH_SCAN = 'return function(ctx)\n if ctx.state.started then return bot.done(ctx.result) end\n ctx.state.started=true\n return bot.stash_scan(ctx.args)\nend';
-const stashDetails = new Map();
 
 function el(tag, cls = '', text = '') {
   const node = document.createElement(tag); if (cls) node.className = cls; if (text !== '') node.textContent = text; return node;
@@ -38,7 +42,7 @@ async function api(path, request, method = request ? 'POST' : 'GET', extraHeader
   let response, body;
   try {
   response = await fetch('/ui/api/' + path, {
-    method, credentials: 'omit', mode: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(8000),
+    method, credentials: 'omit', mode: 'cors', cache: 'no-store', signal: AbortSignal.timeout(8000),
     headers: { Authorization: 'Bearer ' + token, ...(request ? { 'Content-Type': 'application/json' } : {}), ...extraHeaders },
     ...(request ? { body: JSON.stringify(request) } : {})
   });
@@ -48,15 +52,36 @@ async function api(path, request, method = request ? 'POST' : 'GET', extraHeader
     failure.uncertain = true; throw failure;
   }
   if (!response.ok) {
-    if (response.status === 403) { if (attempt === generation) token = ''; throw new Error('Access rejected. Reconnect with the host API token from this allowed origin.'); }
+    if (response.status === 403) {
+      if (path === 'status' && body.error === 'Invalid API token' && attempt === generation) clearToken();
+      throw new Error((body.error || body.detail || 'Access rejected') + (path === 'status' ? '. Reconnect with the API token from an allowed origin.' : '. Your saved token is unchanged.'));
+    }
     throw new Error(body.detail || body.error || 'Request rejected (HTTP ' + response.status + ')');
   }
   return body;
 }
-async function resource(method, path, body, commandId) {
-  const reply=await api('v1/' + path, body, method, method === 'GET' ? {} : { 'Idempotency-Key': commandId || crypto.randomUUID() });
+async function resource(method, path, body, commandId, revision) {
+  const headers=method === 'GET' ? {} : { 'Idempotency-Key': commandId || crypto.randomUUID() };
+  if(revision)headers['If-Match']=revision;
+  const reply=await api('v1/' + path, body, method, headers);
   if(reply.state==='outcome_uncertain') {const error=new Error('The host cannot confirm this command yet. Inspect its operation receipt before creating replacement work.');error.uncertain=true;throw error;}
   return reply;
+}
+async function crewResource(legacyId) {
+  const crews=await resource('GET','crews?limit=100');
+  const match=crews.items.find(crew=>crew.name===(snapshot.crewLabels?.[legacyId]||legacyId));
+  if(!match)throw new Error('Crew changed. Refresh the roster before retrying.');
+  return resource('GET','crews/'+match.id);
+}
+async function stashResourceId(stash) {
+  let cursor='';
+  do {
+    const page=await resource('GET','stashes?limit=100'+(cursor?'&cursor='+encodeURIComponent(cursor):''));
+    const match=page.items.find(row=>row.crew===stash.crew&&row.scope===stash.scope&&row.name===stash.name);
+    if(match)return match.id;
+    cursor=page.nextCursor||'';
+  } while(cursor);
+  throw new Error('Stash changed. Refresh the stash list before retrying.');
 }
 async function refresh() {
   if (refreshing || !token && !demo) return;
@@ -86,7 +111,7 @@ function unlock() {
 }
 function logout() {
   if (pendingSubmission && !confirm('A submission may have reached the host. Disconnect anyway? Inspect Jobs before submitting replacement work.')) return;
-  token = ''; demo = false; snapshot = null; packaged = null; pendingSubmission = pendingSubmissionKey = null; inspecting = null; refreshedAt = 0;
+  clearToken(); demo = false; snapshot = null; packaged = null; pendingSubmission = pendingSubmissionKey = null; inspecting = null; refreshedAt = 0;
   generation++;
   clearTimeout(polling); document.querySelectorAll('dialog[open]').forEach(d => d.close());
   $('token').value = ''; $('app').hidden = true; $('login').hidden = false; $('login-error').textContent = ''; notice('');
@@ -95,11 +120,12 @@ $('login-form').addEventListener('submit', async event => {
   event.preventDefault(); demo = false; token = $('token').value.trim(); $('token').value = '';
   const attempt = ++generation;
   const submit = event.submitter; submit.disabled = true; $('login-error').textContent = '';
-  try { const data = await api('status'); if (attempt !== generation) return; snapshot = data; refreshedAt = Date.now(); unlock(); }
-  catch (error) { if (attempt === generation) { token = ''; $('login-error').textContent = error.message; } }
+  try { const data = await api('status'); if (attempt !== generation) return; snapshot = data; refreshedAt = Date.now(); saveToken(); unlock(); }
+  catch (error) { if (attempt === generation) { clearToken(); $('login-error').textContent = error.message; } }
   finally { submit.disabled = false; }
 });
 $('logout').addEventListener('click', logout);
+if (token) api('status').then(data => { snapshot = data; refreshedAt = Date.now(); unlock(); }).catch(error => { $('login-error').textContent = error.message; });
 $('refresh').addEventListener('click', refresh);
 document.addEventListener('visibilitychange', () => { if (!document.hidden && (token || demo)) { refresh(); startPolling(); } });
 document.querySelectorAll('[data-page]').forEach(node => node.addEventListener('click', () => { page = node.dataset.page; render(); }));
@@ -168,7 +194,9 @@ function render() {
   if (page === 'stashes') {
     section('Overall resources', 'Combined observations across all exported and host-defined stashes');
     $('content').append(overallResources(snapshot.stashes || []));
-    section('Stashes', 'Read-only experimental discovery · quantities include shulker contents');
+    section('Kit work', 'Retained job records only; completed box counts exclude unfinished jobs');
+    $('content').append(kitUsage(snapshot));
+    section('Stashes', 'Observed quantities include shulker contents; unscanned columns are not counted');
     for (const stash of snapshot.stashes || []) $('content').append(stashCard(stash));
     if (!(snapshot.stashes || []).length) $('content').append(empty('No stash observations yet', 'Select a cuboid with Stash Manager’s wooden pickaxe, or dispatch an Inspect stash job with its bounds.'));
   }
@@ -259,6 +287,7 @@ function workerTable(workers) {
   const body = el('tbody');
   for (const worker of workers) {
     const state = workerState(worker); const row = el('tr'); const name = el('td');name.append(button(worker.name,()=>inspect('worker',worker.id),false,'text-button'), el('small', '', state.task?.name || state.detail));
+    if(worker.implementation)name.append(el('small','',worker.implementation.id+' '+worker.implementation.version));
     const position = state.native || worker; const coords = ['x', 'y', 'z'].every(k => Number.isFinite(position[k])) ? [position.x, position.y, position.z].map(Math.floor).join(', ') : '—';
     const status = el('td'); status.append(badge(state.status, tone(state.status))); const actions = el('td');
     actions.append(button('Manage', () => inspect('worker', worker.id), false, '', 'worker-' + worker.id));
@@ -283,7 +312,7 @@ function jobCard(task) {
   const card = el('article', 'card job-card'); const header = el('div', 'card-header'); header.append(el('h3', '', task.name), badge(task.status, tone(task.status))); card.append(header);
   const meta = el('div', 'job-meta'),distance=el('div');card.append(meta,distance);
   const detail=el('p','job-detail'),guidance=el('p','hint operator-live');
-  guidance.updateStatus=()=>{const t=[...snapshot.tasks,...snapshot.history].find(v=>v.id===task.id)||task;detail.textContent=t.detail||'Awaiting worker checkpoint';guidance.textContent=t.operatorGuidance||'Host-owned job. Pause/Resume/Cancel affect all assigned workers; Detach affects one.';header.lastChild.textContent=t.status;header.lastChild.className='pill '+tone(t.status);meta.replaceChildren(...[t.crew,t.workflowName||'Workflow','Priority '+t.priority,Object.keys(t.runs||{}).length+' workers',t.publicJoin?'Public joining':'Invite only'].map(v=>el('span','',v)));distance.replaceChildren();if(t.nativeDefinition?.length)progress(distance,t.highwayProgress||0,t.nativeDefinition.length);};guidance.updateStatus();
+  guidance.updateStatus=()=>{const t=[...snapshot.tasks,...snapshot.history].find(v=>v.id===task.id)||task;detail.textContent=t.detail||'Awaiting worker checkpoint';guidance.textContent=t.operatorGuidance||'Host-owned job. Pause/Resume/Cancel affect all assigned workers; Detach affects one.';header.lastChild.textContent=t.status;header.lastChild.className='pill '+tone(t.status);const fields=[t.crew,t.workflowName||'Workflow','Priority '+t.priority,Object.keys(t.runs||{}).length+' workers',t.publicJoin?'Public joining':'Invite only'];if(t.kitJob)fields.push((t.kitJob.transferAll?'All kits · up to '+t.kitJob.count+'/trip':t.kitJob.count+' kit boxes')+' · '+t.kitJob.name+' → '+t.kitJob.destination);meta.replaceChildren(...fields.map(v=>el('span','',v)));distance.replaceChildren();if(t.nativeDefinition?.length)progress(distance,t.highwayProgress||0,t.nativeDefinition.length);};guidance.updateStatus();
   card.append(detail,guidance,jobActions(task));
   if (task.cleanupPending) card.append(el('p', 'hint', 'Decision is final; delivery/recovery acknowledgements remain outstanding. History deletion is protected.'));
   return card;
@@ -302,13 +331,26 @@ async function control(request, confirmation) {
     else if (op === 'detach') await resource('POST', 'jobs/' + id + '/workers/' + worker + '/' + (request.detached ? 'detach' : 'rejoin'), {});
     else if (op === 'priority' && !worker) await resource('PATCH', 'jobs/' + id, { priority: request.priority });
     else if (op === 'crew-create') await resource('POST', 'crews', { id, name: request.name });
+    else if (op === 'crew-rename') {const crew=await crewResource(request.crew);await resource('PATCH','crews/'+crew.id,{name:request.name},undefined,crew.revision);}
+    else if (op === 'crew-delete') {const crew=await crewResource(request.crew);await resource('DELETE','crews/'+crew.id);}
+    else if (op === 'crew-move') {const crew=await crewResource(request.crew);await resource('PUT','crews/'+crew.id+'/workers/'+worker,{});}
     else await api('control', request);
     notice('Host accepted ' + op + '. Worker cleanup and delivery may continue independently.', true);
   }
   catch (error) { notice(error.message + ' Refresh status before retrying; the command may already have reached the host.'); }
   finally { busy = false; await refresh(); }
 }
-function inspect(kind, id) { inspecting = { kind, id }; showInspection(); if (!$('inspect-dialog').open) $('inspect-dialog').showModal(); }
+function inspect(kind, id) { inspecting = { kind, id }; showInspection(); if (!$('inspect-dialog').open) $('inspect-dialog').showModal(); loadInspection(); }
+async function loadInspection() {
+  const selected=inspecting;if(!selected||selected.loading||demo)return;
+  selected.loading=true;showInspection();
+  try {
+    const record=selected.kind==='crew'?await crewResource(selected.id):await resource('GET',selected.kind+'s/'+selected.id);
+    if(inspecting!==selected)return;
+    selected.record=record;selected.loadedAt=Date.now();selected.error='';
+  } catch(error) {if(inspecting===selected)selected.error=error.message;}
+  finally {if(inspecting===selected){selected.loading=false;showInspection();}}
+}
 function jsonDetails(title, value) { const node = el('details'); node.append(el('summary', '', title), el('pre', '', JSON.stringify(value, null, 2))); return node; }
 function configurationInspector(task) {
   const panel=el('details');panel.append(el('summary','','Captured configuration & live requests'));
@@ -554,9 +596,9 @@ function showInspection() {
   const expanded=new Set(same?[...content.querySelectorAll('details[open]')].map(n=>n.querySelector('summary')?.textContent):[]);
   const scroll=same?$('inspect-dialog').scrollTop:0,focus=same?document.activeElement:null;
   inspectionKey=key;inspecting.shape=inspectionShape();content.replaceChildren();
-  content.append(button('Refresh inspection ↻', async () => { await refresh(); showInspection(); }), el('p', 'hint', 'Diagnostics snapshot ' + new Date(refreshedAt || Date.now()).toLocaleTimeString() + '; operational status updates live. Uncertain resources are not cleared by opening this view.'));
+  content.append(button('Refresh inspection ↻', async () => { await refresh(); await loadInspection(); if(demo)showInspection(); }), el('p', 'hint', 'Live diagnostics updated ' + new Date(refreshedAt || Date.now()).toLocaleTimeString() + '; resource inspection ' + (demo?'unavailable in demo':inspecting.loading?'loading':inspecting.error?'failed: '+inspecting.error:inspecting.loadedAt?'read at '+new Date(inspecting.loadedAt).toLocaleTimeString():'pending') + '. Uncertain resources are not cleared by opening this view.'));
   if (kind === 'stash') {
-    const db=stashDetails.get(id); $('inspect-title').textContent=db?.name || 'Stash'; if(!db)return;
+    const db=inspecting.record; $('inspect-title').textContent=db?.name || 'Stash'; if(!db)return;
     content.append(el('p','hint',db.scope+' · observations can be stale; scan again before withdrawing'));
     for(const container of Object.values(db.containers || {})) {
       const row=el('article','inspection-row');row.append(el('h3','',container.x+', '+container.y+', '+container.z+' · '+container.block),badge(container.status,container.status==='observed'?'good':'bad'),el('p','hint',container.reason || 'Server contents observed '+new Date(container.observedAt).toLocaleString()),jsonDetails('Items and shulker classification',container));content.append(row);
@@ -577,20 +619,22 @@ function showInspection() {
       if(!terminal(task.status))content.append(participationControls(task,workerId));
     }
     if (snapshot.highways[task.crew]?.execution) content.append(jsonDetails('Crew verification, supply reservations and exchange state', snapshot.highways[task.crew]));
-    content.append(jsonDetails('Full job snapshot', task));
+    if(inspecting.record)content.append(jsonDetails('Job resource', inspecting.record));
   } else if (kind === 'crew') {
     const native = snapshot.highways[id] || {}; $('inspect-title').textContent = snapshot.crewLabels?.[id]||id;
     const live=el('div','operator-live');live.updateStatus=()=>{const n=snapshot.highways[id]||{};live.replaceChildren(resourceLine(n.resourceCounts,true),predictionLine(n.roadPrediction,id));};live.updateStatus();content.append(live);managementControls(content,id);chatPanel(content,id);crewControls(content,id);
     const roster=el('div','operator-live');roster.updateStatus=()=>roster.replaceChildren(workerTable(snapshot.workers.filter(w=>w.crew===id)));roster.updateStatus();content.append(roster);
     for(const task of snapshot.tasks.filter(t=>t.crew===id))for(const run of Object.values(task.runs || {}))if(run.stashScan)content.append(stashPanel(run));
     if (native.execution) content.append(button('End native highway', () => control({ op: 'end-highway', crew: id }, 'End this crew’s native highway and cancel its owning job? Outstanding supplies remain recorded.'), !writable(), 'danger'));
+    if(inspecting.record)content.append(jsonDetails('Crew resource', inspecting.record));
     content.append(jsonDetails('Supply ownership, verification and diagnostics', native), eventList((native.events || []).slice(-20).reverse()));
   } else {
     const worker = snapshot.workers.find(w => w.id === id); $('inspect-title').textContent = worker?.name || 'Worker no longer connected'; if (!worker) return;
-    const state = workerState(worker),live=el('div','operator-live');live.updateStatus=()=>{const w=snapshot.workers.find(w=>w.id===id);if(!w){live.replaceChildren(el('p','hint','Worker no longer present'));return;}const s=workerState(w);live.replaceChildren(el('p','job-detail',s.status+' · '+s.detail),el('p','hint',w.id),resourceLine(s.native?.resourceCounts),predictionLine(s.native?.roadPrediction,w.crew,w.id));};live.updateStatus();content.append(live);
+    const state = workerState(worker),live=el('div','operator-live');live.updateStatus=()=>{const w=snapshot.workers.find(w=>w.id===id);if(!w){live.replaceChildren(el('p','hint','Worker no longer present'));return;}const s=workerState(w);live.replaceChildren(el('p','job-detail',s.status+' · '+s.detail),el('p','hint',w.implementation?w.implementation.id+' '+w.implementation.version+' · '+w.id:w.id),resourceLine(s.native?.resourceCounts),predictionLine(s.native?.roadPrediction,w.crew,w.id));};live.updateStatus();content.append(live);
     if(state.run?.stashScan)content.append(stashPanel(state.run));
     managementControls(content,worker.crew,worker.id);chatPanel(content,worker.crew,worker.id);crewControls(content,worker.crew,worker.id);
-    content.append(jsonDetails('Worker diagnostics and current crew report', { ...worker, crewReport: state.native || null }));
+    if(inspecting.record)content.append(jsonDetails('Worker resource', inspecting.record));
+    if(state.native)content.append(jsonDetails('Native crew diagnostics', state.native));
   }
   for(const node of content.querySelectorAll('[data-preserve]')){const old=kept.get(node.dataset.preserve);if(old)node.replaceWith(old);}
   for(const node of content.querySelectorAll('details'))if(expanded.has(node.querySelector('summary')?.textContent))node.open=true;
@@ -612,18 +656,35 @@ function refreshStashPanels() {
     const run=[...snapshot.tasks,...snapshot.history].flatMap(t=>Object.values(t.runs || {})).find(r=>r.id===panel.dataset.stashRun);if(run)fillStashPanel(panel,run);
   }
 }
+const shulkerColors={white:'#dfe3e8',orange:'#ed9b51',magenta:'#c677c4',light_blue:'#72b9df',yellow:'#e2c15e',lime:'#9cc960',pink:'#e99cb9',gray:'#777e88',light_gray:'#b7bdc4',cyan:'#61b5b4',purple:'#aa81cb',blue:'#728bd0',brown:'#aa8467',green:'#80aa71',red:'#d2807a',black:'#666d7a',uncolored:'#9d8aaf'};
+function shulkerLabel(row,item) {
+  const match=/^minecraft:(?:(\w+)_)?shulker_box$/.exec(item||'');if(!match)return item;
+  const color=match[1]||'uncolored';row.classList.add('shulker-row');row.style.setProperty('--shulker-color',shulkerColors[color]||shulkerColors.uncolored);row.title=item;
+  return color.replaceAll('_',' ').replace(/^./,letter=>letter.toUpperCase())+' shulker box';
+}
 function stashCard(stash) {
-  const card=el('article','job-card');card.append(el('h3','',stash.name),el('p','hint',(snapshot.crewLabels?.[stash.crew] || stash.crew)+' · '+stash.scope),el('p','',number(stash.observed)+' observed · '+number(stash.inferred||0)+' inferred · '+number(stash.unscanned)+' unscanned'),el('p','hint','Last observation '+new Date(stash.updatedAt).toLocaleString()));
-  const table=el('table','worker-table');for(const [item,count] of Object.entries(stash.items || {}).sort((a,b)=>b[1]-a[1])){const row=el('tr');row.append(el('td','',item),el('td','',number(count)));table.append(row);}card.append(table);
-  const actions=el('div','actions');actions.append(button('Scan with workers',()=>{
-    $('new-job').click();$('job-kind').value='stash';$('job-crew').value=stash.crew;updateWorkers();updateSource();$('job-name').value='Inspect '+stash.name;
-    $('job-args').value=JSON.stringify(stash.bounds);const [server,dimension]=stash.scope.split('\n');$('job-server').value=server;$('job-dimension').value=dimension;
-  },!writable()),button('Inspect containers',async()=>{try{const db=await api('control',{op:'stash-get',crew:stash.crew,scope:stash.scope,name:stash.name});const key=JSON.stringify([stash.crew,stash.scope,stash.name]);stashDetails.set(key,db);while(stashDetails.size>16)stashDetails.delete(stashDetails.keys().next().value);inspecting={kind:'stash',id:key};showInspection();$('inspect-dialog').showModal();}catch(e){notice(e.message);}}));card.append(actions);return card;
+  const card=el('article','card job-card');card.append(el('h3','',stash.name),el('p','hint',(snapshot.crewLabels?.[stash.crew] || stash.crew)+' · '+stash.scope+' · /home '+(stash.bounds?.homeName||'not set')+' · '+(stash.bounds?.scanMode||'Full')+' scan'),el('p','',number(stash.observed)+' observed · '+number(stash.inferred||0)+' inferred · '+number(stash.unscanned)+' unscanned · '+number(stash.mappedColumns||0)+' mapped columns'),el('p','hint','Catalog updated '+new Date(stash.updatedAt).toLocaleString()));
+  const columns=Object.values(stash.columns||{});if(columns.length)card.append(el('p','hint',number(columns.filter(c=>c.available).length)+' observed free columns · '+number(columns.filter(c=>c.reservation).length)+' reserved · '+number(columns.filter(c=>c.reservation?.blocked).length)+' conflicts (see container inspection)'));
+  const table=el('table','worker-table');for(const [item,count] of Object.entries(stash.items || {}).sort((a,b)=>b[1]-a[1])){const row=el('tr');row.append(el('td','',shulkerLabel(row,item)),el('td','',number(count)));table.append(row);}const resourceTable=el('div','table-panel');resourceTable.append(table);card.append(resourceTable);
+  const types=Object.entries(stash.kitTypes||{}),canDispatch=writable()&&snapshot.workers.some(worker=>worker.connected&&worker.reconciled&&worker.scope===stash.scope&&(stash.crew==='Local'||worker.crew===stash.crew));
+  if(types.length){card.append(el('h3','','Kits · observed stock'));const kits=el('table','worker-table');
+    for(const [id,type] of types){const counts=stash.kitCounts?.[id]||{},row=el('tr'),name=el('td'),label=shulkerLabel(row,type.item);row.title+=' · '+id;name.append(el('strong','',type.name||label),el('small','',label));row.append(name,el('td','',number(counts.complete)+' complete · '+number(counts.incomplete)+' incomplete'));
+      const controls=el('td'),actions=el('div','actions');actions.append(button('Deliver',()=>openJob({crew:stash.crew,kitStash:stash,kitTypeId:id,preset:'task-kit-delivery'}),!canDispatch),button('Remove incomplete',()=>openJob({crew:stash.crew,kitStash:stash,kitTypeId:id,preset:'task-kit-remove-incomplete'}),!canDispatch));controls.append(actions);row.append(controls);kits.append(row);}
+    const kitTable=el('div','table-panel');kitTable.append(kits);card.append(kitTable,el('p','hint','Counts include directly observed boxes only. Shulker type follows color and custom name; incomplete means below the fullest observed exemplar.'));}
+  else card.append(el('p','hint','No kit types observed yet. Scan a stash column to classify its shulkers.'));
+  const actions=el('div','actions');actions.append(button('Scan with workers',async()=>{try{await openJob(pendingSubmission?{}:{crew:stash.crew,stash,id:await stashResourceId(stash)});}catch(e){notice(e.message);}},!writable()),button('Inspect containers',async()=>{try{inspect('stash',await stashResourceId(stash));}catch(e){notice(e.message);}}));card.append(actions);return card;
+}
+function kitUsage(data) {
+  const jobs=[...data.tasks,...data.history].filter(job=>job.kitJob),done=jobs.filter(job=>job.status==='Complete');
+  const delivered=done.filter(job=>job.kitJob.workflow==='task-kit-delivery').reduce((sum,job)=>sum+Number(job.kitJob.delivered??(job.kitJob.transferAll?0:job.kitJob.count??0)),0);
+  const removed=done.filter(job=>job.kitJob.workflow==='task-kit-remove-incomplete').reduce((sum,job)=>sum+Number(job.kitJob.delivered??(job.kitJob.transferAll?0:job.kitJob.count??0)),0);
+  const card=el('article','card');card.append(el('p','',number(jobs.length)+' kit jobs · '+number(done.length)+' completed · '+number(jobs.filter(job=>job.status==='Failed').length)+' failed'),el('p','hint',number(delivered)+' boxes delivered/stored · '+number(removed)+' incomplete boxes removed (completed jobs only)'));
+  return card;
 }
 function overallResources(stashes) {
   const unique=new Map();for(const stash of stashes){const key=JSON.stringify([stash.scope,stash.name,stash.bounds]);if(!unique.has(key)||(unique.get(key).updatedAt||0)<(stash.updatedAt||0))unique.set(key,stash);}
   const totals={};for(const stash of unique.values())for(const [item,count] of Object.entries(stash.items||{}))totals[item]=(totals[item]||0)+count;
-  const card=el('article','job-card');const table=el('table','worker-table');for(const [item,count] of Object.entries(totals).sort((a,b)=>b[1]-a[1])){const row=el('tr');row.append(el('td','',item),el('td','',number(count)));table.append(row);}
+  const card=el('article','job-card');const table=el('table','worker-table');for(const [item,count] of Object.entries(totals).sort((a,b)=>b[1]-a[1])){const row=el('tr');row.append(el('td','',shulkerLabel(row,item)),el('td','',number(count)));table.append(row);}
   card.append(table.childElementCount?table:el('p','hint','No observed resources yet. Export a stash definition, then assign a scan.'));return card;
 }
 
@@ -666,31 +727,43 @@ async function openJob(context={}) {
   reviewedSubmission=null;$('job-preview').hidden=true;
   $('job-fields').disabled = !!pendingSubmission; $('job-submit').textContent = pendingSubmission ? 'Retry same submission ↗' : 'Preview job';
   if (!pendingSubmission) {
+    scanStash=context.stash?{...context.stash,id:context.id}:null;
+    kitContext=context.kitStash?context:null;$('kit-source').replaceChildren();$('kit-type').replaceChildren();$('kit-field').dataset.entry='';
     for(const axis of ['x','y','z'])$('highway-'+axis).value='';
     $('job-crew').replaceChildren(); snapshot.crews.forEach(crew => { const option = el('option', '', crew); option.value = crew; $('job-crew').append(option); });
     if(lastLaunch)for(const id of rememberedFields.filter(id=>id!=='job-preset'))if($(id).tagName!=='SELECT'||[...$(id).options].some(o=>o.value===lastLaunch[id]))$(id).value=lastLaunch[id];
-    if(context.crew)$('job-crew').value=context.crew;
+    if(context.preset){$('job-kind').value='preset';$('preset-field').hidden=false;$('highway-field').hidden=true;$('kit-field').hidden=true;}
+    if(context.crew)$('job-crew').value=snapshot.crews.includes(context.crew)?context.crew:snapshot.workers.find(w=>w.scope===context.kitStash?.scope&&w.connected)?.crew||snapshot.crews[0];
     updateWorkers(); updateSource();
     if(context.worker){for(const input of $('job-workers').querySelectorAll('input'))input.checked=input.value===context.worker;updateScope();}
   }
-  $('job-dialog').showModal();
-  if(!pendingSubmission){$('job-fields').disabled=true;$('job-submit').disabled=true;
+  $('job-fields').disabled=true;$('job-submit').disabled=true;$('job-dialog').showModal();
+  if(!pendingSubmission){let loaded=false;
     try {
-      presetList=(await api('control',{op:'workflow-list'})).workflows;$('job-preset').replaceChildren();
+      presetList=scanStash?[]:(await api('control',{op:'workflow-list'})).workflows;$('job-preset').replaceChildren();
       for(const p of presetList){const o=el('option','',p.folder+' / '+p.name);o.value=p.id;$('job-preset').append(o);}
+      if(context.preset&&!presetList.some(p=>p.id===context.preset))throw Error('Requested job preset is unavailable. Refresh the host and try again.');
       const preferred=context.preset||lastLaunch?.['job-preset'];
       if(preferred&&presetList.some(p=>p.id===preferred))$('job-preset').value=preferred;
       if(context.preset)$('job-kind').value='preset';
-      updateSource();useWorkerPosition();if(lastLaunch&&!context.preset)$('job-name').value=lastLaunch['job-name'];
+      if(scanStash){
+        $('job-kind').value='stash';
+        const [server,dimension]=scanStash.scope.split('\n');$('job-server').value=server;$('job-dimension').value=dimension;
+      }
+      updateSource();useWorkerPosition();
+      if(scanStash)$('job-name').value='Scan '+scanStash.name;
+      else if(kitContext){const [server,dimension]=kitContext.kitStash.scope.split('\n');$('job-server').value=server;$('job-dimension').value=dimension;updateKitSources();}
+      else if(lastLaunch&&!context.preset)$('job-name').value=lastLaunch['job-name'];
+      loaded=true;
     }catch(e){$('job-error').textContent=e.message;}
-    finally{$('job-fields').disabled=false;$('job-submit').disabled=false;}
+    finally{$('job-fields').disabled=!loaded;$('job-submit').disabled=!loaded;}
   }
 }
 $('new-job').addEventListener('click',()=>openJob());
-$('job-dialog').addEventListener('close',()=>{if(!pendingSubmission)rememberLaunch();});
+$('job-dialog').addEventListener('close',()=>{if(!pendingSubmission&&!scanStash)rememberLaunch();});
 function updateWorkers() {
   $('job-workers').replaceChildren(); const crew = $('job-crew').value;
-  const workers = snapshot.workers.filter(w => w.crew === crew && w.connected && w.reconciled);
+  const workers = snapshot.workers.filter(w => w.crew === crew && w.connected && w.reconciled && (!scanStash || w.scope === scanStash.scope) && (!kitContext || w.scope === kitContext.kitStash.scope));
   for (const worker of workers) {
     const label = el('label', 'worker-option'); const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.value = worker.id; checkbox.checked = true; checkbox.addEventListener('change', updateScope);
     const text = el('span', '', worker.name); text.append(el('small', '', ' · ' + workerState(worker).status)); label.append(checkbox, text); $('job-workers').append(label);
@@ -704,16 +777,46 @@ function useWorkerPosition() {
   const worker=selectedWorkers()[0];if(!worker||!worker.positionFresh||!['x','y','z'].every(axis=>Number.isFinite(worker[axis])))return false;
   for(const axis of ['x','y','z'])$('highway-'+axis).value=Math.floor(worker[axis]);return true;
 }
-function updateScope() { const worker = selectedWorkers()[0]; if (worker) { const [server, dimension] = worker.scope.split('\n'); $('job-server').value = server; $('job-dimension').value = dimension; if($('job-kind').value==='highway')useWorkerPosition(); } }
+function updateScope() { const worker = selectedWorkers()[0]; if (worker && !scanStash) { const [server, dimension] = worker.scope.split('\n'); $('job-server').value = server; $('job-dimension').value = dimension; if($('job-kind').value==='highway')useWorkerPosition(); } if(!$('kit-field').hidden)updateKitSources(); }
+function kitSources(){
+  const scope=$('job-server').value.trim()+'\n'+$('job-dimension').value.trim(),crew=$('job-crew').value,sources=new Map();
+  for(const stash of snapshot.stashes||[])if(stash.scope===scope&&(stash.crew===crew||stash.crew==='Local')&&(!sources.has(stash.name)||stash.crew===crew))sources.set(stash.name,stash);
+  return [...sources.values()];
+}
+function updateKitSources(){
+  if($('kit-field').hidden)return;
+  const selected=$('kit-source').value||kitContext?.kitStash.name||'',sources=kitSources();$('kit-source').replaceChildren();
+  for(const stash of sources){const option=el('option','',stash.name+' · '+Object.keys(stash.kitTypes||{}).length+' kit types');option.value=stash.name;$('kit-source').append(option);}
+  if(sources.some(stash=>stash.name===selected))$('kit-source').value=selected;
+  const recipient=$('kit-recipient-worker'),previous=recipient.value,manual=el('option','','Enter another player manually');manual.value='';recipient.replaceChildren(manual);
+  for(const worker of snapshot.workers.filter(worker=>worker.crew===$('job-crew').value&&worker.scope===$('job-server').value.trim()+'\n'+$('job-dimension').value.trim()&&worker.connected&&worker.reconciled&&worker.id!==selectedWorkers()[0]?.id)){const option=el('option','',worker.name);option.value=worker.id;recipient.append(option);}
+  if([...recipient.options].some(option=>option.value===previous))recipient.value=previous;
+  updateKitTypes();
+}
+function updateKitTypes(){
+  const source=kitSources().find(stash=>stash.name===$('kit-source').value),selected=$('kit-type').value||kitContext?.kitTypeId||'';$('kit-type').replaceChildren();
+  for(const [id,type] of Object.entries(source?.kitTypes||{})){const counts=source.kitCounts?.[id]||{},option=el('option','',(type.name||type.item)+' · '+number(counts.complete)+' complete / '+number(counts.incomplete)+' incomplete');option.value=id;$('kit-type').append(option);}
+  if([...$('kit-type').options].some(option=>option.value===selected))$('kit-type').value=selected;
+  const target=$('kit-target').value;$('kit-target').replaceChildren();for(const stash of kitSources().filter(stash=>stash.name!==source?.name)){const option=el('option','',stash.name);option.value=stash.name;$('kit-target').append(option);}if([...$('kit-target').options].some(option=>option.value===target))$('kit-target').value=target;
+  $('kit-hint').textContent=source?'Choose one worker. Counts are directly observed boxes; unscanned upper chests are not guaranteed.':'No stash with this crew and world is mapped. Define or export one first.';
+}
+function updateKitDestination(){const active=!$('kit-field').hidden,player=active&&$('kit-destination').value==='Player';$('kit-recipient-field').hidden=!player;$('kit-target-field').hidden=!active||$('kit-destination').value!=='Stash';$('kit-recipient-name').required=$('kit-recipient-id').required=player;if($('kit-destination').value!=='Stash')$('kit-all').checked=false;$('kit-count-label').textContent=$('kit-all').checked?'Boxes per trip':'Boxes';}
+$('kit-all').addEventListener('change',()=>{if($('kit-all').checked){$('kit-destination').value='Stash';$('kit-count').value='36';}updateKitDestination();});
+$('kit-source').addEventListener('change',updateKitTypes);$('kit-destination').addEventListener('change',updateKitDestination);
+$('kit-recipient-worker').addEventListener('change',()=>{const worker=snapshot.workers.find(worker=>worker.id===$('kit-recipient-worker').value);if(worker){$('kit-recipient-name').value=worker.name;$('kit-recipient-id').value=worker.id;}});
 function updateSource() {
-  const kind = $('job-kind').value,preset=presetList.find(p=>p.id===$('job-preset').value),highway=kind==='highway'||kind==='preset'&&preset?.highway,follow=kind==='preset'&&['task-follow','task-bodyguard'].includes(preset?.entry);
-  $('preset-field').hidden=kind!=='preset';$('follow-field').hidden=!follow;$('highway-field').hidden=!highway;$('package-field').hidden=kind!=='package';$('lua-field').hidden=kind!=='lua';$('args-field').hidden=highway||follow;
+  const kind = $('job-kind').value,preset=presetList.find(p=>p.id===$('job-preset').value),highway=kind==='highway'||kind==='preset'&&preset?.highway,follow=kind==='preset'&&['task-follow','task-bodyguard','task-crystal-guard'].includes(preset?.entry),kit=kind==='preset'&&['task-kit-delivery','task-kit-remove-incomplete'].includes(preset?.entry);
+  $('preset-field').hidden=kind!=='preset';$('follow-field').hidden=!follow;$('kit-field').hidden=!kit;$('highway-field').hidden=!highway;$('package-field').hidden=kind!=='package';$('lua-field').hidden=kind!=='lua';$('args-field').hidden=highway||follow||kit;
+  if(kit&&$('kit-field').dataset.entry!==preset.entry){$('kit-destination').value=preset.entry==='task-kit-remove-incomplete'?'Carry':'Player';$('kit-count').value='1';$('kit-all').checked=$('kit-include-incomplete').checked=false;const boxes=$('job-workers').querySelectorAll('input');boxes.forEach((box,index)=>{box.checked=index===0;});$('kit-field').dataset.entry=preset.entry;updateScope();updateKitSources();}updateKitDestination();
+  $('crystal-target-field').hidden=preset?.entry!=='task-crystal-guard';
   for(const input of $('highway-field').querySelectorAll('input'))input.required=highway;
   if(kind==='preset'){if(preset)$('job-name').value=preset.name;if(preset?.entry==='task-travel'){const w=selectedWorkers()[0];$('job-args').value=JSON.stringify({x:Math.floor(w?.x||0),y:Math.floor(w?.y??116),z:Math.floor(w?.z||0),radius:2});}if(preset?.entry==='task-wait')$('job-args').value='{"ticks":200}';}
   if(follow)excludeLeader();
   if (!$('job-script').value) $('job-script').value = WAIT;
   if(kind==='highway') { if(!$('job-name').value||['Highway job','Inspect stash'].includes($('job-name').value))$('job-name').value='6b6t highway';useWorkerPosition(); }
   if(kind==='stash') { $('job-name').value='Inspect stash'; if($('job-args').value==='{}')$('job-args').value=JSON.stringify({name:'Main stash',minX:0,maxX:15,minY:116,maxY:120,minZ:0,maxZ:15}); }
+  if(scanStash){$('args-field').hidden=true;for(const id of ['job-kind','job-name','job-crew','job-server','job-dimension'])$(id).disabled=true;}
+  else for(const id of ['job-kind','job-name','job-crew','job-server','job-dimension'])$(id).disabled=false;
 }
 function excludeLeader(){for(const box of $('job-workers').querySelectorAll('input'))if(box.value===$('follow-leader').value)box.checked=false;}
 $('follow-leader').addEventListener('change',excludeLeader);
@@ -733,6 +836,7 @@ $('package-file').addEventListener('change', async () => {
 });
 $('job-form').addEventListener('submit', async event => {
   event.preventDefault(); if (!writable()) return; $('job-error').textContent = '';
+  let scanJobId;
   busy=true;$('job-fields').disabled=true;$('job-submit').disabled=true;
   try {
     if (!pendingSubmission && reviewedSubmission) {pendingSubmission=reviewedSubmission;reviewedSubmission=null;}
@@ -744,12 +848,25 @@ $('job-form').addEventListener('submit', async event => {
       if(crew.crew!==$('job-crew').value||!crew.connected)throw new Error('Crew membership changed. Refresh the roster and preview again.');
       const kind = $('job-kind').value; if (kind === 'package' && !packaged) throw new Error('Choose an exported workflow package first.');
       const common={id:crypto.randomUUID(),name:$('job-name').value.trim(),crewId:crew.crewId,workerIds:workers.map(w=>w.id),scope:{server:$('job-server').value.trim(),dimension:$('job-dimension').value.trim()},priority:Number($('job-priority').value)};
-      if(kind==='highway'||kind==='preset') {
+      if(scanStash){
+        if(scope!==scanStash.scope)throw new Error('Stash world changed. Refresh the stash list before retrying.');
+        pendingSubmission={...common,stashId:scanStash.id,bounds:scanStash.bounds};
+      } else if(kind==='highway'||kind==='preset') {
         const preset=kind==='highway'?{id:'highway-default',highway:true}:presetList.find(p=>p.id===$('job-preset').value);
         if(!preset)throw Error('Choose a preset.');
-        let args=preset.highway||['task-follow','task-bodyguard'].includes(preset.entry)?{}:JSON.parse($('job-args').value);
+        const kit=['task-kit-delivery','task-kit-remove-incomplete'].includes(preset.entry);
+        let args=preset.highway||kit||['task-follow','task-bodyguard','task-crystal-guard'].includes(preset.entry)?{}:JSON.parse($('job-args').value);
         if(preset.highway){if(workers.length>3)throw Error('Native highway jobs support at most three workers.');args={direction:$('highway-direction').value,length:Number($('highway-length').value),x:Number($('highway-x').value),y:Number($('highway-y').value),z:Number($('highway-z').value)};}
-        if(['task-follow','task-bodyguard'].includes(preset.entry)){args={target:$('follow-leader').value,radius:Number($('follow-radius').value),ticks:0};if(workers.some(w=>w.id===args.target))throw Error('Uncheck the subject; select workers only.');if(preset.entry==='task-bodyguard'&&workers.length>3)throw Error('Bodyguard supports at most three workers.');}
+        if(kit){
+          if(workers.length!==1)throw Error('Choose exactly one worker for a kit job.');
+          const source=kitSources().find(stash=>stash.name===$('kit-source').value),count=Number($('kit-count').value),destination=$('kit-destination').value,kitTypeId=$('kit-type').value;
+          if(!source||source.scope!==scope||!source.kitTypes?.[kitTypeId])throw Error('Choose a mapped stash and one of its known kit types in this world.');
+          if(!Number.isInteger(count)||count<1||count>36)throw Error('Choose 1–36 kit boxes.');
+          args={...source.bounds,name:source.name,kitTypeId,count,destination,transferAll:$('kit-all').checked,includeIncomplete:$('kit-include-incomplete').checked};
+          if(destination==='Player'){args.recipient=$('kit-recipient-id').value.trim();args.recipientName=$('kit-recipient-name').value.trim();if(!/^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(args.recipient)||!/^[A-Za-z0-9_]{1,16}$/.test(args.recipientName))throw Error('Specify the recipient’s exact UUID and Minecraft username.');}
+          if(destination==='Stash'){args.targetStashName=$('kit-target').value;if(!args.targetStashName||args.targetStashName===source.name)throw Error('Choose another mapped stash in this world.');}
+        }
+        if(['task-follow','task-bodyguard','task-crystal-guard'].includes(preset.entry)){args={target:$('follow-leader').value,radius:Number($('follow-radius').value),ticks:0};if(workers.some(w=>w.id===args.target))throw Error('Uncheck the subject; select workers only.');if(preset.entry!=='task-follow'&&workers.length>3)throw Error('Bodyguard supports at most three workers.');if(preset.entry==='task-crystal-guard')args.combatTargets=$('crystal-targets').value.split(',').map(name=>name.trim()).filter(Boolean);}
         const packet=await api('control',{op:'workflow-prepare',id:preset.id,scope,args});
         pendingSubmission={...common,args,package:packet};
       } else {
@@ -762,18 +879,22 @@ $('job-form').addEventListener('submit', async event => {
     }
     busy = true; $('job-fields').disabled = true; $('job-submit').disabled = true; render();
     pendingSubmissionKey ||= crypto.randomUUID();
-    await resource('POST','jobs',pendingSubmission,pendingSubmissionKey); pendingSubmission = pendingSubmissionKey = null; $('job-dialog').close(); notice('Job dispatched. Follow delivery and worker readiness in Jobs.', true);
+    const submission=pendingSubmission;
+    const target=submission.stashId?'stashes/'+submission.stashId+'/scan':'jobs';
+    const payload=submission.stashId?{id:submission.id,workerIds:submission.workerIds,priority:submission.priority}:submission;
+    const job=await resource('POST',target,payload,pendingSubmissionKey);scanJobId=submission.stashId?job.id:null;
+    pendingSubmission = pendingSubmissionKey = null; $('job-dialog').close(); notice('Job dispatched. Follow delivery and worker readiness in Jobs.', true);
   } catch (error) {
     const uncertain = pendingSubmission && error.uncertain;
     if (!uncertain) pendingSubmission = pendingSubmissionKey = null;
     $('job-fields').disabled = !!pendingSubmission; $('job-submit').textContent = pendingSubmission ? 'Retry same submission ↗' : 'Preview job';
     $('job-error').textContent = error.message + (pendingSubmission ? ' Outcome uncertain: retry uses the same command and job IDs. Inspect Jobs before creating replacement work.' : '');
-  } finally { busy = false; $('job-fields').disabled=!!pendingSubmission;$('job-submit').disabled = false; await refresh(); }
+  } finally { busy = false; $('job-fields').disabled=!!pendingSubmission;$('job-submit').disabled = false; await refresh(); if(scanJobId)inspect('job',scanJobId); }
 });
 
 $('demo').addEventListener('click', () => {
   generation++;
-  token = ''; demo = true; const now = Date.now();
+  clearToken(); demo = true; const now = Date.now();
   const workers = ['Atlas', 'AtlasBot', 'AtlasBot2'].map((name, i) => ({ id: 'demo-worker-' + i, name, crew: 'Highway', scope: 'example.invalid\nminecraft:the_nether', connected: true, reconciled: true, positionFresh: true, observationAgeMs: 120, x: i - 1, y: 116, z: -2048, current: 'demo-run-' + i }));
   const nativeWorkers = workers.map((w, i) => ({ ...w, phase: i === 2 ? 'resupplying' : 'building', status: i === 2 ? 'Recovering supply container; crew continues' : 'Healthy · paving and excavating', currentRow: 2048, verifiedBase: 2049, verifiedMask: 31, currentResolved: true, fresh: true, resourceCounts: { inventory: { obsidian: 512-i*64, pickaxes: 3, food: 48 }, enderChest: { obsidian: 1728, pickaxes: 9, food: 128 }, total: { obsidian: 2240-i*64, pickaxes: 12, food: 176 }, enderChestKnown: true } }));
   const task = { id: 'demo-job', name: 'Northbound · the long road', crew: 'Highway', workflowName: 'Highway Builder', status: 'Running', priority: 0, server: 'example.invalid', dimension: 'minecraft:the_nether', highwayProgress: 2048, nativeDefinition: { length: 100000 }, detail: 'Paving verified. Detached supplier returning; remaining workers keep building.', runs: Object.fromEntries(workers.map((w, i) => [w.id, { id: w.current, status: 'Running', detail: nativeWorkers[i].status }])) };

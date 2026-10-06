@@ -1,6 +1,8 @@
 # Workers API v1: Phase 1 contract draft
 
-Status: **proposal for cross-platform review, not frozen**. This package is the Phase 1 discussion artifact from [the roadmap](../../v1_API_ROADMAP.md). The current Monocle endpoints and `monocle-crew-6` protocol are described in [the existing API notes](../workers-api.md). A [Phase 2 operator adapter](phase2-operator.md) implements a subset of the HTTP route names, but not yet the proposed schemas or worker messages.
+Status: **proposal for cross-platform review, not frozen**. This package is the Phase 1 discussion artifact from [the roadmap](../../v1_API_ROADMAP.md). The current Monocle endpoints and private native protocol are described in [the existing API notes](../workers-api.md); the [transport notes](../bot-web-transport.md) cover `monocle-crew-7` (0.13.15+). A [Phase 2 operator adapter](phase2-operator.md) implements a subset of the HTTP route names, but not yet the proposed schemas. A separate [Phase 4 worker endpoint](phase4-worker.md) supports authenticated registration, observation, reconciliation, built-in Wait and Travel, and bounded routing of worker-advertised extension actions.
+
+RWP defines **how a host and worker agree on and track work, not which jobs every client must offer**. A job carries a namespaced, versioned action and its arguments. The worker advertises exact action capabilities; the host must refuse unsupported assignments. RWP governs identity, authority, assignment, reports, cancellation, retries, and reconciliation, while the action's own specification governs its arguments, permitted effects, and success criteria. Monocle highway and stash jobs remain Monocle-defined actions. A generic RWP host can transport an unfamiliar action for a capable worker without claiming to understand or independently verify its gameplay result.
 
 ## Vocabulary
 
@@ -11,8 +13,8 @@ Status: **proposal for cross-platform review, not frozen**. This package is the 
 | Crew | Host-managed set of workers eligible for a shared assignment. Membership and access grants are separate. |
 | Job | Durable operator request: scope, target workers, priority, and a captured workflow/action definition. Its ID is stable across worker disconnects. |
 | Execution | One worker's attempt to carry out a job. It has its own ID and generation. A new generation requires a host decision, never an inference from reconnect. |
-| Action | Typed unit of work with validated arguments, completion criteria, and cancellation/retry rules. |
-| Workflow | Versioned composition of actions; a job captures the revision it will use. Workers need not run Lua. |
+| Action | Namespaced, versioned unit of work. Its owner defines argument validation, permitted effects, and observable completion; RWP defines the shared execution lifecycle. |
+| Workflow | Optional versioned composition of actions; a job captures the revision it will use. RWP does not require a particular workflow language or Lua. |
 | Capability | Namespaced/versioned action or protocol feature a worker explicitly supports, such as `workers.travel.v1`. |
 | Observation | Timestamped worker report about position, inventory, game state, or an attempted action. It may be stale or wrong; it is not automatically server confirmation. |
 | Resource inventory | Counts of carried or stored items with provenance and observation time. An unknown container is not an empty one. |
@@ -40,30 +42,29 @@ The host is authoritative for job intent, membership, priority, generation, and 
 
 ## Common wire rules
 
-- API major version is `workers.monocle.dev/v1`. A peer with no compatible major version is rejected before assignment. Minor/optional additions may be ignored only if they do not alter required behavior.
+- The public RWP worker binding uses draft `rwp/1-draft`; Monocle temporarily accepts `workers.monocle.dev/v1` for existing workers. The session version is fixed at hello. A peer with no compatible version is rejected before assignment. Minor/optional additions may be ignored only if they do not alter required behavior.
 - IDs are UUIDs; timestamps are UTC RFC 3339 strings; world scope contains a server identifier and namespaced dimension. Revisions are nonnegative integers. Cursor values are opaque and must not be parsed by clients.
 - Worker frames use the envelope in [`worker-message.schema.json`](schemas/worker-message.schema.json): `apiVersion`, `type`, `messageId`, `correlationId`, `sequence`, `sentAt`, `payload`, and the sender identity once authenticated. Sequences increase per authenticated session; replay across sessions uses durable message IDs and execution generations.
 - A repeated message ID with the same payload yields the recorded acknowledgement; the same ID with different content is a protocol conflict. A stale generation or sequence cannot change newer state. Out-of-order delivery is acknowledged or rejected according to the message type; it is never silently treated as current.
-- Unknown optional fields are ignored. An unknown required field, action type, major version, or capability is rejected with a machine-readable reason before the worker acquires game controls. Extension names must be namespaced and versioned.
-- Size limits and heartbeat intervals are negotiated in `session.accepted`, then enforced on both peers. Queue overflow or timeout closes the session; reconnect follows reconciliation. Exact v1 defaults remain a review decision; the current private transport uses 64,000-byte WebSocket frames and 16,000-character records.
+- Unknown optional fields are ignored. An unknown required field, incompatible major version, or action capability not advertised by the worker is rejected with a machine-readable reason before the worker acquires game controls. The host validates the common envelope, authorization, and size limits even when the action body belongs to an extension; the worker validates that body's arguments. Extension names must be namespaced and versioned.
+- Size limits and heartbeat intervals are negotiated in `session.accepted`, then enforced on both peers. Queue overflow or timeout closes the session; reconnect follows reconciliation. Exact v1 defaults remain a review decision; the private native transport uses 256 KiB UTF-8 records and 1 MiB/128-record queue budgets in 0.13.15+. The public RWP draft binding retains its separate 16,000-byte record limit.
 - HTTP errors use RFC 9457 problem bodies with stable `code`, `retryable`, and correlation ID. Mutation responses distinguish host acceptance, worker delivery, worker acknowledgement, game-server confirmation when observable, and uncertainty.
 
-## Portable action draft
+## Optional standard-action profiles (draft)
 
-These are the proposed core actions in [`common.schema.json`](schemas/common.schema.json). A host assigns only actions the worker advertises. Arguments are copied into the job snapshot; changing a workflow later does not mutate a running job.
+RWP itself has **no mandatory or closed job-type list**. The generic `action` schema validates only the namespaced ID and argument envelope; the candidate profiles in [`common.schema.json`](schemas/common.schema.json) have separate schemas for their own arguments. A worker may support none of them and still implement RWP. If it advertises one, it must follow that profile's arguments, permitted effects, observable outcome, and cancellation/retry rules—not a mandated movement or inventory algorithm. Arguments are copied into the job snapshot; changing a workflow later does not mutate a running job.
 
 | Action | Completion and cancellation | Replay rule |
 | --- | --- | --- |
 | `workers.wait.v1` | Count `ticks` of active execution; pause freezes the remaining count. Zero ticks completes immediately. | Resend the same execution/checkpoint safely; never restart the count from zero after a reconnect. |
 | `workers.travel.v1` | Reach target coordinates within `radius` in the specified world on safe footing; cancellation releases movement. | Resend the target with the same execution ID; current position is observed again and no movement packet is assumed to have succeeded. |
 | `workers.drop-items.v1` | Drop an exact item/count and report authoritative inventory change or an uncertain outcome; cancellation stops further drops. | Never repeat a possibly issued drop after acknowledgement loss. Persist intent before the drop and require reconciliation or inspection. |
-| `workers.set-profile.v1` | Apply a captured profile revision for the execution and acknowledge the effective revision; restore the prior profile on exit where the worker supports leases. | A duplicate revision is idempotent; an unknown profile or unacknowledged prior update is rejected. Profile format is capability-specific. |
 
-Minecraft-specific `/home`, `/tpa`, highway construction, shulker recovery, and Monocle module settings stay namespaced extensions for now. `Travel` does not authorize mining or placing blocks. Profile application does not imply authority to override a job-owned executor.
+`workers.set-profile.v1` remains an illustrative candidate in the draft schema, **not an agreed standard profile**: portable profile identity, revisions, and restoration need review. Minecraft-specific `/home`, `/tpa`, highway construction, stash work, shulker recovery, and Monocle module settings stay namespaced extensions. `Travel` does not authorize mining or placing blocks. A host may show a generic worker-reported result for an extension, but must not relabel it as game-server confirmation without evidence defined by that extension.
 
 ## Review packet
 
-- [JSON Schemas](schemas/) describe common IDs, scopes, actions, and worker message families.
+- [JSON Schemas](schemas/common.schema.json) describe common IDs, scopes, actions, and worker message families.
 - [OpenAPI draft](openapi.json) describes the initial proposed operator route shapes. It is a target contract, not a claim that current hosts serve those routes.
 - [Examples](examples.json) contain valid messages, deliberately invalid messages, and expected rejections.
 - [Scenario walkthrough](scenarios.md) asks a prospective implementer to decide registration, execution, cancellation, and reconnect using only this packet.

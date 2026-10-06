@@ -24,6 +24,12 @@ public final class HostServiceTest {
             rollingHistoryCheck(); System.out.println("Rolling history checks passed: oldest completion, active protection and rejected submissions."); return;
         }
         assert HostService.ACTIONS.contains("Tpa") : "Standalone workers must be able to use the trusted TPA action";
+        assert HostService.ACTIONS.contains("StashDeposit") : "An operator can safely store kits already carried after an interrupted pickup";
+        publicWorkerGatewayCheck();
+        monocleRwpWorkerCheck();
+        publicWorkerActionsCheck();
+        publicExtensionActionCheck();
+        independentWorkerCheck();
         resourceApiCheck();
         operationsCheck();
         operatorDetachCheck();
@@ -293,8 +299,9 @@ public final class HostServiceTest {
             try (AutoConnection worker = new AutoConnection(url, KEY)) {
                 await(() -> worker.c.connected() && Arrays.stream(listener.connections()).anyMatch(c -> c != null && c.connected()));
                 SwarmConnection host = Arrays.stream(listener.connections()).filter(c -> c != null && c.connected()).findFirst().orElseThrow();
-                String frame = "Pink shulkers 🌸 " + "x".repeat(15000);
+                String frame = "🌸".repeat(CrewFrames.MAX_BYTES / 4);
                 assert worker.c.send(frame); await(() -> frame.equals(host.poll()));
+                assert host.send(frame); await(() -> frame.equals(worker.c.poll()));
                 assert host.send("cancelled-execution-ack"); await(() -> "cancelled-execution-ack".equals(worker.c.poll()));
                 try (HttpClient http = HttpClient.newHttpClient()) {
                     for (String suffix : List.of("/wrong-path", "/v1/workers?token=secret")) {
@@ -303,10 +310,15 @@ public final class HostServiceTest {
                     }
                     try { http.newWebSocketBuilder().header("Origin", "https://browser.invalid").buildAsync(URI.create("ws://127.0.0.1:" + listener.webPort() + "/v1/workers"), new java.net.http.WebSocket.Listener() {}).get(3, java.util.concurrent.TimeUnit.SECONDS); throw new AssertionError("Browser-origin worker accepted"); }
                     catch (java.util.concurrent.ExecutionException expected) { }
+                    var closed = new java.util.concurrent.CompletableFuture<Integer>();
+                    var oversized = http.newWebSocketBuilder().buildAsync(URI.create("ws://127.0.0.1:" + listener.webPort() + "/v1/workers"), new java.net.http.WebSocket.Listener() {
+                        public java.util.concurrent.CompletionStage<?> onClose(java.net.http.WebSocket ws, int code, String reason) { closed.complete(code); return null; }
+                    }).get(3, java.util.concurrent.TimeUnit.SECONDS);
+                    try {
+                        oversized.sendText("x".repeat(CrewFrames.MAX_BYTES + 1), true).join();
+                        assert closed.get(5, java.util.concurrent.TimeUnit.SECONDS) == 1009 : "Remote oversized frames must close before protocol decoding";
+                    } finally { oversized.abort(); }
                 }
-                CrewTransport oversized = CrewTransport.worker("ws://127.0.0.1:" + listener.webPort() + "/v1/workers", 6969);
-                try { oversized.open(); oversized.read(); oversized.write("x".repeat(65000)); await(oversized::closed); }
-                finally { oversized.close(); }
                 assert host.connected() && worker.c.connected() : "Rejected connections cannot disrupt a healthy authenticated worker";
             }
         } finally { javax.net.ssl.SSLContext.setDefault(previous); }
@@ -906,7 +918,7 @@ public final class HostServiceTest {
             JsonObject crews=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/crews?limit=1",null,TOKEN).body()).getAsJsonObject();
             assert crews.getAsJsonArray("items").size()==1 && crews.has("nextCursor");
             assert resourceRequest(http,api,"GET","/v1/crews?limit=1&cursor="+text(crews,"nextCursor"),null,TOKEN).statusCode()==200;
-            worker.close();await(()->connected(host)==0);
+            worker.close();await(()->connected(host)==0 && eventSeen(host,"worker-disconnected",workerId));
             assert resourceRequest(http,api,"DELETE","/v1/workers/"+workerId,null,TOKEN).statusCode()==200;
             assert resourceRequest(http,api,"GET","/v1/workers/"+workerId,null,TOKEN).statusCode()==404;
             for(int i=0;i<130;i++)host.control(op("configuration-controls"));
@@ -966,12 +978,17 @@ public final class HostServiceTest {
             try(ControlApi api=new ControlApi(host,0,TOKEN);HttpClient http=HttpClient.newHttpClient()) {
                 JsonObject catalog=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/stashes",null,TOKEN).body()).getAsJsonObject();
                 String stashId=text(catalog.getAsJsonArray("items").get(0).getAsJsonObject(),"id");
+                JsonObject detail=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/stashes/"+stashId,null,TOKEN).body()).getAsJsonObject();
+                assert text(detail,"id").equals(stashId) && detail.getAsJsonObject("containers").size()==1
+                    : "Stash inspection resolves the listed resource ID and exposes observed containers";
                 JsonObject resources=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/stashes/"+stashId+"/resources",null,TOKEN).body()).getAsJsonObject();
                 assert resources.getAsJsonObject("items").get("minecraft:obsidian").getAsInt()==64 && resources.has("observedAt");
             }
             JsonObject request=submit(workerId,0);UUID task=UUID.fromString(text(request,"id"));request.addProperty("name","Inspect depot");request.addProperty("script","return function(ctx) return bot.stash_scan(ctx.args) end");
             request.add("args",JsonParser.parseString("{\"name\":\"Depot\",\"homeName\":\"depot\",\"minX\":0,\"maxX\":1,\"minY\":116,\"maxY\":116,\"minZ\":0,\"maxZ\":0}").getAsJsonObject());host.control(request);
             await(()->state(host,task).equals("Running"),worker);
+            Set<String> transferEvents=new HashSet<>();for(JsonElement event:host.control(op("status")).getAsJsonArray("activity"))transferEvents.add(text(event.getAsJsonObject(),"event"));
+            assert transferEvents.containsAll(Set.of("worker-transfer-begin","worker-transfer-queued")) : "Package transfer stages must be visible before diagnosing worker movement";
             JsonObject run=worker.checkpoints.values().iterator().next();
             JsonObject observation=JsonParser.parseString("{\"x\":0,\"y\":116,\"z\":0,\"status\":\"observed\",\"block\":\"minecraft:chest\",\"reason\":\"\",\"items\":{\"minecraft:stone\":1728},\"shulkers\":[]}").getAsJsonObject();
             JsonObject message=message("stash-findings");message.addProperty("run",text(run,"run"));message.addProperty("task",task.toString());message.add("action",run.get("action").deepCopy());message.add("token",run.get("token"));message.addProperty("delivery",1);message.add("observation",observation);
@@ -980,6 +997,35 @@ public final class HostServiceTest {
             JsonObject stash=host.control(op("status")).getAsJsonArray("stashes").get(0).getAsJsonObject();assert stash.getAsJsonObject("items").get("minecraft:stone").getAsInt()==1728 : "Duplicate delivery is acknowledged, not double-counted";
             JsonObject inspect=op("stash-get");inspect.addProperty("crew","Default");inspect.addProperty("scope","test.invalid\nminecraft:the_nether");inspect.addProperty("name","Depot");assert host.control(inspect).getAsJsonObject("containers").size()==2;
             JsonObject cancel=op("cancel");cancel.addProperty("id",task.toString());host.control(cancel);await(()->worker.current.isEmpty()&&state(host,task).equals("Cancelled"),worker);
+            JsonObject box=JsonParser.parseString("{slot:0,item:'minecraft:purple_shulker_box',quantity:1,name:'Raid kit',contentsKnown:true,items:{'minecraft:obsidian':64}}").getAsJsonObject();
+            JsonObject kitObservation=observation.deepCopy();kitObservation.addProperty("x",1);kitObservation.getAsJsonArray("shulkers").add(box);
+            StashCatalog.save(dir,"Default","test.invalid\nminecraft:the_nether",definition.getAsJsonObject("stash"),kitObservation);
+            JsonObject args=definition.getAsJsonObject("stash").deepCopy();args.addProperty("kitTypeId",StashCatalog.kitTypeId(box));args.addProperty("count",1);args.addProperty("destination","Carry");
+            JsonObject prepare=op("workflow-prepare");prepare.addProperty("id","task-kit-delivery");prepare.addProperty("scope","test.invalid\nminecraft:the_nether");prepare.add("args",args);
+            JsonObject delivery=submit(workerId,0);delivery.remove("script");delivery.addProperty("name","Deliver raid kit");delivery.add("args",args);delivery.add("package",host.control(prepare));host.control(delivery);
+            JsonObject kitView=taskView(host,UUID.fromString(text(delivery,"id"))).getAsJsonObject("kitJob");
+            assert text(kitView,"kitTypeId").equals(StashCatalog.kitTypeId(box))&&kitView.get("count").getAsInt()==1&&text(kitView,"name").equals("Depot") : "Kit usage metadata survives the redacted status view";
+            await(()->state(host,UUID.fromString(text(delivery,"id"))).equals("Running"),worker);
+            assert worker.checkpoints.get(UUID.fromString(worker.current)).getAsJsonObject("action").has("picks") : "Kit-delivery presets still prepare source withdrawals";
+            cancel.addProperty("id",text(delivery,"id"));host.control(cancel);await(()->worker.current.isEmpty()&&state(host,UUID.fromString(text(delivery,"id"))).equals("Cancelled"),worker);
+            JsonObject emptyDestination=observation.deepCopy();emptyDestination.add("items",new JsonObject());
+            StashCatalog.save(dir,"Default","test.invalid\nminecraft:the_nether",definition.getAsJsonObject("stash"),emptyDestination);
+            kitObservation.add("items",JsonParser.parseString("{'minecraft:purple_shulker_box':1,'minecraft:obsidian':64}").getAsJsonObject());
+            StashCatalog.save(dir,"Default","test.invalid\nminecraft:the_nether",definition.getAsJsonObject("stash"),kitObservation);
+            JsonObject deposit=submit(workerId,0),depositArgs=definition.getAsJsonObject("stash").deepCopy();
+            depositArgs.addProperty("kitTypeId",StashCatalog.kitTypeId(box));depositArgs.addProperty("count",1);
+            deposit.add("args",depositArgs);deposit.addProperty("script","return function(ctx) return bot.stash_store(ctx.args) end");host.control(deposit);
+            UUID depositId=UUID.fromString(text(deposit,"id"));await(()->state(host,depositId).equals("Running"),worker);
+            JsonObject depositRun=worker.checkpoints.get(UUID.fromString(worker.current));
+            assert text(depositRun.getAsJsonObject("action"),"type").equals("StashDeposit")
+                && !depositRun.getAsJsonObject("action").has("picks") : "A carried-kit deposit is not reinterpreted as a withdrawal because it has a kit ID";
+            JsonObject reservation=message("stash-findings");reservation.addProperty("task",depositId.toString());reservation.add("run",depositRun.get("run"));reservation.add("token",depositRun.get("token"));reservation.add("action",depositRun.get("action").deepCopy());reservation.addProperty("delivery",1);
+            worker.c.send(reservation.toString());await(()->worker.stashAcks==3,worker);
+            assert worker.lastStashAck.getAsJsonObject("column").get("x").getAsInt()==1&&!worker.lastStashAck.get("permit").getAsBoolean() : "A reservation request needs no fabricated observation";
+            JsonObject changed=observation.deepCopy();changed.addProperty("x",1);reservation.add("observation",changed);reservation.addProperty("delivery",2);
+            worker.c.send(reservation.toString());await(()->worker.stashAcks==4,worker);
+            assert worker.lastStashAck.getAsJsonObject("column").get("x").getAsInt()==0&&!worker.lastStashAck.get("permit").getAsBoolean() : "The real socket binding reports changed stock and redirects before authorizing a deposit";
+            cancel.addProperty("id",depositId.toString());host.control(cancel);await(()->worker.current.isEmpty()&&state(host,depositId).equals("Cancelled"),worker);
         }
         try(HostService restarted=new HostService(dir,"127.0.0.1",0,CREWS,30)){assert restarted.control(op("status")).getAsJsonArray("stashes").size()==1;}
     }
@@ -1009,7 +1055,419 @@ public final class HostServiceTest {
     private static void rejects(Runnable action) {
         try { action.run(); throw new AssertionError("Expected rejection"); } catch (IllegalArgumentException | IllegalStateException expected) { }
     }
+    private static void publicWorkerGatewayCheck() throws Exception {
+        var rate=new PublicWorkerGateway.Session(UUID.randomUUID());
+        for(int i=0;i<64;i++)assert rate.allowFrame(1_000L);
+        assert !rate.allowFrame(1_000L) && rate.allowFrame(1_000_001_000L)
+            : "A noisy worker must be disconnected, while a new time window recovers";
+        UUID worker=UUID.randomUUID(), other=UUID.randomUUID();
+        String token="interop-worker-secret-12345678901234567890", otherToken="interop-other-secret-12345678901234567890";
+        Path directory=Files.createTempDirectory("monocle-public-worker-check-");
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
+            PublicWorkerGateway gateway=new PublicWorkerGateway(0,Map.of(worker,token,other,otherToken),host);
+            HttpClient http=HttpClient.newHttpClient()) {
+            URI endpoint=URI.create("ws://127.0.0.1:"+gateway.getPort()+PublicWorkerGateway.PATH);
+            var listener=new java.net.http.WebSocket.Listener() {
+                final java.util.concurrent.BlockingQueue<String> frames=new java.util.concurrent.LinkedBlockingQueue<>();
+                @Override public void onOpen(java.net.http.WebSocket socket) { socket.request(1); }
+                @Override public java.util.concurrent.CompletionStage<?> onText(java.net.http.WebSocket socket,CharSequence text,boolean last) {
+                    assert last;frames.add(text.toString());socket.request(1);return null;
+                }
+            };
+            handshakeRejected(http.newWebSocketBuilder().header("Authorization","Bearer wrong-secret-12345678901234567890").buildAsync(endpoint,new java.net.http.WebSocket.Listener() {}));
+            handshakeRejected(http.newWebSocketBuilder().header("Authorization","Bearer "+token).header("Origin","https://browser.invalid").buildAsync(endpoint,new java.net.http.WebSocket.Listener() {}));
+            handshakeRejected(http.newWebSocketBuilder().header("Authorization","Bearer "+token).buildAsync(URI.create(endpoint+"/wrong"),new java.net.http.WebSocket.Listener() {}));
+            java.net.http.WebSocket socket=http.newWebSocketBuilder().header("Authorization","Bearer "+token).buildAsync(endpoint,listener).join();
+            JsonObject hello=JsonParser.parseString("{apiVersion:'workers.monocle.dev/v1',type:'session.hello',sequence:0,payload:{supportedVersions:['workers.monocle.dev/v1'],capabilities:[{id:'workers.wait.v1'}],lastHostSequence:0,lastWorkerSequence:0}}").getAsJsonObject();
+            hello.addProperty("messageId",UUID.randomUUID().toString());hello.addProperty("correlationId",UUID.randomUUID().toString());
+            hello.addProperty("sentAt",java.time.Instant.now().toString());hello.getAsJsonObject("payload").addProperty("workerId",worker.toString());
+            socket.sendText(hello.toString(),true).join();
+            JsonObject accepted=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(accepted,"type").equals("session.accepted")&&text(accepted,"correlationId").equals(text(hello,"correlationId"));
+            assert text(accepted,"apiVersion").equals(PublicWorkerGateway.LEGACY_VERSION)
+                && text(accepted.getAsJsonObject("payload"),"version").equals(PublicWorkerGateway.LEGACY_VERSION);
+            assert accepted.getAsJsonObject("payload").get("executionEnabled").getAsBoolean() : "The host advertises its narrow Wait adapter";
+            JsonObject observation=hello.deepCopy();observation.addProperty("type","worker.observation");observation.addProperty("sequence",1);
+            observation.addProperty("messageId",UUID.randomUUID().toString());observation.add("payload",JsonParser.parseString("{observedAt:'2026-09-28T12:00:00Z',scope:{server:'play.example.org',dimension:'minecraft:the_nether'},position:{x:12,y:116,z:34}}").getAsJsonObject());
+            observation.addProperty("workerId",worker.toString());socket.sendText(observation.toString(),true).join();
+            JsonObject reconcile=hello.deepCopy();reconcile.addProperty("type","state.reconcile");reconcile.addProperty("sequence",2);
+            reconcile.addProperty("messageId",UUID.randomUUID().toString());reconcile.addProperty("workerId",worker.toString());
+            reconcile.add("payload",JsonParser.parseString("{lastHostSequence:0,lastWorkerSequence:1,activeExecutions:[{jobId:'34bc05e5-6973-4629-bd69-644d6fbf3a3b',executionId:'c9547876-e3d8-4713-97d3-35a751718ccd',generation:1}]}").getAsJsonObject());
+            socket.sendText(reconcile.toString(),true).join();
+            JsonObject reconciled=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(reconciled,"type").equals("state.reconciled") && text(reconciled.getAsJsonObject("payload").getAsJsonArray("decisions").get(0).getAsJsonObject(),"decision").equals("inspect") : "Unknown public executions cannot resume";
+            JsonObject view=host.control(op("status")).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject).filter(w->text(w,"id").equals(worker.toString())).findFirst().orElseThrow();
+            assert flag(view,"reconciled") && flag(view,"connected") && text(view,"scope").equals("play.example.org\nminecraft:the_nether") && view.get("x").getAsDouble()==12;
+            hello.addProperty("apiVersion",PublicWorkerGateway.VERSION);
+            socket.sendText(hello.toString(),true).join();
+            JsonObject rejected=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(rejected,"type").equals("protocol.error") : "A legacy session cannot switch versions midstream";
+            socket.abort();
+            await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject)
+                .anyMatch(w->text(w,"id").equals(worker.toString())&&!flag(w,"connected")&&!flag(w,"reconciled")));
+            var wrongVersion=new java.net.http.WebSocket.Listener() {
+                final java.util.concurrent.BlockingQueue<String> frames=new java.util.concurrent.LinkedBlockingQueue<>();
+                @Override public void onOpen(java.net.http.WebSocket socket) { socket.request(1); }
+                @Override public java.util.concurrent.CompletionStage<?> onText(java.net.http.WebSocket socket,CharSequence text,boolean last) { frames.add(text.toString());socket.request(1);return null; }
+            };
+            java.net.http.WebSocket second=http.newWebSocketBuilder().header("Authorization","Bearer "+otherToken).buildAsync(endpoint,wrongVersion).join();
+            hello.getAsJsonObject("payload").addProperty("workerId",other.toString());hello.getAsJsonObject("payload").getAsJsonArray("supportedVersions").set(0,new JsonPrimitive("workers.monocle.dev/v2"));
+            second.sendText(hello.toString(),true).join();
+            JsonObject versionError=JsonParser.parseString(wrongVersion.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(versionError,"type").equals("protocol.error")&&text(versionError.getAsJsonObject("payload"),"code").equals("unsupported_version");
+            second.abort();
+        }
+        System.out.println("Public worker registration checks passed: credentials, observation, conservative reconciliation, offline roster, and no legacy execution.");
+    }
+    private static void monocleRwpWorkerCheck() throws Exception {
+        UUID worker = UUID.randomUUID();
+        String token = "monocle-rwp-worker-secret-12345678901234567890";
+        Path directory = Files.createTempDirectory("monocle-rwp-worker-");
+        Path journal = directory.resolve("rwp-execution.json");
+        try (HostService host = new HostService(directory, "127.0.0.1", 0, CREWS, 30);
+             PublicWorkerGateway gateway = new PublicWorkerGateway(0, Map.of(worker, token), host)) {
+            String address = "ws://127.0.0.1:" + gateway.getPort() + RwpWorkerConnection.PATH;
+            JsonObject observation = JsonParser.parseString("{observedAt:'2026-09-30T12:00:00Z',name:'Unbans',scope:{server:'play.example.org',dimension:'minecraft:the_nether'},position:{x:12,y:116,z:34}}").getAsJsonObject();
+            try (RwpWorkerConnection first = new RwpWorkerConnection(address, worker, token, journal)) {
+                first.connect();
+                await(() -> {
+                    first.poll(() -> observation);
+                    return first.connected() && first.hostImplementation().startsWith("dev.monocle.host ")
+                        && host.control(op("status")).getAsJsonArray("workers").asList().stream()
+                        .map(JsonElement::getAsJsonObject).anyMatch(w -> text(w,"id").equals(worker.toString())
+                            && flag(w,"connected") && flag(w,"reconciled") && text(w,"name").equals("Unbans") && text(w,"scope").equals("play.example.org\nminecraft:the_nether")
+                            && text(w.getAsJsonObject("implementation"),"id").equals("dev.monocle.client")
+                            && w.getAsJsonArray("capabilities").asList().stream().anyMatch(capability -> capability.getAsString().equals("workers.wait.v1")));
+                });
+                JsonObject resource=ResourceApi.route(host,"GET",URI.create("/v1/workers/"+worker),null,null).body();
+                assert text(resource.getAsJsonObject("implementation"),"id").equals("dev.monocle.client")
+                    && resource.getAsJsonArray("capabilities").asList().stream().anyMatch(c->c.getAsString().equals("workers.wait.v1"))
+                    : "Operator readback must retain the worker's identity and advertised actions";
+                JsonObject move = op("crew-move"); move.addProperty("crew", "Default"); move.addProperty("worker", worker.toString()); host.control(move);
+                UUID job = submitPublicWait(host, worker, 40);
+                await(() -> { first.poll(() -> observation); return state(host, job).equals("Running") && first.work().startsWith("running"); });
+                first.gameTick(); first.gameTick();
+                assert first.work().contains("38 ticks remaining") : "Wait ticks must be saved before disconnect";
+                await(() -> text(taskView(host, job).getAsJsonObject("runs").getAsJsonObject(worker.toString()), "detail").contains("ticks remaining"));
+            }
+            try (RwpWorkerConnection resumed = new RwpWorkerConnection(address, worker, token, journal)) {
+                assert resumed.work().contains("38 ticks remaining") : "Wait checkpoint must survive client restart";
+                resumed.connect();
+                await(() -> { resumed.poll(() -> observation); return resumed.connected(); });
+                UUID job = UUID.fromString(text(TaskFiles.read(journal).getAsJsonObject("run"), "jobId"));
+                await(() -> { resumed.poll(() -> observation); resumed.gameTick(); return state(host, job).equals("Complete") && resumed.work().equals("idle"); });
+                UUID travel = submitPublicTravel(host, worker);
+                await(() -> { resumed.poll(() -> observation); return state(host, travel).equals("Running") && resumed.activeTravel() != null; });
+                assert text(resumed.activeTravel().getAsJsonObject("action"), "type").equals("workers.travel.v1");
+                resumed.reportTravelProgress("Walking toward destination");
+                await(() -> text(taskView(host, travel).getAsJsonObject("runs").getAsJsonObject(worker.toString()), "detail").equals("Walking toward destination"));
+                rejects(() -> resumed.completeTravel(observation));
+                JsonObject arrived = observation.deepCopy();
+                arrived.addProperty("observedAt", java.time.Instant.now().toString());
+                JsonObject position = arrived.getAsJsonObject("position");
+                position.addProperty("x", 10); position.addProperty("y", 116); position.addProperty("z", -10);
+                resumed.completeTravel(arrived);
+                await(() -> { resumed.poll(() -> arrived); return state(host, travel).equals("Complete") && resumed.work().equals("idle"); });
+                UUID stoppedTravel = submitPublicTravel(host, worker);
+                await(() -> { resumed.poll(() -> observation); return state(host, stoppedTravel).equals("Running") && resumed.activeTravel() != null; });
+                assert text(TaskFiles.read(journal).getAsJsonObject("run").getAsJsonObject("action"), "type").equals("workers.travel.v1");
+                JsonObject stopTravel = op("cancel"); stopTravel.addProperty("id", stoppedTravel.toString()); host.control(stopTravel);
+                await(() -> { resumed.poll(() -> observation); return resumed.activeTravel() == null && resumed.work().equals("idle") && !flag(taskView(host, stoppedTravel), "cleanupPending"); });
+                UUID cancelled = submitPublicWait(host, worker, 40);
+                await(() -> { resumed.poll(() -> observation); return state(host, cancelled).equals("Running") && resumed.work().startsWith("running"); });
+            }
+            UUID cancelled = UUID.fromString(text(TaskFiles.read(journal).getAsJsonObject("run"), "jobId"));
+            JsonObject cancel = op("cancel"); cancel.addProperty("id", cancelled.toString()); host.control(cancel);
+            try (RwpWorkerConnection returned = new RwpWorkerConnection(address, worker, token, journal)) {
+                returned.connect();
+                await(() -> { returned.poll(() -> observation); return returned.connected() && returned.work().equals("idle") && !flag(taskView(host, cancelled), "cleanupPending"); });
+            }
+        }
+        rejects(() -> new RwpWorkerConnection("ws://example.org:6972" + RwpWorkerConnection.PATH, worker, token, directory.resolve("invalid.json")));
+        System.out.println("Monocle RWP checks passed: durable Wait, Travel arrival report, restart, offline cancellation, and checkpoint reconciliation.");
+    }
+    private static JsonObject publicFrame(UUID worker,int sequence,String type,JsonObject payload) {
+        JsonObject frame=new JsonObject();frame.addProperty("apiVersion",PublicWorkerGateway.VERSION);frame.addProperty("type",type);
+        frame.addProperty("messageId",UUID.randomUUID().toString());frame.addProperty("correlationId",UUID.randomUUID().toString());
+        frame.addProperty("workerId",worker.toString());frame.addProperty("sequence",sequence);
+        frame.addProperty("sentAt",java.time.Instant.now().toString());frame.add("payload",payload);return frame;
+    }
+    private static UUID submitPublicWait(HostService host,UUID worker) { return submitPublicWait(host,worker,40); }
+    private static UUID submitPublicWait(HostService host,UUID worker,int ticks) {
+        UUID job=UUID.randomUUID();JsonObject prepare=op("workflow-prepare");prepare.addProperty("id","task-wait");
+        prepare.addProperty("scope","play.example.org\nminecraft:the_nether");JsonObject args=new JsonObject();args.addProperty("ticks",ticks);prepare.add("args",args);
+        JsonObject request=op("submit");request.addProperty("id",job.toString());request.addProperty("crew","Default");request.addProperty("name","Public Wait");
+        request.addProperty("server","play.example.org");request.addProperty("dimension","minecraft:the_nether");
+        JsonArray workers=new JsonArray();workers.add(worker.toString());request.add("workers",workers);request.add("args",args);request.add("package",host.control(prepare));
+        host.control(request);return job;
+    }
+    private static UUID submitPublicTravel(HostService host,UUID worker) {
+        UUID job=UUID.randomUUID();JsonObject prepare=op("workflow-prepare");prepare.addProperty("id","task-travel");
+        prepare.addProperty("scope","play.example.org\nminecraft:the_nether");
+        JsonObject args=JsonParser.parseString("{x:10,y:116,z:-10,radius:2}").getAsJsonObject();prepare.add("args",args);
+        JsonObject request=op("submit");request.addProperty("id",job.toString());request.addProperty("crew","Default");request.addProperty("name","Public Travel");
+        request.addProperty("server","play.example.org");request.addProperty("dimension","minecraft:the_nether");
+        JsonArray workers=new JsonArray();workers.add(worker.toString());request.add("workers",workers);request.add("args",args);request.add("package",host.control(prepare));
+        host.control(request);return job;
+    }
+    private static void publicWorkerActionsCheck() throws Exception {
+        assert PublicWorkerGateway.hasOutboundCapacity(31) && !PublicWorkerGateway.hasOutboundCapacity(32)
+            : "A stalled worker must not accumulate unbounded outbound frames";
+        UUID worker=UUID.randomUUID();String token="public-wait-secret-12345678901234567890";
+        HttpClient http=HttpClient.newHttpClient();
+        Path directory=Files.createTempDirectory("monocle-public-wait-");
+        JsonObject waitCompletion=new JsonObject();
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
+            PublicWorkerGateway gateway=new PublicWorkerGateway(0,Map.of(worker,token),host)) {
+            var listener=new java.net.http.WebSocket.Listener(){
+                final java.util.concurrent.BlockingQueue<String> frames=new java.util.concurrent.LinkedBlockingQueue<>();
+                @Override public void onOpen(java.net.http.WebSocket socket){socket.request(1);}
+                @Override public java.util.concurrent.CompletionStage<?> onText(java.net.http.WebSocket socket,CharSequence text,boolean last){assert last;frames.add(text.toString());socket.request(1);return null;}
+            };
+            java.net.http.WebSocket socket=http.newWebSocketBuilder().header("Authorization","Bearer "+token)
+                .buildAsync(URI.create("ws://127.0.0.1:"+gateway.getPort()+PublicWorkerGateway.PATH),listener).join();
+            JsonObject hello=JsonParser.parseString("{supportedVersions:['rwp/1-draft'],implementation:{id:'dev.monocle.test',version:'1'},capabilities:[{id:'workers.wait.v1'},{id:'workers.travel.v1'}],lastHostSequence:0,lastWorkerSequence:0,workerId:'"+worker+"'}").getAsJsonObject();
+            socket.sendText(publicFrame(worker,0,"session.hello",hello).toString(),true).join();
+            assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("session.accepted");
+            assert eventSeen(host,"worker-connected",worker) : "Public worker connection belongs in the operator feed";
+            JsonObject observation=JsonParser.parseString("{observedAt:'2026-09-28T12:00:00Z',scope:{server:'play.example.org',dimension:'minecraft:the_nether'}}").getAsJsonObject();
+            socket.sendText(publicFrame(worker,1,"worker.observation",observation).toString(),true).join();
+            JsonObject reconcile=JsonParser.parseString("{lastHostSequence:0,lastWorkerSequence:1,activeExecutions:[]}").getAsJsonObject();
+            socket.sendText(publicFrame(worker,2,"state.reconcile",reconcile).toString(),true).join();
+            assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("state.reconciled");
+            JsonObject move=op("crew-move");move.addProperty("crew","Default");move.addProperty("worker",worker.toString());host.control(move);
+            UUID job=submitPublicWait(host,worker);
+            JsonObject assignment=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(assignment,"type").equals("execution.assign");
+            JsonObject ref=assignment.getAsJsonObject("payload").deepCopy();
+            assert text(ref.getAsJsonObject("action"),"type").equals("workers.wait.v1") && ref.getAsJsonObject("action").getAsJsonObject("arguments").get("ticks").getAsInt()==40;
+            for(String type:List.of("execution.accepted","execution.started","execution.completed")){
+                JsonObject report=publicFrame(worker,type.equals("execution.accepted")?3:type.equals("execution.started")?4:5,type,ref);
+                if(type.equals("execution.completed"))waitCompletion=report.deepCopy();
+                socket.sendText(report.toString(),true).join();
+                JsonObject ack=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+                assert text(ack,"type").equals("message.ack") && text(ack.getAsJsonObject("payload"),"messageId").equals(text(report,"messageId"))
+                    && text(ack.getAsJsonObject("payload"),"result").equals("accepted");
+                String expected=type.equals("execution.accepted")?"Ready":type.equals("execution.started")?"Running":"Complete";
+                await(()->text(taskView(host,job).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals(expected));
+            }
+            await(()->state(host,job).equals("Complete"));
+            UUID cancelled=submitPublicWait(host,worker);
+            JsonObject next=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(next,"type").equals("execution.assign");JsonObject cancelRef=next.getAsJsonObject("payload").deepCopy();
+            socket.sendText(publicFrame(worker,6,"execution.accepted",cancelRef).toString(),true).join();
+            assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("message.ack");
+            await(()->text(taskView(host,cancelled).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals("Ready"));
+            JsonObject stop=op("cancel");stop.addProperty("id",cancelled.toString());host.control(stop);
+            JsonObject cancel=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(cancel,"type").equals("execution.cancel") && text(cancel.getAsJsonObject("payload"),"executionId").equals(text(cancelRef,"executionId"));
+            cancelRef.addProperty("cleanup","acknowledged");socket.sendText(publicFrame(worker,7,"execution.cancelled",cancelRef).toString(),true).join();
+            assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("message.ack");
+            await(()->text(taskView(host,cancelled).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals("Cancelled"));
+            rejects(()->submitPublicTravel(host,worker)); // Travel requires a fresh position, not merely a matching world.
+            JsonObject positioned=observation.deepCopy();positioned.add("position",JsonParser.parseString("{x:0,y:116,z:0}"));
+            socket.sendText(publicFrame(worker,8,"worker.observation",positioned).toString(),true).join();
+            await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject)
+                .anyMatch(w->text(w,"id").equals(worker.toString()) && flag(w,"positionFresh")));
+            UUID resumed=submitPublicTravel(host,worker);
+            JsonObject third=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(third,"type").equals("execution.assign");JsonObject resumeRef=third.getAsJsonObject("payload").deepCopy();
+            assert text(resumeRef.getAsJsonObject("action"),"type").equals("workers.travel.v1")
+                && resumeRef.getAsJsonObject("action").getAsJsonObject("arguments").get("x").getAsDouble()==10;
+            socket.sendText(publicFrame(worker,9,"execution.accepted",resumeRef).toString(),true).join();
+            assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("message.ack");
+            await(()->text(taskView(host,resumed).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals("Ready"));
+            socket.sendText(publicFrame(worker,10,"execution.started",resumeRef).toString(),true).join();
+            assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("message.ack");
+            await(()->text(taskView(host,resumed).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals("Running"));
+            socket.abort();
+            await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject)
+                .anyMatch(w->text(w,"id").equals(worker.toString())&&!flag(w,"connected")) && eventSeen(host,"worker-disconnected",worker));
+            var resumedListener=new java.net.http.WebSocket.Listener(){
+                final java.util.concurrent.BlockingQueue<String> frames=new java.util.concurrent.LinkedBlockingQueue<>();
+                @Override public void onOpen(java.net.http.WebSocket connection){connection.request(1);}
+                @Override public java.util.concurrent.CompletionStage<?> onText(java.net.http.WebSocket connection,CharSequence text,boolean last){assert last;frames.add(text.toString());connection.request(1);return null;}
+            };
+            java.net.http.WebSocket reconnect=http.newWebSocketBuilder().header("Authorization","Bearer "+token)
+                .buildAsync(URI.create("ws://127.0.0.1:"+gateway.getPort()+PublicWorkerGateway.PATH),resumedListener).join();
+            reconnect.sendText(publicFrame(worker,0,"session.hello",hello).toString(),true).join();
+            assert text(JsonParser.parseString(resumedListener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("session.accepted");
+            reconnect.sendText(publicFrame(worker,1,"worker.observation",positioned).toString(),true).join();
+            JsonObject claim=new JsonObject();for(String key:List.of("jobId","executionId","generation"))claim.add(key,resumeRef.get(key).deepCopy());
+            JsonArray active=new JsonArray();active.add(claim);reconcile.add("activeExecutions",active);
+            reconnect.sendText(publicFrame(worker,2,"state.reconcile",reconcile).toString(),true).join();
+            JsonObject decision=JsonParser.parseString(resumedListener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(decision,"type").equals("state.reconciled") && text(decision.getAsJsonObject("payload").getAsJsonArray("decisions").get(0).getAsJsonObject(),"decision").equals("continue");
+            rejects(()->host.publicWorkerReport(worker,UUID.randomUUID(),"execution.completed",resumeRef)); // Starting position is not arrival.
+            JsonObject arrived=observation.deepCopy();arrived.add("position",JsonParser.parseString("{x:10,y:116,z:-10}"));
+            reconnect.sendText(publicFrame(worker,3,"worker.observation",arrived).toString(),true).join();
+            await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject)
+                .anyMatch(w->text(w,"id").equals(worker.toString()) && w.has("x") && w.get("x").getAsDouble()==10));
+            reconnect.sendText(publicFrame(worker,4,"execution.completed",resumeRef).toString(),true).join();
+            assert text(JsonParser.parseString(resumedListener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("message.ack");
+            await(()->state(host,resumed).equals("Complete"));
+            JsonObject retry=waitCompletion.deepCopy();retry.addProperty("sequence",5);retry.addProperty("sentAt",java.time.Instant.now().toString());
+            reconnect.sendText(retry.toString(),true).join();
+            JsonObject duplicate=JsonParser.parseString(resumedListener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(duplicate,"type").equals("message.ack") && text(duplicate.getAsJsonObject("payload"),"result").equals("duplicate");
+            assert TaskFiles.read(directory.resolve("host-tasks.json")).getAsJsonObject("publicReportReceipts")
+                .getAsJsonObject(worker.toString()).has(text(waitCompletion,"messageId"));
+            JsonObject conflict=retry.deepCopy();conflict.addProperty("sequence",6);conflict.getAsJsonObject("payload").addProperty("generation",999);
+            reconnect.sendText(conflict.toString(),true).join();
+            JsonObject conflictError=JsonParser.parseString(resumedListener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(conflictError,"type").equals("protocol.error") && text(conflictError.getAsJsonObject("payload"),"code").equals("message_id_conflict");
+            reconnect.abort();
+        }
+        try(HostService reopened=new HostService(directory,"127.0.0.1",0,CREWS,30)){
+            JsonObject reordered=new JsonObject();
+            var keys=new java.util.ArrayList<>(waitCompletion.getAsJsonObject("payload").keySet());
+            java.util.Collections.reverse(keys);
+            for(String key:keys)reordered.add(key,waitCompletion.getAsJsonObject("payload").get(key).deepCopy());
+            assert reopened.publicWorkerReport(worker,UUID.fromString(text(waitCompletion,"messageId")),"execution.completed",reordered)
+                : "A report already committed before shutdown must be recognized after restart";
+        }
+        System.out.println("Public Wait/Travel checks passed: durable dispatch, arrival, cancellation, reconnect and report retries.");
+    }
+    private static void publicExtensionActionCheck() throws Exception {
+        UUID worker=UUID.randomUUID(),job=UUID.randomUUID();
+        Path directory=Files.createTempDirectory("monocle-public-extension-");
+        String type="dev.example.inspect.v1",token="public-extension-secret-1234567890123456";
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);
+            PublicWorkerGateway gateway=new PublicWorkerGateway(0,Map.of(worker,token),host)) {
+            var listener=new java.net.http.WebSocket.Listener(){
+                final java.util.concurrent.BlockingQueue<String> frames=new java.util.concurrent.LinkedBlockingQueue<>();
+                @Override public void onOpen(java.net.http.WebSocket socket){socket.request(1);}
+                @Override public java.util.concurrent.CompletionStage<?> onText(java.net.http.WebSocket socket,CharSequence text,boolean last){frames.add(text.toString());socket.request(1);return null;}
+            };
+            java.net.http.WebSocket socket=HttpClient.newHttpClient().newWebSocketBuilder().header("Authorization","Bearer "+token)
+                .buildAsync(URI.create("ws://127.0.0.1:"+gateway.getPort()+PublicWorkerGateway.PATH),listener).join();
+            JsonObject hello=JsonParser.parseString("{supportedVersions:['rwp/1-draft'],implementation:{id:'dev.monocle.test',version:'1'},capabilities:[{id:'"+type+"'}],lastHostSequence:0,lastWorkerSequence:0,workerId:'"+worker+"'}").getAsJsonObject();
+            socket.sendText(publicFrame(worker,0,"session.hello",hello).toString(),true).join();
+            JsonObject accepted=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(accepted,"type").equals("session.accepted") && flag(accepted.getAsJsonObject("payload"),"extensionRouting");
+            JsonObject observation=JsonParser.parseString("{observedAt:'2026-09-30T12:00:00Z',scope:{server:'play.example.org',dimension:'minecraft:the_nether'}}").getAsJsonObject();
+            socket.sendText(publicFrame(worker,1,"worker.observation",observation).toString(),true).join();
+            JsonObject reconcile=JsonParser.parseString("{lastHostSequence:0,lastWorkerSequence:1,activeExecutions:[]}").getAsJsonObject();
+            socket.sendText(publicFrame(worker,2,"state.reconcile",reconcile).toString(),true).join();
+            assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("state.reconciled");
+            JsonObject move=op("crew-move");move.addProperty("crew","Default");move.addProperty("worker",worker.toString());host.control(move);
+            JsonObject capabilities=ResourceApi.route(host,"GET",URI.create("/v1/capabilities"),new JsonObject(),null).body();
+            assert flag(capabilities,"extensionRouting");
+            String crewId=ResourceApi.route(host,"GET",URI.create("/v1/crews"),new JsonObject(),null).body().getAsJsonArray("items").asList().stream()
+                .map(JsonElement::getAsJsonObject).filter(c->text(c,"name").equals("Default")).map(c->text(c,"id")).findFirst().orElseThrow();
+            JsonObject submission=new JsonObject();submission.addProperty("id",job.toString());submission.addProperty("crewId",crewId);
+            submission.addProperty("name","Public extension");submission.add("workerIds",new Gson().toJsonTree(List.of(worker.toString())));
+            submission.add("scope",observation.get("scope").deepCopy());
+            JsonObject action=JsonParser.parseString("{type:'"+type+"',arguments:{message:'keep this opaque',steps:[1,2,3]}}").getAsJsonObject();
+            submission.add("action",action);
+            JsonObject unsupported=submission.deepCopy();unsupported.addProperty("id",UUID.randomUUID().toString());
+            unsupported.getAsJsonObject("action").addProperty("type","dev.example.other.v1");
+            rejects(()->ResourceApi.route(host,"POST",URI.create("/v1/jobs"),unsupported,null));
+            JsonObject reserved=submission.deepCopy();reserved.addProperty("id",UUID.randomUUID().toString());
+            reserved.getAsJsonObject("action").addProperty("type","workers.fly.v1");
+            rejects(()->ResourceApi.route(host,"POST",URI.create("/v1/jobs"),reserved,null));
+            JsonObject oversized=submission.deepCopy();oversized.addProperty("id",UUID.randomUUID().toString());
+            oversized.getAsJsonObject("action").getAsJsonObject("arguments").addProperty("message","x".repeat(8_192));
+            rejects(()->ResourceApi.route(host,"POST",URI.create("/v1/jobs"),oversized,null));
+            JsonObject privateTarget=submission.deepCopy();privateTarget.addProperty("id",UUID.randomUUID().toString());
+            privateTarget.getAsJsonArray("workerIds").set(0,new JsonPrimitive(UUID.randomUUID().toString()));
+            rejects(()->ResourceApi.route(host,"POST",URI.create("/v1/jobs"),privateTarget,null));
+            JsonObject response=ResourceApi.route(host,"POST",URI.create("/v1/jobs"),submission,null).body();
+            assert response.getAsJsonObject("action").equals(action) && !response.has("package");
+            JsonObject assignment=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(assignment,"type").equals("execution.assign");
+            JsonObject ref=assignment.getAsJsonObject("payload").deepCopy();
+            assert ref.getAsJsonObject("action").equals(action) && !taskView(host,job).has("package");
+            int sequence=3;
+            for(String reportType:List.of("execution.accepted","execution.started","execution.completed")) {
+                socket.sendText(publicFrame(worker,sequence++,reportType,ref).toString(),true).join();
+                assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("message.ack");
+            }
+            await(()->state(host,job).equals("Complete"));
+            assert text(taskView(host,job).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"detail").contains("not independently game-verified");
+            UUID uncertain=UUID.randomUUID();JsonObject second=submission.deepCopy();second.addProperty("id",uncertain.toString());
+            ResourceApi.route(host,"POST",URI.create("/v1/jobs"),second,null);
+            JsonObject secondAssignment=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
+            assert text(secondAssignment,"type").equals("execution.assign");
+            JsonObject secondRef=secondAssignment.getAsJsonObject("payload").deepCopy();
+            for(String reportType:List.of("execution.accepted","execution.started")) {
+                socket.sendText(publicFrame(worker,sequence++,reportType,secondRef).toString(),true).join();
+                assert text(JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject(),"type").equals("message.ack");
+            }
+            await(()->state(host,uncertain).equals("Running"));
+            host.publicWorkerReconcile(worker,reconcile); // A lost extension checkpoint must not replay an unknown side effect.
+            assert text(taskView(host,uncertain).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals("Inspection required");
+            assert state(host,uncertain).equals("Inspection required");
+            socket.abort();
+        }
+        try(HostService reopened=new HostService(directory,"127.0.0.1",0,CREWS,30)) {
+            assert text(taskView(reopened,job).getAsJsonObject("publicAction"),"type").equals(type);
+        }
+        System.out.println("Public extension check passed: exact capability, opaque action, worker-reported outcome and restart persistence.");
+    }
+    private static void independentWorkerCheck() throws Exception {
+        int node;
+        try {
+            Process probe=new ProcessBuilder("node","-p","Number(process.versions.node.split('.')[0])").start();
+            node=Integer.parseInt(new String(probe.getInputStream().readAllBytes()).trim());
+            if(probe.waitFor()!=0)throw new IllegalStateException("Cannot check Node version");
+        } catch(java.io.IOException unavailable) {
+            System.out.println("Independent worker check skipped: Node 26 is not installed.");return;
+        }
+        if(node<26){System.out.println("Independent worker check skipped: Node 26 is required.");return;}
+        Path script=Path.of("src/test/rwp-mock-worker.mjs");assert Files.isRegularFile(script);
+        UUID worker=UUID.randomUUID();String token="independent-worker-secret-1234567890123456";
+        Path log=Files.createTempFile("rwp-mock-worker-",".log");
+        try(HostService host=new HostService(Files.createTempDirectory("monocle-independent-worker-"),"127.0.0.1",0,CREWS,30);
+            PublicWorkerGateway gateway=new PublicWorkerGateway(0,Map.of(worker,token),host)) {
+            ProcessBuilder builder=new ProcessBuilder("node",script.toAbsolutePath().toString()).redirectErrorStream(true).redirectOutput(log.toFile());
+            builder.environment().put("RWP_URL","ws://127.0.0.1:"+gateway.getPort()+PublicWorkerGateway.PATH);
+            builder.environment().put("RWP_TOKEN",token);builder.environment().put("RWP_WORKER_ID",worker.toString());
+            builder.environment().put("RWP_SERVER","play.example.org");builder.environment().put("RWP_DIMENSION","minecraft:the_nether");
+            Path probe=Path.of("src/test/rwp-conformance.mjs");assert Files.isRegularFile(probe);
+            ProcessBuilder check=new ProcessBuilder("node",probe.toAbsolutePath().toString()).redirectErrorStream(true);
+            check.environment().putAll(builder.environment());
+            Process checked=check.start();
+            if(!checked.waitFor(10,java.util.concurrent.TimeUnit.SECONDS)){checked.destroyForcibly();throw new AssertionError("Independent RWP probe timed out");}
+            assert checked.exitValue()==0 : new String(checked.getInputStream().readAllBytes());
+            await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject)
+                .anyMatch(w->text(w,"id").equals(worker.toString()) && !flag(w,"connected")));
+            Process process=builder.start();
+            try {
+                await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject)
+                    .anyMatch(w->text(w,"id").equals(worker.toString()) && flag(w,"connected") && flag(w,"reconciled")));
+                JsonObject move=op("crew-move");move.addProperty("crew","Default");move.addProperty("worker",worker.toString());host.control(move);
+                UUID wait=submitPublicWait(host,worker,2);await(()->state(host,wait).equals("Complete"));
+                UUID travel=submitPublicTravel(host,worker);await(()->state(host,travel).equals("Complete"));
+                UUID cancelled=submitPublicWait(host,worker,400);
+                await(()->text(taskView(host,cancelled).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals("Running"));
+                JsonObject stop=op("cancel");stop.addProperty("id",cancelled.toString());host.control(stop);
+                await(()->text(taskView(host,cancelled).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals("Cancelled"));
+                UUID restarted=submitPublicWait(host,worker,40);
+                await(()->text(taskView(host,restarted).getAsJsonObject("runs").getAsJsonObject(worker.toString()),"status").equals("Running"));
+                process.destroy();process.waitFor(2,java.util.concurrent.TimeUnit.SECONDS);
+                await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().map(JsonElement::getAsJsonObject)
+                    .anyMatch(w->text(w,"id").equals(worker.toString()) && !flag(w,"connected")));
+                process=builder.start(); // A fresh implementation has no checkpoint; the host must issue a new generation.
+                await(()->state(host,restarted).equals("Complete"));
+                assert taskView(host,restarted).getAsJsonObject("runs").getAsJsonObject(worker.toString()).get("generation").getAsInt()==2;
+                assert process.isAlive() : "Independent worker exited unexpectedly";
+            } finally {
+                process.destroy();if(!process.waitFor(2,java.util.concurrent.TimeUnit.SECONDS))process.destroyForcibly();
+                if(Files.size(log)>0)System.err.println(Files.readString(log));
+            }
+        }
+        System.out.println("Independent Node checks passed: host probe, Wait, simulated Travel, and cancellation without Monocle libraries.");
+    }
+    private static void handshakeRejected(java.util.concurrent.CompletableFuture<java.net.http.WebSocket> connection) {
+        try { connection.join(); throw new AssertionError("Unauthorized public worker handshake accepted"); }
+        catch (java.util.concurrent.CompletionException expected) { }
+    }
     private static long connected(HostService host) { return host.control(op("status")).getAsJsonArray("workers").asList().stream().filter(w->flag(w.getAsJsonObject(),"connected")).count(); }
+    private static boolean eventSeen(HostService host,String type,UUID worker) {
+        return host.control(op("status")).getAsJsonArray("activity").asList().stream().map(JsonElement::getAsJsonObject)
+            .anyMatch(event->type.equals(text(event,"event"))&&worker.toString().equals(text(event,"worker")));
+    }
 
     private static void checkpointReleaseCheck() throws Exception {
         Path directory=Files.createTempDirectory("monocle-release-check-");UUID a=UUID.randomUUID(),b=UUID.randomUUID();
@@ -1130,6 +1588,7 @@ public final class HostServiceTest {
         final List<JsonObject> tpaAccepts = new ArrayList<>();
         int count, installs, resumes;
         int stashAcks;
+        JsonObject lastStashAck;
         JsonArray stashCatalog=new JsonArray();
         long announceAt;
         JsonObject nativeJob;
@@ -1238,7 +1697,7 @@ public final class HostServiceTest {
                                 decision = BotLua.next(text(envelope.getAsJsonObject("programs").getAsJsonObject(text(envelope, "entry")), "script"), decision.state(), metadata.getAsJsonObject("args"), new JsonObject(), null);
                             }
                             if(text(decision.action(),"type").equals("StashScan")){decision.action().addProperty("workerIndex",metadata.get("workerIndex").getAsInt());decision.action().addProperty("workerCount",metadata.get("workerCount").getAsInt());}
-                            assert Set.of("Wait","Travel","DropItems","Highway","StashScan").contains(text(decision.action(), "type"));
+                            assert Set.of("Wait","Travel","DropItems","Highway","StashScan","StashResupply","StashDeposit").contains(text(decision.action(), "type"));
                             assert !checkpoints.containsKey(UUID.fromString(transfer));
                             JsonObject run = new JsonObject(); run.addProperty("run", transfer); run.addProperty("status", "Ready");run.add("action",decision.action());run.addProperty("token",UUID.randomUUID().toString()); checkpoints.put(UUID.fromString(transfer), run); installs++; sendStatus(run);
                         }
@@ -1258,7 +1717,7 @@ public final class HostServiceTest {
                         }
                         sendStatus(run); heartbeat();
                     }
-                    case "task-stash-ack" -> { assert message.get("delivery").getAsInt()==1;stashAcks++; }
+                    case "task-stash-ack" -> { assert message.get("delivery").getAsInt()>0;lastStashAck=message.deepCopy();stashAcks++; }
                     case "task-stash-catalog" -> { assert message.getAsJsonArray("stashes").size()<=64;stashCatalog=message.getAsJsonArray("stashes").deepCopy(); }
                     case "prepare", "reconfigure" -> { nativeJob=message.deepCopy();row=message.get("startRow").getAsInt();begun=nativePaused=false;announce(); }
                     case "restore" -> { assert recoveryOnly && recoveryReady; restores++; recoveryOnly=false; nativeJob=message.deepCopy(); row=message.get("startRow").getAsInt(); detached=HighwayCoordinator.detachedMembers(nativeJob).contains(id); returning=detached; announce(); }

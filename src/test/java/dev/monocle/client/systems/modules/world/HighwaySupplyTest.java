@@ -41,6 +41,14 @@ public final class HighwaySupplyTest {
         assert HighwayBuilder.reachedRepairRows(17.5,32)==17;
         assert HighwayBuilder.reachedRepairRows(-2,32)==0;
         assert HighwayBuilder.reachedRepairRows(40,32)==32;
+        assert Math.abs(HighwayBuilder.repairTravelDistance(10, true) - 10 * Math.sqrt(2)) < 1e-9;
+        assert HighwayBuilder.reachedRepairRows(HighwayBuilder.repairRowProjection(
+            new Vec3(10.5, 64, 10.5), new net.minecraft.core.BlockPos(0, 64, 0), 1, 1), 32) == 10
+            : "Diagonal flight must not count the same progress twice";
+        assert HighwayBuilder.repairCorridorClear(new Vec3(.5, 64, .5), new Vec3(20.5, 64, 20.5), true, .72, 1.8,
+            box -> !(box.minX < 11 && box.maxX > 10 && box.minZ < 1 && box.maxZ > 0)) : "Diagonal flight checks the narrow road, not its entire bounding square";
+        assert !HighwayBuilder.repairCorridorClear(new Vec3(.5, 64, .5), new Vec3(20.5, 64, 20.5), true, .72, 1.8,
+            box -> !(box.minX < 11 && box.maxX > 10 && box.minZ < 11 && box.maxZ > 10)) : "A real diagonal corridor obstruction must stop the flight";
         assert HighwayBuilder.repairFlightVelocity(new Vec3(0,0,0),new Vec3(10,0,0),5).equals(new Vec3(5,0,0));
         assert HighwayBuilder.repairFlightVelocity(new Vec3(0,0,0),new Vec3(3,0,0),5).equals(new Vec3(3,0,0));
         assert HighwayBuilder.repairFlightVelocity(new Vec3(0,3,0),new Vec3(10,0,0),5).equals(new Vec3(5,0,0)) : "Repair cruising must never auto-drop";
@@ -59,6 +67,13 @@ public final class HighwaySupplyTest {
             && HighwayBuilder.operationExcavates(HighwayBuilder.Operation.ClearTunnel)
             && !HighwayBuilder.operationExcavates(HighwayBuilder.Operation.Pave)
             : "Repair clears passage obstructions; only Pave preserves them";
+        try (var bytes = HighwayBuilder.class.getResourceAsStream("HighwayBuilder.class")) {
+            var calls = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes()).methods().stream()
+                .filter(m -> m.methodName().equalsString("advanceRoad")).findFirst().orElseThrow().code().orElseThrow().elementList().stream()
+                .filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
+            assert calls.contains("placeClearTunnelFooting") : "Clear Tunnel must establish confirmed footing before advancing";
+        }
         assert HighwayBuilder.repairFlightRetryDelay(false, false) == 0
             && HighwayBuilder.repairFlightRetryDelay(true, false) == 20
             && HighwayBuilder.repairFlightRetryDelay(false, true) == 200

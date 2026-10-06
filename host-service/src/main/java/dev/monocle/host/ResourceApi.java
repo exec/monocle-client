@@ -52,6 +52,7 @@ final class ResourceApi {
                     default -> {
                         result.add("actions", snapshot.getAsJsonArray("capabilities").deepCopy());
                         result.add("portableActions", new Gson().toJsonTree(List.of("workers.wait.v1", "workers.travel.v1", "workers.drop-items.v1")));
+                        result.addProperty("extensionRouting",host.publicExtensionRouting());
                     }
                 }
                 return new Reply(200, result);
@@ -124,7 +125,9 @@ final class ResourceApi {
             String worker=uuid(parts[5]);
             if (find(items(snapshot,"workers"),worker)==null) return missing();
             JsonObject request=op("crew-move");request.addProperty("crew",internal);request.addProperty("worker",worker);host.control(request);
-            return new Reply(200,receipt(worker,"Reassignment sent; confirm after worker reconnects"));
+            JsonObject updated=find(items(host.control(op("status")),"workers"),worker);
+            return new Reply(200,receipt(worker,updated!=null && updated.has("publicProtocol") && updated.get("publicProtocol").getAsBoolean()
+                ? "Assigned" : "Reassignment sent; confirm after worker reconnects"));
         }
         return missing();
     }
@@ -142,8 +145,13 @@ final class ResourceApi {
             if(!body.has("workerIds") || !body.get("workerIds").isJsonArray())throw new IllegalArgumentException("Specify workerIds");
             request.add("workers",body.getAsJsonArray("workerIds"));
             if(body.has("priority"))request.add("priority",body.get("priority"));
-            JsonObject args=body.has("action")?portableArgs(body,server,dimension):body.has("args")?body.getAsJsonObject("args"):new JsonObject();request.add("args",args);
-            if(body.has("workflowId") || body.has("action")) {
+            JsonObject action=body.has("action")?object(body,"action"):null;
+            boolean extension=action!=null && !Set.of("workers.wait.v1","workers.travel.v1","workers.drop-items.v1").contains(text(action,"type"));
+            if(extension && body.has("args"))throw new IllegalArgumentException("Action arguments belong inside action.arguments");
+            JsonObject args=action==null?body.has("args")?body.getAsJsonObject("args"):new JsonObject():extension?new JsonObject():portableArgs(body,server,dimension);
+            request.add("args",args);
+            if(extension)request.add("publicAction",action.deepCopy());
+            else if(body.has("workflowId") || action!=null) {
                 String workflow=body.has("action")?portableWorkflow(object(body,"action")):workflowKey(snapshot,text(body,"workflowId"));
                 JsonObject prepare=op("workflow-prepare");prepare.addProperty("id",workflow);
                 prepare.addProperty("scope",server+"\n"+dimension);prepare.add("args",args);
@@ -346,7 +354,7 @@ final class ResourceApi {
         JsonObject view=source.deepCopy();view.addProperty("crewId",publicCrew(text(source,"crew")));
         view.addProperty("connection",!source.get("connected").getAsBoolean()?"offline":source.get("reconciled").getAsBoolean()?"online":"reconciling");
         view.addProperty("observedAt",Instant.ofEpochMilli(source.get("lastSeen").getAsLong()).toString());
-        view.add("capabilities",snapshot.getAsJsonArray("capabilities").deepCopy());return view;
+        if(!view.has("capabilities"))view.add("capabilities",snapshot.getAsJsonArray("capabilities").deepCopy());return view;
     }
     private static JsonObject crew(JsonObject snapshot,String internal) {
         JsonObject view=new JsonObject();view.addProperty("id",publicCrew(internal));
@@ -367,6 +375,7 @@ final class ResourceApi {
     private static JsonObject job(JsonObject source) {
         JsonObject view=source.deepCopy();view.addProperty("crewId",publicCrew(text(source,"crew")));
         view.addProperty("state",text(source,"status").toLowerCase(Locale.ROOT).replace(' ','_'));
+        if(source.has("publicAction")){view.add("action",source.get("publicAction").deepCopy());view.remove("publicAction");}
         JsonObject scope=new JsonObject();scope.addProperty("server",text(source,"server"));scope.addProperty("dimension",text(source,"dimension"));view.add("scope",scope);
         JsonArray workers=new JsonArray();source.getAsJsonObject("runs").keySet().forEach(workers::add);view.add("workerIds",workers);
         return view;

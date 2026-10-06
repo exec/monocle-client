@@ -14,7 +14,7 @@ import static dev.monocle.coordinator.TaskWire.*;
 
 /** One coordinator thread/monitor, real worker protocol, no game or account in this process. */
 public final class HostService implements AutoCloseable {
-    public static final List<String> ACTIONS = List.of("Wait", "Travel", "DropItems", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies", "StashScan", "StashResupply");
+    public static final List<String> ACTIONS = List.of("Wait", "Travel", "DropItems", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies", "StashScan", "StashResupply", "StashDeposit");
     private final Path journal;
     private final Path directory;
     private final OperationsLibrary library;
@@ -35,7 +35,10 @@ public final class HostService implements AutoCloseable {
     private final Map<String, String> crews;
     private final Map<String, String> selectors = new ConcurrentHashMap<>();
     private final Map<UUID, JsonObject> tasks = new LinkedHashMap<>();
+    private final JsonObject publicReportReceipts = new JsonObject();
     private final Map<SwarmConnection, Peer> peers = new HashMap<>();
+    private final Map<UUID, PublicPeer> publicPeers = new LinkedHashMap<>();
+    private PublicWorkerGateway publicGateway;
     private final Map<UUID, Long> commands = new HashMap<>();
     private final Map<String, HighwayHost> highways = new LinkedHashMap<>();
     private final ScheduledExecutorService ticker = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("Monocle coordinator").factory());
@@ -62,9 +65,24 @@ public final class HostService implements AutoCloseable {
         Transfer transfer;
         final Set<UUID> transferred = new HashSet<>();
     }
+    private static final class PublicPeer {
+        final Set<String> capabilities;
+        final JsonObject implementation;
+        String name;
+        String crew = "Unassigned";
+        String scope = "";
+        double x, y, z;
+        boolean position, reconciled;
+        long observationAt;
+        long seen = System.currentTimeMillis();
+        PublicPeer(Set<String> capabilities, JsonObject implementation) {
+            this.capabilities = Set.copyOf(capabilities);
+            this.implementation = implementation == null ? null : implementation.deepCopy();
+        }
+    }
     private static final class Transfer {
-        final UUID run; final String data; int next;
-        Transfer(UUID run, String data) { this.run = run; this.data = data; }
+        final UUID run; final String data; final JsonObject state; int next;
+        Transfer(UUID run, String data, JsonObject state) { this.run = run; this.data = data; this.state = state; }
     }
 
     public HostService(Path directory, String bind, int port, Map<String, String> crews, int historyDays) throws IOException {
@@ -101,6 +119,19 @@ public final class HostService implements AutoCloseable {
             JsonObject saved = TaskFiles.read(journal);
             if (!saved.isEmpty()) {
                 if (integer(saved, "version", 1, 1) != 1 || !saved.has("tasks") || saved.getAsJsonObject("tasks").size() > 64) throw new IllegalArgumentException("Invalid host journal");
+                if(saved.has("publicReportReceipts")) {
+                    JsonObject receipts=saved.getAsJsonObject("publicReportReceipts");
+                    if(receipts.size()>256)throw new IllegalArgumentException("Too many public worker receipt owners");
+                    for(var worker:receipts.entrySet()){
+                        UUID.fromString(worker.getKey());JsonObject entries=worker.getValue().getAsJsonObject();
+                        if(entries.size()>128)throw new IllegalArgumentException("Too many public worker receipts");
+                        for(var receipt:entries.entrySet()){
+                            UUID.fromString(receipt.getKey());JsonObject record=receipt.getValue().getAsJsonObject();
+                            if(!PUBLIC_REPORTS.contains(text(record,"type")) || !text(record,"hash").matches("[a-f0-9]{64}"))throw new IllegalArgumentException("Invalid public worker receipt");
+                        }
+                        publicReportReceipts.add(worker.getKey(),entries.deepCopy());
+                    }
+                }
                 for (var entry : saved.getAsJsonObject("tasks").entrySet()) {
                     UUID id = UUID.fromString(entry.getKey()); JsonObject task = entry.getValue().getAsJsonObject();
                     validateTask(id, task);
@@ -121,6 +152,183 @@ public final class HostService implements AutoCloseable {
 
     public int port() { return listener.port(); }
     public int webPort() { return listener.webPort(); }
+    synchronized boolean publicExtensionRouting() { return publicGateway != null && !closed; }
+    synchronized void publicWorkerGateway(PublicWorkerGateway gateway) { publicGateway=gateway; }
+    synchronized void publicWorkerHello(UUID id, Set<String> capabilities, JsonObject implementation) {
+        if (closed || publicPeers.containsKey(id) || peers.entrySet().stream().anyMatch(entry -> entry.getKey().connected() && id.equals(entry.getValue().id)))
+            throw new IllegalArgumentException("Worker already connected");
+        PublicPeer peer=new PublicPeer(capabilities,implementation);
+        JsonObject saved=roster.get(id);
+        if(saved!=null && flag(saved,"publicProtocol") && crews.containsKey(text(saved,"crew")))peer.crew=text(saved,"crew");
+        publicPeers.put(id, peer);
+        logEvent("worker-connected", id.toString(), "", "public protocol");
+    }
+    synchronized void publicWorkerObservation(UUID id, JsonObject payload) {
+        PublicPeer peer = publicPeer(id);
+        java.time.Instant.parse(payload.get("observedAt").getAsString());
+        if(payload.has("name")) {
+            String name=text(payload,"name");
+            if(!name.matches("[A-Za-z0-9_]{1,16}"))throw new IllegalArgumentException("Invalid worker name");
+            peer.name=name;
+        }
+        JsonObject scope = payload.getAsJsonObject("scope");
+        String server = scope.get("server").getAsString(), dimension = scope.get("dimension").getAsString();
+        if (server.isBlank() || server.length() > 1024 || server.chars().anyMatch(Character::isISOControl)
+            || dimension.length()>128 || !dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) throw new IllegalArgumentException("Invalid observation scope");
+        if (payload.has("position")) {
+            JsonObject position = payload.getAsJsonObject("position");
+            double x = position.get("x").getAsDouble(), y = position.get("y").getAsDouble(), z = position.get("z").getAsDouble();
+            if (!Double.isFinite(x) || !Double.isFinite(y) || !Double.isFinite(z)) throw new IllegalArgumentException("Invalid position");
+            peer.x=x;peer.y=y;peer.z=z;peer.position=true;
+        } else peer.position=false;
+        peer.scope=server+"\n"+dimension;peer.seen=peer.observationAt=System.currentTimeMillis();
+    }
+    synchronized JsonObject publicWorkerReconcile(UUID id, JsonObject payload) {
+        PublicPeer peer = publicPeer(id);
+        if (payload.get("lastHostSequence").getAsBigDecimal().longValueExact()<0 || payload.get("lastWorkerSequence").getAsBigDecimal().longValueExact()<0)
+            throw new IllegalArgumentException("Invalid sequence");
+        JsonArray claimed=payload.getAsJsonArray("activeExecutions");
+        if (claimed==null || claimed.size()>16) throw new IllegalArgumentException("Invalid execution claims");
+        if (payload.has("unresolvedEffects") && !payload.getAsJsonArray("unresolvedEffects").isEmpty())
+            throw new IllegalArgumentException("Unresolved effects require an execution adapter");
+        for(JsonObject task:tasks.values()){
+            JsonObject run=task.getAsJsonObject("runs").getAsJsonObject(id.toString());
+            if(run!=null && flag(run,"publicProtocol") && !task.has("publicAction") && !flag(task,"cancelled") && text(task,"status").equals("Inspection required")
+                && text(task,"detail").startsWith("Host restarted;")){
+                task.addProperty("paused",false);task.addProperty("status","Queued");task.addProperty("detail","Portable action reconciled after host restart");
+            }
+        }
+        JsonArray decisions=new JsonArray();
+        Set<String> present=new HashSet<>();
+        for (JsonElement value:claimed) {
+            JsonObject claim=value.getAsJsonObject(), decision=new JsonObject();
+            decision.addProperty("jobId",UUID.fromString(claim.get("jobId").getAsString()).toString());
+            decision.addProperty("executionId",UUID.fromString(claim.get("executionId").getAsString()).toString());
+            long generation=claim.get("generation").getAsBigDecimal().longValueExact();
+            if (generation<1) throw new IllegalArgumentException("Invalid generation");
+            decision.addProperty("generation",generation);
+            JsonObject task=tasks.get(UUID.fromString(text(decision,"jobId")));
+            JsonObject run=task==null?null:task.getAsJsonObject("runs").getAsJsonObject(id.toString());
+            boolean known=run!=null && flag(run,"publicProtocol") && text(run,"id").equals(text(decision,"executionId"))
+                && run.get("generation").getAsLong()==generation && !QueuePolicy.terminal(text(run,"status"));
+            String capability=known?text(publicAction(task),"type"):"";
+            boolean ready=known && peer.capabilities.contains(capability)
+                && peer.scope.equals(text(task,"server")+"\n"+text(task,"dimension"))
+                && (!capability.equals("workers.travel.v1") || peer.position && System.currentTimeMillis()-peer.observationAt<5_000);
+            decision.addProperty("decision",!known?"inspect":flag(task,"cancelled")?"cancel":task.has("publicAction")
+                && text(task,"status").equals("Inspection required")?"inspect":!ready || flag(task,"paused")?"wait":"continue");
+            if(known)present.add(text(run,"id"));
+            decisions.add(decision);
+        }
+        for(JsonObject task:tasks.values()){
+            JsonObject run=task.getAsJsonObject("runs").getAsJsonObject(id.toString());
+            if(run==null || !flag(run,"publicProtocol") || QueuePolicy.terminal(text(run,"status")) || present.contains(text(run,"id")))continue;
+            if(flag(task,"cancelled")){run.addProperty("status","Cancelled");run.addProperty("detail","Worker confirms no active execution");}
+            else if(task.has("publicAction") && !text(run,"status").equals("Queued")) {
+                run.addProperty("status","Inspection required");run.addProperty("detail","Extension checkpoint missing; inspect effects before cancelling or recreating work");
+                task.addProperty("paused",true);task.addProperty("status","Inspection required");
+            } else if(!task.has("publicAction")) {
+                run.addProperty("status","Queued");run.addProperty("generation",Math.incrementExact(run.get("generation").getAsInt()));
+                run.addProperty("commandId",UUID.randomUUID().toString());run.addProperty("detail","Restarting portable action after missing checkpoint");
+            }
+        }
+        persist();
+        peer.reconciled=true;peer.seen=System.currentTimeMillis();
+        JsonObject response=new JsonObject();response.add("decisions",decisions);return response;
+    }
+    synchronized void publicWorkerDisconnected(UUID id) {
+        if (!publicPeers.containsKey(id)) return;
+        status(); // Retain even short-lived sessions that disconnected before the periodic roster checkpoint.
+        publicPeers.remove(id);checkpointRoster();
+        logEvent("worker-disconnected", id.toString(), "", "public protocol");
+    }
+    private PublicPeer publicPeer(UUID id) {
+        PublicPeer peer=publicPeers.get(id);if(peer==null)throw new IllegalArgumentException("Unknown public worker");return peer;
+    }
+    synchronized void publicWorkerProgress(UUID id, JsonObject payload) {
+        PublicPeer peer=publicPeer(id);
+        if(!peer.reconciled)throw new IllegalArgumentException("Reconcile before reporting progress");
+        UUID job=UUID.fromString(text(payload,"jobId")),execution=UUID.fromString(text(payload,"executionId"));
+        JsonObject task=tasks.get(job),run=task==null?null:task.getAsJsonObject("runs").getAsJsonObject(id.toString());
+        if(run==null || !flag(run,"publicProtocol") || !text(run,"id").equals(execution.toString())
+            || run.get("generation").getAsBigDecimal().longValueExact()!=payload.get("generation").getAsBigDecimal().longValueExact()
+            || !text(run,"status").equals("Running") || flag(task,"cancelled")
+            || !peer.scope.equals(text(task,"server")+"\n"+text(task,"dimension")))throw new IllegalArgumentException("Progress for inactive execution");
+        String detail=text(payload,"detail");
+        if(detail.isBlank() || detail.length()>240 || detail.chars().anyMatch(Character::isISOControl))throw new IllegalArgumentException("Invalid progress detail");
+        if(payload.has("remainingTicks")) {
+            if(!text(publicAction(task),"type").equals("workers.wait.v1")
+                || payload.get("remainingTicks").getAsBigDecimal().signum()<0
+                || payload.get("remainingTicks").getAsBigDecimal().compareTo(new java.math.BigDecimal(1_728_000))>0)
+                throw new IllegalArgumentException("Invalid Wait progress");
+        }
+        long now=System.currentTimeMillis();
+        if(run.has("progressAt") && now-run.get("progressAt").getAsLong()<1_000)return; // Replaceable telemetry, not a durable execution report.
+        peer.seen=now;run.addProperty("detail",detail);run.addProperty("progressAt",now);
+        if(payload.has("remainingTicks"))run.add("remainingTicks",payload.get("remainingTicks").deepCopy());
+    }
+    private static final Set<String> PUBLIC_REPORTS=Set.of("execution.accepted","execution.rejected","execution.started","execution.completed","execution.failed","execution.cancelled");
+    synchronized boolean publicWorkerReport(UUID id,UUID messageId,String type,JsonObject payload) {
+        if(!PUBLIC_REPORTS.contains(type))throw new IllegalArgumentException("Unsupported public execution report");
+        JsonObject receipts=publicReportReceipts.has(id.toString())?publicReportReceipts.getAsJsonObject(id.toString()):new JsonObject();
+        String hash;
+        try { hash=TaskFiles.hash(type+"\n"+canonical(payload).toString()); }
+        catch(StackOverflowError nested){throw new IllegalArgumentException("Execution report is too deeply nested",nested);}
+        JsonObject prior=receipts.has(messageId.toString())?receipts.getAsJsonObject(messageId.toString()):null;
+        if(prior!=null){
+            if(!type.equals(text(prior,"type")) || !hash.equals(text(prior,"hash")))throw new IllegalArgumentException("Message ID reused with different report");
+            return true;
+        }
+        PublicPeer peer=publicPeer(id);
+        if(!peer.reconciled)throw new IllegalArgumentException("Reconcile before reporting execution");
+        UUID job=UUID.fromString(text(payload,"jobId")),execution=UUID.fromString(text(payload,"executionId"));
+        JsonObject task=tasks.get(job),run=task==null?null:task.getAsJsonObject("runs").getAsJsonObject(id.toString());
+        if(run==null || !flag(run,"publicProtocol") || !text(run,"id").equals(execution.toString())
+            || run.get("generation").getAsBigDecimal().longValueExact()!=payload.get("generation").getAsBigDecimal().longValueExact())
+            throw new IllegalArgumentException("Unknown or stale execution");
+        String previous=text(run,"status"),next=switch(type){
+            case "execution.accepted" -> {if(!previous.equals("Sending") || !text(run,"commandId").equals(text(payload,"commandId")))throw new IllegalArgumentException("Unexpected assignment acknowledgement");yield "Ready";}
+            case "execution.rejected" -> {if(!previous.equals("Sending") || !text(run,"commandId").equals(text(payload,"commandId")))throw new IllegalArgumentException("Unexpected assignment rejection");yield "Failed";}
+            case "execution.started" -> {if(!previous.equals("Ready") || flag(task,"cancelled")
+                || !peer.scope.equals(text(task,"server")+"\n"+text(task,"dimension"))
+                || text(publicAction(task),"type").equals("workers.travel.v1") && (!peer.position || System.currentTimeMillis()-peer.observationAt>5_000))
+                throw new IllegalArgumentException("Unexpected execution start");yield "Running";}
+            case "execution.completed" -> {if(!previous.equals("Running") || flag(task,"cancelled") || task.has("publicAction") && flag(task,"paused"))throw new IllegalArgumentException("Unexpected completion");
+                if(publicAction(task).get("type").getAsString().equals("workers.travel.v1") && !arrived(peer,task))throw new IllegalArgumentException("Travel has no fresh destination observation");
+                yield "Complete";}
+            case "execution.failed" -> {if(!Set.of("Ready","Running").contains(previous))throw new IllegalArgumentException("Unexpected failure");yield "Failed";}
+            case "execution.cancelled" -> {if(!flag(task,"cancelled") || !Set.of("Sending","Ready","Running").contains(previous)
+                || !Set.of("acknowledged","inspection_required").contains(text(payload,"cleanup")))throw new IllegalArgumentException("Unexpected cancellation");
+                yield "Cancelled";}
+            default -> throw new IllegalArgumentException("Unsupported public execution report");
+        };
+        if(type.equals("execution.rejected") || type.equals("execution.failed")){
+            String code=text(payload,"code");if(!code.matches("[a-z][a-z0-9_]{0,63}"))throw new IllegalArgumentException("Invalid failure code");run.addProperty("detail",code);
+        }
+        if(type.equals("execution.cancelled") && text(payload,"cleanup").equals("inspection_required"))
+            run.addProperty("detail","Public action cancellation reported for inspection; verify unresolved effects");
+        if(type.equals("execution.completed") && task.has("publicAction"))
+            run.addProperty("detail","Worker-reported extension result; not independently game-verified");
+        run.addProperty("status",next);task.addProperty("status",QueuePolicy.summarizedStatus(task));peer.seen=System.currentTimeMillis();
+        JsonObject receipt=new JsonObject();receipt.addProperty("type",type);receipt.addProperty("hash",hash);
+        receipts.add(messageId.toString(),receipt);
+        while(receipts.size()>128)receipts.remove(receipts.keySet().iterator().next());
+        if(!publicReportReceipts.has(id.toString()) && publicReportReceipts.size()>=256)
+            publicReportReceipts.remove(publicReportReceipts.keySet().iterator().next());
+        publicReportReceipts.add(id.toString(),receipts);persist();
+        logEvent("worker-state",id.toString(),execution.toString(),"task="+job+" "+previous+" -> "+next);
+        return false;
+    }
+    private static JsonElement canonical(JsonElement value) {
+        if(value.isJsonObject()){
+            JsonObject sorted=new JsonObject();value.getAsJsonObject().keySet().stream().sorted()
+                .forEach(key->sorted.add(key,canonical(value.getAsJsonObject().get(key))));return sorted;
+        }
+        if(value.isJsonArray()){
+            JsonArray sorted=new JsonArray();value.getAsJsonArray().forEach(item->sorted.add(canonical(item)));return sorted;
+        }
+        return value.deepCopy();
+    }
     OperatorOperations operatorOperations() { return operatorOperations; }
     synchronized void operatorReceipt(String commandId, String state) { logEvent("operator-command", "", commandId, state); }
     synchronized JsonObject operatorEvents(String after, int limit) {
@@ -152,15 +360,19 @@ public final class HostService implements AutoCloseable {
     }
     private void persist() {
         JsonObject root = new JsonObject(), records = new JsonObject(); root.addProperty("version", 1);
-        tasks.forEach((id, task) -> records.add(id.toString(), task)); root.add("tasks", records); TaskFiles.write(journal, root);
+        tasks.forEach((id, task) -> records.add(id.toString(), task)); root.add("tasks", records);
+        root.add("publicReportReceipts",publicReportReceipts);TaskFiles.write(journal, root);
     }
     // ponytail: one coordinator monitor; shard by crew only if measured controller load warrants it.
     private synchronized void tick() {
         if (closed || !failure.isEmpty()) return;
         try {
+            for (var entry : List.copyOf(peers.entrySet())) if (!entry.getKey().connected()) {
+                Peer departed = peers.remove(entry.getKey());
+                if (departed != null) logEvent("worker-disconnected", departed.id.toString(), "", departed.crew);
+            }
             for (SwarmConnection c : listener.connections()) {
-                if (c == null) continue;
-                if (!c.connected()) { peers.remove(c); continue; }
+                if (c == null || !c.connected()) continue;
                 for (int i = 0; i < 32; i++) {
                     String wire = c.poll(); if (wire == null) break;
                     try { receive(c, JsonParser.parseString(wire).getAsJsonObject()); }
@@ -170,6 +382,7 @@ public final class HostService implements AutoCloseable {
                         Peer rejected = peers.get(c);
                         if (rejected != null) logEvent("worker-message-rejected", rejected.id.toString(), "", e.getClass().getSimpleName());
                         c.disconnect(); peers.remove(c);
+                        if(rejected!=null)logEvent("worker-disconnected",rejected.id.toString(),"",rejected.crew);
                         lastConnectionError = "Rejected worker message: " + e.getClass().getSimpleName() + (e.getMessage() == null ? "" : " · " + e.getMessage());
                         if (lastConnectionError.length() > 1024) lastConnectionError = lastConnectionError.substring(0, 1024);
                         System.err.println(lastConnectionError); break;
@@ -186,6 +399,7 @@ public final class HostService implements AutoCloseable {
                 heartbeatAt = now;
             }
             tickAutoTpy();
+            schedulePublic();
             for (var entry : List.copyOf(peers.entrySet())) {
                 SwarmConnection c = entry.getKey(); Peer peer = entry.getValue();
                 if (!c.connected() || !peer.reconciled || now - peer.seen >= 5_000_000_000L) continue;
@@ -231,6 +445,7 @@ public final class HostService implements AutoCloseable {
             Peer peer = peers.get(c);
             if (peer != null && !peer.id.equals(observation.id())) throw new IllegalArgumentException("Player identity changed");
             if (peers.entrySet().stream().anyMatch(e -> e.getKey() != c && e.getKey().connected() && e.getValue().id.equals(observation.id()))) throw new IllegalArgumentException("Duplicate live worker identity");
+            if (publicPeers.containsKey(observation.id())) throw new IllegalArgumentException("Worker identity is registered on the public endpoint");
             if (peer == null) { peer = new Peer(); peer.id = observation.id(); peer.crew = selectors.get(c.credentialId()); peers.put(c, peer); }
             if (peer.crew == null) throw new IllegalArgumentException("Unknown authenticated crew");
             HighwayHost highway = highways.get(peer.crew);
@@ -258,7 +473,8 @@ public final class HostService implements AutoCloseable {
                 update(peer, report, false);
             }
             peer.current = current;
-            for (JsonObject task : tasks.values()) if (task.getAsJsonObject("runs").has(peer.id.toString()) && text(task, "crew").equals(peer.crew)) {
+            for (JsonObject task : tasks.values()) if (task.getAsJsonObject("runs").has(peer.id.toString()) && text(task, "crew").equals(peer.crew)
+                && !flag(run(task,peer.id),"publicProtocol")) {
                 JsonObject run = run(task, peer.id); UUID id = UUID.fromString(text(run, "id"));
                 if (!present.contains(id.toString()) && (peer.transfer == null || !peer.transfer.run.equals(id)) && !peer.transferred.contains(id)) QueuePolicy.reconcileMissingRun(task, run);
             }
@@ -271,8 +487,9 @@ public final class HostService implements AutoCloseable {
         else if(type.equals("task-stash-findings")) {
             JsonObject task=tasks.get(UUID.fromString(text(message,"task")));
             if(task==null||!task.getAsJsonObject("runs").has(peer.id.toString()))throw new IllegalArgumentException("Unknown stash task");
-            JsonObject ack=StashCatalog.accept(directory,task,run(task,peer.id),peer.id.toString(),peer.crew,message);
-            if(ack!=null){persist();c.send(ack.toString());logEvent("stash-container-observed",peer.id.toString(),text(task,"id"),text(message.getAsJsonObject("observation"),"status"));}
+            JsonObject finding=message.deepCopy();if(message.has("observation")||message.has("observationGzip"))finding.add("observation",StashCatalog.readObservation(message));finding.remove("observationGzip");
+            JsonObject ack=StashCatalog.accept(directory,task,run(task,peer.id),peer.id.toString(),peer.crew,finding);
+            if(ack!=null){persist();c.send(ack.toString());logEvent("stash-container-observed",peer.id.toString(),text(task,"id"),finding.has("observation")?text(finding.getAsJsonObject("observation"),"status")+(flag(ack,"deposit")&&!flag(ack,"permit")?" · destination column changed":""):"Destination column reservation");}
         }
         else if(type.equals("task-stash-definition")) {
             String scope=text(message,"scope");if(scope.length()>384||!scope.contains("\n")||peer.observation==null||!scope.equals(peer.observation.scope()))throw new IllegalArgumentException("Stash definition must match the worker's current world");
@@ -281,7 +498,7 @@ public final class HostService implements AutoCloseable {
         }
         else if(type.equals("task-stash-import")) {
             String scope=text(message,"scope");if(scope.length()>384||!scope.contains("\n")||peer.observation==null||!scope.equals(peer.observation.scope()))throw new IllegalArgumentException("Stash import must match the worker's current world");
-            JsonObject saved=StashCatalog.save(directory,peer.crew,scope,message.getAsJsonObject("stash"),message.getAsJsonObject("observation"));persist();
+            JsonObject saved=StashCatalog.save(directory,peer.crew,scope,message.getAsJsonObject("stash"),StashCatalog.readObservation(message));persist();
             logEvent("stash-container-imported",peer.id.toString(),"",text(saved,"name"));
         }
         else if(type.equals("worker-tpa-request")) requestAutoTpy(peer,message);
@@ -349,7 +566,7 @@ public final class HostService implements AutoCloseable {
 
     private boolean bodyguardRequest(Peer requester,JsonObject message) {
         if(!flag(message,"bodyguard")||!message.has("targetId"))return false;UUID target=UUID.fromString(text(message,"targetId"));
-        return tasks.values().stream().anyMatch(t->!QueuePolicy.terminal(text(t,"status"))&&requester.crew.equals(text(t,"crew"))&&text(t.getAsJsonObject("package"),"entry").equals("task-bodyguard")
+        return tasks.values().stream().anyMatch(t->!QueuePolicy.terminal(text(t,"status"))&&requester.crew.equals(text(t,"crew"))&&t.has("package")&&Set.of("task-bodyguard","task-crystal-guard").contains(text(t.getAsJsonObject("package"),"entry"))
             &&t.getAsJsonObject("runs").has(requester.id.toString())&&text(t.getAsJsonObject("args"),"target").equals(target.toString()));
     }
 
@@ -370,16 +587,16 @@ public final class HostService implements AutoCloseable {
             if(target.getKey().send(accept.toString())){autoTpyRequests.remove(entry.getKey());logEvent("worker-auto-tpy",request.target().toString(),"",request.requesterName());}
         }
     }
-    private void sendStashCatalog(SwarmConnection c,Peer peer){if(!peer.stashCatalogSupported)return;JsonObject m=TaskWire.message("stash-catalog");JsonArray list=new JsonArray();for(JsonElement value:StashCatalog.list(directory)){JsonObject s=value.getAsJsonObject();if(text(s,"crew").equals(peer.crew))list.add(s.deepCopy());if(list.size()==64)break;}m.add("stashes",list);c.send(m.toString());}
+    private void sendStashCatalog(SwarmConnection c,Peer peer){if(!peer.stashCatalogSupported)return;JsonObject m=TaskWire.message("stash-catalog");JsonArray list=new JsonArray();for(JsonElement value:StashCatalog.list(directory)){JsonObject s=value.getAsJsonObject();if(!text(s,"crew").equals(peer.crew))continue;JsonObject compact=StashCatalog.wireSummary(s);if(m.toString().length()+list.toString().length()+compact.toString().length()>14_000)break;list.add(compact);if(list.size()==64)break;}m.add("stashes",list);c.send(m.toString());}
     private void update(Peer peer, JsonObject message, boolean full) {
         UUID.fromString(text(message, "run"));
         for (JsonObject task : tasks.values()) if (task.getAsJsonObject("runs").has(peer.id.toString())) {
-            JsonObject run = run(task, peer.id); if (!text(run, "id").equals(text(message, "run"))) continue;
+            JsonObject run = run(task, peer.id); if (flag(run,"publicProtocol") || !text(run, "id").equals(text(message, "run"))) continue;
             if (!text(task, "crew").equals(peer.crew)) throw new IllegalArgumentException("Report belongs to another crew");
             if(full && message.has("action")) {
                 JsonObject action=message.getAsJsonObject("action");String type=text(action,"type");
                 if(!ACTIONS.contains(type))throw new IllegalArgumentException("Unsupported native action");
-                if(type.equals("StashScan"))StashCatalog.plan(action);
+                if(type.equals("StashScan")||type.equals("StashDeposit"))StashCatalog.plan(action);
                 if(type.equals("Highway")) {
                     JsonObject packaged=task.getAsJsonObject("package");
                     if(!packaged.has("geometry") || !packaged.getAsJsonObject("highways").has(text(action,"workflow"))) throw new IllegalArgumentException("Unknown Highway preset");
@@ -387,7 +604,8 @@ public final class HostService implements AutoCloseable {
                     for(String axis:List.of("x","y","z"))if(action.has(axis))integer(action,axis,axis.equals("y")?-2048:-29_900_000,axis.equals("y")?2048:29_900_000);
                 }
             }
-            if(full&&message.has("stashWithdrawal")&&!text(run,"stashWithdrawalToken").equals(text(message,"token"))){JsonObject receipt=message.getAsJsonObject("stashWithdrawal");StashCatalog.invalidateWithdrawn(directory,peer.crew,text(task,"server")+"\n"+text(task,"dimension"),text(receipt,"stash"),receipt.getAsJsonArray("withdrawn"));run.addProperty("stashWithdrawalToken",text(message,"token"));}
+            if(full&&message.has("stashWithdrawal")&&!text(run,"stashWithdrawalToken").equals(text(message,"token"))){JsonObject receipt=message.getAsJsonObject("stashWithdrawal");String catalogCrew=text(receipt,"catalogCrew");if(catalogCrew.isEmpty())catalogCrew=peer.crew;if(!catalogCrew.equals(peer.crew))throw new IllegalArgumentException("Withdrawal belongs to another crew");StashCatalog.invalidateWithdrawn(directory,catalogCrew,text(task,"server")+"\n"+text(task,"dimension"),text(receipt,"stash"),receipt.getAsJsonArray("withdrawn"));run.addProperty("stashWithdrawalToken",text(message,"token"));}
+            if(full)StashCatalog.depositReceipt(directory,peer.crew,text(task,"server")+"\n"+text(task,"dimension"),run,message);
             String previousStatus = text(run, "status"), previousDetail = text(run, "detail");
             HighwayHost highway = highways.get(text(task, "crew"));
             boolean isolateInspection = task.has("nativeDefinition") && highway != null && ownsHighway(task, highway) && highway.independentSupplies();
@@ -405,8 +623,86 @@ public final class HostService implements AutoCloseable {
         // Unknown saved executions are not adopted or replayed. Their current ID still blocks new work.
     }
 
+    private void schedulePublic() {
+        if(publicGateway==null)return;
+        long now=System.currentTimeMillis();
+        for(var entry:publicPeers.entrySet()){
+            UUID id=entry.getKey();PublicPeer peer=entry.getValue();if(!peer.reconciled)continue;
+            for(JsonObject task:tasks.values()){
+                JsonObject run=task.getAsJsonObject("runs").getAsJsonObject(id.toString());
+                if(run==null || !flag(run,"publicProtocol") || !flag(task,"cancelled") || QueuePolicy.terminal(text(run,"status")))continue;
+                if(text(run,"status").equals("Queued")){run.addProperty("status","Cancelled");persist();continue;}
+                if(!Set.of("Sending","Ready","Running").contains(text(run,"status")))continue;
+                if(run.has("cancelSentAt") && now-run.get("cancelSentAt").getAsLong()<1000)continue;
+                if(!run.has("cancelCommandId")){run.addProperty("cancelCommandId",UUID.randomUUID().toString());persist();}
+                JsonObject cancel=publicReference(task,run);cancel.addProperty("commandId",text(run,"cancelCommandId"));
+                if(publicGateway.sendTo(id,"execution.cancel",cancel)){run.addProperty("cancelSentAt",now);persist();}
+            }
+            if(!crews.containsKey(peer.crew) || peer.scope.isEmpty() || now-peer.observationAt>30_000)continue;
+            JsonObject task=QueuePolicy.choose(tasks.values().stream().filter(t->text(t,"crew").equals(peer.crew)
+                && t.getAsJsonObject("runs").has(id.toString()) && flag(run(t,id),"publicProtocol")).toList(),id);
+            if(task==null)continue;
+            JsonObject run=run(task,id);if(!Set.of("Queued","Sending").contains(text(run,"status")))continue;
+            JsonObject action=publicAction(task);
+            if(!peer.capabilities.contains(text(action,"type")) || text(action,"type").equals("workers.travel.v1")
+                && (!peer.position || now-peer.observationAt>5_000))continue;
+            if(!peer.scope.equals(text(task,"server")+"\n"+text(task,"dimension")))continue;
+            if(text(run,"status").equals("Sending") && run.has("assignmentSentAt") && now-run.get("assignmentSentAt").getAsLong()<1000)continue;
+            if(text(run,"status").equals("Queued")){run.addProperty("status","Sending");persist();}
+            JsonObject assign=publicReference(task,run),scope=new JsonObject();
+            scope.addProperty("server",text(task,"server"));scope.addProperty("dimension",text(task,"dimension"));
+            assign.add("scope",scope);assign.add("action",action);assign.addProperty("commandId",text(run,"commandId"));
+            if(publicGateway.sendTo(id,"execution.assign",assign)){run.addProperty("assignmentSentAt",now);persist();}
+        }
+    }
+    private JsonObject publicAction(JsonObject task) {
+        if(task.has("publicAction"))return checkedExtensionAction(task.getAsJsonObject("publicAction"));
+        return publicAction(task.getAsJsonObject("package"),task.getAsJsonObject("args"),text(task,"server"),text(task,"dimension"));
+    }
+    private static JsonObject checkedExtensionAction(JsonObject action) {
+        if(action==null || !action.has("type") || !action.get("type").isJsonPrimitive()
+            || !action.getAsJsonPrimitive("type").isString() || !action.has("arguments") || !action.get("arguments").isJsonObject())
+            throw new IllegalArgumentException("Extension action needs a type and arguments object");
+        String type=action.get("type").getAsString();
+        if(type.length()>128 || type.startsWith("workers.")
+            || !type.matches("[a-z][a-z0-9.-]*\\.[a-z][a-z0-9-]*\\.v[1-9][0-9]*"))
+            throw new IllegalArgumentException("Use a versioned owner namespace for extension actions");
+        TaskFiles.jsonBytes(action,8_192);
+        return action.deepCopy();
+    }
+    private JsonObject publicAction(JsonObject packaged,JsonObject args,String server,String dimension) {
+        String type;JsonObject arguments=new JsonObject();
+        if(packaged.equals(library.get("task-wait").getAsJsonObject("package"))){
+            type="workers.wait.v1";arguments.addProperty("ticks",integer(args,"ticks",0,1_728_000));
+        } else if(packaged.equals(library.get("task-travel").getAsJsonObject("package"))){
+            type="workers.travel.v1";
+            JsonObject scope=new JsonObject();scope.addProperty("server",server);scope.addProperty("dimension",dimension);arguments.add("scope",scope);
+            arguments.addProperty("x",coordinate(args,"x",-29_999_984,29_999_984));
+            arguments.addProperty("y",coordinate(args,"y",-2048,2048));
+            arguments.addProperty("z",coordinate(args,"z",-29_999_984,29_999_984));
+            arguments.addProperty("radius",args.has("radius")?coordinate(args,"radius",.15,8):2);
+        } else throw new IllegalArgumentException("Public workers currently support built-in Wait and Travel only");
+        JsonObject action=new JsonObject();action.addProperty("type",type);action.add("arguments",arguments);return action;
+    }
+    private static double coordinate(JsonObject args,String key,double min,double max) {
+        JsonElement value=args.get(key);
+        if(value==null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())throw new IllegalArgumentException("Missing coordinate "+key);
+        double number=value.getAsDouble();
+        if(!Double.isFinite(number) || number<min || number>max)throw new IllegalArgumentException("Invalid coordinate "+key);
+        return number;
+    }
+    private static boolean arrived(PublicPeer peer,JsonObject task) {
+        if(!peer.position || System.currentTimeMillis()-peer.observationAt>5_000 || !peer.scope.equals(text(task,"server")+"\n"+text(task,"dimension")))return false;
+        JsonObject target=task.getAsJsonObject("args");double radius=target.has("radius")?target.get("radius").getAsDouble():2;
+        return Math.hypot(Math.hypot(peer.x-target.get("x").getAsDouble(),peer.y-target.get("y").getAsDouble()),peer.z-target.get("z").getAsDouble())<=radius;
+    }
+    private static JsonObject publicReference(JsonObject task,JsonObject run){
+        JsonObject ref=new JsonObject();ref.addProperty("jobId",text(task,"id"));ref.addProperty("executionId",text(run,"id"));
+        ref.addProperty("generation",run.get("generation").getAsInt());return ref;
+    }
     private void schedule(SwarmConnection c, Peer peer) {
-        List<JsonObject> eligible = tasks.values().stream().filter(task -> text(task, "crew").equals(peer.crew)).toList();
+        List<JsonObject> eligible = tasks.values().stream().filter(task -> text(task, "crew").equals(peer.crew)
+            && (!task.getAsJsonObject("runs").has(peer.id.toString()) || !flag(run(task,peer.id),"publicProtocol"))).toList();
         for (JsonObject task : eligible) if (flag(task, "cancelled") && task.getAsJsonObject("runs").has(peer.id.toString())) {
             JsonObject run = run(task, peer.id);
             if (QueuePolicy.terminal(text(run, "status"))) continue;
@@ -461,6 +757,13 @@ public final class HostService implements AutoCloseable {
     private void dispatchTpa(SwarmConnection connection, Peer requester, JsonObject task, JsonObject run) {
         JsonObject action = run.getAsJsonObject("action");
         if (action == null || !text(action, "type").equals("Tpa")) return;
+        if(flag(action,"external")){
+            if(flag(run,"commandSent"))return; // The recipient, not this host, decides whether to accept.
+            String name=text(action,"targetName");if(!name.matches("[A-Za-z0-9_]{1,16}"))throw new IllegalArgumentException("Invalid external TPA username");
+            JsonObject command=TaskWire.message("task-tpa-send");command.addProperty("run",text(run,"id"));command.addProperty("token",text(run,"token"));command.addProperty("name",name);
+            command.addProperty("target",UUID.fromString(text(action,"target")).toString());command.addProperty("dimension",requester.observation.scope().substring(requester.observation.scope().indexOf('\n')+1));
+            if(connection.send(command.toString())){run.addProperty("commandSent",true);run.addProperty("tpaSentAt",System.currentTimeMillis());persist();}return;
+        }
         String selector = text(action, "target");
         Peer target = null;
         long now = System.nanoTime();
@@ -493,17 +796,39 @@ public final class HostService implements AutoCloseable {
         UUID id = UUID.fromString(text(run, "id"));
         if (peer.transfer != null || peer.transferred.contains(id)) return;
         JsonObject envelope = TaskWire.envelope(task, peer.id);
-        JsonObject metadata=envelope.getAsJsonObject("dispatch"),args=metadata.getAsJsonObject("args");if(args.has("needs")&&args.has("primary"))metadata.add("args",StashCatalog.refillAction(directory,peer.crew,text(task,"server")+"\n"+text(task,"dimension"),args,peer.id.toString()));else if(args.has("name")&&args.has("minX"))metadata.add("args",StashCatalog.route(directory,peer.crew,text(task,"server")+"\n"+text(task,"dimension"),args,peer.id.toString()));
+        JsonObject metadata=envelope.getAsJsonObject("dispatch"),args=metadata.getAsJsonObject("args");
+        String scope=text(task,"server")+"\n"+text(task,"dimension");
+        if(Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(text(envelope,"entry"))){
+            JsonObject kit=args.deepCopy();if(text(envelope,"entry").equals("task-kit-remove-incomplete"))kit.addProperty("incomplete",true);
+            metadata.add("args",StashCatalog.kitAction(directory,peer.crew,scope,kit,peer.id.toString()));
+        }
+        else if(args.has("needs")&&args.has("primary"))metadata.add("args",StashCatalog.refillAction(directory,peer.crew,scope,args,peer.id.toString()));
+        else if(args.has("name")&&args.has("minX")){
+            if(text(envelope,"entry").equals("task-stash-scan")){
+                long now=System.nanoTime();
+                List<PlayerObservation> participants=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().reconciled&&e.getValue().observation!=null&&task.getAsJsonObject("runs").has(e.getValue().id.toString())).map(e->e.getValue().observation).toList();
+                metadata.add("args",StashCatalog.scanRoute(directory,peer.crew,scope,args,peer.id.toString(),participants,now));
+            }else metadata.add("args",StashCatalog.route(directory,peer.crew,scope,args,peer.id.toString()));
+        }
         String data = Base64.getEncoder().encodeToString(TaskFiles.jsonBytes(envelope, TaskFiles.MAX_PACKAGE));
         run.addProperty("status", "Sending"); run.addProperty("detail", "Sending immutable workflow and profiles"); persist();
-        if (c.send(TaskWire.begin(id, data).toString())) peer.transfer = new Transfer(id, data);
+        if (c.send(TaskWire.begin(id, data).toString())) {
+            peer.transfer = new Transfer(id, data, run);
+            logEvent("worker-transfer-begin", peer.id.toString(), id.toString(), "Queued begin; " + data.length() + " encoded bytes in " + ((data.length() + TaskFiles.CHUNK - 1) / TaskFiles.CHUNK) + " chunks");
+        } else logEvent("worker-transfer-send-failed", peer.id.toString(), id.toString(), c.failure());
     }
     private void flush(SwarmConnection c, Peer peer) {
         Transfer transfer = peer.transfer; if (transfer == null) return;
         int count = (transfer.data.length() + TaskFiles.CHUNK - 1) / TaskFiles.CHUNK;
         for (int sent = 0; sent < 4 && transfer.next < count; sent++, transfer.next++)
-            if (!c.send(TaskWire.chunk(transfer.run, transfer.data, transfer.next).toString())) return;
-        if (transfer.next == count) { peer.transferred.add(transfer.run); peer.transfer = null; }
+            if (!c.send(TaskWire.chunk(transfer.run, transfer.data, transfer.next).toString())) {
+                logEvent("worker-transfer-send-failed", peer.id.toString(), transfer.run.toString(), "Chunk " + transfer.next + "/" + count + ": " + c.failure()); return;
+            }
+        if (transfer.next == count) {
+            transfer.state.addProperty("detail", "Package frames queued; awaiting worker install report"); persist();
+            logEvent("worker-transfer-queued", peer.id.toString(), transfer.run.toString(), count + " chunks queued; awaiting worker install report");
+            peer.transferred.add(transfer.run); peer.transfer = null;
+        }
     }
     private void command(SwarmConnection c, JsonObject run, String command) {
         UUID id = UUID.fromString(text(run, "id")); long now = System.nanoTime(); Long previous = commands.get(id);
@@ -697,7 +1022,7 @@ public final class HostService implements AutoCloseable {
         }
         if (op.equals("worker-forget")) {
             UUID worker=UUID.fromString(text(request,"worker"));
-            if(peers.entrySet().stream().anyMatch(e->e.getKey().connected()&&e.getValue().id.equals(worker)))
+            if(publicPeers.containsKey(worker) || peers.entrySet().stream().anyMatch(e->e.getKey().connected()&&e.getValue().id.equals(worker)))
                 throw new IllegalStateException("Disconnect the worker before removing it from the roster");
             if(tasks.values().stream().anyMatch(task->workerJobPending(task,worker)) || highways.values().stream().anyMatch(highway->{
                 JsonObject recovery=highway.recoveryRecord();
@@ -732,8 +1057,12 @@ public final class HostService implements AutoCloseable {
         }
         UUID id = UUID.fromString(text(request, "id")); JsonObject task = tasks.get(id);
         if (task == null) throw new IllegalArgumentException("Unknown task");
-        if (op.equals("task-configuration")) return dev.monocle.coordinator.TaskConfiguration.inspect(task);
+        if (op.equals("task-configuration")) {
+            if(task.has("publicAction"))throw new IllegalArgumentException("Public extension actions do not have Monocle configuration");
+            return dev.monocle.coordinator.TaskConfiguration.inspect(task);
+        }
         if (op.equals("configuration-read") || op.equals("configuration-read-result")) {
+            if(task.has("publicAction"))throw new IllegalArgumentException("Public extension actions do not have Monocle configuration");
             UUID worker = UUID.fromString(text(request,"worker"));
             if (!task.getAsJsonObject("runs").has(worker.toString())) throw new IllegalArgumentException("Worker is not assigned to this job");
             if (op.equals("configuration-read")) {
@@ -762,12 +1091,16 @@ public final class HostService implements AutoCloseable {
                     if(!request.has("enabled")||!request.get("enabled").isJsonPrimitive()||!request.getAsJsonPrimitive("enabled").isBoolean())throw new IllegalArgumentException("enabled must be true or false");
                     task.addProperty("publicJoin",request.get("enabled").getAsBoolean());
                 }
-                case "configure" -> TaskWire.configure(task, request.has("worker") ? UUID.fromString(text(request, "worker")) : null, request.getAsJsonObject("modules"));
+                case "configure" -> {
+                    if(task.has("publicAction"))throw new IllegalArgumentException("Public extension actions do not have Monocle configuration");
+                    TaskWire.configure(task, request.has("worker") ? UUID.fromString(text(request, "worker")) : null, request.getAsJsonObject("modules"));
+                }
                 case "detach" -> {
+                    if(task.has("publicAction"))throw new IllegalArgumentException("Public extension actions cannot detach workers");
                     UUID worker=UUID.fromString(text(request,"worker"));
                     if(!task.getAsJsonObject("runs").has(worker.toString()))throw new IllegalArgumentException("Worker is not assigned to this job");
                     if(!request.has("detached")||!request.get("detached").isJsonPrimitive()||!request.getAsJsonPrimitive("detached").isBoolean())throw new IllegalArgumentException("Specify detached true or false");
-                    if(!task.getAsJsonObject("package").getAsJsonObject("highways").isEmpty()) {
+                    if(task.has("package") && !task.getAsJsonObject("package").getAsJsonObject("highways").isEmpty()) {
                         HighwayHost highway=highways.get(text(task,"crew"));
                         if(!task.has("nativeDefinition")||!ownsHighway(task,highway)||!highway.independentSupplies())throw new IllegalStateException("Wait for the independent highway to start, or pause the whole job");
                         if(request.get("detached").getAsBoolean()&&!QueuePolicy.detached(task,worker)&&!highway.reservedReturns().contains(worker)) {
@@ -776,7 +1109,12 @@ public final class HostService implements AutoCloseable {
                     }
                     QueuePolicy.detach(task,worker,request.get("detached").getAsBoolean());
                 }
-                case "pause" -> QueuePolicy.pause(task);
+                case "pause" -> {
+                    if(task.getAsJsonObject("runs").asMap().values().stream().anyMatch(v->flag(v.getAsJsonObject(),"publicProtocol")
+                        && Set.of("Sending","Ready","Running").contains(text(v.getAsJsonObject(),"status"))))
+                        throw new IllegalStateException("Active public Wait cannot pause; cancel it instead");
+                    QueuePolicy.pause(task);
+                }
                 case "resume" -> {
                     HighwayHost highway=highways.get(text(task,"crew"));
                     if(ownsHighway(task,highway) && !highway.assigned() && highway.recoveryRecord()!=null)
@@ -833,13 +1171,19 @@ public final class HostService implements AutoCloseable {
             if(crews.size()==1)throw new IllegalArgumentException("Keep at least one crew");
             HighwayHost highway=highways.get(id);
             if(highway.assigned() || highway.recoveryRecord()!=null || highway.pendingEndCount()>0 || tasks.values().stream().anyMatch(t->text(t,"crew").equals(text(request,"crew")))
-                || peers.entrySet().stream().anyMatch(e->e.getKey().connected() && e.getValue().crew.equals(text(request,"crew"))))
+                || peers.entrySet().stream().anyMatch(e->e.getKey().connected() && e.getValue().crew.equals(text(request,"crew")))
+                || publicPeers.values().stream().anyMatch(p->p.crew.equals(text(request,"crew"))))
                 throw new IllegalStateException("Move its workers and delete finished job history before deleting this crew; active jobs and recovery cannot be orphaned");
             Map<String,String> changed=new LinkedHashMap<>(crews);changed.remove(id);Map<String,String> labels=new LinkedHashMap<>(crewLabels);labels.remove(id);saveCrews(changed,labels);
             selectors.remove(SwarmConnection.credentialSelector(crews.remove(id)));crewLabels.remove(id);highways.remove(id);return status();
         }
         if(op.equals("crew-move")) {
             UUID worker=UUID.fromString(text(request,"worker"));
+            PublicPeer external=publicPeers.get(worker);
+            if(external!=null){
+                if(tasks.values().stream().anyMatch(t->workerJobPending(t,worker)))throw new IllegalStateException("Finish or cancel public worker jobs before moving crews");
+                external.crew=id;checkpointRoster();return status();
+            }
             var source=peers.entrySet().stream().filter(e->e.getKey().connected() && e.getValue().id.equals(worker)).findFirst().orElseThrow(()->new IllegalArgumentException("Worker is offline"));
             if(source.getValue().crew.equals(id))return status();
             JsonObject destination=activeHighwayTask(id,null);moveWorker(source.getKey(),source.getValue(),id,destination==null?null:UUID.fromString(text(destination,"id")));return status();
@@ -902,13 +1246,17 @@ public final class HostService implements AutoCloseable {
         }
         String crew = text(request, "crew"); if (!crews.containsKey(crew)) throw new IllegalArgumentException("Unknown crew");
         String name = WorkflowPackages.label(text(request, "name")), server = text(request, "server"), dimension = text(request, "dimension");
-        if (server.isBlank() || server.length() > 1024 || server.chars().anyMatch(Character::isISOControl) || !dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) throw new IllegalArgumentException("Specify Minecraft server and dimension");
+        if (server.isBlank() || server.length() > 1024 || server.chars().anyMatch(Character::isISOControl) || dimension.length()>128 || !dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) throw new IllegalArgumentException("Specify Minecraft server and dimension");
         JsonArray workers = request.getAsJsonArray("workers"); if (workers == null || workers.isEmpty() || workers.size() > 16) throw new IllegalArgumentException("Target 1–16 workers");
         int priority = request.has("priority") ? integer(request, "priority", -1000, 1000) : 0;
         JsonObject args = request.has("args") ? request.getAsJsonObject("args").deepCopy() : new JsonObject();
         if (args.toString().length() > BotLua.MAX_STATE) throw new IllegalArgumentException("Arguments too large");
+        JsonObject extension=request.has("publicAction")?checkedExtensionAction(request.getAsJsonObject("publicAction")):null;
+        if(extension!=null && (request.has("package") || request.has("script") || !args.isEmpty()))
+            throw new IllegalArgumentException("Public extension actions cannot carry a Monocle package, script, or separate args");
         JsonObject packaged;
-        if (request.has("package")) packaged = checkedPackage(request.getAsJsonObject("package"));
+        if(extension!=null)packaged=null;
+        else if (request.has("package")) packaged = checkedPackage(request.getAsJsonObject("package"));
         else {
             String script = text(request, "script"); BotLua.validate(script);
             packaged = new JsonObject(); packaged.addProperty("version", 1); packaged.addProperty("entry", "main");
@@ -916,31 +1264,60 @@ public final class HostService implements AutoCloseable {
             program.addProperty("name", name); program.addProperty("script", script); programs.add("main", program); profiles.add("Current", new JsonObject());
             packaged.add("programs", programs); packaged.add("profiles", profiles); packaged.add("highways", new JsonObject());
         }
-        if (Set.of("task-follow","task-bodyguard").contains(text(packaged,"entry"))) {
+        if(packaged!=null&&Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(text(packaged,"entry"))){
+            if(workers.size()!=1)throw new IllegalArgumentException("Kit jobs use one worker so the same boxes cannot be claimed twice");
+            JsonObject kit=args.deepCopy();if(text(packaged,"entry").equals("task-kit-remove-incomplete"))kit.addProperty("incomplete",true);
+            StashCatalog.kitAction(directory,crew,server+"\n"+dimension,kit,UUID.fromString(workers.get(0).getAsString()).toString());
+        }
+        boolean publicJob=workers.asList().stream().anyMatch(value->publicPeers.containsKey(UUID.fromString(value.getAsString())));
+        if(extension!=null && !publicJob)throw new IllegalArgumentException("Extension actions require a connected public worker");
+        if(publicJob){
+            JsonObject action=extension!=null?extension:publicAction(packaged,args,server,dimension);
+            String capability=text(action,"type");
+            for(JsonElement value:workers){
+                UUID worker=UUID.fromString(value.getAsString());PublicPeer peer=publicPeers.get(worker);
+                if(peer==null || !peer.reconciled || !peer.crew.equals(crew) || !peer.capabilities.contains(capability)
+                    || !peer.scope.equals(server+"\n"+dimension) || capability.equals("workers.travel.v1")
+                    && (!peer.position || System.currentTimeMillis()-peer.observationAt>5_000))
+                    throw new IllegalArgumentException("Every public worker must be reconciled in the target crew/world with action capability and a fresh position for Travel");
+                if(tasks.values().stream().anyMatch(t->workerJobPending(t,worker)))throw new IllegalStateException("Public worker already has unfinished work");
+            }
+        }
+        if (packaged!=null && Set.of("task-follow","task-bodyguard","task-crystal-guard").contains(text(packaged,"entry"))) {
             UUID leader=UUID.fromString(text(args,"target"));
             if(workers.asList().stream().anyMatch(w->w.getAsString().equals(leader.toString())))throw new IllegalArgumentException("Select followers only; the leader must not receive this job");
             Peer subject=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().id.equals(leader)&&e.getValue().crew.equals(crew)&&e.getValue().reconciled&&e.getValue().observation!=null).map(Map.Entry::getValue).findFirst().orElseThrow(()->new IllegalArgumentException("Choose a connected leader in this crew"));
-            if(text(packaged,"entry").equals("task-bodyguard"))args.addProperty("targetName",subject.observation.name());
-            if(text(packaged,"entry").equals("task-bodyguard")&&workers.size()>3)throw new IllegalArgumentException("Bodyguard supports at most three workers");
+            if(!text(packaged,"entry").equals("task-follow"))args.addProperty("targetName",subject.observation.name());
+            if(!text(packaged,"entry").equals("task-follow")&&workers.size()>3)throw new IllegalArgumentException("Bodyguard supports at most three workers");
+            if(text(packaged,"entry").equals("task-crystal-guard")) {
+                JsonArray protectedPlayers=new JsonArray();protectedPlayers.add(leader.toString());
+                peers.values().stream().filter(p->p.crew.equals(crew)&&p.reconciled&&p.observation!=null&&!p.id.equals(leader))
+                    .forEach(p->protectedPlayers.add(p.id.toString()));
+                args.add("protectedPlayers",protectedPlayers);
+            }
         }
         JsonObject task = new JsonObject(), runs = new JsonObject();
         if(request.has("nativeDefinition")) {
             JsonObject definition=HighwayJobs.checked(request.getAsJsonObject("nativeDefinition"));
-            if(!text(definition,"scope").equals(server+"\n"+dimension) || !packaged.getAsJsonObject("highways").has(text(definition.getAsJsonObject("workflow"),"id")))throw new IllegalArgumentException("Native checkpoint must match the task's world and bundled workflow");
+            if(packaged==null || !text(definition,"scope").equals(server+"\n"+dimension) || !packaged.getAsJsonObject("highways").has(text(definition.getAsJsonObject("workflow"),"id")))throw new IllegalArgumentException("Native checkpoint must match the task's world and bundled workflow");
             definition.addProperty("crew",crew);definition.addProperty("status","Assigning");task.add("preparedDefinition",definition);task.addProperty("highwayProgress",integer(definition,"progress",0,integer(definition,"length",16,100000)));
         }
         for (JsonElement value : workers) {
             UUID worker = UUID.fromString(value.getAsString()); if (runs.has(worker.toString())) throw new IllegalArgumentException("Duplicate worker");
-            boolean present = peers.entrySet().stream().anyMatch(e -> e.getKey().connected() && e.getValue().id.equals(worker) && e.getValue().crew.equals(crew) && e.getValue().reconciled);
+            boolean present = publicJob ? publicPeers.containsKey(worker) : peers.entrySet().stream().anyMatch(e -> e.getKey().connected() && e.getValue().id.equals(worker) && e.getValue().crew.equals(crew) && e.getValue().reconciled);
             if (!present) throw new IllegalArgumentException("Every worker must be connected and reconciled in this crew");
-            JsonObject run = new JsonObject(); run.addProperty("id", UUID.randomUUID().toString()); run.addProperty("status", "Queued"); runs.add(worker.toString(), run);
+            JsonObject run = new JsonObject(); run.addProperty("id", UUID.randomUUID().toString()); run.addProperty("status", "Queued");
+            if(publicJob){run.addProperty("publicProtocol",true);run.addProperty("generation",1);run.addProperty("commandId",UUID.randomUUID().toString());}
+            runs.add(worker.toString(), run);
         }
         task.addProperty("id", id.toString()); task.addProperty("requestHash", digest); task.addProperty("name", name); task.addProperty("workflowName", name); task.addProperty("crew", crew);
         task.addProperty("server", server); task.addProperty("dimension", dimension); task.addProperty("priority", priority); task.addProperty("status", "Queued");
         task.addProperty("publicJoin",false);
-        task.add("runs", runs); task.add("overrides", new JsonObject()); task.add("args", args); task.add("package", packaged); task.add("supportedActions", new Gson().toJsonTree(ACTIONS));
+        task.add("runs", runs); task.add("overrides", new JsonObject()); task.add("args", args);
+        if(extension!=null)task.add("publicAction",extension);else task.add("package",packaged);
+        task.add("supportedActions", new Gson().toJsonTree(ACTIONS));
         validateTask(id, task);
-        for (String worker : runs.keySet()) TaskFiles.jsonBytes(TaskWire.envelope(task, UUID.fromString(worker)), TaskFiles.MAX_PACKAGE);
+        if(!publicJob)for (String worker : runs.keySet()) TaskFiles.jsonBytes(TaskWire.envelope(task, UUID.fromString(worker)), TaskFiles.MAX_PACKAGE);
         JsonObject retired = tasks.size() < 64 ? null : tasks.values().stream()
             .filter(t -> BotHistory.taskFinished(t, t.has("nativeDefinition")))
             .min(Comparator.comparingLong(BotHistory::finishedAt))
@@ -979,10 +1356,30 @@ public final class HostService implements AutoCloseable {
             worker.addProperty("lastSeen",System.currentTimeMillis()-Math.max(0,(System.nanoTime()-peer.observation.receivedAt())/1_000_000));
             if(entry.getKey().connected()) { online.add(peer.id);roster.put(peer.id,worker); }
         }
+        publicPeers.forEach((id,peer)->{
+            JsonObject worker=new JsonObject();worker.addProperty("id",id.toString());worker.addProperty("name",peer.name==null?"External "+id.toString().substring(0,8):peer.name);
+            worker.addProperty("crew",peer.crew);worker.addProperty("scope",peer.scope);worker.addProperty("connected",true);
+            worker.addProperty("reconciled",peer.reconciled);worker.addProperty("current","");worker.addProperty("publicProtocol",true);
+            worker.addProperty("positionFresh",peer.position && System.currentTimeMillis()-peer.observationAt<5000);
+            if(peer.position){worker.addProperty("x",peer.x);worker.addProperty("y",peer.y);worker.addProperty("z",peer.z);}
+            worker.addProperty("observationAgeMs",Math.max(0,System.currentTimeMillis()-peer.observationAt));worker.addProperty("lastSeen",peer.seen);
+            worker.add("capabilities",new Gson().toJsonTree(peer.capabilities));
+            if(peer.implementation!=null)worker.add("implementation",peer.implementation.deepCopy());
+            online.add(id);roster.put(id,worker);
+        });
         while(roster.size()>256)roster.remove(roster.keySet().iterator().next());
         roster.forEach((id,r)->{JsonObject view=r.deepCopy();if(!online.contains(id)){view.addProperty("connected",false);view.addProperty("positionFresh",false);view.addProperty("reconciled",false);view.addProperty("observationAgeMs",Math.max(0,System.currentTimeMillis()-r.get("lastSeen").getAsLong()));}workers.add(view);});
         for (JsonObject task : tasks.values()) {
             JsonObject view = task.deepCopy(); view.remove("package"); view.remove("requestHash"); view.remove("args");
+            if(task.has("package")&&Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(text(task.getAsJsonObject("package"),"entry"))){
+                JsonObject kit=new JsonObject(),args=task.getAsJsonObject("args");
+                kit.addProperty("workflow",text(task.getAsJsonObject("package"),"entry"));
+                for(String key:List.of("name","kitTypeId","count","destination","targetStashName","transferAll","includeIncomplete"))if(args.has(key))kit.add(key,args.get(key).deepCopy());
+                long delivered=0;boolean reported=false;
+                for(var value:task.getAsJsonObject("runs").entrySet()){JsonObject run=value.getValue().getAsJsonObject();if(run.has("workflowResult")&&run.get("workflowResult").isJsonObject()&&run.getAsJsonObject("workflowResult").has("delivered")){delivered+=StashCatalog.integer(run.getAsJsonObject("workflowResult"),"delivered",0,10_000_000);reported=true;}}
+                if(reported)kit.addProperty("delivered",delivered);
+                view.add("kitJob",kit);
+            }
             if(!view.has("nativeDefinition") && view.has("highwayDefinition"))view.add("nativeDefinition",view.get("highwayDefinition").deepCopy());
             view.addProperty("cleanupPending", QueuePolicy.terminal(text(task,"status")) && !BotHistory.taskFinished(task, task.has("nativeDefinition")));
             view.addProperty("operatorGuidance",QueuePolicy.guidance(task));
@@ -998,12 +1395,16 @@ public final class HostService implements AutoCloseable {
     }
     private void validateTask(UUID id, JsonObject task) {
         if (!id.toString().equals(text(task, "id")) || !crews.containsKey(text(task, "crew"))) throw new IllegalArgumentException("Invalid saved task identity/crew");
-        name(text(task, "name")); checkedPackage(task.getAsJsonObject("package")); integer(task, "priority", -1000, 1000);
+        name(text(task, "name"));
+        boolean extension=task.has("publicAction");
+        if(extension){if(task.has("package"))throw new IllegalArgumentException("Public extension cannot contain a Monocle package");checkedExtensionAction(task.getAsJsonObject("publicAction"));}
+        else checkedPackage(task.getAsJsonObject("package"));
+        integer(task, "priority", -1000, 1000);
         for(String key:List.of("preparedDefinition","highwayDefinition"))if(task.has(key)) {
             JsonObject definition=HighwayJobs.checked(task.getAsJsonObject(key));if(!text(definition,"scope").equals(text(task,"server")+"\n"+text(task,"dimension")))throw new IllegalArgumentException("Checkpoint world does not match task");
         }
         if (!text(task, "requestHash").matches("[a-f0-9]{64}") || text(task, "server").isBlank() || text(task, "server").length() > 1024 || text(task, "server").chars().anyMatch(Character::isISOControl)
-            || !text(task, "dimension").matches("[a-z0-9_.-]+:[a-z0-9_./-]+") || !task.get("args").isJsonObject() || task.get("args").toString().length() > BotLua.MAX_STATE)
+            || text(task, "dimension").length()>128 || !text(task, "dimension").matches("[a-z0-9_.-]+:[a-z0-9_./-]+") || !task.get("args").isJsonObject() || task.get("args").toString().length() > BotLua.MAX_STATE)
             throw new IllegalArgumentException("Invalid saved task scope/arguments");
         if (!Set.of("Queued", "Paused", "Cancelling", "Running", "Suspended", "Inspection required", "Complete", "Failed", "Cancelled").contains(text(task, "status"))) throw new IllegalArgumentException("Invalid saved task state");
         for (String key : List.of("paused", "cancelled")) if (task.has(key) && (!task.get(key).isJsonPrimitive() || !task.getAsJsonPrimitive(key).isBoolean())) throw new IllegalArgumentException("Invalid saved control flag");
@@ -1014,6 +1415,8 @@ public final class HostService implements AutoCloseable {
         for (var entry : runs.entrySet()) {
             UUID.fromString(entry.getKey()); JsonObject run = entry.getValue().getAsJsonObject();
             if (!executions.add(UUID.fromString(text(run, "id"))) || !Set.of("Queued", "Sending", "Ready", "Running", "Suspending", "Suspended", "Inspection required", "Complete", "Failed", "Cancelled").contains(text(run, "status"))) throw new IllegalArgumentException("Invalid saved execution");
+            if(flag(run,"publicProtocol")){integer(run,"generation",1,Integer.MAX_VALUE);UUID.fromString(text(run,"commandId"));publicAction(task);}
+            else if(extension)throw new IllegalArgumentException("Extension action assigned to a private worker");
             for (String key : List.of("resumeSent", "resumeInspection")) if (run.has(key) && (!run.get(key).isJsonPrimitive() || !run.getAsJsonPrimitive(key).isBoolean())) throw new IllegalArgumentException("Invalid saved execution flag");
         }
         for (var entry : task.getAsJsonObject("overrides").entrySet()) {

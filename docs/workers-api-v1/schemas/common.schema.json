@@ -89,22 +89,15 @@
       },
       "additionalProperties": true
     },
-    "extensionAction": {
+    "action": {
       "type": "object",
       "required": ["type", "arguments"],
       "properties": {
-        "type": {"allOf": [{"$ref": "#/$defs/capabilityId"}, {"not": {"pattern": "^workers\\."}}]},
+        "type": {"$ref": "#/$defs/capabilityId"},
         "arguments": {"type": "object"}
       },
       "additionalProperties": true
     },
-    "action": {"oneOf": [
-      {"$ref": "#/$defs/waitAction"},
-      {"$ref": "#/$defs/travelAction"},
-      {"$ref": "#/$defs/dropItemsAction"},
-      {"$ref": "#/$defs/setProfileAction"},
-      {"$ref": "#/$defs/extensionAction"}
-    ]},
     "executionRef": {
       "type": "object", "required": ["jobId", "executionId", "generation"],
       "properties": {

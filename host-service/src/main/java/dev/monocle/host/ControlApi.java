@@ -36,8 +36,10 @@ public final class ControlApi implements AutoCloseable {
                     respond(exchange, 405, "GET /v1/status or POST /v1/control required"); return;
                 }
                 String auth = exchange.getRequestHeaders().getFirst("Authorization");
-                if ((browser ? !ui.allowed(exchange, !status) : exchange.getRequestHeaders().containsKey("Origin"))
-                    || auth == null || !MessageDigest.isEqual(expected, auth.getBytes(StandardCharsets.UTF_8))) { respond(exchange, 403, "Forbidden"); return; }
+                if (browser ? !ui.allowed(exchange, !status) : exchange.getRequestHeaders().containsKey("Origin")) {
+                    respond(exchange, 403, browser ? "UI origin is not accepted" : "Origin is not accepted"); return;
+                }
+                if (auth == null || !MessageDigest.isEqual(expected, auth.getBytes(StandardCharsets.UTF_8))) { respond(exchange, 403, "Invalid API token"); return; }
                 if (status) {
                     JsonObject request = new JsonObject(); request.addProperty("op", "status");
                     send(exchange, 200, host.control(request)); return;

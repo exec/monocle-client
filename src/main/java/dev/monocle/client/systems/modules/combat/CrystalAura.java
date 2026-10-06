@@ -8,6 +8,7 @@ package dev.monocle.client.systems.modules.combat;
 import it.unimi.dsi.fastutil.ints.*;
 import dev.monocle.client.events.entity.EntityAddedEvent;
 import dev.monocle.client.events.entity.EntityRemovedEvent;
+import dev.monocle.client.systems.bots.CrystalFightRecorder;
 import dev.monocle.client.events.packets.PacketEvent;
 import dev.monocle.client.events.render.Render2DEvent;
 import dev.monocle.client.events.render.Render3DEvent;
@@ -589,6 +590,38 @@ public class CrystalAura extends Module {
 
     private int breakTimer, placeTimer, switchTimer, ticksPassed;
     private final List<LivingEntity> targets = new ArrayList<>();
+    private Set<String> guardNames;
+    private Set<UUID> guardProtected = Set.of();
+
+    /** A running worker job may narrow player targets without changing the user's saved aura settings. */
+    public void guardTargets(Set<String> names, Set<UUID> protectedPlayers) {
+        guardNames = names.stream().map(name -> name.toLowerCase(Locale.ROOT)).collect(java.util.stream.Collectors.toUnmodifiableSet());
+        guardProtected = Set.copyOf(protectedPlayers);
+        clearPlan();
+        bestTarget = null;
+    }
+
+    public void clearGuardTargets() {
+        guardNames = null;
+        guardProtected = Set.of();
+        clearPlan();
+    }
+
+    public boolean guardAllows(Player player) {
+        return guardNames == null || guardAllows(player.getUUID(), player.getName().getString(), guardNames, guardProtected);
+    }
+
+    public Player guardEnemy(Player subject, double range) {
+        if (guardNames == null || mc.level == null || mc.player == null) return null;
+        return mc.level.players().stream().filter(player -> player != mc.player && player.isAlive() && !player.isSpectator()
+                && !player.getAbilities().instabuild && Friends.get().shouldAttack(player) && guardAllows(player)
+                && player.distanceToSqr(subject) <= range * range)
+            .min(Comparator.comparingDouble(player -> player.distanceToSqr(mc.player))).orElse(null);
+    }
+
+    static boolean guardAllows(UUID id, String name, Set<String> names, Set<UUID> protectedPlayers) {
+        return !protectedPlayers.contains(id) && (names.isEmpty() || names.contains(name.toLowerCase(Locale.ROOT)));
+    }
 
     private final Vec3 vec3d = new Vec3(0, 0, 0);
     private final Vec3 playerEyePos = new Vec3(0, 0, 0);
@@ -920,6 +953,7 @@ public class CrystalAura extends Module {
     private void attackCrystal(Entity entity) {
         // Attack
         mc.player.connection.send(new ServerboundAttackPacket(entity.getId()));
+        CrystalFightRecorder.crystalAttack(entity, bestTarget, bestTargetDamage);
 
         InteractionHand hand = InvUtils.findInHotbar(Items.END_CRYSTAL).getHand();
         if (hand == null) hand = InteractionHand.MAIN_HAND;
@@ -1010,6 +1044,8 @@ public class CrystalAura extends Module {
         BlockIterator.after(() -> {
             if (best.get() == null || activePlan != null) return;
             activePlan = best.get();
+            CrystalFightRecorder.auraPlan(activePlan.base(), activePlan.target(), activePlan.targetDamage(),
+                activePlan.selfDamage(), activePlan.needsSupport(), activePlan.cover());
             advancePlan();
         });
     }
@@ -1155,6 +1191,7 @@ public class CrystalAura extends Module {
             if (activePlan == null || !pos.equals(pendingBlock)) return;
             sendingBlock = pos;
             try {
+                CrystalFightRecorder.blockAttempt(pos, activePlan.needsSupport() && pos.equals(activePlan.base()) ? "crystal_base" : "self_cover");
                 if (!BlockUtils.place(pos, obsidian, false, 50, swingMode.get().client(), true, true)) inhibitAndClearPlan();
             } finally {
                 sendingBlock = null;
@@ -1252,6 +1289,7 @@ public class CrystalAura extends Module {
         if (hand == null) return;
 
         mc.gameMode.startPrediction(mc.level, sequence -> new ServerboundUseItemOnPacket(hand, result, sequence));
+        CrystalFightRecorder.crystalAttempt(result.getBlockPos(), damage);
 
         if (swingMode.get().client()) mc.player.swing(hand);
         if (swingMode.get().packet()) mc.getConnection().send(new ServerboundSwingPacket(hand));
@@ -1294,15 +1332,18 @@ public class CrystalAura extends Module {
 
     private boolean isSelfDamageSafe(double damage) {
         double health = EntityUtils.getTotalHealth(mc.player);
-        return damage <= maxDamage.get() && health - damage >= healthReserve.get() && (!antiSuicide.get() || damage < health);
+        double maximum = guardNames == null ? maxDamage.get() : Math.min(5, maxDamage.get());
+        double reserve = guardNames == null ? healthReserve.get() : Math.max(10, healthReserve.get());
+        return damage <= maximum && health - damage >= reserve && (guardNames == null && !antiSuicide.get() || damage < health);
     }
 
     private boolean isFriendDamageSafe(Vec3 explosion, BlockPos base, List<BlockPos> cover) {
-        if (!protectFriends.get()) return true;
+        if (!protectFriends.get() && guardNames == null) return true;
         for (Player friend : mc.level.players()) {
-            if (friend == mc.player || Friends.get().shouldAttack(friend)) continue;
+            if (friend == mc.player || !guardProtected.contains(friend.getUUID()) && Friends.get().shouldAttack(friend)) continue;
             double damage = DamageUtils.crystalDamage(friend, explosion, predictMovement.get(), base, cover);
-            if (damage > maxFriendDamage.get() || damage >= EntityUtils.getTotalHealth(friend)) return false;
+            if (damage > (guardProtected.contains(friend.getUUID()) ? Math.min(2, maxFriendDamage.get()) : maxFriendDamage.get())
+                || damage >= EntityUtils.getTotalHealth(friend)) return false;
         }
         return true;
     }
@@ -1443,6 +1484,7 @@ public class CrystalAura extends Module {
             if (livingEntity instanceof Player player) {
                 if (player.getAbilities().instabuild || livingEntity == mc.player) continue;
                 if (!player.isAlive() || !Friends.get().shouldAttack(player)) continue;
+                if (player.isSpectator() || !guardAllows(player)) continue;
 
                 if (ignoreNakeds.get()) {
                     if (player.getOffhandItem().isEmpty()
@@ -1454,6 +1496,8 @@ public class CrystalAura extends Module {
                     ) continue;
                 }
             }
+
+            if (guardNames != null && !(livingEntity instanceof Player)) continue;
 
             // Animals, water animals, monsters, bats, misc
             if (!(entities.get().contains(livingEntity.getType()))) continue;

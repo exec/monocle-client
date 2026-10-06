@@ -39,12 +39,56 @@ public final class BotWorkflows {
         }
         values.put("task-bodyguard", new Workflow("task-bodyguard", "Bodyguard", "Common Tasks", true, List.of(),
             "return function(ctx)\n  if ctx.state.started then return bot.done() end\n  ctx.state.started = true\n  ctx.args.bodyguard = true\n  return bot.follow(ctx.args)\nend\n", List.of(), List.of("Current")));
+        values.put("task-crystal-guard", new Workflow("task-crystal-guard", "Crystal Guard", "Combat", true, List.of(),
+            "return function(ctx)\n  if ctx.state.started then return bot.done() end\n  ctx.state.started = true\n  ctx.args.bodyguard = true\n  ctx.args.crystalGuard = true\n  return bot.follow(ctx.args)\nend\n", List.of(), List.of("Current")));
         values.put("task-stash-hunt", new Workflow("task-stash-hunt", "Distributed stash hunt", "Stash Hunting", true, List.of(),
             "return function(ctx)\n  if ctx.state.started then return bot.done() end\n  ctx.state.started = true\n  return bot.stash_hunt(ctx.args)\nend\n", List.of(), List.of("Current")));
         values.put("task-stash-scan", new Workflow("task-stash-scan", "Inspect stash", "Stash Management", true, List.of(),
-            "return function(ctx)\n if ctx.state.started then return bot.done(ctx.result) end\n ctx.state.started=true\n return bot.stash_scan(ctx.args)\nend", List.of(), List.of("Current")));
+            "return function(ctx)\n if ctx.args.scanAnchor and not ctx.state.rendezvoused then\n  ctx.state.rendezvoused=true\n  return bot.tpa({target=ctx.args.scanAnchor,allowFailure=true})\n end\n if ctx.state.started then return bot.done(ctx.result) end\n ctx.state.started=true\n return bot.stash_scan(ctx.args)\nend", List.of(), List.of("Current")));
         values.put("task-stash-resupply",new Workflow("task-stash-resupply","Resupply from stash","Stash Management",true,List.of(),
             "return function(ctx)\n if not ctx.state.loaded then ctx.state.loaded=true; return bot.stash_resupply(ctx.args) end\n if not ctx.state.returning then ctx.state.returning=true; return bot.tpa({target=ctx.args.target,warmupTicks=ctx.args.warmupTicks,acceptDelayTicks=ctx.args.acceptDelayTicks,timeoutTicks=1200}) end\n return bot.done(ctx.result)\nend",List.of(),List.of("Current")));
+        String kitScript="""
+            return function(ctx)
+             local s=ctx.state
+             if not s.phase then s.phase='take'; s.left=ctx.args.count; s.cursor=0; s.all=ctx.args.transferAll or false; s.total=0 end
+             if s.phase=='taking' then
+              local r=ctx.result
+              if not r or not r.picked or not r.nextPick or r.picked<0 or r.picked>(s.all and ctx.args.count or s.left) or r.nextPick<s.cursor or r.nextPick>#ctx.args.picks or (r.sourceExhausted and r.nextPick~=#ctx.args.picks) or (r.picked==0 and not (s.all and r.sourceExhausted)) then return bot.fail('Invalid kit pickup receipt') end
+              if not s.all then s.left=s.left-r.picked end
+              s.batch=r.picked; s.cursor=r.nextPick; s.exhausted=r.sourceExhausted or false; s.issue=r.sourceIssue
+              if s.batch==0 then
+               s.emptyPasses=(s.emptyPasses or 0)+1
+               if s.emptyPasses>=2 then return bot.done({delivered=s.total,sourceExhausted=true}) end
+               s.cursor=0; s.exhausted=false; s.phase='take'
+               return bot.wait(20)
+              end
+              s.emptyPasses=0
+              if ctx.args.destination=='Carry' and s.left>0 then return bot.fail('Carry destination has no room for the remaining kits') end
+              s.phase=(ctx.args.destination=='Ender Chest' or ctx.args.destination=='Carry') and 'take' or 'deliver'
+              if s.phase=='take' then s.total=s.total+s.batch end
+             end
+             if s.phase=='dropping' or s.phase=='storing' then s.total=s.total+s.batch; s.phase='take' end
+             if s.phase=='teleporting' then
+              s.phase='dropping'
+              return bot.drop({item=ctx.args.kitItem,kitTypeId=ctx.args.kitTypeId,kitExemplar=ctx.args.kitExemplar,incomplete=ctx.args.incomplete,count=s.batch,recipient=ctx.args.recipient})
+             end
+             if s.phase=='deliver' then
+              if ctx.args.destination=='Player' then
+               s.phase='teleporting'
+               return bot.tpa({target=ctx.args.recipient,targetName=ctx.args.recipientName,external=true,radius=4,timeoutTicks=1200})
+              end
+              s.phase='storing'; ctx.args.targetStash.count=s.batch
+              return bot.stash_store(ctx.args.targetStash)
+             end
+             if s.issue then return bot.fail('Delivered '..s.total..' kits before source needs attention: '..s.issue) end
+             if s.left==0 then return bot.done({delivered=s.total,sourceExhausted=s.exhausted}) end
+             if s.all and s.exhausted then s.cursor=0; s.exhausted=false end
+             s.phase='taking'; ctx.args.count=s.all and ctx.args.count or s.left; ctx.args.pickIndex=s.cursor
+             return bot.stash_resupply(ctx.args)
+            end
+            """;
+        values.put("task-kit-delivery",new Workflow("task-kit-delivery","Kit Delivery","Stash Management",true,List.of(),kitScript,List.of(),List.of("Current")));
+        values.put("task-kit-remove-incomplete",new Workflow("task-kit-remove-incomplete","Remove Incomplete Kits","Stash Management",true,List.of(),kitScript,List.of(),List.of("Current")));
         values.put("task-recover", new Workflow("task-recover", "Recover supplies", "Common Tasks", true, List.of(),
             "return function(ctx)\n if ctx.state.started then return bot.done() end\n ctx.state.started=true\n return bot.recover(ctx.args)\nend", List.of(), List.of("Current")));
         return values;
