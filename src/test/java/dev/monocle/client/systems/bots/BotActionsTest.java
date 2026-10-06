@@ -290,10 +290,10 @@ public final class BotActionsTest {
         net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(net.minecraft.data.registries.VanillaRegistries.createLookup()).forEach(net.minecraft.core.component.DataComponentInitializers.PendingComponents::apply);
         batchDeposits();
         var chestState=net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState();
-        // Live failure: Baritone stood flush against a chest at the world edge, with open sky above.
+        // Reproduce the live failure using synthetic world-edge coordinates, never an operator's stash location.
         var chest=chestState.getCollisionShape(net.minecraft.world.level.EmptyBlockGetter.INSTANCE,BlockPos.ZERO).bounds()
-            .move(29496179,237,-29130829);
-        var feet=new Vec3(29496179.303270917,237,-29130829.237500012);
+            .move(29999979,237,-29999829);
+        var feet=new Vec3(29999979.303270917,237,-29999829.237500012);
         double width=(double).6f;
         var body=dev.monocle.client.utils.world.PrinterFlight.body(feet,width,1.8);
         java.util.function.Predicate<net.minecraft.world.phys.AABB> clear=b->!b.intersects(chest);

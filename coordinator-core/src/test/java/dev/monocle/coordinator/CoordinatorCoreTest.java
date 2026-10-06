@@ -354,9 +354,11 @@ public final class CoordinatorCoreTest {
         assert StashCatalog.get(root,"A","server\nnether","Overflow").getAsJsonObject("containers").getAsJsonObject("100,116,0").get("reason").getAsString().contains("attempted") : "An attempted transfer cannot be reported as a verified deposit";
         JsonObject missed=observation.deepCopy();missed.addProperty("status","unscanned");missed.add("items",new JsonObject());missed.addProperty("reason","Opening timed out");
         StashCatalog.save(root,"A","server\nnether",p,missed);
-        assert StashCatalog.list(root).get(0).getAsJsonObject().get("unscanned").getAsInt()==2;
+        JsonObject missedSummary=StashCatalog.summary(StashCatalog.get(root,"A","server\nnether","Depot"));
+        assert missedSummary.get("unscanned").getAsInt()==2 : "Inspect Depot, not the filesystem's first entry (which may be Overflow)";
         JsonObject inferred=observation.deepCopy();inferred.addProperty("inferred",true);StashCatalog.save(root,"A","server\nnether",p,inferred);
-        assert StashCatalog.list(root).get(0).getAsJsonObject().get("inferred").getAsInt()==1&&StashCatalog.list(root).get(0).getAsJsonObject().get("observed").getAsInt()==1 : "Estimates never masquerade as observed containers";
+        JsonObject inferredSummary=StashCatalog.summary(StashCatalog.get(root,"A","server\nnether","Depot"));
+        assert inferredSummary.get("inferred").getAsInt()==1&&inferredSummary.get("observed").getAsInt()==1 : "Estimates never masquerade as observed containers";
         assert StashCatalog.get(root,"B","server\nnether","Depot").isEmpty();
         JsonObject invalid=observation.deepCopy();invalid.addProperty("x",3);JsonObject assignment=p;
         rejects(()->StashCatalog.save(root,"A","server\nnether",assignment,invalid));
