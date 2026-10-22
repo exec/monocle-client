@@ -1278,6 +1278,16 @@ public class HighwayBuilder extends Module {
         if (idleTicks >= 20 && !miningInProgress() && (!pendingPlaces.isEmpty() || !pendingBreaks.isEmpty()))
             pendingPredictionSince = mc.player.tickCount - 12;
     }
+
+    public dev.monocle.coordinator.ActionProgress.Observation actionProgress() {
+        BlockPos target = normalMining != null ? normalMining.blockPos : packetMining != null ? packetMining.blockPos : crewTravelTarget != null ? crewTravelTarget : workOrigin;
+        double effort = normalMining != null && mc.gameMode != null ? ((MultiPlayerGameModeAccessor) mc.gameMode).monocle$getBreakingProgress() : packetMining != null ? packetMining.progress() : 0;
+        String expected = lifecycle.paused() ? "Native highway Resume / hazard clearance" : normalMining != null || packetMining != null ? "Mining / server break confirmation" : crewTravelTarget != null ? "Reach supply / return target" : crewPendingResource >= 0 ? "Supply resource availability" : "Verified highway row";
+        return new dev.monocle.coordinator.ActionProgress.Observation("Highway: " + state, expected,
+            blocksBroken + "/" + blocksPlaced + "/" + workOrigin, target == null ? "" : target.toShortString(),
+            target == null ? Double.MAX_VALUE : mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(target)),
+            Double.isFinite(effort) ? Math.clamp(effort, 0, 1) : 1, lifecycle.paused(), !lifecycle.paused() && !crewNeedsCleanup() && mc.player.containerMenu == mc.player.inventoryMenu);
+    }
     public String crewDiagnostics() {
         String detail = getStatus();
         return detail.substring(0, Math.min(detail.length(), 384)) + " [" + state + "; place ACKs=" + pendingPlaces.size() + ", break ACKs=" + pendingBreaks.size()
@@ -2554,6 +2564,7 @@ public class HighwayBuilder extends Module {
 
     private String readinessProblem() {
         if (!Utils.canUpdate()) return "Join a world first.";
+        if(Modules.get().get(StashBuilder.class).isActive())return "Stop Stash Builder before starting Highway Builder.";
         HorizontalDirection direction = lifecycle.hasJob() ? dir : selectedHeading();
         if (direction != null && direction.diagonal && width.get() < 3) return "Diagonal highways need a width of at least 3.";
         if (doesPave() && blocksToPlace.get().isEmpty()) return "Choose at least one building material.";
@@ -3234,6 +3245,10 @@ public class HighwayBuilder extends Module {
         }
         if (!lifecycle.hasJob()) { updatePreview(); return; }
         updateHud();
+        if (!dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready()) {
+            waitForWorld(); status = dev.monocle.client.utils.network.WorldReadiness.INSTANCE.snapshot().get("reason").getAsString();
+            timingPhase(HighwayHud.Phase.Paused); return;
+        }
         boolean localSessionReset = Utils.canUpdate() && mc.level == jobWorld && jobSessionChanged();
         if (!Utils.canUpdate() || mc.getConnection() == null || mc.gameMode == null || jobSessionChanged()) waitForWorld();
         if ((lifecycle == Lifecycle.WaitingForWorld)) {

@@ -247,9 +247,9 @@ public class AutoEat extends Module {
             }
         }
 
-        wasBaritone = pauseBaritone.get() && PathManagers.get().isPathing();
+        wasBaritone = pauseBaritone.get() && PathManagers.hasNavigation();
         if (wasBaritone) {
-            PathManagers.get().pause();
+            PathManagers.pause(this);
         }
 
         return true;
@@ -328,7 +328,7 @@ public class AutoEat extends Module {
         });
         wasAura.clear();
 
-        if (wasBaritone) PathManagers.get().resume();
+        if (wasBaritone) PathManagers.resume(this);
         wasBaritone = false;
     }
 
@@ -439,6 +439,15 @@ public class AutoEat extends Module {
 
     static boolean foodAllowed(ItemStack stack, List<Item> blacklist, boolean protectNamed) {
         return !blacklist.contains(stack.getItem()) && (!protectNamed || !stack.has(DataComponents.CUSTOM_NAME));
+    }
+
+    public static int foodCount(Container inventory, ItemStack offhand, List<Item> blacklist, boolean protectNamed) {
+        int count = offhand.has(DataComponents.FOOD) && foodAllowed(offhand, blacklist, protectNamed) ? offhand.getCount() : 0;
+        for (int i = 0; i < Math.min(36, inventory.getContainerSize()); i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (stack.has(DataComponents.FOOD) && foodAllowed(stack, blacklist, protectNamed)) count += stack.getCount();
+        }
+        return count;
     }
 
     static float foodScore(FoodProperties food, Priority priority, int missingHunger, boolean lowHealth) {

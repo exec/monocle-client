@@ -12,7 +12,25 @@ Use **Queue workflow** in Jobs or on a workflow card. Choose a crew, its target 
 
 The **Highway Builder** folder also contains native highway presets. These describe recurring excavation/paving duties and supply fallback order, not Lua programs. They remain usable by the saved highway job forms and can also be called from Lua.
 
+## Remote lobby retry
+
+On clients running 0.13.45 or newer, send `.worker lobby-skip start` from the host's selected-worker command box to explicitly retry walking through the 6b6t lobby. Both in-game and standalone hosts use the existing authenticated worker command path; no new endpoint is needed. `.worker lobby-skip status` reports its state, and `.worker lobby-skip stop` releases movement without disabling future automatic login skipping. Replace `.` if the worker uses a different command prefix.
+
+Explicit start enables Lobby Skip even if it was off. It walks in the player's current facing direction, including with chat/pause screens open or the window backgrounded, and stops on a world transfer or after 60 seconds. It refuses non-6b6t servers and does not replace another feature's movement input. **Use it only after confirming the worker is in the lobby**: an explicit operator command can also walk in the real world. Ordinary module off/on toggles do not force a lobby retry.
+
+### Player-triggered logout and reconnect
+
+On 0.13.78+, Auto Log's **Only Trusted** check ignores players in the lobby detected by active Lobby Skip. The exemption remains if lobby walking times out or is stopped; it ends when Lobby Skip detects the world transfer/teleport, the world object changes, or Lobby Skip is disabled. Health, damage, totem, gear and configured dangerous-entity checks are not exempted. This uses Lobby Skip's existing 6b6t login detection, not a general-purpose lobby classifier; enable it before connecting, and do not explicitly start lobby skipping in the real game world.
+
+For repeated five-minute retries: enable Lobby Skip and Auto Log, set Auto Log's `only-trusted` on, `untrusted-player-range` to `0` (all loaded players), `untrusted-confirmation-seconds` to `0`, `toggle-off` off and `toggle-auto-reconnect` off. Enable Auto Reconnect with `delay` `300` seconds and adaptive delay off. Add your own nearby accounts to Friends. Another untrusted player still present after entering the game triggers another disconnect. This does not resume a host-paused job or guarantee that nobody sees the account before it disconnects.
+
 ## Execution model
+
+**Stash Management → Transfer Stash Kits** moves all or selected known kit types between stashes in one job. Both host modes prepare its compact type list and resolve individual plans; its Lua calls the existing Kit Delivery dependency. See [multi-kit transfers](stash-kits.md#transfer-multiple-kit-types-in-one-job-01336) for setup, bounds and optional recovery of already-carried boxes. The internal `bot.kit_transfer_plan({index=...})` action is bound to this job's host-approved source, destination and frozen type IDs; it is not an arbitrary client-requested stash lookup.
+
+On 0.13.59, its optional **Round Robin** mode instead accepts ordered `routes` with individual source stash, kit ID and destination stash. It delivers one load per turn, retaining separate route cursors and verification across checkpoints. Both host adapters reuse the same planning and native inventory handlers; see [Round Robin routes](stash-kits.md#round-robin-sources-and-destinations-01359) for constraints and API arguments. The normal drain-one-type mode is unchanged.
+
+**Stash Management → Crew Stash Transfer** uses the same native inventory actions with a shared two/three-worker batch barrier. The leader sends `/home`; that send event immediately releases followers' TPA requests, overlapping the warmups. Source inventories and destination columns are exclusive per worker, and every batch completes before the next travel leg. See [crew transfer setup and safety](stash-kits.md#crew-stash-transfer-01338). The internal planning request uses `{step,receipt}` rather than the solo `{index}`; both remain host-approved, token-bound lookups. The client `bot.stash_visit(args)` establishes arrival without opening chests.
 
 A program returns a function. That function makes **one decision** and returns **one action**. Monocle completes the action before evaluating the function again. Store your program counter and other persistent data in `ctx.state`:
 

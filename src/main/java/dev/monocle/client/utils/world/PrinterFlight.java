@@ -3,6 +3,9 @@ package dev.monocle.client.utils.world;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.BooleanOp;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -12,7 +15,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.BiPredicate;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.ToDoubleFunction;
 
@@ -22,6 +27,8 @@ public final class PrinterFlight {
     public static final int MAX_DISTANCE = 32;
     public static final int MAX_NODES = 4096;
     public static final int MAX_SEGMENT = 128;
+    public static final double MAX_SAFE_SPEED = 2.5;
+    public static final double CRUISE_CLEARANCE = 3;
     private static final int[][] NEIGHBORS = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
 
     private PrinterFlight() {}
@@ -31,6 +38,23 @@ public final class PrinterFlight {
         requirePosition(feet);
         return new AABB(feet.x - width / 2, feet.y, feet.z - width / 2,
             feet.x + width / 2, feet.y + height, feet.z + width / 2);
+    }
+
+    /** Conservative full-body clearance, including floor, ceiling and sideways corners. */
+    public static AABB cruiseEnvelope(AABB body) { return body.inflate(CRUISE_CLEARANCE); }
+
+    /** Takeoff/recovery may cross the buffer, but never actual terrain. Prefer gaining altitude. */
+    public static Vec3 clearanceExit(Vec3 start, double width, double height, Predicate<AABB> clear, Predicate<AABB> cruiseClear) {
+        if (!clear.test(body(start,width,height))) return null;
+        if (cruiseClear.test(body(start,width,height))) return copy(start);
+        for (int[] direction : new int[][]{{0,1,0},{1,0,0},{-1,0,0},{0,0,1},{0,0,-1}}) {
+            for (double distance=1;distance<=8;distance+=.5) {
+                Vec3 point=start.add(direction[0]*distance,direction[1]*distance,direction[2]*distance);
+                if (!cruiseClear.test(body(point,width,height))) continue;
+                if (segmentClear(start,point,width,height,clear)) return point;
+            }
+        }
+        return null;
     }
 
     /** Overlapping full-body sweeps cover the whole segment without reserving an entire diagonal rectangle. */
@@ -75,6 +99,11 @@ public final class PrinterFlight {
                 if (delta.lengthSqr() > 64 && !clear.test(body(waypoint, width, height)))
                     waypoint = from.add(delta.normalize().scale(Math.min(24, delta.length())));
                 path = route(from, waypoint, width, height, clear);
+                // Both projected waypoints can be inside a long storage bank. Seek safe progress, not an occupied endpoint.
+                if(path.isEmpty() && delta.lengthSqr()>64){
+                    double remaining=delta.length()-8;
+                    path=shorten(search(from,width,height,clear,p->p.distanceTo(goal)<=remaining,p->p.distanceTo(goal)),width,height,clear);
+                }
                 step = 1;
                 if (path.size() < 2) { path = List.of(); return null; }
             }
@@ -109,7 +138,7 @@ public final class PrinterFlight {
     public static Vec3 safeVelocity(Vec3 from, Vec3 to, double speed, double width, double height, Predicate<AABB> clear) {
         requirePosition(from);
         requirePosition(to);
-        if (!Double.isFinite(speed) || speed <= 0 || speed > 1) throw new IllegalArgumentException("Flight speed must be in (0, 1] blocks/tick.");
+        if (!Double.isFinite(speed) || speed <= 0 || speed > MAX_SAFE_SPEED) throw new IllegalArgumentException("Flight speed must be in (0, 2.5] blocks/tick.");
         Vec3 delta = to.subtract(from);
         double distance = delta.length();
         Vec3 velocity = distance <= speed ? delta : delta.scale(speed / distance);
@@ -155,6 +184,28 @@ public final class PrinterFlight {
                 return Math.max(0, Math.abs(eye.x - center.x) + Math.abs(eye.y - center.y) + Math.abs(eye.z - center.z) - reach * Math.sqrt(3)); }), width, height, clear);
     }
 
+    /** Existing containers use their actual collision shape, not a future full cube or printing's minimum distance. */
+    public static List<Vec3> routeToInteraction(Vec3 start, BlockPos target, double width, double height,
+                                               double eyeHeight, double reach, Predicate<AABB> clear, Predicate<Vec3> visible) {
+        requirePosition(start); dimensions(width, height);
+        if(target==null||!Double.isFinite(eyeHeight)||eyeHeight<0||eyeHeight>4
+            ||!Double.isFinite(reach)||reach<=0||reach>MAX_DISTANCE)throw new IllegalArgumentException("Invalid interaction reach or eye height.");
+        Vec3 center=Vec3.atCenterOf(target);
+        if(start.distanceTo(center)>MAX_DISTANCE+reach+eyeHeight||!clear.test(body(start,width,height)))return List.of();
+        Predicate<Vec3> goal=p->p.add(0,eyeHeight,0).distanceToSqr(center)<=reach*reach&&visible.test(p);
+        if(goal.test(start))return List.of(copy(start));
+        List<Vec3> approaches=new ArrayList<>();
+        approaches.add(Vec3.atBottomCenterOf(target.above()));
+        approaches.add(new Vec3(center.x,target.getY()+1+CRUISE_CLEARANCE+.05,center.z));
+        for(int[] side:NEIGHBORS)if(side[1]==0)for(int y=0;y<=1;y++)
+            for(double distance:new double[]{1.5,.5+width/2+CRUISE_CLEARANCE+.05})
+                approaches.add(new Vec3(center.x+side[0]*distance,target.getY()+y,center.z+side[2]*distance));
+        approaches.sort(Comparator.comparingDouble(start::distanceToSqr));
+        for(Vec3 point:approaches)if(goal.test(point)&&segmentClear(start,point,width,height,clear))return List.of(copy(start),point);
+        return shorten(search(start,width,height,clear,goal,
+            p->Math.max(0,p.add(0,eyeHeight,0).distanceTo(center)-reach)),width,height,clear);
+    }
+
     /** Caller chooses a real, safe full-block floor; route keeps standing-height clearance for landing. */
     public static List<Vec3> routeToLanding(Vec3 start, BlockPos floor, double width, double standingHeight,
                                            Predicate<AABB> clear, Predicate<BlockPos> safeFloor) {
@@ -173,6 +224,36 @@ public final class PrinterFlight {
             }
         }
         return true;
+    }
+
+    /** Actual collision tops, including fractional chest/slab heights; the whole footprint and standing body must fit. */
+    public static Vec3 landingBelow(Vec3 from,double width,double flightHeight,double standingHeight,int depth,
+                                    Function<BlockPos,VoxelShape> safeShape,Predicate<AABB> clear) {
+        requirePosition(from);dimensions(width,flightHeight);dimensions(width,standingHeight);
+        if(depth<0||depth>MAX_DISTANCE)throw new IllegalArgumentException("Invalid landing depth");
+        AABB footprint=body(from,width,standingHeight);
+        int minX=(int)Math.floor(footprint.minX),maxX=(int)Math.floor(Math.nextDown(footprint.maxX));
+        int minZ=(int)Math.floor(footprint.minZ),maxZ=(int)Math.floor(Math.nextDown(footprint.maxZ));
+        for(int y=(int)Math.floor(from.y);y>=(int)Math.floor(from.y)-depth;y--){
+            var shapes=new HashMap<BlockPos,VoxelShape>();var heights=new TreeSet<Double>(Comparator.reverseOrder());
+            for(int x=minX;x<=maxX;x++)for(int z=minZ;z<=maxZ;z++){
+                BlockPos pos=new BlockPos(x,y,z);VoxelShape shape=safeShape.apply(pos).move(x,y,z);shapes.put(pos,shape);
+                for(AABB box:shape.toAabbs())if(box.maxY<=from.y&&from.y-box.maxY<=depth)heights.add(box.maxY);
+            }
+            for(double top:heights){
+                Vec3 feet=new Vec3(from.x,top,from.z);
+                if(!clear.test(body(feet,width,standingHeight)))continue;
+                boolean supported=true;
+                for(var entry:shapes.entrySet()){
+                    BlockPos pos=entry.getKey();
+                    AABB sole=new AABB(Math.max(footprint.minX,pos.getX()),top-.0001,Math.max(footprint.minZ,pos.getZ()),
+                        Math.min(footprint.maxX,pos.getX()+1),top,Math.min(footprint.maxZ,pos.getZ()+1));
+                    if(Shapes.joinIsNotEmpty(Shapes.create(sole),entry.getValue(),BooleanOp.ONLY_FIRST)){supported=false;break;}
+                }
+                if(supported&&segmentClear(from,feet,width,flightHeight,clear))return feet;
+            }
+        }
+        return null;
     }
 
     /** A real, collision-checked escape to wholly outside the build plus a one-block margin. Never drills. */

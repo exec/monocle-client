@@ -90,7 +90,7 @@ public final class ControlApi implements AutoCloseable {
                 ResourceApi.Reply reply;
                 synchronized (host) {
                     OperatorOperations operations = host.operatorOperations();
-                    JsonObject prior = operations.get(commandId);
+                    JsonObject prior = host.operatorOperation(commandId);
                     operations.begin(commandId, fingerprint);
                     if (prior != null) {
                         if (!prior.has("response")) {
@@ -100,7 +100,9 @@ public final class ControlApi implements AutoCloseable {
                         } else reply = new ResourceApi.Reply(prior.get("httpStatus").getAsInt(), prior.getAsJsonObject("response"));
                     } else {
                         try {
-                            reply = ResourceApi.route(host, method, resourceUri, body, exchange.getRequestHeaders().getFirst("If-Match"));
+                            host.operatorCommand(commandId);
+                            try { reply = ResourceApi.route(host, method, resourceUri, body, exchange.getRequestHeaders().getFirst("If-Match")); }
+                            finally { host.operatorCommand(""); }
                         } catch (ResourceApi.Precondition e) {
                             reply = new ResourceApi.Reply(e.status, problemBody(e.status, e.status == 428 ? "precondition_required" : "revision_mismatch", e.getMessage(), commandId, resourceUri.getPath()));
                         } catch (IllegalStateException e) {
@@ -115,6 +117,7 @@ public final class ControlApi implements AutoCloseable {
                         result.addProperty("operationId", commandId); result.addProperty("correlationId", commandId);
                         reply = new ResourceApi.Reply(code, result);
                         operations.finish(commandId, code, result, async);
+                        host.operatorOperation(commandId);
                         host.operatorReceipt(commandId, async ? "host_accepted" : "completed");
                     }
                 }

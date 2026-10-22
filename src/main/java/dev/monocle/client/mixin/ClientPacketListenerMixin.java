@@ -28,12 +28,14 @@ import dev.monocle.client.systems.config.Config;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.combat.CrystalAura;
 import dev.monocle.client.systems.modules.combat.Surround;
+import dev.monocle.client.systems.modules.movement.LobbySkip;
 import dev.monocle.client.systems.modules.movement.Scaffold;
 import dev.monocle.client.systems.modules.movement.Velocity;
 import dev.monocle.client.systems.modules.player.NoRotate;
 import dev.monocle.client.systems.modules.render.NoRender;
 import dev.monocle.client.systems.modules.world.HighwayBuilder;
 import dev.monocle.client.systems.modules.world.AutoWither;
+import dev.monocle.client.systems.modules.world.StashBuilder;
 import dev.monocle.client.systems.modules.world.PrinterHelper;
 import dev.monocle.client.utils.player.ChatUtils;
 import net.minecraft.client.Minecraft;
@@ -111,8 +113,12 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
     @Inject(method = "handleLevelChunkWithLight", at = @At("TAIL"))
     private void onHandleLevelChunkWithLight(ClientboundLevelChunkWithLightPacket packet, CallbackInfo ci) {
         LevelChunk chunk = minecraft.level.getChunk(packet.getX(), packet.getZ());
+        dev.monocle.client.systems.bots.Bots.get().stashObserver.chunk(chunk);
         MonocleClient.EVENT_BUS.post(new ChunkDataEvent(chunk));
     }
+
+    @Inject(method = "handleOpenScreen", at = @At("TAIL"))
+    private void monocle$stashMenu(ClientboundOpenScreenPacket packet, CallbackInfo ci){dev.monocle.client.systems.bots.Bots.get().stashObserver.opened(packet.getContainerId());}
 
     @Inject(method = "handleContainerSetSlot", at = @At("TAIL"))
     private void onHandleContainerSetSlot(ClientboundContainerSetSlotPacket packet, CallbackInfo ci) {
@@ -130,6 +136,7 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
         Modules.get().get(HighwayBuilder.class).onServerBlockAck(packet.sequence());
         Modules.get().get(PrinterHelper.class).onServerBlockAck(packet.sequence());
         Modules.get().get(AutoWither.class).onServerBlockAck(packet.sequence());
+        Modules.get().get(StashBuilder.class).onServerBlockAck(packet.sequence());
         Modules.get().get(CrystalAura.class).onServerBlockAck(packet.sequence());
         Modules.get().get(Surround.class).onServerBlockAck(packet.sequence());
         Modules.get().get(Scaffold.class).onServerBlockAck(packet.sequence());
@@ -137,9 +144,11 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
 
     @Inject(method = "handleBlockUpdate", at = @At("TAIL"))
     private void onHandleBlockUpdate(ClientboundBlockUpdatePacket packet, CallbackInfo ci) {
+        dev.monocle.client.systems.bots.Bots.get().stashObserver.block(packet.getPos(),packet.getBlockState());
         Modules.get().get(HighwayBuilder.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(PrinterHelper.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(AutoWither.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
+        Modules.get().get(StashBuilder.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(CrystalAura.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(Surround.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
         Modules.get().get(Scaffold.class).onServerBlockUpdate(packet.getPos(), packet.getBlockState());
@@ -148,9 +157,11 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
     @Inject(method = "handleChunkBlocksUpdate", at = @At("TAIL"))
     private void onHandleChunkBlocksUpdate(ClientboundSectionBlocksUpdatePacket packet, CallbackInfo ci) {
         packet.runUpdates((pos, state) -> {
+            dev.monocle.client.systems.bots.Bots.get().stashObserver.block(pos,state);
             Modules.get().get(HighwayBuilder.class).onServerBlockUpdate(pos, state);
             Modules.get().get(PrinterHelper.class).onServerBlockUpdate(pos, state);
             Modules.get().get(AutoWither.class).onServerBlockUpdate(pos, state);
+            Modules.get().get(StashBuilder.class).onServerBlockUpdate(pos, state);
             Modules.get().get(CrystalAura.class).onServerBlockUpdate(pos, state);
             Modules.get().get(Surround.class).onServerBlockUpdate(pos, state);
             Modules.get().get(Scaffold.class).onServerBlockUpdate(pos, state);
@@ -191,11 +202,19 @@ public abstract class ClientPacketListenerMixin extends ClientCommonPacketListen
 
     @Inject(method = "handleMovePlayer", at = @At("HEAD"))
     private void onHandleMovePlayerHead(ClientboundPlayerPositionPacket packet, CallbackInfo ci, @Share("noRotateYaw") LocalFloatRef yawRef, @Share("noRotatePitch") LocalFloatRef pitchRef) {
+        dev.monocle.client.utils.network.WorldReadiness.INSTANCE.onServerTeleport(packet);
+        Modules.get().get(LobbySkip.class).onServerTeleport(packet);
         NoRotate noRotate = Modules.get().get(NoRotate.class);
         if (!noRotate.isActive() || minecraft.player == null) return;
 
         yawRef.set(minecraft.player.getYRot());
         pitchRef.set(minecraft.player.getXRot());
+    }
+
+    @Inject(method = "handleRespawn", at = @At("TAIL"))
+    private void monocle$lobbyRespawn(ClientboundRespawnPacket packet, CallbackInfo ci) {
+        dev.monocle.client.utils.network.WorldReadiness.INSTANCE.onServerRespawn();
+        Modules.get().get(LobbySkip.class).onServerRespawn();
     }
 
     @Inject(method = "handleMovePlayer", at = @At("RETURN"))

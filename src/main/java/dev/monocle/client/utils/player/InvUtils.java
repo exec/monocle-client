@@ -191,19 +191,46 @@ public class InvUtils {
 
     /** Place in an explicit empty menu slot, asking for authoritative snapshots after both ordered clicks. */
     public static void moveConfirmed(int inventoryIndex, int destination) {
-        var menu=mc.player.containerMenu;
         int source=SlotUtils.indexToId(inventoryIndex);
-        if(source<0||destination<0||destination>=menu.slots.size()||!menu.getCarried().isEmpty()
+        moveSlotsConfirmed(source,destination);
+    }
+
+    /** Same confirmed move in either direction; indices belong to the current open menu. */
+    public static void moveSlotsConfirmed(int source, int destination) {
+        var menu=mc.player.containerMenu;
+        if(source<0||source>=menu.slots.size()||destination<0||destination>=menu.slots.size()||source==destination||!menu.getCarried().isEmpty()
             ||menu.getSlot(source).getItem().isEmpty()||menu.getSlot(destination).hasItem())
             throw new IllegalStateException("Confirmed inventory move requires a carried item, empty destination and empty cursor");
         // No local prediction: each mismatched state ID makes vanilla send the post-click full contents
         // within that handler, before a subsequent hopper tick can drain the destination.
-        for(int slot:new int[]{source,destination})mc.getConnection().send(confirmedClick(menu.containerId,slot));
+        sendConfirmedMove(menu.containerId,source,destination);
+    }
+
+    /** Ordered, non-predicted clicks for a prevalidated exact-slot burst. */
+    public static void sendConfirmedMove(int menu, int source, int destination) {
+        for(int slot:new int[]{source,destination})mc.getConnection().send(confirmedClick(menu,slot));
+    }
+
+    /** Vanilla shift-click with an authoritative post-click snapshot, not local prediction. */
+    public static void sendConfirmedQuickMove(int menu, int source) { mc.getConnection().send(confirmedQuickMove(menu,source)); }
+
+    public static net.minecraft.network.protocol.game.ServerboundContainerClickPacket confirmedQuickMove(int menu,int slot) {
+        return new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(menu,-1,(short)slot,(byte)0,
+            ContainerInput.QUICK_MOVE,it.unimi.dsi.fastutil.ints.Int2ObjectMaps.emptyMap(),net.minecraft.network.HashedStack.EMPTY);
     }
 
     public static net.minecraft.network.protocol.game.ServerboundContainerClickPacket confirmedClick(int menu,int slot) {
         return new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(menu,-1,(short)slot,(byte)0,
             ContainerInput.PICKUP,it.unimi.dsi.fastutil.ints.Int2ObjectMaps.emptyMap(),net.minecraft.network.HashedStack.EMPTY);
+    }
+
+    /** Throw exactly this server-verified stack without predicting the inventory change. */
+    public static void dropSlotConfirmed(int slot) {
+        var menu=mc.player.containerMenu;
+        if(slot<0||slot>=menu.slots.size()||menu.getSlot(slot).container!=mc.player.getInventory()||!menu.getCarried().isEmpty()||!menu.getSlot(slot).hasItem())
+            throw new IllegalStateException("Confirmed discard requires a player slot and empty cursor");
+        mc.getConnection().send(new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(menu.containerId,-1,(short)slot,(byte)1,
+            ContainerInput.THROW,it.unimi.dsi.fastutil.ints.Int2ObjectMaps.emptyMap(),net.minecraft.network.HashedStack.EMPTY));
     }
 
     public static Action drop() {

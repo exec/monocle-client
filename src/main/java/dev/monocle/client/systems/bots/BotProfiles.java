@@ -49,8 +49,13 @@ public final class BotProfiles {
         }
         return validate(result);
     }
-    /** Read actual in-memory task overrides, not the original settings substituted during module persistence. */
-    public static JsonObject captureEffective() { return capture("Current"); }
+    /** Checkpoint every live value, including defaults, so resume cannot inherit restored personal settings. */
+    public static JsonObject captureEffective() {
+        JsonObject full = new JsonObject();
+        for (Module module : Modules.get().getAll()) if (gameplay(module))
+            full.add(module.name, encode(fullSettings(module.settings), module.isActive() && !executorOwned(module.name)));
+        return validate(full);
+    }
 
     static CompoundTag readProfile(Path path) throws IOException {
         try (var input = new DataInputStream(Files.newInputStream(path))) {
@@ -104,10 +109,7 @@ public final class BotProfiles {
     public static JsonObject begin() {
         if (originals != null) return originals.deepCopy();
         requireIdle();
-        JsonObject full = new JsonObject();
-        for (Module module : Modules.get().getAll()) if (gameplay(module))
-            full.add(module.name, encode(fullSettings(module.settings), module.isActive() && !executorOwned(module.name)));
-        originals = validate(full); return originals.deepCopy();
+        originals = captureEffective(); return originals.deepCopy();
     }
 
     /** A client-thread observation, not the effectiveProfile checkpoint (which may be old). */
@@ -215,11 +217,12 @@ public final class BotProfiles {
             Module module = Modules.get().get(name);
             if (module == null || !gameplay(module)) throw new IllegalArgumentException("Worker cannot apply gameplay module: " + name);
             CompoundTag patch = parse(checked.getAsJsonObject(name).get("settings").getAsString());
+            CompoundTag before = fullSettings(module.settings);
             // Workflow profiles are overlays: built-ins intentionally specify only their
             // job policy, while workers retain unrelated local module settings.
-            desired.put(module, mergeSettings(fullSettings(module.settings), patch));
+            desired.put(module, mergeSettings(before, patch));
             enabled.put(module, checked.getAsJsonObject(name).get("active").getAsBoolean());
-            previous.put(module, module.settings.toTag().copy()); oldEnabled.put(module, module.isActive());
+            previous.put(module, before); oldEnabled.put(module, module.isActive());
         }
         if (originals == null) throw new IllegalStateException("Checkpoint original settings before applying a task profile.");
         try { applyStates(desired, enabled, false); }
@@ -265,7 +268,7 @@ public final class BotProfiles {
     private static void applyStates(Map<Module, CompoundTag> settings, Map<Module, Boolean> enabled, boolean restoring) {
         RuntimeException failed = null;
         Set<Module> changed = new HashSet<>(), broken = new HashSet<>();
-        settings.forEach((module, tag) -> { if (settingsChanged(module.settings.toTag(), tag)) changed.add(module); });
+        settings.forEach((module, tag) -> { if (settingsChanged(fullSettings(module.settings), tag)) changed.add(module); });
         // Changed modules are inactive while ALL settings are installed. Unchanged modules never cycle.
         for (int phase = 0; phase < 3; phase++) for (var entry : settings.entrySet()) {
             Module module = entry.getKey();

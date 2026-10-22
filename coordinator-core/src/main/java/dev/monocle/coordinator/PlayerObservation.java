@@ -28,6 +28,21 @@ public record PlayerObservation(UUID id, String name, String scope, Position pos
 
     /** Decode only roster fields; no mutable protocol object crosses into decisions. */
     public static PlayerObservation fromHello(JsonObject report, long receivedAt) {
+        if (report.has("playerSightings")) PlayerSightings.validate(report.getAsJsonArray("playerSightings"));
+        if (report.has("playerChecks")) PlayerSightings.validateChecks(report.getAsJsonObject("playerChecks"));
+        if (report.has("inLobby") && (!report.get("inLobby").isJsonPrimitive() || !report.getAsJsonPrimitive("inLobby").isBoolean())) throw new IllegalArgumentException("Invalid lobby state");
+        if (report.has("worldReadiness")) {
+            JsonObject readiness=report.getAsJsonObject("worldReadiness");TaskFiles.jsonBytes(readiness,512);
+            if(!readiness.has("state")||!readiness.get("state").isJsonPrimitive()||!readiness.getAsJsonPrimitive("state").isString()
+                ||!readiness.has("reason")||!readiness.get("reason").isJsonPrimitive()||!readiness.getAsJsonPrimitive("reason").isString()
+                ||!java.util.Set.of("Disconnected","Connecting","Lobby","Transferring","Loading","Ready").contains(TaskWire.text(readiness,"state"))
+                || TaskWire.text(readiness,"reason").length()>160)throw new IllegalArgumentException("Invalid world readiness");
+        }
+        if (report.has("safeReconnect")) TaskFiles.jsonBytes(report.getAsJsonObject("safeReconnect"), 2048);
+        if(report.has("combat")) {
+            if(!report.get("combat").isJsonObject())throw new IllegalArgumentException("Invalid worker combat evidence");
+            TaskFiles.jsonBytes(report.getAsJsonObject("combat"),4096);
+        }
         if (report.has("diagnostics")) {
             if (!report.get("diagnostics").isJsonObject()) throw new IllegalArgumentException("Invalid worker diagnostics");
             TaskFiles.jsonBytes(report.getAsJsonObject("diagnostics"), 8192);

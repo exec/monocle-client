@@ -14,16 +14,28 @@ import static dev.monocle.coordinator.TaskWire.*;
 
 /** One coordinator thread/monitor, real worker protocol, no game or account in this process. */
 public final class HostService implements AutoCloseable {
-    public static final List<String> ACTIONS = List.of("Wait", "Travel", "DropItems", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies", "StashScan", "StashResupply", "StashDeposit");
+    public static final List<String> ACTIONS = List.of("Wait", "Travel", "DropItems", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies", "StashScan", "StashResupply", "StashDeposit", "KitTransferPlan", "StashVisit", "StashSortPlan");
     private final Path journal;
     private final Path directory;
+    private final ScheduledExecutorService catalogReader=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon().name("Monocle catalog reader").factory());
+    private volatile JsonArray catalogSnapshot=new JsonArray();
+    private volatile String catalogError="";
+    private String catalogRevision="";
+    private record WatchRequest(String crew,int limit) {}
+    private final Map<WatchRequest,List<JsonObject>> catalogWatches=new ConcurrentHashMap<>();
     private final OperationsLibrary library;
+    private final KitBot kitBot;
+    private final KnownHostiles hostiles;
+    private final HostileWarnings hostileWarnings = new HostileWarnings();
+    private final IncidentTimeline incidents;
+    private DiscordNotifications notifications;
     private final Map<String, String> crewLabels = new LinkedHashMap<>();
     private final Map<UUID, JsonObject> roster = new LinkedHashMap<>();
     private final Deque<JsonObject> activity = new ArrayDeque<>();
     private final BotChat chat = new BotChat();
     private final ConfigurationReadback readbacks = new ConfigurationReadback();
     private final Map<UUID, Long> chatAt = new HashMap<>();
+    private final DirectMessages directMessages = new DirectMessages();
     private final Map<UUID, AutoTpy> autoTpyRequests = new LinkedHashMap<>();
     private final CrewTelemetry events;
     private final OperatorOperations operatorOperations;
@@ -55,10 +67,23 @@ public final class HostService implements AutoCloseable {
     private static final class Peer {
         boolean chatSupported;
         boolean stashCatalogSupported;
+        boolean stashLiveSupported;
+        boolean categoriesSupported;
+        boolean sortSupported;
+        int stashContainerLimit=StashCatalog.LEGACY_MAX_CONTAINERS;
+        final ArrayDeque<JsonObject> stashWatches=new ArrayDeque<>();
+        long stashCatalogAt;
         UUID id;
         String crew, current = "";
         PlayerObservation observation;
         JsonObject diagnostics;
+        JsonObject worldReadiness;
+        JsonObject combat;
+        boolean hostilesSupported;
+        boolean hostileWarningsSupported;
+        boolean safeReconnectSupported;
+        JsonObject safeReconnect;
+        long hostilesRevision=-1;
         boolean reconciled;
         long seen;
         long stateLogAt;
@@ -84,6 +109,20 @@ public final class HostService implements AutoCloseable {
         final UUID run; final String data; final JsonObject state; int next;
         Transfer(UUID run, String data, JsonObject state) { this.run = run; this.data = data; this.state = state; }
     }
+    private record ScanAck(SwarmConnection connection,JsonObject ack,String worker,String task,String detail){}
+    private final List<ScanAck> scanAcks=new ArrayList<>();
+    private boolean scanCheckpointDirty;
+    private long scanAckAt;
+    private void flushScanAcks(){
+        if(!StashCatalog.scanAckBatchReady(scanAcks.size(),System.nanoTime()-scanAckAt))return;
+        if(scanCheckpointDirty)persist();
+        scanCheckpointDirty=false;
+        for(ScanAck receipt:scanAcks){
+            if(receipt.connection().connected())receipt.connection().send(receipt.ack().toString());
+            if(!receipt.detail().isEmpty())logEvent("stash-container-observed",receipt.worker(),receipt.task(),receipt.detail());
+        }
+        scanAcks.clear();
+    }
 
     public HostService(Path directory, String bind, int port, Map<String, String> crews, int historyDays) throws IOException {
         this(directory, bind, port, crews, historyDays, -1);
@@ -108,6 +147,11 @@ public final class HostService implements AutoCloseable {
             if (lock == null) throw new IllegalStateException("Another host owns this data directory");
             operatorOperations = new OperatorOperations(directory.resolve("operator-operations.json"));
             library = new OperationsLibrary(directory.resolve("bot-operations.json"));
+            kitBot = new KitBot(directory);
+            hostiles = new KnownHostiles(directory.resolve("known-hostiles.json"));
+            notifications = new DiscordNotifications(directory);
+            incidents = new IncidentTimeline(directory.resolve("incidents.telemetry.jsonl"));
+            incidents.onEvent(notifications::incident);
             JsonObject config = TaskFiles.read(directory.resolve("host-config.json"));
             autoTpy = config.has("autoTpy") && config.get("autoTpy").isJsonPrimitive() && config.getAsJsonPrimitive("autoTpy").isBoolean() && config.get("autoTpy").getAsBoolean();
             if (config.has("crewLabels")) config.getAsJsonObject("crewLabels").entrySet().forEach(e -> {
@@ -135,6 +179,7 @@ public final class HostService implements AutoCloseable {
                 for (var entry : saved.getAsJsonObject("tasks").entrySet()) {
                     UUID id = UUID.fromString(entry.getKey()); JsonObject task = entry.getValue().getAsJsonObject();
                     validateTask(id, task);
+                    notifications.prime(task);
                     if (flag(task, "cancelled")) QueuePolicy.cancel(task);
                     else if (!QueuePolicy.terminal(text(task, "status"))) {
                         task.addProperty("paused", true); task.addProperty("status", "Inspection required");
@@ -146,8 +191,9 @@ public final class HostService implements AutoCloseable {
             persist();
             listener = opened = new CrewListener(bind, port, selector -> { String crew = selectors.get(selector); return crew == null ? null : this.crews.get(crew); }, webPort);
             for (String crew : crews.keySet()) highways.put(crew, new HighwayHost(directory, crew, id -> nativeReady(crew, id), this::highwayCheckpoint));
-        } catch (IOException | RuntimeException e) { if(opened!=null)opened.close();lockChannel.close(); ticker.shutdownNow(); throw e; }
+        } catch (IOException | RuntimeException e) { catalogReader.shutdownNow();if(notifications!=null)notifications.close();if(opened!=null)opened.close();lockChannel.close(); ticker.shutdownNow(); throw e; }
         ticker.scheduleWithFixedDelay(this::tick, 0, 50, TimeUnit.MILLISECONDS);
+        catalogReader.scheduleWithFixedDelay(this::refreshCatalog,0,1,TimeUnit.SECONDS);
     }
 
     public int port() { return listener.port(); }
@@ -223,9 +269,10 @@ public final class HostService implements AutoCloseable {
         for(JsonObject task:tasks.values()){
             JsonObject run=task.getAsJsonObject("runs").getAsJsonObject(id.toString());
             if(run==null || !flag(run,"publicProtocol") || QueuePolicy.terminal(text(run,"status")) || present.contains(text(run,"id")))continue;
-            if(flag(task,"cancelled")){run.addProperty("status","Cancelled");run.addProperty("detail","Worker confirms no active execution");}
+            if(flag(task,"cancelled")){run.addProperty("status","Cancelled");run.addProperty("detail","Worker confirms no active execution");CommandReceipts.noExecution(task,run);}
             else if(task.has("publicAction") && !text(run,"status").equals("Queued")) {
                 run.addProperty("status","Inspection required");run.addProperty("detail","Extension checkpoint missing; inspect effects before cancelling or recreating work");
+                CommandReceipts.uncertain(task,run);
                 task.addProperty("paused",true);task.addProperty("status","Inspection required");
             } else if(!task.has("publicAction")) {
                 run.addProperty("status","Queued");run.addProperty("generation",Math.incrementExact(run.get("generation").getAsInt()));
@@ -238,7 +285,7 @@ public final class HostService implements AutoCloseable {
     }
     synchronized void publicWorkerDisconnected(UUID id) {
         if (!publicPeers.containsKey(id)) return;
-        status(); // Retain even short-lived sessions that disconnected before the periodic roster checkpoint.
+        workerViews(); // Retain even short-lived sessions that disconnected before the periodic roster checkpoint.
         publicPeers.remove(id);checkpointRoster();
         logEvent("worker-disconnected", id.toString(), "", "public protocol");
     }
@@ -310,6 +357,10 @@ public final class HostService implements AutoCloseable {
         if(type.equals("execution.completed") && task.has("publicAction"))
             run.addProperty("detail","Worker-reported extension result; not independently game-verified");
         run.addProperty("status",next);task.addProperty("status",QueuePolicy.summarizedStatus(task));peer.seen=System.currentTimeMillis();
+        JsonObject evidence=new JsonObject();evidence.addProperty("status",next);evidence.addProperty("detail",text(run,"detail"));
+        if(run.has("operatorControl"))evidence.addProperty("controlId",text(run.getAsJsonObject("operatorControl"),"id"));
+        evidence.addProperty("inspectionRequired",type.equals("execution.cancelled")&&text(payload,"cleanup").equals("inspection_required"));
+        CommandReceipts.report(task,run,evidence);
         JsonObject receipt=new JsonObject();receipt.addProperty("type",type);receipt.addProperty("hash",hash);
         receipts.add(messageId.toString(),receipt);
         while(receipts.size()>128)receipts.remove(receipts.keySet().iterator().next());
@@ -330,7 +381,33 @@ public final class HostService implements AutoCloseable {
         return value.deepCopy();
     }
     OperatorOperations operatorOperations() { return operatorOperations; }
+    private String operatorCommandId="";
+    synchronized void operatorCommand(String id) { operatorCommandId=id; }
+    private String commandReceiptId(){return operatorCommandId.isEmpty()?UUID.randomUUID().toString():operatorCommandId;}
+    synchronized JsonObject operatorOperation(String id) {
+        JsonObject record=operatorOperations.get(id);if(record==null)return null;
+        for(JsonObject task:tasks.values())if(task.has("controlReceipts")&&task.getAsJsonObject("controlReceipts").has(id)) {
+            observeOperation(id,task.getAsJsonObject("controlReceipts").getAsJsonObject(id));
+            return operatorOperations.get(id);
+        }
+        if(record.has("crewWatch")&&!Set.of("completed","rejected").contains(text(record,"state"))) {
+            JsonObject watch=record.getAsJsonObject("crewWatch");UUID worker=UUID.fromString(text(watch,"worker"));String crew=text(watch,"crew");
+            boolean confirmed=publicPeers.containsKey(worker)&&publicPeers.get(worker).crew.equals(crew)
+                ||peers.entrySet().stream().anyMatch(e->e.getKey().connected()&&e.getValue().id.equals(worker)&&e.getValue().reconciled&&e.getValue().crew.equals(crew));
+            JsonObject receipt=new JsonObject();receipt.addProperty("state",confirmed?"completed":"delivery_queued");receipt.addProperty("updatedAt",confirmed?System.currentTimeMillis():0);receipt.add("worker",watch.get("worker"));receipt.addProperty("detail",confirmed?"Authenticated worker belongs to the requested crew":"Reassignment queued; awaiting authenticated worker reconnect to the requested crew");
+            if(confirmed||!record.has("receipt"))observeOperation(id,receipt);
+            return operatorOperations.get(id);
+        }
+        return record;
+    }
+    private void observeOperation(String id,JsonObject receipt) {
+        JsonObject before=operatorOperations.get(id);if(before==null||before.has("httpStatus")&&before.get("httpStatus").getAsInt()>=400)return;
+        operatorOperations.observe(id,receipt);
+        if(!text(before,"state").equals(text(receipt,"state")))operatorReceipt(id,text(receipt,"state"));
+    }
     synchronized void operatorReceipt(String commandId, String state) { logEvent("operator-command", "", commandId, state); }
+    synchronized JsonObject incidentPage(String before, int limit, String kind, String search) { return incidents.page(before, limit, kind, search); }
+
     synchronized JsonObject operatorEvents(String after, int limit) {
         if (limit < 1 || limit > 100) throw new IllegalArgumentException("limit must be 1–100");
         long sequence = 0;
@@ -362,11 +439,17 @@ public final class HostService implements AutoCloseable {
         JsonObject root = new JsonObject(), records = new JsonObject(); root.addProperty("version", 1);
         tasks.forEach((id, task) -> records.add(id.toString(), task)); root.add("tasks", records);
         root.add("publicReportReceipts",publicReportReceipts);TaskFiles.write(journal, root);
+        for(JsonObject task:tasks.values())if(task.has("controlReceipts"))for(var entry:task.getAsJsonObject("controlReceipts").entrySet())if(operatorOperations.contains(entry.getKey()))observeOperation(entry.getKey(),entry.getValue().getAsJsonObject());
+        tasks.values().forEach(CommandReceipts::prune);
+        tasks.values().forEach(notifications::observeTask);
     }
     // ponytail: one coordinator monitor; shard by crew only if measured controller load warrants it.
     private synchronized void tick() {
         if (closed || !failure.isEmpty()) return;
         try {
+            for(var entry:peers.entrySet())if(entry.getKey().connected())for(int i=0;i<2&&!entry.getValue().stashWatches.isEmpty();i++){
+                if(!entry.getKey().send(entry.getValue().stashWatches.peek().toString()))break;entry.getValue().stashWatches.remove();
+            }
             for (var entry : List.copyOf(peers.entrySet())) if (!entry.getKey().connected()) {
                 Peer departed = peers.remove(entry.getKey());
                 if (departed != null) logEvent("worker-disconnected", departed.id.toString(), "", departed.crew);
@@ -378,6 +461,7 @@ public final class HostService implements AutoCloseable {
                     try { receive(c, JsonParser.parseString(wire).getAsJsonObject()); }
                     catch (RuntimeException e) {
                         // A failed checkpoint is not a bad worker. Stop dispatch entirely until repaired.
+                        if(e instanceof OperatorOperations.JournalException)throw e;
                         if (e instanceof IllegalStateException && e.getMessage() != null && e.getMessage().startsWith("Task checkpoint failed")) throw e;
                         Peer rejected = peers.get(c);
                         if (rejected != null) logEvent("worker-message-rejected", rejected.id.toString(), "", e.getClass().getSimpleName());
@@ -389,13 +473,28 @@ public final class HostService implements AutoCloseable {
                     }
                 }
             }
+            flushScanAcks();
             long now = System.nanoTime();
+            for(JsonObject request:kitBot.pending()){
+                JsonObject submission=request.getAsJsonObject("submission");if(tasks.values().stream().anyMatch(t->StashSortExecution.sameScope(t,text(submission,"crew"),text(submission,"server")+"\n"+text(submission,"dimension"))))continue;
+                try{submit(request.getAsJsonObject("submission"));kitBot.state(text(request,"id"),"Queued","");}
+                catch(RuntimeException e){if(e.getMessage()!=null&&e.getMessage().startsWith("Task checkpoint failed"))throw e;kitBot.state(text(request,"id"),"Failed",String.valueOf(e.getMessage()));logEvent("kitbot-error","",text(request,"id"),String.valueOf(e.getMessage()));}
+            }
+            kitBot.reconcile(tasks);
+            for(var entry:peers.entrySet()){
+                Peer p=entry.getValue();if(!entry.getKey().connected()||!p.reconciled||!p.chatSupported||p.worldReadiness==null||!text(p.worldReadiness,"state").equals("Ready"))continue;
+                directMessages.drain(p.id,p.crew,p.observation.scope(),System.currentTimeMillis(),m->{
+                    JsonObject reply=new JsonObject();reply.addProperty("type","manage-chat");reply.addProperty("id",m.id());reply.addProperty("scope",m.scope());reply.addProperty("text",m.text());return entry.getKey().send(reply.toString());
+                });
+            }
             if (now-rosterAt >= 20_000_000_000L) {
                 checkpointRoster();rosterAt=now;
             }
             if (now - heartbeatAt >= 1_000_000_000L) {
+                for(String id:operatorOperations.crewWatches())operatorOperation(id);
                 JsonObject heartbeat=new JsonObject();heartbeat.addProperty("type","heartbeat");heartbeat.addProperty("autoTpy",autoTpy);heartbeat.add("crews",crewDiscovery());
                 for (SwarmConnection c : listener.connections()) if (c != null && c.connected()) c.send(heartbeat.toString());
+                for(var entry:peers.entrySet())if(entry.getKey().connected())sendHostiles(entry.getKey(),entry.getValue());
                 heartbeatAt = now;
             }
             tickAutoTpy();
@@ -411,17 +510,19 @@ public final class HostService implements AutoCloseable {
             boolean changed = false;
             for (JsonObject task : tasks.values()) {
                 String status = QueuePolicy.summarizedStatus(task);
+                HighwayHost receiptHighway=highways.get(text(task,"crew"));
+                if(receiptHighway!=null)changed|=CommandReceipts.confirmNative(task,receiptHighway::workerWorking);
                 if(task.has("nativeDefinition") && QueuePolicy.terminal(status) && !flag(task,"cancelled")) status="Running";
                 if (!status.equals(text(task, "status"))) { task.addProperty("status", status); changed = true; }
                 changed |= BotHistory.stamp(task, BotHistory.taskFinished(task, task.has("nativeDefinition")), System.currentTimeMillis());
             }
             if (now - historyAt >= 60_000_000_000L) {
                 historyAt = now;
-                changed |= tasks.values().removeIf(task -> BotHistory.taskFinished(task, task.has("nativeDefinition")) && BotHistory.expired(BotHistory.finishedAt(task), System.currentTimeMillis(), historyDays));
+                changed |= tasks.values().removeIf(task -> !StashSortExecution.holds(task)&&BotHistory.taskFinished(task, task.has("nativeDefinition")) && BotHistory.expired(BotHistory.finishedAt(task), System.currentTimeMillis(), historyDays));
             }
             if (changed) persist();
         } catch (RuntimeException e) {
-            logEvent("coordinator-failed", "", "", e.getClass().getSimpleName());
+            logEvent("coordinator-failed", "", "", e.getClass().getSimpleName()+": "+e.getMessage());
             failure = "Coordinator stopped: " + e.getClass().getSimpleName() + ". Inspect the journal/log before restarting.";
             System.err.println(failure); e.printStackTrace(System.err);
             listener.close(); // Worker connection-loss cleanup is safer than continuing after a failed durable intent.
@@ -455,14 +556,57 @@ public final class HostService implements AutoCloseable {
             else if (!peer.observation.scope().equals(observation.scope())) logEvent("worker-world-changed", peer.id.toString(), peer.current, peer.observation.scope() + " -> " + observation.scope());
             peer.observation = observation;
             peer.diagnostics = message.has("diagnostics") ? message.getAsJsonObject("diagnostics").deepCopy() : null;
+            peer.worldReadiness=message.has("worldReadiness")?message.getAsJsonObject("worldReadiness").deepCopy():null;
+            notifications.observeWorker(message);
+            JsonObject combat=!flag(message,"inLobby")&&message.has("combat")?message.getAsJsonObject("combat"):null;
+            if(combat!=null&&!combat.equals(peer.combat)&&combat.size()>2)
+                logEvent("worker-combat",peer.id.toString(),peer.current,combat.toString());
+            peer.combat=combat==null?null:combat.deepCopy();
+            peer.hostilesSupported=message.has("knownHostilesProtocol")&&integer(message,"knownHostilesProtocol",1,1)==1;
+            peer.hostileWarningsSupported=message.has("hostileWarningsProtocol")&&integer(message,"hostileWarningsProtocol",1,1)==1;
+            peer.safeReconnectSupported=message.has("safeReconnectProtocol")&&integer(message,"safeReconnectProtocol",1,1)==1;
+            peer.safeReconnect=message.has("safeReconnect")?message.getAsJsonObject("safeReconnect").deepCopy():null;
+            Set<UUID> protectedPlayers=new HashSet<>(roster.keySet());peers.values().forEach(p->protectedPlayers.add(p.id));
+            try{
+                if(hostiles.observe(peer.id,observation.scope(),combat,protectedPlayers))logEvent("hostile-identified",peer.id.toString(),peer.current,"New server-attributed attacker");
+            }catch(RuntimeException e){logEvent("hostile-list-error",peer.id.toString(),peer.current,String.valueOf(e.getMessage()));}
+            try{incidents.observe(peer.id,observation.name(),peer.crew,message,protectedPlayers,hostiles);}
+            catch(RuntimeException e){logEvent("incident-error",peer.id.toString(),peer.current,String.valueOf(e.getMessage()));}
+            for(JsonObject warning:hostileWarnings.observe(peer.id,observation.name(),peer.crew,message,hostiles,protectedPlayers,System.currentTimeMillis())) {
+                JsonObject player=warning.getAsJsonObject("sighting").getAsJsonObject("player");
+                String detail=text(player,"name")+" sighted by "+observation.name()+" · "+peer.crew+" · "+text(warning,"server")+" · "+text(player,"x")+", "+text(player,"y")+", "+text(player,"z");
+                logEvent("hostile-sighted",peer.id.toString(),peer.current,detail);
+                notifications.failure("hostile-sighted",observation.name(),detail);
+            }
+            for(var entry:peers.entrySet())if(entry.getKey().connected())sendHostiles(entry.getKey(),entry.getValue());
+            if(peer.hostileWarningsSupported&&message.has("playerChecks"))c.send(HostileWarnings.receipt(message,hostiles.revision()).toString());
             peer.chatSupported = message.has("chatProtocol") && integer(message,"chatProtocol",1,1)==1;
             return;
         }
         Peer peer = peers.get(c); if (peer == null) throw new IllegalArgumentException("Announce worker identity first");
         if (type.equals("worker-chat")) {
             chat.append(peer.id,peer.crew,peer.observation.name(),peer.observation.scope(),text(message,"direction"),text(message,"text"),message.has("parts")?message.getAsJsonArray("parts"):null);
+            if(text(message,"direction").equals("sent")&&DirectMessages.isDm(text(message,"text")))directMessages.sent(peer.id,System.currentTimeMillis());
+            if(text(message,"direction").equals("received")&&peer.reconciled&&peer.worldReadiness!=null&&text(peer.worldReadiness,"state").equals("Ready")&&kitBot.receiver(peer.id.toString(),peer.crew,peer.observation.scope())){
+                try {
+                    JsonObject accepted=kitBot.listing(text(message,"text"));
+                    if(accepted==null)accepted=kitBot.receive(text(message,"text"),System.currentTimeMillis(),library);
+                    if(accepted!=null){
+                        logEvent("kitbot-request",peer.id.toString(),text(accepted,"id"),text(accepted,"name")+" · "+text(accepted,"category")+" · "+text(accepted,"status"));
+                        String response=switch(text(accepted,"status")){case "Listing"->" "+text(accepted,"text");case "Pending"->" Gotchu—your kits are queued. It might take a minute.";case "LimitExceeded"->" Maximum kits per request: "+accepted.get("maxKits").getAsInt()+". Try: kit "+text(accepted,"category")+" "+accepted.get("maxKits").getAsInt();default->" Sorry, that kit is out of stock right now.";};
+                        String id=accepted.has("id")?text(accepted,"id"):UUID.randomUUID().toString();
+                        if(!directMessages.add(peer.id,peer.crew,peer.observation.scope(),id,"/msg "+text(accepted,"name")+response,System.currentTimeMillis()))logEvent("kitbot-reply-dropped",peer.id.toString(),id,"DM queue is full");
+                    }
+                }catch(RuntimeException e){logEvent("kitbot-error",peer.id.toString(),"",String.valueOf(e.getMessage()));}
+            }
         } else if (type.equals("task-worker")) {
+            peer.categoriesSupported=message.has("kitCategoriesProtocol")&&integer(message,"kitCategoriesProtocol",1,1)==1;
+            peer.sortSupported=message.has("stashSortProtocol")&&integer(message,"stashSortProtocol",1,1)==1;
             peer.stashCatalogSupported=message.has("stashCatalogProtocol")&&integer(message,"stashCatalogProtocol",1,1)==1;
+            boolean hadLive=peer.stashLiveSupported;
+            peer.stashLiveSupported=message.has("stashLiveProtocol")&&integer(message,"stashLiveProtocol",1,1)==1;
+            int previousLimit=peer.stashContainerLimit;peer.stashContainerLimit=message.has("stashContainerLimit")?integer(message,"stashContainerLimit",1,StashCatalog.MAX_CONTAINERS):StashCatalog.LEGACY_MAX_CONTAINERS;
+            if(peer.stashLiveSupported&&(!hadLive||previousLimit!=peer.stashContainerLimit)){peer.stashCatalogAt=0;peer.stashWatches.clear();}
             String current = text(message, "current"); if (!current.isEmpty()) UUID.fromString(current);
             JsonArray states = message.getAsJsonArray("runs");
             if (states == null || states.size() > 64) throw new IllegalArgumentException("Invalid worker checkpoint list");
@@ -478,7 +622,8 @@ public final class HostService implements AutoCloseable {
                 JsonObject run = run(task, peer.id); UUID id = UUID.fromString(text(run, "id"));
                 if (!present.contains(id.toString()) && (peer.transfer == null || !peer.transfer.run.equals(id)) && !peer.transferred.contains(id)) QueuePolicy.reconcileMissingRun(task, run);
             }
-            persist(); peer.seen = System.nanoTime(); peer.reconciled = true;sendStashCatalog(c,peer);
+            persist(); peer.seen = System.nanoTime(); peer.reconciled = true;
+            if (peer.stashCatalogAt == 0 || peer.seen - peer.stashCatalogAt >= 60_000_000_000L) sendStashCatalog(c,peer);
         } else if (type.equals("task-status")) { update(peer, message, true); persist(); }
         else if (type.equals("task-configuration-report")) {
             JsonObject task = tasks.get(UUID.fromString(text(message,"task")));
@@ -488,18 +633,45 @@ public final class HostService implements AutoCloseable {
             JsonObject task=tasks.get(UUID.fromString(text(message,"task")));
             if(task==null||!task.getAsJsonObject("runs").has(peer.id.toString()))throw new IllegalArgumentException("Unknown stash task");
             JsonObject finding=message.deepCopy();if(message.has("observation")||message.has("observationGzip"))finding.add("observation",StashCatalog.readObservation(message));finding.remove("observationGzip");
-            JsonObject ack=StashCatalog.accept(directory,task,run(task,peer.id),peer.id.toString(),peer.crew,finding);
-            if(ack!=null){persist();c.send(ack.toString());logEvent("stash-container-observed",peer.id.toString(),text(task,"id"),finding.has("observation")?text(finding.getAsJsonObject("observation"),"status")+(flag(ack,"deposit")&&!flag(ack,"permit")?" · destination column changed":""):"Destination column reservation");}
+            boolean repeated=StashCatalog.scanFindingRecorded(run(task,peer.id),finding);
+            JsonObject ack=StashCatalog.accept(directory,task,run(task,peer.id),peer.id.toString(),peer.crew,finding,peer.categoriesSupported);
+            if(ack!=null){
+                if(!repeated)StashSortExecution.finding(task,run(task,peer.id),finding);
+                if(text(finding.getAsJsonObject("action"),"type").equals("StashScan")){
+                    scanCheckpointDirty|=!repeated;
+                    if(scanAcks.isEmpty())scanAckAt=System.nanoTime();
+                    scanAcks.add(new ScanAck(c,ack,peer.id.toString(),text(task,"id"),repeated?"":text(finding.getAsJsonObject("observation"),"status")));
+                    if(scanAcks.size()>=32)flushScanAcks();
+                }else {persist();c.send(ack.toString());logEvent("stash-container-observed",peer.id.toString(),text(task,"id"),finding.has("observation")?text(finding.getAsJsonObject("observation"),"status")+(flag(ack,"deposit")&&!flag(ack,"permit")?" · destination column changed":""):"Destination column reservation");}
+            }
+        }
+        else if(Set.of("task-stash-definition","task-stash-import").contains(type)&&message.has("exportId")) {
+            String scope=text(message,"scope");if(scope.length()>384||!scope.contains("\n"))throw new IllegalArgumentException("Invalid stash export world");
+            JsonObject ack;
+            if(peer.observation==null||!scope.equals(peer.observation.scope())){ack=TaskWire.message("stash-export-ack");ack.addProperty("exportId",text(message,"exportId"));ack.addProperty("outcome","deferred");}
+            else {ack=StashCatalog.acceptExport(directory,peer.crew,peer.id.toString(),message);logEvent("stash-export-"+text(ack,"outcome"),peer.id.toString(),"",text(message.getAsJsonObject("stash"),"name")+" · "+text(ack,"detail"));}
+            c.send(ack.toString());if(type.equals("task-stash-definition")&&text(ack,"outcome").equals("accepted"))sendStashCatalog(c,peer);
         }
         else if(type.equals("task-stash-definition")) {
             String scope=text(message,"scope");if(scope.length()>384||!scope.contains("\n")||peer.observation==null||!scope.equals(peer.observation.scope()))throw new IllegalArgumentException("Stash definition must match the worker's current world");
-            JsonObject saved=StashCatalog.define(directory,peer.crew,scope,message.getAsJsonObject("stash"),peer.id.toString());persist();sendStashCatalog(c,peer);
-            logEvent("stash-defined",peer.id.toString(),"",text(saved,"name"));
+            try{JsonObject saved=StashCatalog.importDefinition(directory,peer.crew,scope,message.getAsJsonObject("stash"),peer.id.toString(),text(message,"definitionRevision"));persist();logEvent("stash-defined",peer.id.toString(),"",text(saved,"name"));}
+            catch(StashCatalog.DefinitionConflict e){logEvent("stash-definition-conflict",peer.id.toString(),"",e.getMessage());}
+            sendStashCatalog(c,peer);
+        }
+        else if(type.equals("task-stash-live-batch")) {
+            JsonObject ack=StashCatalog.acceptLiveBatch(directory,peer.crew,peer.id.toString(),peer.observation==null?"":peer.observation.scope(),message);c.send(ack.toString());
+            for(JsonElement result:ack.getAsJsonArray("entries")){JsonObject a=result.getAsJsonObject();if(!text(a,"outcome").equals("unchanged"))logEvent("stash-live-"+text(a,"outcome"),peer.id.toString(),"","Batched observation · "+text(a,"eventId"));}
+        }
+        else if(type.equals("task-stash-live")) {
+            String scope=text(message,"scope");if(scope.length()>384||!scope.contains("\n"))throw new IllegalArgumentException("Invalid live stash world");
+            if(peer.observation==null||!scope.equals(peer.observation.scope())){JsonObject deferred=TaskWire.message("stash-live-ack");deferred.addProperty("eventId",text(message,"eventId"));deferred.addProperty("outcome","deferred");c.send(deferred.toString());return;}
+            JsonObject ack=StashCatalog.acceptLive(directory,peer.crew,scope,peer.id.toString(),message);c.send(ack.toString());
+            if(!text(ack,"outcome").equals("unchanged")){JsonObject o=StashCatalog.readObservation(message);logEvent("stash-live-"+text(ack,"outcome"),peer.id.toString(),"",text(message,"name")+" · "+StashCatalog.containerKey(o)+" · "+text(o,"status"));}
         }
         else if(type.equals("task-stash-import")) {
             String scope=text(message,"scope");if(scope.length()>384||!scope.contains("\n")||peer.observation==null||!scope.equals(peer.observation.scope()))throw new IllegalArgumentException("Stash import must match the worker's current world");
-            JsonObject saved=StashCatalog.save(directory,peer.crew,scope,message.getAsJsonObject("stash"),StashCatalog.readObservation(message));persist();
-            logEvent("stash-container-imported",peer.id.toString(),"",text(saved,"name"));
+            StashCatalog.record(directory,peer.crew,scope,message.getAsJsonObject("stash"),StashCatalog.readObservation(message));persist();
+            logEvent("stash-container-imported",peer.id.toString(),"",text(message.getAsJsonObject("stash"),"name"));
         }
         else if(type.equals("worker-tpa-request")) requestAutoTpy(peer,message);
         else if(type.equals("crew-join-request")) {
@@ -570,6 +742,16 @@ public final class HostService implements AutoCloseable {
             &&t.getAsJsonObject("runs").has(requester.id.toString())&&text(t.getAsJsonObject("args"),"target").equals(target.toString()));
     }
 
+    private void sendHostiles(SwarmConnection connection,Peer peer){
+        if(!peer.hostilesSupported)return;
+        if(peer.hostilesRevision!=hostiles.revision()){
+            JsonObject frame=TaskWire.message("known-hostiles");frame.add("catalog",hostiles.snapshot());
+            if(!connection.send(frame.toString()))return;peer.hostilesRevision=hostiles.revision();
+        }
+        hostileWarnings.retainRecipients(peers.keySet());
+        if(peer.hostileWarningsSupported)for(JsonObject frame:hostileWarnings.pending(connection,hostiles,System.currentTimeMillis()))
+            if(connection.send(frame.toString()))hostileWarnings.delivered(connection,frame);
+    }
     private void tickAutoTpy() {
         long now=System.currentTimeMillis(),fresh=System.nanoTime();
         for(var entry:List.copyOf(autoTpyRequests.entrySet())) {
@@ -587,16 +769,31 @@ public final class HostService implements AutoCloseable {
             if(target.getKey().send(accept.toString())){autoTpyRequests.remove(entry.getKey());logEvent("worker-auto-tpy",request.target().toString(),"",request.requesterName());}
         }
     }
-    private void sendStashCatalog(SwarmConnection c,Peer peer){if(!peer.stashCatalogSupported)return;JsonObject m=TaskWire.message("stash-catalog");JsonArray list=new JsonArray();for(JsonElement value:StashCatalog.list(directory)){JsonObject s=value.getAsJsonObject();if(!text(s,"crew").equals(peer.crew))continue;JsonObject compact=StashCatalog.wireSummary(s);if(m.toString().length()+list.toString().length()+compact.toString().length()>14_000)break;list.add(compact);if(list.size()==64)break;}m.add("stashes",list);c.send(m.toString());}
+    private void refreshCatalog(){
+        try{
+            String revision=StashCatalog.catalogRevision(directory);boolean changed=!revision.equals(catalogRevision);
+            if(changed)catalogSnapshot=StashCatalog.list(directory);
+            boolean ready=changed;
+            for(WatchRequest request:catalogWatches.keySet())if(changed||catalogWatches.get(request).isEmpty()){
+                List<JsonObject> frames=StashCatalog.watchFrames(directory,request.crew,request.limit);catalogWatches.put(request,frames);ready|=!frames.isEmpty();
+            }
+            catalogRevision=revision;
+            if(ready)synchronized(this){for(Peer peer:peers.values())peer.stashCatalogAt=0;}
+            catalogError="";
+        }catch(RuntimeException e){catalogError="Catalog refresh failed: "+e.getClass().getSimpleName();}
+    }
+    private void sendStashCatalog(SwarmConnection c,Peer peer){if(!peer.stashCatalogSupported)return;JsonObject m=TaskWire.message("stash-catalog");m.addProperty("stashExportProtocol",1);m.addProperty("stashLiveBatchProtocol",1);JsonArray list=new JsonArray();for(JsonElement value:catalogSnapshot){JsonObject s=value.getAsJsonObject();if(!text(s,"crew").equals(peer.crew))continue;JsonObject compact=StashCatalog.wireSummary(s);if(m.toString().length()+list.toString().length()+compact.toString().length()>14_000)break;list.add(compact);if(list.size()==64)break;}m.add("stashes",list);if(c.send(m.toString()))peer.stashCatalogAt=System.nanoTime();if(peer.stashLiveSupported&&peer.stashWatches.isEmpty())peer.stashWatches.addAll(catalogWatches.computeIfAbsent(new WatchRequest(peer.crew,peer.stashContainerLimit),key->List.of()));}
     private void update(Peer peer, JsonObject message, boolean full) {
         UUID.fromString(text(message, "run"));
+        TaskWire.validateProgress(message,full);
         for (JsonObject task : tasks.values()) if (task.getAsJsonObject("runs").has(peer.id.toString())) {
             JsonObject run = run(task, peer.id); if (flag(run,"publicProtocol") || !text(run, "id").equals(text(message, "run"))) continue;
             if (!text(task, "crew").equals(peer.crew)) throw new IllegalArgumentException("Report belongs to another crew");
             if(full && message.has("action")) {
                 JsonObject action=message.getAsJsonObject("action");String type=text(action,"type");
+                StashSortExecution.validateAction(task,action);
                 if(!ACTIONS.contains(type))throw new IllegalArgumentException("Unsupported native action");
-                if(type.equals("StashScan")||type.equals("StashDeposit"))StashCatalog.plan(action);
+                if(Set.of("StashScan","StashDeposit","StashVisit").contains(type))StashCatalog.plan(action);
                 if(type.equals("Highway")) {
                     JsonObject packaged=task.getAsJsonObject("package");
                     if(!packaged.has("geometry") || !packaged.getAsJsonObject("highways").has(text(action,"workflow"))) throw new IllegalArgumentException("Unknown Highway preset");
@@ -604,12 +801,15 @@ public final class HostService implements AutoCloseable {
                     for(String axis:List.of("x","y","z"))if(action.has(axis))integer(action,axis,axis.equals("y")?-2048:-29_900_000,axis.equals("y")?2048:29_900_000);
                 }
             }
-            if(full&&message.has("stashWithdrawal")&&!text(run,"stashWithdrawalToken").equals(text(message,"token"))){JsonObject receipt=message.getAsJsonObject("stashWithdrawal");String catalogCrew=text(receipt,"catalogCrew");if(catalogCrew.isEmpty())catalogCrew=peer.crew;if(!catalogCrew.equals(peer.crew))throw new IllegalArgumentException("Withdrawal belongs to another crew");StashCatalog.invalidateWithdrawn(directory,catalogCrew,text(task,"server")+"\n"+text(task,"dimension"),text(receipt,"stash"),receipt.getAsJsonArray("withdrawn"));run.addProperty("stashWithdrawalToken",text(message,"token"));}
-            if(full)StashCatalog.depositReceipt(directory,peer.crew,text(task,"server")+"\n"+text(task,"dimension"),run,message);
             String previousStatus = text(run, "status"), previousDetail = text(run, "detail");
+            JsonObject previousProgress=run.has("actionProgress")?run.getAsJsonObject("actionProgress"):null;
             HighwayHost highway = highways.get(text(task, "crew"));
             boolean isolateInspection = task.has("nativeDefinition") && highway != null && ownsHighway(task, highway) && highway.independentSupplies();
             if (!TaskWire.applyStatus(task, run, message, full, isolateInspection)) return;
+            if(full){StashCatalog.beginTransfer(directory,peer.crew,text(task,"server")+"\n"+text(task,"dimension"),run,message);StashCatalog.withdrawalReceipt(directory,peer.crew,text(task,"server")+"\n"+text(task,"dimension"),run,message);StashCatalog.depositReceipt(directory,peer.crew,text(task,"server")+"\n"+text(task,"dimension"),run,message);StashSortExecution.evidence(task,run,message);}
+            if (dev.monocle.coordinator.ActionProgress.recoveryChanged(previousProgress,run.has("actionProgress")?run.getAsJsonObject("actionProgress"):null))
+                logEvent("worker-action-stall",peer.id.toString(),text(run,"id"),run.get("actionProgress").toString());
+            notifications.observeTask(task);
             String status = text(run, "status");
             long now = System.nanoTime();
             if (!previousStatus.equals(status) || !previousDetail.equals(text(run, "detail")) && now - peer.stateLogAt >= 1_000_000_000L) {
@@ -631,12 +831,12 @@ public final class HostService implements AutoCloseable {
             for(JsonObject task:tasks.values()){
                 JsonObject run=task.getAsJsonObject("runs").getAsJsonObject(id.toString());
                 if(run==null || !flag(run,"publicProtocol") || !flag(task,"cancelled") || QueuePolicy.terminal(text(run,"status")))continue;
-                if(text(run,"status").equals("Queued")){run.addProperty("status","Cancelled");persist();continue;}
+                if(text(run,"status").equals("Queued")){run.addProperty("status","Cancelled");run.addProperty("detail","Cancelled before dispatch");CommandReceipts.noExecution(task,run);persist();continue;}
                 if(!Set.of("Sending","Ready","Running").contains(text(run,"status")))continue;
                 if(run.has("cancelSentAt") && now-run.get("cancelSentAt").getAsLong()<1000)continue;
                 if(!run.has("cancelCommandId")){run.addProperty("cancelCommandId",UUID.randomUUID().toString());persist();}
                 JsonObject cancel=publicReference(task,run);cancel.addProperty("commandId",text(run,"cancelCommandId"));
-                if(publicGateway.sendTo(id,"execution.cancel",cancel)){run.addProperty("cancelSentAt",now);persist();}
+                if(publicGateway.sendTo(id,"execution.cancel",cancel)){run.addProperty("cancelSentAt",now);CommandReceipts.queued(task,run,"cancel");persist();}
             }
             if(!crews.containsKey(peer.crew) || peer.scope.isEmpty() || now-peer.observationAt>30_000)continue;
             JsonObject task=QueuePolicy.choose(tasks.values().stream().filter(t->text(t,"crew").equals(peer.crew)
@@ -652,7 +852,7 @@ public final class HostService implements AutoCloseable {
             JsonObject assign=publicReference(task,run),scope=new JsonObject();
             scope.addProperty("server",text(task,"server"));scope.addProperty("dimension",text(task,"dimension"));
             assign.add("scope",scope);assign.add("action",action);assign.addProperty("commandId",text(run,"commandId"));
-            if(publicGateway.sendTo(id,"execution.assign",assign)){run.addProperty("assignmentSentAt",now);persist();}
+            if(publicGateway.sendTo(id,"execution.assign",assign)){run.addProperty("assignmentSentAt",now);CommandReceipts.queued(task,run,"transfer");persist();}
         }
     }
     private JsonObject publicAction(JsonObject task) {
@@ -705,9 +905,9 @@ public final class HostService implements AutoCloseable {
             && (!task.getAsJsonObject("runs").has(peer.id.toString()) || !flag(run(task,peer.id),"publicProtocol"))).toList();
         for (JsonObject task : eligible) if (flag(task, "cancelled") && task.getAsJsonObject("runs").has(peer.id.toString())) {
             JsonObject run = run(task, peer.id);
-            if (QueuePolicy.terminal(text(run, "status"))) continue;
+            if (QueuePolicy.cancellationAcknowledged(text(run, "status"))) continue;
             if (Set.of("Queued", "Sending").contains(text(run, "status")) && !text(run, "id").equals(peer.current)) {
-                run.addProperty("status", "Cancelled"); run.addProperty("detail", "Cancelled before start"); peer.transfer = null; persist();
+                run.addProperty("status", "Cancelled"); run.addProperty("detail", "Cancelled before start"); CommandReceipts.noExecution(task,run);peer.transfer = null; persist();
             }
             else {
                 command(c, run, QueuePolicy.cancellationCommand(run));
@@ -734,8 +934,9 @@ public final class HostService implements AutoCloseable {
             }
         }
         if (active != null && !flag(active, "cancelled") && !flag(active, "paused")) {
+            if(QueuePolicy.choose(eligible,peer.id)==active&&!QueuePolicy.detached(active,peer.id)&&text(run(active,peer.id),"status").equals("Running")&&CommandReceipts.pendingResume(active,run(active,peer.id)))command(c,run(active,peer.id),"resume");
             JsonObject config = TaskWire.configurationToSend(run(active, peer.id), System.currentTimeMillis());
-            if (config != null) c.send(config.toString());
+            if (config != null && c.send(config.toString()) && CommandReceipts.queued(active,run(active,peer.id),"configure"))persist();
         }
         QueuePolicy.Dispatch dispatch = QueuePolicy.dispatch(active, QueuePolicy.choose(eligible, peer.id), peer.id);
         if (dispatch.task() == null) return;
@@ -756,11 +957,31 @@ public final class HostService implements AutoCloseable {
 
     private void dispatchTpa(SwarmConnection connection, Peer requester, JsonObject task, JsonObject run) {
         JsonObject action = run.getAsJsonObject("action");
+        if(action!=null&&text(action,"type").equals("StashSortPlan")){
+            JsonObject reply=TaskWire.message("result");reply.addProperty("run",text(run,"id"));reply.addProperty("token",text(run,"token"));
+            try{JsonObject planned=StashSortExecution.next(directory,task,run,requester.id.toString());persist();reply.add("result",planned);reply.addProperty("success",true);reply.addProperty("detail","Sorting instruction durably checkpointed");}
+            catch(IllegalArgumentException|IllegalStateException e){persist();reply.addProperty("success",false);reply.addProperty("detail",e.getMessage());}
+            connection.send(reply.toString());return;
+        }
+        if(action!=null&&text(action,"type").equals("KitTransferPlan")){
+            JsonObject reply=TaskWire.message("result");reply.addProperty("run",text(run,"id"));reply.addProperty("token",text(run,"token"));
+            try{
+                boolean fresh=!text(run,"kitPlanToken").equals(text(run,"token"));
+                JsonObject planned;
+                if(text(task.getAsJsonObject("package"),"entry").equals(StashTransferTeam.WORKFLOW)){
+                    Map<UUID,PlayerObservation> observed=new HashMap<>();for(var e:peers.entrySet())if(e.getKey().connected()&&e.getValue().reconciled&&e.getValue().crew.equals(text(task,"crew"))&&e.getValue().observation!=null)observed.put(e.getValue().id,e.getValue().observation);
+                    String before=task.toString();try{planned=StashTransferTeam.next(directory,task,run,requester.id.toString(),observed,System.nanoTime(),System.currentTimeMillis());}finally{if(!before.equals(task.toString()))persist();}if(planned==null)return;
+                }else{planned=StashCatalog.cachedKitTransferPlan(directory,task,run,requester.id.toString());if(fresh)persist();}
+                reply.add("result",planned);
+                reply.addProperty("success",true);reply.addProperty("detail","Kit transfer plan ready");
+            }catch(IllegalArgumentException|IllegalStateException e){reply.addProperty("success",false);reply.addProperty("detail",e.getMessage());}
+            connection.send(reply.toString());return;
+        }
         if (action == null || !text(action, "type").equals("Tpa")) return;
         if(flag(action,"external")){
             if(flag(run,"commandSent"))return; // The recipient, not this host, decides whether to accept.
             String name=text(action,"targetName");if(!name.matches("[A-Za-z0-9_]{1,16}"))throw new IllegalArgumentException("Invalid external TPA username");
-            JsonObject command=TaskWire.message("task-tpa-send");command.addProperty("run",text(run,"id"));command.addProperty("token",text(run,"token"));command.addProperty("name",name);
+            JsonObject command=TaskWire.message("tpa-send");command.addProperty("run",text(run,"id"));command.addProperty("token",text(run,"token"));command.addProperty("name",name);
             command.addProperty("target",UUID.fromString(text(action,"target")).toString());command.addProperty("dimension",requester.observation.scope().substring(requester.observation.scope().indexOf('\n')+1));
             if(connection.send(command.toString())){run.addProperty("commandSent",true);run.addProperty("tpaSentAt",System.currentTimeMillis());persist();}return;
         }
@@ -813,6 +1034,7 @@ public final class HostService implements AutoCloseable {
         String data = Base64.getEncoder().encodeToString(TaskFiles.jsonBytes(envelope, TaskFiles.MAX_PACKAGE));
         run.addProperty("status", "Sending"); run.addProperty("detail", "Sending immutable workflow and profiles"); persist();
         if (c.send(TaskWire.begin(id, data).toString())) {
+            if(CommandReceipts.queued(task,run,"transfer"))persist();
             peer.transfer = new Transfer(id, data, run);
             logEvent("worker-transfer-begin", peer.id.toString(), id.toString(), "Queued begin; " + data.length() + " encoded bytes in " + ((data.length() + TaskFiles.CHUNK - 1) / TaskFiles.CHUNK) + " chunks");
         } else logEvent("worker-transfer-send-failed", peer.id.toString(), id.toString(), c.failure());
@@ -834,10 +1056,10 @@ public final class HostService implements AutoCloseable {
         UUID id = UUID.fromString(text(run, "id")); long now = System.nanoTime(); Long previous = commands.get(id);
         if (previous != null && now - previous < 1_000_000_000L) return;
         if (command.equals("resume") && !flag(run, "resumeSent")) { run.addProperty("resumeSent", true); persist(); }
-        boolean sent = c.send(TaskWire.control(id, command).toString());
+        boolean sent = c.send(CommandReceipts.control(run, command).toString());
         Peer peer = peers.get(c);
         logEvent(sent ? "worker-control-sent" : "worker-control-send-failed", peer == null ? "" : peer.id.toString(), id.toString(), command);
-        if (sent) commands.put(id, now);
+        if (sent) {commands.put(id, now);for(JsonObject task:tasks.values())if(task.getAsJsonObject("runs").asMap().values().stream().anyMatch(v->v==run)&&CommandReceipts.queued(task,run,command))persist();}
     }
 
     private Peer peer(String crew, UUID id) {
@@ -849,7 +1071,7 @@ public final class HostService implements AutoCloseable {
         Peer peer=peer(crew,id);
         if(peer==null || !peer.reconciled || System.nanoTime()-peer.seen>=5_000_000_000L) return false;
         return tasks.values().stream().filter(t -> !flag(t,"cancelled") && !flag(t,"paused") && !QueuePolicy.terminal(text(t,"status")) && text(t,"crew").equals(crew) && t.getAsJsonObject("runs").has(id.toString()))
-            .anyMatch(t -> { JsonObject r=run(t,id); return text(r,"id").equals(peer.current) && text(r,"status").equals("Running") && highwayAction(r); });
+            .anyMatch(t -> { JsonObject r=run(t,id); return !QueuePolicy.detached(t,id) && text(r,"id").equals(peer.current) && text(r,"status").equals("Running") && highwayAction(r); });
     }
     private static boolean ownsHighway(JsonObject task, HighwayHost highway) {
         JsonObject snapshot=highway.snapshot();
@@ -938,11 +1160,90 @@ public final class HostService implements AutoCloseable {
     }
 
     /** Serialized local control API. No arbitrary file paths, shell commands or code loading. */
-    public synchronized JsonObject control(JsonObject request) {
-        if (text(request, "op").equals("status")) return status();
+    public JsonObject control(JsonObject request) {
+        if(text(request,"op").equals("stash-sort-preview")){
+            String crew=text(request,"crew"),scope=text(request,"scope"),name=text(request,"name");
+            synchronized(this){
+                if(closed||!failure.isEmpty())throw new IllegalStateException("Host is stopped; inspect status");
+                if(!crew.equals("Local")&&!crews.containsKey(crew))throw new IllegalArgumentException("Unknown crew");
+            }
+            JsonObject db=StashCatalog.get(directory,crew,scope,name);if(db.isEmpty())throw new IllegalArgumentException("Unknown stash");
+            Map<String,List<String>> selections=new HashMap<>();
+            for(String field:List.of("categoryOrder","categoryIds"))if(request.has(field)){
+                if(!request.get(field).isJsonArray())throw new IllegalArgumentException(field+" must be an array");
+                List<String> ids=new ArrayList<>();for(JsonElement id:request.getAsJsonArray(field)){
+                    if(!id.isJsonPrimitive()||!id.getAsJsonPrimitive().isString())throw new IllegalArgumentException(field+" needs category IDs");ids.add(id.getAsString());
+                }
+                selections.put(field,ids);
+            }
+            JsonObject plan=StashSortPlanner.preview(db,KitCategories.get(directory,crew,scope),request.has("buffers")?integer(request,"buffers",1,16):4,request.has("carrySlots")?integer(request,"carrySlots",1,36):34,selections.getOrDefault("categoryOrder",List.of()),selections.get("categoryIds"),request.has("growthColumns")?integer(request,"growthColumns",0,2):0);
+            if(request.has("expected")&&!text(plan,"stashRevision").equals(text(request,"expected")))throw new IllegalStateException("Stash changed; refresh the preview");return plan;
+        }
+        if(Set.of("worker-supply-get","worker-supply-save","worker-supply-plan").contains(text(request,"op"))){
+            String crew=text(request,"crew"),worker=text(request,"worker"),op=text(request,"op");
+            synchronized(this){
+                if(closed||!failure.isEmpty())throw new IllegalStateException("Host is stopped; inspect status");
+                JsonObject known=roster.get(UUID.fromString(worker));
+                if(!crews.containsKey(crew)||known==null||!crew.equals(text(known,"crew")))throw new IllegalArgumentException("Choose a worker from this crew");
+                logEvent("control-request",worker,"",op);
+            }
+            // Catalog reads must not hold the heartbeat/receipt monitor.
+            if(op.equals("worker-supply-get"))return WorkerSupplyStations.get(directory,crew,worker);
+            if(op.equals("worker-supply-save"))return WorkerSupplyStations.save(directory,crew,worker,text(request,"expected"),request.getAsJsonObject("station"));
+            return WorkerSupplyStations.plan(directory,crew,WorkerSupplyStations.get(directory,crew,worker),request.getAsJsonArray("sources"),integer(request,"sets",1,16));
+        }
+        // Fresh API reads may be expensive, but must never hold up worker receipts or heartbeats.
+        if(text(request,"op").equals("status")){
+            JsonArray stashes=StashCatalog.list(directory);
+            synchronized(this){JsonObject result=status();result.add("stashes",stashes);return result;}
+        }
+        synchronized(this){return controlLocked(request);}
+    }
+    private JsonObject controlLocked(JsonObject request) {
         if (closed || !failure.isEmpty()) throw new IllegalStateException("Host is stopped; inspect status");
         String op = text(request, "op");
         logEvent("control-request", "", text(request, "id"), op);
+        if(op.equals("stash-sort-start")){
+            JsonObject args=new JsonObject();for(String field:List.of("name","planId","buffers","carrySlots","growthColumns","categoryOrder","categoryIds"))if(request.has(field))args.add(field,request.get(field).deepCopy());
+            JsonObject submit=new JsonObject();submit.addProperty("id",UUID.fromString(text(request,"id")).toString());submit.addProperty("crew",text(request,"crew"));submit.addProperty("name","Sort "+text(request,"name"));String scope=text(request,"scope");int split=scope.indexOf('\n');if(split<1)throw new IllegalArgumentException("Select a stash world");submit.addProperty("server",scope.substring(0,split));submit.addProperty("dimension",scope.substring(split+1));submit.addProperty("priority",0);JsonArray workers=new JsonArray();workers.add(UUID.fromString(text(request,"worker")).toString());submit.add("workers",workers);submit.add("args",args);submit.add("package",library.get(StashSortExecution.WORKFLOW).get("package"));return submit(submit);
+        }
+        if(op.equals("stash-sort-release")){
+            if(!request.has("confirmCargoRecovered")||!request.get("confirmCargoRecovered").isJsonPrimitive()||!request.getAsJsonPrimitive("confirmCargoRecovered").isBoolean())throw new IllegalArgumentException("Explicit boolean cargo recovery confirmation required");
+            JsonObject task=tasks.get(UUID.fromString(text(request,"id")));if(task==null||!StashSortExecution.holds(task)||!BotHistory.taskFinished(task,false)||!flag(request,"confirmCargoRecovered"))throw new IllegalStateException("Stop the sort, wait for cleanup, and explicitly confirm all carried kits are recovered");
+            task.getAsJsonObject("stashSort").addProperty("status","Released");persist();logEvent("stash-sort-released","",text(task,"id"),"Operator confirmed cargo recovered; original ledger retained");return StashSortExecution.summary(task);
+        }
+        if(Set.of("stash-reserve-columns","stash-update","stash-delete","stash-clear","stash-clear-contents").contains(op)&&tasks.values().stream().anyMatch(t->StashSortExecution.sameScope(t,text(request,"crew"),text(request,"scope"))))throw new IllegalStateException("This crew/world has a sorting lease; finish it or explicitly release its stopped cargo record first");
+        if(op.equals("kitbot-get"))return kitBot.view();
+        if(op.equals("kitbot-save")){
+            JsonObject config=request.getAsJsonObject("config");String crew=text(config,"crew"),scope=text(config,"scope");
+            if(!crews.containsKey(crew)||StashCatalog.get(directory,crew,scope,text(config,"source")).isEmpty())throw new IllegalArgumentException("Choose a saved crew stash");
+            UUID worker=UUID.fromString(text(config,"worker"));JsonObject saved=roster.get(worker);
+            if(saved==null||!text(saved,"crew").equals(crew))throw new IllegalArgumentException("Choose a worker from this crew");
+            return kitBot.configure(config,text(request,"expected"));
+        }
+        if(op.startsWith("kit-categories-")){
+            String crew=text(request,"crew"),scope=text(request,"scope");if(!crews.containsKey(crew)&&!crew.equals("Local"))throw new IllegalArgumentException("Unknown crew");
+            if(op.equals("kit-categories-get")){JsonObject out=KitCategories.get(directory,crew,scope);if(request.has("source")){JsonObject source=StashCatalog.get(directory,crew,scope,text(request,"source"));if(source.isEmpty())throw new IllegalArgumentException("Unknown source stash");out.add("stock",KitCategories.stock(source));}return out;}
+            if(tasks.values().stream().anyMatch(t->StashSortExecution.sameScope(t,crew,scope)))throw new IllegalStateException("Finish or release the sorting lease before editing its category rules");
+            for(JsonObject task:tasks.values())if(!BotHistory.taskFinished(task,false)&&scope.equals(text(task,"server")+"\n"+text(task,"dimension")))for(var entry:task.getAsJsonObject("runs").entrySet()){
+                JsonObject action=entry.getValue().getAsJsonObject().getAsJsonObject("action");if(action!=null&&text(action,"type").equals("StashDeposit")&&crew.equals(text(action,"catalogCrew").isEmpty()?text(task,"crew"):text(action,"catalogCrew")))throw new IllegalStateException("Wait until active deposits finish before editing categories");
+            }
+            if(op.equals("kit-categories-save"))return KitCategories.save(directory,crew,scope,text(request,"expected"),request.getAsJsonObject("category"));
+            if(op.equals("kit-categories-seed")){JsonObject source=StashCatalog.get(directory,crew,scope,text(request,"source"));if(source.isEmpty())throw new IllegalArgumentException("Unknown source stash");return KitCategories.seed(directory,crew,scope,source,250);}
+        }
+        if(op.equals("discord-settings"))return notifications.configure(request);
+        if(op.equals("discord-test"))return notifications.test();
+        if(op.equals("hostile-add")||op.equals("hostile-remove")||op.equals("hostile-policy")){
+            if(op.equals("hostile-add"))hostiles.add(text(request,"server"),text(request,"name"),text(request,"uuid"));
+            else if(op.equals("hostile-remove"))hostiles.remove(text(request,"id"));
+            else{
+                if(!request.has("enabled")||!request.get("enabled").isJsonPrimitive()||!request.getAsJsonPrimitive("enabled").isBoolean())throw new IllegalArgumentException("enabled must be true or false");
+                if(request.has("safeReconnect")&&(!request.get("safeReconnect").isJsonPrimitive()||!request.getAsJsonPrimitive("safeReconnect").isBoolean()))throw new IllegalArgumentException("safeReconnect must be true or false");
+                hostiles.policy(request.get("enabled").getAsBoolean(),request.has("safeReconnect")?request.get("safeReconnect").getAsBoolean():hostiles.safeReconnect(),request.has("reconnectSeconds")?integer(request,"reconnectSeconds",5,3600):hostiles.reconnectSeconds());
+            }
+            for(var entry:peers.entrySet())if(entry.getKey().connected())sendHostiles(entry.getKey(),entry.getValue());
+            logEvent(op,"",text(request,"id"),op.equals("hostile-add")?text(request,"name"):op.equals("hostile-policy")?String.valueOf(hostiles.enabled()):"Player forgiven");return hostiles.snapshot();
+        }
         if (op.equals("submit")) return submit(request);
         if (op.equals("configuration-controls")) return dev.monocle.coordinator.JobSettingControls.catalog();
         if (op.equals("preview-configuration")) return dev.monocle.coordinator.JobSettingControls.preview(request);
@@ -964,6 +1265,28 @@ public final class HostService implements AutoCloseable {
             JsonObject saved=StashCatalog.define(directory,crew,scope,plan);
             for(var entry:peers.entrySet())if(entry.getKey().connected() && entry.getValue().reconciled && entry.getValue().crew.equals(crew))sendStashCatalog(entry.getKey(),entry.getValue());
             logEvent("stash-defined","","",text(saved,"name"));return saved;
+        }
+        if (op.equals("stash-kit-reserve")) {
+            String crew=text(request,"crew"),scope=text(request,"scope"),name=text(request,"name");
+            if(!crew.equals("Local")&&!crews.containsKey(crew))throw new IllegalArgumentException("Unknown crew");
+            JsonObject saved=StashCatalog.setKitReserve(directory,crew,scope,name,text(request,"expected"),text(request,"kitTypeId"),integer(request,"floor",0,1_000_000));
+            logEvent("stash-kit-reserve","","",name+" · "+text(request,"kitTypeId")+" · "+text(request,"floor"));return saved;
+        }
+        if (op.equals("stash-reserve-columns")) {
+            String crew=text(request,"crew"),scope=text(request,"scope"),name=text(request,"name");
+            JsonArray columns=request.getAsJsonArray("columns");
+            if(request.has("categoryId")==request.has("kitTypeId"))throw new IllegalArgumentException("Specify categoryId or kitTypeId (empty to clear)");
+            if(!crew.equals("Local")&&!crews.containsKey(crew))throw new IllegalArgumentException("Unknown crew");
+            if(columns==null||columns.isEmpty()||columns.size()>4096)throw new IllegalArgumentException("Select 1–4096 columns");
+            Set<String> keys=new HashSet<>();for(JsonElement value:columns){JsonObject column=value.getAsJsonObject();keys.add(StashCatalog.integer(column,"x",-29_900_000,29_900_000)+","+StashCatalog.integer(column,"z",-29_900_000,29_900_000));}
+            for(JsonObject task:tasks.values())if(!BotHistory.taskFinished(task,false)&&scope.equals(text(task,"server")+"\n"+text(task,"dimension")))for(var entry:task.getAsJsonObject("runs").entrySet()){
+                JsonObject run=entry.getValue().getAsJsonObject(),action=run.getAsJsonObject("action");
+                if(action==null||!text(action,"type").equals("StashDeposit")||!name.equals(text(action,"name"))||!crew.equals(text(action,"catalogCrew").isEmpty()?text(task,"crew"):text(action,"catalogCrew"))||!run.has("depositColumn"))continue;
+                JsonObject column=run.getAsJsonObject("depositColumn");if(keys.contains(column.get("x")+","+column.get("z")))throw new IllegalStateException("A selected column is in use by a worker; wait until its deposit finishes");
+            }
+            JsonObject saved=StashCatalog.setColumnReservations(directory,crew,scope,name,text(request,"expected"),text(request,"kitTypeId"),text(request,"categoryId"),columns);
+            for(var entry:peers.entrySet())if(entry.getKey().connected()&&entry.getValue().reconciled&&(crew.equals("Local")||entry.getValue().crew.equals(crew)))sendStashCatalog(entry.getKey(),entry.getValue());
+            logEvent("stash-columns-reserved","","",name+" · "+columns.size()+" columns · "+text(request,"kitTypeId"));return saved;
         }
         if (op.equals("stash-update")) {
             String crew=text(request,"crew"),scope=text(request,"scope"),name=text(request,"name");
@@ -1005,11 +1328,11 @@ public final class HostService implements AutoCloseable {
             long now=System.nanoTime();
             for(var target:targets) { Peer p=target.getValue();if(!p.chatSupported)throw new IllegalStateException("Install 0.7.54 or newer on "+p.observation.name());
                 if(p.observation.scope().isEmpty())throw new IllegalStateException("Worker is not in a world");
-                if(now-chatAt.getOrDefault(p.id,0L)<1_000_000_000L)throw new IllegalStateException("Wait one second between messages per worker"); }
+                if(!DirectMessages.isDm(content)&&now-chatAt.getOrDefault(p.id,0L)<1_000_000_000L)throw new IllegalStateException("Wait one second between messages per worker"); }
             JsonArray delivered=new JsonArray();
             for(var target:targets) {Peer p=target.getValue();JsonObject m=new JsonObject();m.addProperty("type","manage-chat");m.addProperty("id",command.toString());m.addProperty("text",content);m.addProperty("scope",p.observation.scope());
-                if(target.getKey().send(m.toString())) {delivered.add(p.id.toString());chatAt.put(p.id,now);} }
-            JsonObject result=new JsonObject();result.add("delivered",delivered);result.addProperty("status","Sent to connected clients; not a server acknowledgement");return result;
+                if(DirectMessages.isDm(content)?directMessages.add(p.id,p.crew,p.observation.scope(),command.toString(),content,System.currentTimeMillis()):target.getKey().send(m.toString())) {delivered.add(p.id.toString());chatAt.put(p.id,now);} }
+            JsonObject result=new JsonObject();result.add("delivered",delivered);result.addProperty("status",DirectMessages.isDm(content)?"Queued for connected clients; one DM per five seconds; not a server acknowledgement":"Sent to connected clients; not a server acknowledgement");return result;
         }
         if (op.equals("host-settings")) {
             if(!request.has("historyDays")&&!request.has("autoTpy"))throw new IllegalArgumentException("Specify a host setting");
@@ -1094,6 +1417,7 @@ public final class HostService implements AutoCloseable {
                 case "configure" -> {
                     if(task.has("publicAction"))throw new IllegalArgumentException("Public extension actions do not have Monocle configuration");
                     TaskWire.configure(task, request.has("worker") ? UUID.fromString(text(request, "worker")) : null, request.getAsJsonObject("modules"));
+                    CommandReceipts.request(task,commandReceiptId(),"configure",request.has("worker")?UUID.fromString(text(request,"worker")):null);
                 }
                 case "detach" -> {
                     if(task.has("publicAction"))throw new IllegalArgumentException("Public extension actions cannot detach workers");
@@ -1108,18 +1432,26 @@ public final class HostService implements AutoCloseable {
                         }
                     }
                     QueuePolicy.detach(task,worker,request.get("detached").getAsBoolean());
+                    CommandReceipts.request(task,commandReceiptId(),flag(request,"detached")?"detach":"rejoin",worker);
                 }
                 case "pause" -> {
                     if(task.getAsJsonObject("runs").asMap().values().stream().anyMatch(v->flag(v.getAsJsonObject(),"publicProtocol")
                         && Set.of("Sending","Ready","Running").contains(text(v.getAsJsonObject(),"status"))))
                         throw new IllegalStateException("Active public Wait cannot pause; cancel it instead");
                     QueuePolicy.pause(task);
+                    CommandReceipts.request(task,commandReceiptId(),"pause",null);
                 }
                 case "resume" -> {
+                    if(StashSortExecution.canRetryRead(task)){
+                        String worker=text(task.getAsJsonObject("stashSort"),"worker"),scope=text(task,"server")+"\n"+text(task,"dimension");
+                        if(peers.entrySet().stream().noneMatch(e->e.getKey().connected()&&e.getValue().reconciled&&e.getValue().id.toString().equals(worker)&&e.getValue().crew.equals(text(task,"crew"))&&e.getValue().observation!=null&&e.getValue().observation.scope().equals(scope)&&e.getValue().current.isEmpty()&&e.getValue().sortSupported))throw new IllegalStateException("Wait for the sorting worker to finish cleanup and reconnect idle in this world");
+                        StashSortExecution.retryRead(directory,task);
+                    }
                     HighwayHost highway=highways.get(text(task,"crew"));
                     if(ownsHighway(task,highway) && !highway.assigned() && highway.recoveryRecord()!=null)
                         throw new IllegalStateException("Host restart interrupted this native highway. Inspect supplies and saved progress, cancel the old execution, then submit the remaining work; it is not replayed automatically.");
                     QueuePolicy.resume(task);
+                    CommandReceipts.request(task,commandReceiptId(),"resume",null);
                     if(ownsHighway(task,highway) && highway.assigned() && !highway.isReleasing()) task.addProperty("nativeResumeRequested",true);
                 }
                 case "cancel" -> cancelTask(task);
@@ -1132,6 +1464,7 @@ public final class HostService implements AutoCloseable {
                     } else task.addProperty("priority", priority);
                 }
                 case "delete" -> {
+                    if(StashSortExecution.holds(task))throw new IllegalStateException("Release the stopped sorting cargo record before deleting its journal");
                     if (!BotHistory.taskFinished(task, task.has("nativeDefinition"))) throw new IllegalArgumentException("Cancellation is final, but its delivery/recovery record must remain until workers acknowledge cleanup");
                     tasks.remove(id);
                 }
@@ -1148,7 +1481,13 @@ public final class HostService implements AutoCloseable {
         if (type.equals("operator-command")) event.addProperty("correlationId", run);
         event.addProperty("at",System.currentTimeMillis());
         event.addProperty("runOrTask", run.substring(0, Math.min(run.length(), 96))); event.addProperty("detail", detail.substring(0, Math.min(detail.length(), 1024)));
+        if(type.equals("worker-combat"))event.add("combat",JsonParser.parseString(detail));
         events.event(event);
+        if(type.equals("worker-disconnected") || type.endsWith("-failed") || type.endsWith("-error") || type.equals("worker-message-rejected")) {
+            String name=worker;
+            try { JsonObject known=roster.get(UUID.fromString(worker));if(known!=null)name=text(known,"name")+" ("+worker+")"; }catch(IllegalArgumentException ignored){ }
+            notifications.failure(type,name,detail);
+        }
         activity.addLast(event.deepCopy());while(activity.size()>128)activity.removeFirst();
     }
 
@@ -1179,6 +1518,7 @@ public final class HostService implements AutoCloseable {
         }
         if(op.equals("crew-move")) {
             UUID worker=UUID.fromString(text(request,"worker"));
+            if(!operatorCommandId.isEmpty())operatorOperations.watchCrew(operatorCommandId,worker,id);
             PublicPeer external=publicPeers.get(worker);
             if(external!=null){
                 if(tasks.values().stream().anyMatch(t->workerJobPending(t,worker)))throw new IllegalStateException("Finish or cancel public worker jobs before moving crews");
@@ -1214,6 +1554,7 @@ public final class HostService implements AutoCloseable {
 
     private void cancelTask(JsonObject task) {
         QueuePolicy.cancel(task);
+        CommandReceipts.request(task,commandReceiptId(),"cancel",null);
         for (JsonElement value : task.getAsJsonObject("runs").asMap().values()) commands.remove(UUID.fromString(text(value.getAsJsonObject(), "id")));
     }
 
@@ -1247,6 +1588,7 @@ public final class HostService implements AutoCloseable {
         String crew = text(request, "crew"); if (!crews.containsKey(crew)) throw new IllegalArgumentException("Unknown crew");
         String name = WorkflowPackages.label(text(request, "name")), server = text(request, "server"), dimension = text(request, "dimension");
         if (server.isBlank() || server.length() > 1024 || server.chars().anyMatch(Character::isISOControl) || dimension.length()>128 || !dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) throw new IllegalArgumentException("Specify Minecraft server and dimension");
+        if(tasks.values().stream().anyMatch(t->StashSortExecution.sameScope(t,crew,server+"\n"+dimension)))throw new IllegalStateException("This crew/world is leased to a sorting job, including any retained cargo");
         JsonArray workers = request.getAsJsonArray("workers"); if (workers == null || workers.isEmpty() || workers.size() > 16) throw new IllegalArgumentException("Target 1–16 workers");
         int priority = request.has("priority") ? integer(request, "priority", -1000, 1000) : 0;
         JsonObject args = request.has("args") ? request.getAsJsonObject("args").deepCopy() : new JsonObject();
@@ -1268,6 +1610,17 @@ public final class HostService implements AutoCloseable {
             if(workers.size()!=1)throw new IllegalArgumentException("Kit jobs use one worker so the same boxes cannot be claimed twice");
             JsonObject kit=args.deepCopy();if(text(packaged,"entry").equals("task-kit-remove-incomplete"))kit.addProperty("incomplete",true);
             StashCatalog.kitAction(directory,crew,server+"\n"+dimension,kit,UUID.fromString(workers.get(0).getAsString()).toString());
+        }
+        if(packaged!=null&&text(packaged,"entry").equals("task-stash-transfer")){
+            if(workers.size()!=1)throw new IllegalArgumentException("Stash transfers use one worker");
+            args=StashCatalog.kitTransfer(directory,crew,server+"\n"+dimension,args,UUID.fromString(workers.get(0).getAsString()).toString());
+        }
+        if(packaged!=null&&text(packaged,"entry").equals(StashTransferTeam.WORKFLOW))args=StashTransferTeam.prepare(directory,crew,server+"\n"+dimension,args,workers.asList().stream().map(v->UUID.fromString(v.getAsString()).toString()).toList());
+        JsonObject sortState=null;
+        if(packaged!=null&&text(packaged,"entry").equals(StashSortExecution.WORKFLOW)){
+            if(workers.size()!=1||tasks.values().stream().anyMatch(t->crew.equals(text(t,"crew"))&&(server+"\n"+dimension).equals(text(t,"server")+"\n"+text(t,"dimension"))&&!BotHistory.taskFinished(t,t.has("nativeDefinition"))))throw new IllegalStateException("Start write sorting with one worker and no other jobs in this crew/world");
+            String worker=workers.get(0).getAsString();if(peers.entrySet().stream().noneMatch(e->e.getKey().connected()&&e.getValue().reconciled&&e.getValue().id.toString().equals(worker)&&e.getValue().crew.equals(crew)&&e.getValue().observation!=null&&e.getValue().observation.scope().equals(server+"\n"+dimension)&&e.getValue().current.isEmpty()&&e.getValue().sortSupported))throw new IllegalArgumentException("Install the sorting-capable client before starting write mode");
+            sortState=StashSortExecution.prepare(directory,crew,server+"\n"+dimension,args,worker);
         }
         boolean publicJob=workers.asList().stream().anyMatch(value->publicPeers.containsKey(UUID.fromString(value.getAsString())));
         if(extension!=null && !publicJob)throw new IllegalArgumentException("Extension actions require a connected public worker");
@@ -1297,6 +1650,7 @@ public final class HostService implements AutoCloseable {
             }
         }
         JsonObject task = new JsonObject(), runs = new JsonObject();
+        if(sortState!=null)task.add("stashSort",sortState);
         if(request.has("nativeDefinition")) {
             JsonObject definition=HighwayJobs.checked(request.getAsJsonObject("nativeDefinition"));
             if(packaged==null || !text(definition,"scope").equals(server+"\n"+dimension) || !packaged.getAsJsonObject("highways").has(text(definition.getAsJsonObject("workflow"),"id")))throw new IllegalArgumentException("Native checkpoint must match the task's world and bundled workflow");
@@ -1315,20 +1669,26 @@ public final class HostService implements AutoCloseable {
         task.addProperty("publicJoin",false);
         task.add("runs", runs); task.add("overrides", new JsonObject()); task.add("args", args);
         if(extension!=null)task.add("publicAction",extension);else task.add("package",packaged);
-        task.add("supportedActions", new Gson().toJsonTree(ACTIONS));
+        boolean courierReturn=packaged!=null&&Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(text(packaged,"entry"))&&flag(args,"returnHome");
+        task.add("supportedActions", new Gson().toJsonTree(packaged!=null&&text(packaged,"entry").equals(StashTransferTeam.WORKFLOW)?StashTransferTeam.ACTIONS:packaged!=null&&text(packaged,"entry").equals("task-stash-transfer")?List.of("Wait","KitTransferPlan","StashResupply","StashDeposit"):ACTIONS.stream().filter(a->!a.equals("KitTransferPlan")&&!a.equals("StashSortPlan")&&(!a.equals("StashVisit")||courierReturn)).toList()));
+        if(sortState!=null)task.add("supportedActions",new Gson().toJsonTree(List.of("StashSortPlan","StashScan","StashResupply","StashDeposit","Wait")));
         validateTask(id, task);
         if(!publicJob)for (String worker : runs.keySet()) TaskFiles.jsonBytes(TaskWire.envelope(task, UUID.fromString(worker)), TaskFiles.MAX_PACKAGE);
         JsonObject retired = tasks.size() < 64 ? null : tasks.values().stream()
-            .filter(t -> BotHistory.taskFinished(t, t.has("nativeDefinition")))
+            .filter(t -> !StashSortExecution.holds(t)&&BotHistory.taskFinished(t, t.has("nativeDefinition")))
             .min(Comparator.comparingLong(BotHistory::finishedAt))
             .orElseThrow(() -> new IllegalArgumentException("Keep at most 64 active tasks; finish or cancel one first"));
         UUID retiredId = retired == null ? null : UUID.fromString(text(retired, "id"));
         if (retiredId != null) tasks.remove(retiredId);
+        CommandReceipts.request(task,commandReceiptId(),"start",null);
         tasks.put(id, task);
         try { persist(); } catch (RuntimeException e) {
             tasks.remove(id); if (retiredId != null) tasks.put(retiredId, retired); throw e;
         }
         JsonObject result = new JsonObject(); result.addProperty("id", id.toString()); result.addProperty("status", "Queued"); return result;
+    }
+    synchronized JsonObject kitStock(JsonObject snapshot,String requestedId) {
+        return ResourceApi.kitStock(snapshot,requestedId,source->StashCatalog.get(directory,text(source,"crew"),text(source,"scope"),text(source,"name")));
     }
     private JsonObject status() {
         JsonObject result = new JsonObject(); result.addProperty("status", failure.isEmpty() ? closed ? "Stopped" : "Running" : failure);
@@ -1336,23 +1696,38 @@ public final class HostService implements AutoCloseable {
         result.addProperty("telemetryError", events.error()); result.addProperty("telemetryDropped", events.dropped());
         result.addProperty("operationsVersion",1);result.addProperty("historyDays",historyDays);result.addProperty("autoTpy",autoTpy);
         result.addProperty("rosterError",rosterError);
+        result.add("knownHostiles",hostiles.snapshot());
+        result.add("hostileWarnings",hostileWarnings.snapshot(hostiles,System.currentTimeMillis()));
+        result.add("incidentSummary",incidents.summary());
+        result.add("discordNotifications",notifications.status());
         result.add("crewLabels",new Gson().toJsonTree(crewLabels));result.add("workflows",library.list());result.add("drafts",library.drafts());
         result.add("activity",new Gson().toJsonTree(activity));
         result.add("chat",chat.json());
         result.add("crewChat",dev.monocle.coordinator.BotChat.grouped(chat.json()));
         result.addProperty("workerPort", port()); result.addProperty("webPort", webPort()); result.add("capabilities", new Gson().toJsonTree(ACTIONS)); result.add("crews", new Gson().toJsonTree(crews.keySet()));
-        JsonArray workers = new JsonArray(), active = new JsonArray(), history = new JsonArray();
+        JsonArray workers = workerViews(), active = new JsonArray(), history = new JsonArray();
+        return taskViews(result,workers,active,history);
+    }
+    private JsonArray workerViews(){
+        JsonArray workers=new JsonArray();
         Set<UUID> online=new HashSet<>();
         for (var entry : peers.entrySet()) {
             Peer peer = entry.getValue(); JsonObject worker = new JsonObject(); worker.addProperty("id", peer.id.toString()); worker.addProperty("name", peer.observation.name());
             worker.addProperty("crew", peer.crew); worker.addProperty("scope", peer.observation.scope()); worker.addProperty("connected", entry.getKey().connected());
             worker.addProperty("reconciled", peer.reconciled); worker.addProperty("current", peer.current); worker.addProperty("positionFresh", peer.observation.position() != null && peer.observation.fresh(System.nanoTime()));
             worker.addProperty("chatSupported",peer.chatSupported);
+            worker.addProperty("stashSortSupported",peer.sortSupported);
+            if(peer.worldReadiness!=null)worker.add("worldReadiness",peer.worldReadiness.deepCopy());
             if (peer.observation.position() != null) {
                 worker.addProperty("x", peer.observation.position().x()); worker.addProperty("y", peer.observation.position().y()); worker.addProperty("z", peer.observation.position().z());
             }
             worker.addProperty("observationAgeMs", Math.max(0, (System.nanoTime() - peer.observation.receivedAt()) / 1_000_000));
             if (peer.diagnostics != null) worker.add("diagnostics", peer.diagnostics.deepCopy());
+            if(peer.combat!=null)worker.add("combat",peer.combat.deepCopy());
+            worker.addProperty("knownHostilesSupported",peer.hostilesSupported);
+            worker.addProperty("hostileWarningsSupported",peer.hostileWarningsSupported);
+            worker.addProperty("safeReconnectSupported",peer.safeReconnectSupported);
+            if(peer.safeReconnect!=null)worker.add("safeReconnect",peer.safeReconnect.deepCopy());
             worker.addProperty("lastSeen",System.currentTimeMillis()-Math.max(0,(System.nanoTime()-peer.observation.receivedAt())/1_000_000));
             if(entry.getKey().connected()) { online.add(peer.id);roster.put(peer.id,worker); }
         }
@@ -1369,28 +1744,39 @@ public final class HostService implements AutoCloseable {
         });
         while(roster.size()>256)roster.remove(roster.keySet().iterator().next());
         roster.forEach((id,r)->{JsonObject view=r.deepCopy();if(!online.contains(id)){view.addProperty("connected",false);view.addProperty("positionFresh",false);view.addProperty("reconciled",false);view.addProperty("observationAgeMs",Math.max(0,System.currentTimeMillis()-r.get("lastSeen").getAsLong()));}workers.add(view);});
+        return workers;
+    }
+    private JsonObject taskViews(JsonObject result,JsonArray workers,JsonArray active,JsonArray history){
         for (JsonObject task : tasks.values()) {
-            JsonObject view = task.deepCopy(); view.remove("package"); view.remove("requestHash"); view.remove("args");
-            if(task.has("package")&&Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(text(task.getAsJsonObject("package"),"entry"))){
+            JsonObject view = new JsonObject();for(var entry:task.entrySet())if(!Set.of("package","requestHash","args","stashSort").contains(entry.getKey()))view.add(entry.getKey(),entry.getValue().deepCopy());
+            if(task.has("stashSort"))view.add("stashSort",StashSortExecution.summary(task));
+            if(task.has("package")&&Set.of("task-kit-delivery","task-kit-remove-incomplete","task-stash-transfer","task-stash-transfer-team").contains(text(task.getAsJsonObject("package"),"entry"))){
                 JsonObject kit=new JsonObject(),args=task.getAsJsonObject("args");
                 kit.addProperty("workflow",text(task.getAsJsonObject("package"),"entry"));
-                for(String key:List.of("name","kitTypeId","count","destination","targetStashName","transferAll","includeIncomplete"))if(args.has(key))kit.add(key,args.get(key).deepCopy());
+                for(String key:List.of("name","kitTypeId","kitTypeIds","routes","count","destination","targetStashName","targetColumn","transferAll","includeIncomplete","depositCarried","leader","tpaWarmupTicks"))if(args.has(key))kit.add(key,args.get(key).deepCopy());
                 long delivered=0;boolean reported=false;
                 for(var value:task.getAsJsonObject("runs").entrySet()){JsonObject run=value.getValue().getAsJsonObject();if(run.has("workflowResult")&&run.get("workflowResult").isJsonObject()&&run.getAsJsonObject("workflowResult").has("delivered")){delivered+=StashCatalog.integer(run.getAsJsonObject("workflowResult"),"delivered",0,10_000_000);reported=true;}}
                 if(reported)kit.addProperty("delivered",delivered);
+                if(task.has("stashTeam")){
+                    JsonObject team=task.getAsJsonObject("stashTeam"),summary=new JsonObject();
+                    for(String key:List.of("phase","index","kit","delivered","byKit","phaseAt"))if(team.has(key))summary.add(key,team.get(key).deepCopy());
+                    JsonObject members=new JsonObject();for(var e:team.getAsJsonObject("members").entrySet()){JsonObject member=new JsonObject();for(String key:List.of("batch","delivered","ready","emptyPasses"))if(e.getValue().getAsJsonObject().has(key))member.add(key,e.getValue().getAsJsonObject().get(key).deepCopy());members.add(e.getKey(),member);}
+                    summary.add("members",members);view.remove("stashTeam");view.add("crewTransfer",summary);kit.add("delivered",team.get("delivered"));
+                }
                 view.add("kitJob",kit);
             }
             if(!view.has("nativeDefinition") && view.has("highwayDefinition"))view.add("nativeDefinition",view.get("highwayDefinition").deepCopy());
             view.addProperty("cleanupPending", QueuePolicy.terminal(text(task,"status")) && !BotHistory.taskFinished(task, task.has("nativeDefinition")));
+            for(JsonElement run:view.getAsJsonObject("runs").asMap().values())run.getAsJsonObject().remove("kitRoutePlans");
             view.addProperty("operatorGuidance",QueuePolicy.guidance(task));
             (QueuePolicy.terminal(text(task, "status")) ? history : active).add(view);
         }
         JsonObject nativeHighways=new JsonObject();highways.forEach((crew,highway)->nativeHighways.add(crew,highway.status()));result.add("highways",nativeHighways);
-        result.add("workers", workers); result.add("tasks", active); result.add("history", history); result.add("stashes",StashCatalog.list(directory)); return result;
+        result.add("workers", workers); result.add("tasks", active); result.add("history", history); result.add("stashes",catalogSnapshot.deepCopy());result.addProperty("catalogError",catalogError); return result;
     }
     static JsonObject checkedPackage(JsonObject input) { return WorkflowPackages.checked(input); }
     private void checkpointRoster() {
-        try { status();JsonObject saved=new JsonObject();roster.forEach((id,r)->saved.add(id.toString(),r));TaskFiles.write(directory.resolve("worker-roster.json"),saved);rosterError=""; }
+        try { workerViews();JsonObject saved=new JsonObject();roster.forEach((id,r)->saved.add(id.toString(),r));TaskFiles.write(directory.resolve("worker-roster.json"),saved);rosterError=""; }
         catch(RuntimeException e) { rosterError="Could not save the worker roster; coordination continues. "+e.getClass().getSimpleName(); }
     }
     private void validateTask(UUID id, JsonObject task) {
@@ -1411,13 +1797,17 @@ public final class HostService implements AutoCloseable {
         if(task.has("publicJoin")&&(!task.get("publicJoin").isJsonPrimitive()||!task.getAsJsonPrimitive("publicJoin").isBoolean()))throw new IllegalArgumentException("Invalid public joining option");
         if(!task.has("publicJoin"))task.addProperty("publicJoin",false);
         JsonObject runs = task.getAsJsonObject("runs"); if (runs == null || runs.isEmpty() || runs.size() > 16) throw new IllegalArgumentException("Invalid saved targets");
+        StashSortExecution.validateSaved(task);
         Set<UUID> executions = new HashSet<>();
         for (var entry : runs.entrySet()) {
             UUID.fromString(entry.getKey()); JsonObject run = entry.getValue().getAsJsonObject();
             if (!executions.add(UUID.fromString(text(run, "id"))) || !Set.of("Queued", "Sending", "Ready", "Running", "Suspending", "Suspended", "Inspection required", "Complete", "Failed", "Cancelled").contains(text(run, "status"))) throw new IllegalArgumentException("Invalid saved execution");
             if(flag(run,"publicProtocol")){integer(run,"generation",1,Integer.MAX_VALUE);UUID.fromString(text(run,"commandId"));publicAction(task);}
             else if(extension)throw new IllegalArgumentException("Extension action assigned to a private worker");
-            for (String key : List.of("resumeSent", "resumeInspection")) if (run.has(key) && (!run.get(key).isJsonPrimitive() || !run.getAsJsonPrimitive(key).isBoolean())) throw new IllegalArgumentException("Invalid saved execution flag");
+            for (String key : List.of("resumeSent", "resumeInspection", "stallPaused")) if (run.has(key) && (!run.get(key).isJsonPrimitive() || !run.getAsJsonPrimitive(key).isBoolean())) throw new IllegalArgumentException("Invalid saved execution flag");
+            if(run.has("actionProgress"))dev.monocle.coordinator.ActionProgress.checked(run.getAsJsonObject("actionProgress"));
+            if(run.has("dismissedStallId"))UUID.fromString(text(run,"dismissedStallId"));
+            if(run.has("stallIncidentId"))UUID.fromString(text(run,"stallIncidentId"));
         }
         for (var entry : task.getAsJsonObject("overrides").entrySet()) {
             if (!runs.has(entry.getKey())) throw new IllegalArgumentException("Invalid saved priority worker"); integer(task.getAsJsonObject("overrides"), entry.getKey(), -1000, 1000);
@@ -1438,7 +1828,9 @@ public final class HostService implements AutoCloseable {
     @Override public synchronized void close() {
         if (closed) return; closed = true;
         checkpointRoster();
-        listener.close(); ticker.shutdownNow();
+        listener.close(); ticker.shutdownNow();catalogReader.shutdownNow();
+        notifications.close();
+        StashStore.close(directory);
         try { lock.release(); lockChannel.close(); } catch (IOException e) { throw new IllegalStateException("Cannot release host lock", e); }
     }
 }

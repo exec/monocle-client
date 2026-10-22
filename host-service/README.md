@@ -1,5 +1,27 @@
 # Monocle standalone Workers host
 
+**0.15.0 — The Speedy Gonzalez Update:** stash data now uses SQLite with WAL, indexed container rows and transactional observation/recovery commits. This is an intentional fresh start: old stash JSON/deltas and outboxes are not imported. Update workers and host, redefine stashes with their home names, then start new jobs. See [SQLite layout and backup instructions](../docs/stash-sqlite.md); the distribution also includes `stash-sqlite.md`.
+
+**0.14.11 worker job defaults:** built-in highway, stash and movement/guard presets now carry a shared 6b6t safety baseline for fresh workers. Homes, credentials, Lobby Skip and reconnect policies remain separate. Existing jobs and saved copies retain their captured settings. See [settings and boundaries](../docs/worker-job-defaults.md).
+
+**0.14.10 RWP client adapter:** updated Monocle workers advertise `dev.monocle.follow.v1`. The existing public extension route can assign a player UUID, radius and finite/unlimited Follow interval without a Monocle workflow package. Native walking/adaptive flight remains client-side; no automatic TPA or combat is implied. See [the action contract](../docs/workers-api-v1/monocle-actions.md). Highway/stash adapters and live game-backed interoperability are still pending.
+
+**0.14.4 host-wide warnings:** one worker seeing a known hostile warns all updated native clients, across crews. With the guard armed, same-server clients disconnect using safe reconnect preferences; detected lobbies are excluded from player incidents and alarms. Update host and clients together. See [policy, protocol and limits](../docs/known-hostiles.md).
+
+**0.14.3 Discord notifications:** open **Notifications**, save your Discord bot token and owner user ID, enable DMs, and send a test. Job failures/completions, worker disconnects and safety incidents are delivered asynchronously with a persisted outbox. No slash commands yet. See [configuration, API and delivery limits](../docs/discord-notifications.md).
+
+**0.14.2 incident timeline / safe reconnect:** update host and workers for the **Incidents** page (including neutral player sightings) and the **Known hostiles** reconnect policy. Safe reconnect is opt-in with a five-minute default wait; ordinary reconnect behavior is unchanged. Bounded incident logs are best-effort, and reconnection does not prove that an attacker left. See [timeline and controls](../docs/known-hostiles.md#incident-timeline-0142).
+
+**0.14.1 known hostiles:** update host and workers, then use the WebUI's **Known hostiles** page to review reported attackers, add/remove players and enable the shared disconnect guard (off by default). The list is durable, server-scoped and cached by updated clients. Older clients are marked unprotected; unknown crystal attribution never automatically adds players. See [controls, API and limits](../docs/known-hostiles.md).
+
+**0.13.71 passive update batching:** update workers and this service to send up to 32 live stash observations per upload/acknowledgement, bounded to 64 KiB. Per-event IDs, durable commits, revision checks and reconnect retries remain unchanged; older hosts/workers retain single-update compatibility. The queue and snapshot/delta formats are unchanged. See [observation transport](../docs/stash-kits.md#live-storage-observations-01365).
+
+**0.13.69 stash catalogs (historical):** unrelated same-name/color shulkers have separate types; old IDs remain aliases for jobs and reservations. That release used JSON snapshots plus delta files. 0.15.0 supersedes that backend without importing it; see [current storage](../docs/stash-sqlite.md) and [kit semantics](../docs/stash-kits.md).
+
+**0.13.65 live stash updates:** supporting workers passively report server-confirmed menu contents, storage additions and removals inside defined stash bounds. The shared catalog deduplicates reports and rejects stale revisions; removed containers no longer supply resource totals or source plans. New unopened storage has known capacity with unknown contents. Update host and workers together; no workflow change is required. See [observation, reconciliation and outbox limits](../docs/stash-kits.md#live-storage-observations-01365).
+
+**0.13.59 Round Robin transfers:** update host and workers together, then create a new Transfer Stash Kits job with source/kit/destination routes. This optional mode rotates one load per route using the existing native pickup/deposit handlers; ordinary transfers remain unchanged. See [usage and recovery limits](../docs/stash-kits.md#round-robin-sources-and-destinations-01359).
+
 **0.13.15 native transport update:** install 0.13.15+ on both this service and every native Monocle worker. Native protocol 7 uses four-byte UTF-8 length framing on TCP, 256 KiB records on TCP/WebSocket, and 1 MiB/128-record queue budgets. Older native builds cannot connect; the separate public RWP draft binding is unchanged. Pause work before updating, then resume the same saved execution to preserve carried kits and transfer receipts.
 
 Live gameplay configuration requires workers on 0.7.50+. POST `/v1/control` using the existing bearer token:
@@ -39,6 +61,8 @@ Supported now: authenticated worker connections, multiple configured crews, Lua/
 ## Run
 
 Build with Java 25: `./gradlew :host-service:build`. Unzip `host-service/build/distributions/monocle-host-<version>.zip`. The ZIP contains Java dependencies and scripts for macOS/Linux and Windows; the small JAR alone is not an executable bundle. Java 25 must be installed and available via `JAVA_HOME` or `PATH`.
+
+Run the service from a separate, versioned extracted directory, not `build/install/monocle-host`. Gradle `installDist` replaces that directory, removing the old JARs even if their process is still running. Java loads web assets and some classes lazily, so rebuilding can break a live host without stopping its process. Keep the running version's files intact; stage upgrades elsewhere and switch only during a planned host restart.
 
 From the extracted folder on macOS/Linux:
 
@@ -143,4 +167,10 @@ Ctrl+C disconnects workers, which enter their existing connection-loss cleanup. 
 
 `./gradlew :host-service:hostServiceCheck` runs real authenticated socket connections, package frames, localhost HTTP auth/origin checks, cross-crew isolation, priorities, pause/resume/cancel, offline cancellation, idempotency, ownership locks and restart/missing-journal scenarios. Native tests cover preparation, worker verification authority, detached restocking while another worker advances, rejoining, completion and offline cancellation receipts. Minecraft behavior is simulated; real movement/inventory testing is still required. Root `build` runs service, core and existing client checks. No service is installed or left running automatically.
 
-Next: live highway testing and monitoring through this API, then individual priority handoff/return orchestration and the remaining native job types. Launcher UI comes after service behavior is tested.
+For combined failure replay, run `./gradlew :host-service:faultReplayCheck` from the
+repository root. It runs a two-load built-in kit workflow through authenticated
+sockets, loses a committed deposit reply, restarts the host and verifies explicit
+resume without duplicate stock or execution installation. It also replays uncertain
+cancellation and missing worker checkpoints. `./gradlew unattendedReplayCheck`
+includes this plus the existing native receipt and shared crew checks. See the
+[coverage and remaining reliability work](../docs/worker-reliability.md).

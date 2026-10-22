@@ -21,11 +21,21 @@ final class BotRuntime {
     private final Path file = MonocleClient.FOLDER.toPath().resolve("bot-worker-tasks.json");
     private final Map<UUID, JsonObject> runs = new LinkedHashMap<>();
     private UUID current;
+    private UUID landingResume;
+    private BotActions profileLanding;
     private boolean loaded, recoveryRestored, connectionSuspended;
     private String failure, requested = "", requestedDetail = "", actionLoaded = "";
     private JsonObject interruptedOriginal;
     private int ticks, surveySendCursor;
     private String lastStashStatus = "";
+    private String lastStashFinding = "";
+    private long lastStashFindingSentAt;
+    private String scanUploadToken="";
+    private int scanUploaded;
+    private long scanUploadRetryAt;
+    private String homeSentToken = "";
+    private String tpaReplyToken="",tpaReplyCommand="";
+    private volatile String lastCommand="";
     private long nextHistoryCleanup;
     BotRuntime(Bots bots) { this.bots = bots; actions = new BotActions(bots); }
     private void load() {
@@ -68,9 +78,11 @@ final class BotRuntime {
         BotSupplyRecovery.discardCurrent();
         bots.crew.discardPreviousTransfer();
     }
-    boolean ownsControls() { return current != null; }
+    boolean ownsControls() { return current != null || landingResume != null; }
+    boolean ownsScanRead(net.minecraft.core.BlockPos pos){return current!=null&&actions.ownsScanRead(pos);}
     boolean allowsNative() {
         load();
+        if(landingResume!=null)return false;
         if (current == null) return runs.values().stream().noneMatch(BotRuntime::blocksNewWork);
         return requested.isEmpty() && top() != null && top().has("action") && text(top().getAsJsonObject("action"), "type").equals("Highway") && actions.recoveryReady();
     }
@@ -116,6 +128,7 @@ final class BotRuntime {
         for (JsonObject response : dev.monocle.coordinator.ConfigurationReadback.replies(request,report)) send(response);
     }
     static boolean terminal(String status) { return dev.monocle.coordinator.QueuePolicy.terminal(status); }
+    static boolean ignoresControl(String status,String command) { return terminal(status) && !(status.equals("Failed") && command.equals("cancel")); }
     void install(UUID id, JsonObject metadata, JsonObject packaged, String owner) {
         load();
         if (!bots.acceptCrew.get()) throw new IllegalStateException("Trusted host task execution is disabled on this worker");
@@ -135,11 +148,16 @@ final class BotRuntime {
         JsonArray stack = new JsonArray(); stack.add(frame(text(packaged, "entry"), args)); run.add("stack", stack);
         run.remove("effectiveProfile"); run.remove("requestedStatus"); run.remove("requestedDetail");
         validateCheckpoint(id, run);
-        UUID old = runs.size() < 64 ? null : runs.entrySet().stream().filter(e -> terminal(text(e.getValue(), "status"))).map(Map.Entry::getKey).findFirst().orElseThrow(() -> new IllegalStateException("Worker checkpoint queue is full"));
+        UUID old = retirementCandidate(runs, current);
         JsonObject retired = old == null ? null : runs.remove(old);
         runs.put(id, run);
         try { save(); } catch (RuntimeException e) { runs.remove(id); if (old != null) runs.put(old, retired); throw e; }
         sendStatus(id);
+    }
+    static UUID retirementCandidate(Map<UUID, JsonObject> runs, UUID current) {
+        return runs.size() < 64 ? null : runs.entrySet().stream()
+            .filter(e -> !e.getKey().equals(current) && terminal(text(e.getValue(), "status")) && !hasUncertainAction(e.getValue()))
+            .map(Map.Entry::getKey).findFirst().orElseThrow(() -> new IllegalStateException("Worker checkpoint queue is full; active work and unresolved receipts are retained for inspection"));
     }
     static JsonObject frame(String program, JsonObject args) {
         JsonObject f = new JsonObject(); f.addProperty("program", program); f.add("args", args.deepCopy()); f.add("state", new JsonObject()); f.add("result", new JsonObject()); return f;
@@ -158,7 +176,22 @@ final class BotRuntime {
         JsonObject frame = top(run);
         if (frame == null || !frame.has("native")) return uncertainTeleport(frame);
         JsonObject nativeState = frame.getAsJsonObject("native");
-        return nativeState.has("pendingDrop") || text(nativeState, "state").equals("Running") && uncertainTeleport(frame);
+        return nativeState.has("pendingDrop") || pendingStashMove(nativeState)
+            || text(nativeState, "state").equals("Running") && uncertainTeleport(frame);
+    }
+    private static boolean pendingStashMove(JsonObject nativeState) {
+        for (String key : List.of("stashResupply", "stashDeposit")) if (nativeState.has(key)) {
+            JsonObject stash = nativeState.getAsJsonObject(key);
+            for (String flag : List.of("withdrawPending", "depositPending", "discardPending", "pending"))
+                if (stash.has(flag) && stash.get(flag).getAsBoolean()) return true;
+        }
+        return false;
+    }
+    static boolean needsActionRestore(JsonObject frame, String loadedToken, String outcome) {
+        if (frame == null || !frame.has("action") || text(frame, "token").equals(loadedToken)) return false;
+        // Cancel retains uncertain stash receipts, but must not restore/replay their failed move.
+        if (outcome.equals("Cancelled") && frame.has("native") && pendingStashMove(frame.getAsJsonObject("native"))) return false;
+        return outcome.isEmpty() || frame.has("native");
     }
     static boolean nativeFinished(JsonObject snapshot) { return Set.of("Complete", "Failed").contains(text(snapshot, "state")); }
     static Optional<JsonObject> unresolvedOther(Map<UUID, JsonObject> runs, UUID next) {
@@ -171,6 +204,7 @@ final class BotRuntime {
     static boolean sameServer(JsonObject run, String server) { return !run.has("server") || text(run, "server").equalsIgnoreCase(server); }
     private String server() { return mc.getCurrentServer() == null ? "local" : mc.getCurrentServer().ip; }
     static void validateCheckpoint(UUID id, JsonObject run) {
+        if(run.has("controlId"))UUID.fromString(text(run,"controlId"));
         if (!id.toString().equals(text(run, "run"))) throw new IllegalArgumentException("Checkpoint run identity mismatch");
         UUID.fromString(text(run, "task")); BotJobs.name(text(run, "name"));
         if (text(run, "owner").isBlank() || text(run, "owner").length() > 128) throw new IllegalArgumentException("Missing checkpoint owner");
@@ -179,8 +213,8 @@ final class BotRuntime {
         JsonObject packaged = checkedPackage(run.getAsJsonObject("package"));
         if (run.has("supportedActions")) {
             JsonArray supported = run.getAsJsonArray("supportedActions");
-            if (supported == null || supported.isEmpty() || supported.size() > 11) throw new IllegalArgumentException("Invalid host capabilities");
-            for (JsonElement action : supported) if (!Set.of("Travel", "StashHunt", "StashScan", "StashResupply", "StashDeposit", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies").contains(action.getAsString())) throw new IllegalArgumentException("Unknown host capability");
+            if (supported == null || supported.isEmpty() || supported.size() > 14) throw new IllegalArgumentException("Invalid host capabilities");
+            for (JsonElement action : supported) if (!Set.of("Travel", "StashHunt", "StashScan", "StashVisit", "StashResupply", "StashDeposit", "KitTransferPlan", "StashSortPlan", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies").contains(action.getAsString())) throw new IllegalArgumentException("Unknown host capability");
         }
         String pending = savedFinish(run);
         JsonArray stack = run.getAsJsonArray("stack");
@@ -210,21 +244,38 @@ final class BotRuntime {
         JsonArray stack = run.getAsJsonArray("stack"); return stack.isEmpty() ? null : stack.get(stack.size() - 1).getAsJsonObject();
     }
     void control(UUID id, String command, String owner) {
+        control(id,command,owner,"");
+    }
+    void control(UUID id, String command, String owner,String controlId) {
         load(); JsonObject run = runs.get(id);
         if (run == null) return;
         if (!owner.equals(text(run, "owner"))) throw new IllegalArgumentException("This host does not own the saved task");
-        if (terminal(text(run, "status"))) { sendStatus(id); return; }
+        if(!Set.of("pause","resume","cancel").contains(command))throw new IllegalArgumentException("Invalid task control");
+        if(id.equals(landingResume)&&(!command.equals("resume")||grounded()))clearProfileLanding();
+        if(!controlId.isEmpty()){UUID.fromString(controlId);if(!controlId.equals(text(run,"controlId"))){run.addProperty("controlId",controlId);save();}}
+        if (ignoresControl(text(run, "status"),command)) { sendStatus(id); return; }
+        if (text(run,"status").equals("Failed") && !run.has("failureDetail")) run.addProperty("failureDetail",text(run,"detail"));
         switch (command) {
             case "resume" -> {
-                if (!Utils.canUpdate() || !sameServer(run, server())) { run.addProperty("detail", "Join the task's original Minecraft server before resuming"); sendStatus(id); return; }
+                if (!Utils.canUpdate() || !dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready() || !sameServer(run, server())) { run.addProperty("detail", "Wait for the task's original Minecraft world and local chunk before resuming"); sendStatus(id); return; }
                 if (current != null && !current.equals(id)) { run.addProperty("detail", "Waiting for the current task to finish its safe handoff"); sendStatus(id); return; }
                 if (!bots.acceptCrew.get()) throw new IllegalStateException("Worker has disabled task execution");
+                if (run.has("actionProgress") && text(run.getAsJsonObject("actionProgress"),"state").equals("Paused") && !savedFinish(run).equals("Cancelled")) {
+                    run.remove("actionProgress"); run.remove("progressToken");
+                    if (top(run) != null && top(run).has("native")) top(run).getAsJsonObject("native").remove("actionProgress");
+                    if (id.equals(current)) actions.resumeProgress();
+                }
                 if (current == null) {
+                    if(landingResume!=null&&!id.equals(landingResume)){run.addProperty("detail","Waiting for another task's landing recovery");sendStatus(id);return;}
                     Optional<JsonObject> unfinished = unresolvedOther(runs, id);
                     if (unfinished.isPresent()) { run.addProperty("detail", "Reconcile the recorded drop/teleport in '" + bounded(text(unfinished.get(), "name")) + "' before starting another task"); sendStatus(id); return; }
                     if (nativeBusy()) { run.addProperty("detail", "Waiting for the source highway to release this worker"); sendStatus(id); return; }
-                    if (!grounded()) { run.addProperty("detail", "Land safely before applying a task profile"); sendStatus(id); return; }
+                    if (!grounded()) {
+                        landingResume=id;if(profileLanding==null)profileLanding=new BotActions(bots);
+                        run.addProperty("detail", "Landing safely before applying a task profile"); sendStatus(id); return;
+                    }
                     if (interruptedOriginal != null || !recoveryRestored) { run.addProperty("detail", "Waiting for original profile recovery before resuming"); sendStatus(id); return; }
+                    actions.bindTask(id);
                     current = id; requested = savedFinish(run); requestedDetail = text(run, "requestedDetail"); actionLoaded = "";
                     run.addProperty("status", "Running"); run.addProperty("detail", "Resuming workflow");
                     try {
@@ -272,6 +323,8 @@ final class BotRuntime {
         sendStatus(id);
     }
     void disconnected() {
+        tpaReplyToken=tpaReplyCommand=lastCommand="";
+        clearProfileLanding();
         if (current == null) return;
         closeFightRecorder();
         actions.disconnected();
@@ -281,6 +334,18 @@ final class BotRuntime {
         }
     }
     private boolean grounded() { return Utils.canUpdate() && mc.player.onGround() && !mc.player.isFallFlying(); }
+    private void clearProfileLanding(){if(profileLanding!=null)profileLanding.stop();profileLanding=null;landingResume=null;}
+    private void tickProfileLanding(){
+        UUID id=landingResume;JsonObject pending=runs.get(id);
+        if(pending==null||!bots.isWorker()||!bots.acceptCrew.get()||!ownedBy(pending,bots.worker.credentialId())||nativeBusy()
+            ||!sameServer(pending,server())||!text(pending,"dimension").equals(mc.level.dimension().identifier().toString())){clearProfileLanding();return;}
+        try{
+            boolean landed=profileLanding.landForProfile();
+            pending.addProperty("detail",landed?"Landed; waiting for the host's Resume":"Landing before task profile · "+bounded(profileLanding.detail()));
+            if(landed)clearProfileLanding();
+        }catch(RuntimeException error){clearProfileLanding();pending.addProperty("detail","Landing recovery stopped: "+bounded(error.getMessage()==null?error.getClass().getSimpleName():error.getMessage()));}
+        if(ticks%20==0)sendStatus(id);
+    }
     private boolean nativeBusy() { return bots.crew.localAssigned() || Modules.get().get(HighwayBuilder.class).hasJob() || Modules.get().get(PrinterHelper.class).isActive() || Modules.get().get(dev.monocle.client.systems.modules.world.StashManager.class).isScanning(); }
     void tick() {
         load();
@@ -297,6 +362,13 @@ final class BotRuntime {
         // Task status is transport state, not world state. Menus/disconnect screens still acknowledge controls.
         if (ticks % 20 == 0) heartbeat();
         if (!Utils.canUpdate()) { disconnected(); return; }
+        if (!dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready()) {
+            disconnected();
+            if(current!=null){run().addProperty("detail",dev.monocle.client.utils.network.WorldReadiness.INSTANCE.snapshot().get("reason").getAsString());if(ticks%20==0)sendStatus(current);}
+            return;
+        }
+        // Only a host Resume authorizes this movement; no profile or job action runs in flight.
+        if(landingResume!=null){tickProfileLanding();return;}
         if (!recoveryRestored) {
             if (interruptedOriginal != null) {
                 if (nativeBusy() || !grounded()) return;
@@ -318,8 +390,8 @@ final class BotRuntime {
                 JsonObject f = top();
                 // An action with no native checkpoint has not acquired controls or emitted
                 // packets. Cancelling it must not start it just to immediately stop it.
-                if (f != null && f.has("action") && !text(f, "token").equals(actionLoaded) && (requested.isEmpty() || f.has("native"))&&!loadAction(f)){
-                    run().addProperty("detail","Landing before the next action's movement/profile handoff");
+                if (needsActionRestore(f, actionLoaded, requested) && !loadAction(f)) {
+                    run().addProperty("detail","Landing before the next action's movement/profile handoff · "+bounded(actions.detail()));
                     if(ticks%20==0){checkpointAction();sendStatus(current);}return;
                 }
                 if (!requested.isEmpty()) {
@@ -327,11 +399,19 @@ final class BotRuntime {
                 } else if (f == null) finish("Complete", "Workflow complete");
                 else if (f.has("action")) tickAction(f);
                 else {if(actions.stashHandoff())actions.tick();decide(f);}
-                if (current != null && ticks % 20 == 0) { checkpointAction(); sendStatus(current); }
-                if (current != null && actions.stashPending()!=null && ticks % 10 == 0) sendStashFinding();
+                boolean scanProgressed=false;
                 if (current != null && actions.stashTelemetry() != null && typeOfCurrentScan()) {
-                    JsonObject t=actions.stashTelemetry(); String signature=text(t,"phase")+text(t,"reason")+text(t,"target")+t.get("observed")+t.get("unscanned");
-                    if (!signature.equals(lastStashStatus)) { checkpointAction(); sendStatus(current); lastStashStatus=signature; }
+                    String signature=scanProgressSignature(actionLoaded,actions.stashTelemetry());
+                    if (!signature.equals(lastStashStatus)) {
+                        if(!actions.independentScanCheckpoint()){checkpointAction();scanProgressed=true;}
+                        lastStashStatus=signature;
+                    }
+                }
+                sendPendingStashFinding();
+                if(scanProgressed)sendStatus(current);
+                else if(current!=null&&ticks%20==0&&scanPeriodicCheckpoint(typeOfCurrentScan(),ticks)){
+                    if(!actions.independentScanCheckpoint())checkpointAction();
+                    sendStatus(current);
                 }
             } catch (RuntimeException e) {
                 if (current != null) {
@@ -345,9 +425,10 @@ final class BotRuntime {
     }
     private void heartbeat() {
         if (bots.isWorker()) {
-            JsonObject heartbeat = message("worker"); heartbeat.addProperty("current", current == null ? "" : current.toString());heartbeat.addProperty("stashCatalogProtocol",1);
+            JsonObject heartbeat = message("worker"); heartbeat.addProperty("current", current == null ? "" : current.toString());heartbeat.addProperty("stashCatalogProtocol",1);heartbeat.addProperty("stashLiveProtocol",1);heartbeat.addProperty("kitCategoriesProtocol",1);heartbeat.addProperty("stashContainerLimit",dev.monocle.coordinator.StashCatalog.MAX_CONTAINERS);
+            heartbeat.addProperty("stashSortProtocol",1);
             JsonArray states = new JsonArray();
-            for (var e : runs.entrySet()) if (ownedBy(e.getValue(), bots.worker.credentialId())) { JsonObject s = new JsonObject(); s.addProperty("run", e.getKey().toString()); s.addProperty("status", text(e.getValue(), "status")); s.addProperty("readbackVersion",1); states.add(s); }
+            for (var e : runs.entrySet()) if (ownedBy(e.getValue(), bots.worker.credentialId())) { JsonObject s = new JsonObject(); s.addProperty("run", e.getKey().toString()); s.addProperty("status", text(e.getValue(), "status")); s.addProperty("readbackVersion",1);s.addProperty("worldReady",Utils.canUpdate()&&dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready());if(e.getValue().has("controlId"))s.add("controlId",e.getValue().get("controlId").deepCopy()); states.add(s); }
             if (current != null && !ownedBy(run(), bots.worker.credentialId())) heartbeat.addProperty("current", "");
             heartbeat.add("runs", states); send(heartbeat);
             sendSurveyFindings();
@@ -357,6 +438,10 @@ final class BotRuntime {
         if(!actions.prepareNext(frame.getAsJsonObject("action")))return false;
         if (anchorRecovery(frame, mc.player.position())) save(); // Save the fixed search area before any movement, including legacy resumes.
         if (frame.has("native")) actions.restore(frame.getAsJsonObject("native")); else actions.start(frame.getAsJsonObject("action"));
+        if(text(frame.getAsJsonObject("action"),"type").equals("StashScan")){
+            String binding=hash(current+"\n"+text(frame,"token"));
+            actions.scanCheckpoint(MonocleClient.FOLDER.toPath(),binding);
+        }
         actions.resume(); actionLoaded = text(frame, "token");
         if (uncertainTeleport(frame)) actions.markTpaSent(); // Observe the outcome; never resend a checkpointed command intent.
         return true;
@@ -376,7 +461,11 @@ final class BotRuntime {
         if (type.equals("SetProfile") && !frame.has("profileApplied")) {
             String name = text(action, "name"); JsonObject profiles = run().getAsJsonObject("package").getAsJsonObject("profiles");
             if (!profiles.has(name)) throw new IllegalArgumentException("Profile is not included by the host: " + name);
-            if (nativeBusy() || !grounded()) { run().addProperty("detail", "Waiting for safe grounding/native release before applying a profile"); return; }
+            if (nativeBusy() || dev.monocle.client.pathing.BaritoneUtils.movementBusy() || !grounded()) {
+                run().addProperty("detail", "Waiting for safe grounding/native release before applying a profile");
+                actions.awaitingProgress("Safe grounding / native controller release before applying profile");
+                run().add("actionProgress", actions.actionProgress()); run().addProperty("progressToken", actionLoaded); return;
+            }
             // The original personal settings were checkpointed before the first application.
             BotProfiles.apply(profiles.getAsJsonObject(name)); run().add("effectiveProfile", BotProfiles.captureEffective());
             frame.addProperty("profileApplied", true); save(); actions.externalResult(true, "Applied bundled profile " + name, new JsonObject());
@@ -387,6 +476,17 @@ final class BotRuntime {
         }
         if(type.equals("Highway")&&!bots.crew.resourceFailure().isEmpty()) actions.externalResult(false,bots.crew.resourceFailure(),new JsonObject());
         JsonObject status = actions.tick(true);
+        if (!nativeFinished(status)) {
+            actions.watchProgress(); run().add("actionProgress", actions.actionProgress()); run().addProperty("progressToken", actionLoaded);
+            if (actions.progressPaused()) {
+                String reason = "Action stalled: " + dev.monocle.coordinator.ActionProgress.describe(actions.actionProgress()) + " · " + text(status, "detail");
+                MonocleClient.LOG.warn("[Workers] {} · run {} · action {}", reason, current, actionLoaded);
+                finish("Suspended", reason); return;
+            }
+        }
+        if(type.equals("StashVisit")&&actions.stashTravel().get("homeSent").getAsBoolean()&&!homeSentToken.equals(actionLoaded)){
+            checkpointAction();sendStatus(current);homeSentToken=actionLoaded;
+        }
         run().addProperty("detail", type.equals("Highway") && actions.recoveryReady() && !nativeFinished(status)
             ? bots.crew.localAssigned() ? "Highway: " + bots.crew.localStatus()
                 : "Highway profile ready; waiting for host assignment and the other targeted workers"
@@ -396,10 +496,11 @@ final class BotRuntime {
             if (Set.of("StashScan","StashResupply","StashDeposit").contains(type)) { checkpointAction(); sendStatus(current); }
             boolean success = text(status, "state").equals("Complete");
             JsonObject result = status.has("result") ? status.getAsJsonObject("result").deepCopy() : new JsonObject();
+            if(type.equals("DropItems")&&!success)result.addProperty("dropped",action.get("count").getAsInt()-status.get("remaining").getAsInt());
             result.addProperty("ok", success); result.addProperty("detail", text(status, "detail"));
             if (!success && !(action.has("allowFailure") && action.get("allowFailure").getAsBoolean())) { finish("Failed", text(status, "detail")); return; }
-            if (!actions.stashHandoff()&&(!actions.requestSuspend() || !grounded())) { run().addProperty("detail", "Action finished; awaiting safe cleanup before the next step"); return; }
-            frame.add("result", result); frame.remove("action"); frame.remove("native"); frame.remove("profileApplied"); frame.remove("commandSent"); frame.remove("token"); actionLoaded = ""; save();
+            if (!actions.stashHandoff()&&(!actions.requestSuspend() || !grounded())) { run().addProperty("detail", "Action finished; awaiting safe cleanup · "+bounded(actions.detail())); return; }
+            frame.add("result", result); frame.remove("action"); frame.remove("native"); frame.remove("profileApplied"); frame.remove("commandSent"); frame.remove("token"); run().remove("actionProgress"); run().remove("progressToken"); actionLoaded = ""; save();
         }
     }
     private void decide(JsonObject frame) {
@@ -487,6 +588,7 @@ final class BotRuntime {
         JsonObject run = run();
         run.addProperty("status", "Suspending"); run.addProperty("requestedStatus", requested); run.addProperty("requestedDetail", bounded(requestedDetail));
         if (nativeBusy()) { run.addProperty("detail", "Waiting for native highway release: " + bounded(requestedDetail) + " · " + Modules.get().get(HighwayBuilder.class).crewDiagnostics()); return; }
+        if (!mc.player.containerMenu.getCarried().isEmpty()) { run.addProperty("detail", "Settle the carried cursor item before handing off the task; no inventory click will be replayed"); return; }
         if (!actions.requestSuspend()) {
             JsonObject status = actions.tick();
             // Destructive intent was already saved. The regular one-second checkpoint
@@ -511,11 +613,18 @@ final class BotRuntime {
         finally { fightRecorder = null; }
     }
     private static String bounded(String value) { return value == null ? "" : value.substring(0, Math.min(900, value.length())); }
+    void chat(String plain){
+        if(current==null||!bots.isWorker()||!ownedBy(run(),bots.worker.credentialId())||top()==null||!text(top(),"token").equals(actionLoaded))return;
+        if(!teleportReplyCurrent(tpaReplyToken,actionLoaded,tpaReplyCommand,lastCommand))return;
+        if(actions.rejectTeleport(plain)){checkpointAction();sendStatus(current);}
+    }
+    void sentCommand(String command){lastCommand=command;}
+    static boolean teleportReplyCurrent(String issuedToken,String currentToken,String issuedCommand,String lastCommand){return !issuedCommand.isEmpty()&&issuedToken.equals(currentToken)&&issuedCommand.equalsIgnoreCase(lastCommand);}
     void external(UUID id, String token, boolean success, String detail, JsonObject result) {
         if (!matches(id, token)) return;
         String type = text(top().getAsJsonObject("action"), "type");
         if (type.equals("Tpa") && !success && uncertainTeleport(top())) return; // A sent request still has to be observed through completion/timeout.
-        if (!Set.of("Highway", "SetProfile").contains(type) && !(type.equals("Tpa") && !success)) throw new IllegalArgumentException("This action is not host-managed");
+        if (!Set.of("Highway", "SetProfile", "KitTransferPlan", "StashSortPlan").contains(type) && !(type.equals("Tpa") && !success)) throw new IllegalArgumentException("This action is not host-managed");
         if (!token.equals(actionLoaded)&&!loadAction(top()))return;
         if (nativeFinished(actions.snapshot())) return; // Retransmitted results cannot overwrite the first terminal outcome.
         actions.externalResult(success, detail, result); checkpointAction();
@@ -526,9 +635,11 @@ final class BotRuntime {
         if (!targetName.matches("[A-Za-z0-9_]{1,16}")) throw new IllegalArgumentException("Invalid TPA player name");
         if(!token.equals(actionLoaded)&&!loadAction(top()))return;
         // Persist intent before issuing: uncertain restart never repeats an already-issued teleport request.
+        if(nativeFinished(actions.snapshot()))return;
         JsonObject action = top().getAsJsonObject("action"); action.addProperty("target", targetId.toString()); action.addProperty("dimension", dimension);
         actions.stop(); actions.start(action); actionLoaded = token;
         top().addProperty("commandSent", true); actions.markTpaSent(); top().add("native", actions.snapshot()); save();
+        tpaReplyToken=token;tpaReplyCommand="tpa "+targetName;lastCommand="";
         bots.sendWorkflowTpa(targetName); checkpointAction();
     }
     void configure(UUID id, JsonObject modules, int revision, String owner) {
@@ -536,7 +647,7 @@ final class BotRuntime {
         if (run == null || !ownedBy(run, owner)) throw new IllegalArgumentException("Host does not own this execution");
         if (revision < 1) throw new IllegalArgumentException("Invalid configuration revision");
         if (run.has("configRevision") && revision <= run.get("configRevision").getAsInt()) { sendStatus(id); return; }
-        if (!id.equals(current) || !requested.isEmpty() || !bots.acceptCrew.get() || !Utils.canUpdate()) { sendStatus(id); return; }
+        if (!id.equals(current) || !requested.isEmpty() || !bots.acceptCrew.get() || !Utils.canUpdate() || !dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready()) { sendStatus(id); return; }
         String error = "";
         try {
             JsonObject config=new JsonObject();config.addProperty("revision",revision);config.add("modules",TaskWire.checkedConfiguration(modules));run.add("configuration",config);
@@ -552,32 +663,65 @@ final class BotRuntime {
         m.addProperty("connectionSuspended", id.equals(current) && connectionSuspended);
         m.addProperty("configurationVersion", 1);
         m.addProperty("readbackVersion", 1);
+        if(run.has("controlId"))m.add("controlId",run.get("controlId").deepCopy());
+        m.addProperty("worldReady",Utils.canUpdate()&&dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready());
         for (String key : List.of("configRevision", "configError")) if (run.has(key)) m.add(key, run.get(key).deepCopy());
         if (run.has("requestedStatus")) m.addProperty("requestedStatus", text(run, "requestedStatus"));
         if (run.has("workflowResult")) m.add("workflowResult",run.get("workflowResult").deepCopy());
         JsonArray stack = run.getAsJsonArray("stack");
         if (!stack.isEmpty()) { JsonObject f = stack.get(stack.size() - 1).getAsJsonObject(); if (f.has("action")) { m.add("action", f.get("action").deepCopy()); m.addProperty("token", text(f, "token")); m.addProperty("commandSent", f.has("commandSent")); } }
-        if (id.equals(current) && typeOfCurrentScan() && actions.stashTelemetry()!=null) m.add("stashScan",actions.stashTelemetry());
-        if(id.equals(current)&&reportsNativeReceipt(m,actionLoaded,"StashResupply")&&actions.stashWithdrawal()!=null)m.add("stashWithdrawal",actions.stashWithdrawal());
-        if(id.equals(current)&&reportsNativeReceipt(m,actionLoaded,"StashDeposit")&&actions.stashDeposit()!=null)m.add("stashDeposit",actions.stashDeposit());
+        if (m.has("action") && text(m,"token").equals(text(run,"progressToken")) && run.has("actionProgress")) m.add("actionProgress", run.get("actionProgress").deepCopy());
+        if(id.equals(current)){
+            if(typeOfCurrentScan()){JsonObject value=actions.stashTelemetry();if(value!=null)m.add("stashScan",value);}
+            if(reportsNativeReceipt(m,actionLoaded,"StashResupply")){JsonObject value=actions.stashWithdrawal();if(value!=null)m.add("stashWithdrawal",value);}
+            if(reportsNativeReceipt(m,actionLoaded,"StashDeposit")){JsonObject value=actions.stashDeposit();if(value!=null)m.add("stashDeposit",value);}
+            if(reportsNativeReceipt(m,actionLoaded,"StashVisit")){JsonObject value=actions.stashTravel();if(value!=null)m.add("stashTravel",value);}
+        }
         send(m);
     }
     static boolean reportsNativeReceipt(JsonObject message,String loadedToken,String type){
         return message.has("action")&&!loadedToken.isEmpty()&&loadedToken.equals(text(message,"token"))&&type.equals(text(message.getAsJsonObject("action"),"type"));
     }
     private boolean typeOfCurrentScan(){return top()!=null&&top().has("action")&&text(top().getAsJsonObject("action"),"type").equals("StashScan");}
+    static String scanProgressSignature(String token,JsonObject telemetry){return token+"/"+telemetry.get("observed")+"/"+telemetry.get("unscanned")+"/"+telemetry.get("removed")+"/"+telemetry.get("inferred");}
+    private void sendPendingStashFinding(){
+        if(current==null||!actions.hasStashPending())return;
+        if(typeOfCurrentScan()){
+            long now=System.nanoTime();int first=actions.stashDelivery();
+            if(!actionLoaded.equals(scanUploadToken)){scanUploadToken=actionLoaded;scanUploaded=0;scanUploadRetryAt=0;}
+            if(now>=scanUploadRetryAt){scanUploaded=first-1;scanUploadRetryAt=now+3_000_000_000L;}
+            List<JsonObject> batch=actions.scanUploads(scanUploaded);int start=Math.max(first,scanUploaded+1);
+            for(int i=0;i<batch.size();i++){sendStashFinding(start+i,batch.get(i));scanUploaded=start+i;}
+            return;
+        }
+        String finding=actionLoaded+"/"+actions.stashDelivery();
+        long now=System.nanoTime();
+        if(stashFindingDue(finding,lastStashFinding,now,lastStashFindingSentAt,typeOfCurrentScan())){sendStashFinding();lastStashFinding=finding;lastStashFindingSentAt=now;}
+    }
+    static boolean scanPeriodicCheckpoint(boolean scan,int tick){return !scan||tick%100==0;}
+    static boolean stashFindingDue(String finding,String previous,long now,long sentAt){return stashFindingDue(finding,previous,now,sentAt,false);}
+    static boolean stashFindingDue(String finding,String previous,long now,long sentAt,boolean scan){return !finding.equals(previous)||now-sentAt>=(scan?3_000_000_000L:1_000_000_000L);}
+    static boolean currentStashAcknowledgement(boolean pending,int expected,int received){return pending&&expected==received;}
     private void sendStashFinding(){
+        sendStashFinding(actions.stashDelivery(),actions.stashPending());
+    }
+    private void sendStashFinding(int delivery,JsonObject pending){
         if(current==null||top()==null||!top().has("action")||!Set.of("StashScan","StashDeposit").contains(text(top().getAsJsonObject("action"),"type")))return;
         JsonObject m=message("stash-findings");m.addProperty("run",current.toString());m.add("task",run().get("task"));m.add("token",top().get("token"));m.add("action",top().get("action").deepCopy());
-        m.addProperty("delivery",actions.stashDelivery());JsonObject pending=actions.stashPending();
+        m.addProperty("delivery",delivery);
         if(typeOfCurrentScan())dev.monocle.coordinator.StashCatalog.attachObservation(m,pending);
         else{if(pending.has("observation"))dev.monocle.coordinator.StashCatalog.attachObservation(m,pending.getAsJsonObject("observation"));if(pending.has("exhaustedColumn"))m.add("exhaustedColumn",pending.get("exhaustedColumn").deepCopy());}
         send(m);
     }
     void acknowledgeStash(UUID id,String token,JsonObject ack,String owner){
         load();JsonObject r=runs.get(id);if(!ownedBy(r,owner)||!id.equals(current)||!token.equals(actionLoaded))return;
-        if(typeOfCurrentScan())actions.acknowledgeStash(integer(ack,"delivery",1,4096));else if(top()!=null&&top().has("action")&&text(top().getAsJsonObject("action"),"type").equals("StashDeposit"))actions.acknowledgeStashDeposit(ack);else return;
-        checkpointAction();
+        int delivery=integer(ack,"delivery",1,dev.monocle.coordinator.StashCatalog.MAX_CONTAINERS);
+        if(!currentStashAcknowledgement(actions.hasStashPending(),actions.stashDelivery(),delivery))return;
+        if(typeOfCurrentScan()){
+            if(ack.has("record"))bots.stashObserver.scanSaved(text(top().getAsJsonObject("action"),"name"),ack.getAsJsonObject("record"));
+            actions.acknowledgeStash(delivery);
+        }else if(dev.monocle.coordinator.TaskWire.flag(ack,"deposit")&&top()!=null&&top().has("action")&&text(top().getAsJsonObject("action"),"type").equals("StashDeposit"))actions.acknowledgeStashDeposit(ack);else return;
+        if(!typeOfCurrentScan()||!actions.independentScanCheckpoint())checkpointAction();
     }
 
     private void sendSurveyFindings() {

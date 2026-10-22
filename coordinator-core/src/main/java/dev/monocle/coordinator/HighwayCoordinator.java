@@ -198,6 +198,13 @@ public abstract class HighwayCoordinator<P> {
     public void workChanged() { if (assigned()) workDirty = true; }
 
     public boolean isParticipant(UUID worker) { return participants.containsKey(worker) || worker.equals(joiningWorker); }
+    public boolean workerWorking(UUID worker) {
+        if(!assigned()||regrouping||releasing||!activeMembers().contains(worker))return false;
+        JsonObject report=currentReport(worker);
+        return report!=null&&str(report,"phase").equals("building")&&TaskWire.flag(report,"begun")
+            &&!TaskWire.flag(report,"moduleOff")&&!TaskWire.flag(report,"connectionStopped")
+            &&(!report.has("worldReadiness")||str(report.getAsJsonObject("worldReadiness"),"state").equals("Ready"));
+    }
 
     public boolean localAssigned() { return assigned() && localParticipant; }
 

@@ -23,6 +23,8 @@ public final class BotScheduler {
                            String status, String detail, int priority, Map<UUID, Integer> workerPriorities, boolean history) { }
     private final Bots bots;
     private final BotRuntime runtime;
+    void chat(String plain){runtime.chat(plain);}
+    void sentCommand(String command){runtime.sentCommand(command);}
     private final dev.monocle.coordinator.ConfigurationReadback readbacks = new dev.monocle.coordinator.ConfigurationReadback();
     private final Path file = MonocleClient.FOLDER.toPath().resolve("bot-tasks.json");
     private final Map<UUID, JsonObject> tasks = new LinkedHashMap<>();
@@ -31,6 +33,10 @@ public final class BotScheduler {
     private final Map<UUID, Long> seen = new HashMap<>();
     private final Map<UUID, String> workerCurrent = new HashMap<>();
     private final Map<UUID, SwarmConnection> workerSessions = new HashMap<>();
+    private final Map<SwarmConnection, Long> stashCatalogAt = new WeakHashMap<>();
+    private final Map<SwarmConnection, java.util.ArrayDeque<JsonObject>> stashWatches = new WeakHashMap<>();
+    private final Map<SwarmConnection, Integer> stashContainerLimits = new WeakHashMap<>();
+    private final Map<SwarmConnection, Boolean> kitCategorySupport = new WeakHashMap<>();
     private final Map<UUID, Transfer> transfers = new HashMap<>();
     private final Map<UUID, SwarmConnection> transferred = new HashMap<>();
     private final Map<UUID, Long> commands = new HashMap<>();
@@ -46,6 +52,17 @@ public final class BotScheduler {
     private int ticks;
     private long savedAt;
     private boolean dirty;
+    private record ScanAck(SwarmConnection connection,JsonObject ack){}
+    private final List<ScanAck> scanAcks=new ArrayList<>();
+    private boolean scanCheckpointDirty;
+    private long scanAckAt;
+    private void flushScanAcks(){
+        if(!dev.monocle.coordinator.StashCatalog.scanAckBatchReady(scanAcks.size(),System.nanoTime()-scanAckAt))return;
+        if(scanCheckpointDirty){dirty=true;save();}
+        scanCheckpointDirty=false;
+        for(ScanAck receipt:scanAcks)if(receipt.connection().connected())receipt.connection().send(receipt.ack().toString());
+        scanAcks.clear();
+    }
     private record Transfer(UUID run, String data, String hash, JsonObject metadata, SwarmConnection connection, int next) { }
     private record AutoTpy(UUID requester, UUID target, String requesterName, String crew, String requesterScope, long due, long expires,boolean required) { }
     public BotScheduler(Bots bots) { this.bots = bots; runtime = new BotRuntime(bots); }
@@ -73,6 +90,7 @@ public final class BotScheduler {
                 for (var entry : root.getAsJsonObject("tasks").entrySet()) {
                     JsonObject task = entry.getValue().getAsJsonObject(); UUID id = UUID.fromString(entry.getKey());
                     checkedPackage(task.getAsJsonObject("package")); integer(task, "priority", -1000, 1000);
+                    if(bots.mode.get()==Bots.Mode.Host)bots.notifications().prime(task);
                     if (flag(task, "cancelled")) QueuePolicy.cancel(task);
                     else if (!terminal(text(task, "status"))) { task.addProperty("status", "Inspection required"); task.addProperty("paused", true); task.addProperty("detail", "Host restarted. Inspect native job and task checkpoints, then Resume."); }
                     tasks.put(id, task);
@@ -88,10 +106,13 @@ public final class BotScheduler {
         JsonObject root = new JsonObject(), records = new JsonObject(), reservations = new JsonObject(); root.addProperty("version", 1);
         tasks.forEach((id, task) -> records.add(id.toString(), task)); returns.forEach((id, r) -> reservations.add(id.toString(), r));
         root.add("tasks", records); root.add("returns", reservations); write(file, root); dirty = false; savedAt = System.nanoTime();
+        tasks.values().forEach(dev.monocle.coordinator.CommandReceipts::prune);
+        if(bots.mode.get()==Bots.Mode.Host)tasks.values().forEach(bots.notifications()::observeTask);
     }
     public boolean hasWork() { if (bots.mode.get() == Bots.Mode.Worker) return runtime.hasWork(); load(); return !returns.isEmpty() || tasks.values().stream().anyMatch(t -> !terminal(text(t, "status"))); }
     public boolean usesCrew(String crew) { load(); return tasks.entrySet().stream().anyMatch(e -> !deletable(e.getKey(), e.getValue()) && crew.equals(text(e.getValue(), "crew"))) || returns.values().stream().anyMatch(r -> crew.equals(text(r, "crew"))); }
     public boolean workerBusy() { return runtime.ownsControls(); }
+    public boolean ownsScanRead(net.minecraft.core.BlockPos pos) { return runtime.ownsScanRead(pos); }
     public JsonArray stashDiagnostics(UUID taskId) {
         JsonArray result=new JsonArray();if(bots.mode.get()!=Bots.Mode.Host)return result;load();JsonObject t=tasks.get(taskId);if(t==null)return result;
         for(var entry:t.getAsJsonObject("runs").entrySet()){
@@ -135,6 +156,11 @@ public final class BotScheduler {
             JsonObject kit=args.deepCopy();if(workflowId.equals("task-kit-remove-incomplete"))kit.addProperty("incomplete",true);
             dev.monocle.coordinator.StashCatalog.kitAction(MonocleClient.FOLDER.toPath(),crewId,scope(),kit,targets.iterator().next().toString());
         }
+        if(workflowId.equals("task-stash-transfer")){
+            if(targets.size()!=1)throw new IllegalArgumentException("Stash transfers use one worker");
+            args=dev.monocle.coordinator.StashCatalog.kitTransfer(MonocleClient.FOLDER.toPath(),crewId,scope(),args,targets.iterator().next().toString());
+        }
+        if(workflowId.equals(dev.monocle.coordinator.StashTransferTeam.WORKFLOW))args=dev.monocle.coordinator.StashTransferTeam.prepare(MonocleClient.FOLDER.toPath(),crewId,scope(),args,targets.stream().map(UUID::toString).toList());
         if (!packaged.getAsJsonObject("highways").isEmpty()) {
             if (targets.size() > dev.monocle.coordinator.HighwayCoordinator.MAX_CREW_MEMBERS) throw new IllegalArgumentException("Native highway workflows support at most 3 workers");
             JsonObject geometry = new JsonObject();
@@ -158,6 +184,11 @@ public final class BotScheduler {
             JsonObject kit=args.deepCopy();if(text(packet,"entry").equals("task-kit-remove-incomplete"))kit.addProperty("incomplete",true);
             dev.monocle.coordinator.StashCatalog.kitAction(MonocleClient.FOLDER.toPath(),crewId,scope(),kit,targets.iterator().next().toString());
         }
+        if(text(packet,"entry").equals("task-stash-transfer")){
+            if(targets.size()!=1)throw new IllegalArgumentException("Stash transfers use one worker");
+            args=dev.monocle.coordinator.StashCatalog.kitTransfer(MonocleClient.FOLDER.toPath(),crewId,scope(),args,targets.iterator().next().toString());
+        }
+        if(text(packet,"entry").equals(dev.monocle.coordinator.StashTransferTeam.WORKFLOW))args=dev.monocle.coordinator.StashTransferTeam.prepare(MonocleClient.FOLDER.toPath(),crewId,scope(),args,targets.stream().map(UUID::toString).toList());
         if(Set.of("task-follow","task-bodyguard","task-crystal-guard").contains(text(packet,"entry"))) {
             UUID leader=UUID.fromString(text(args,"target"));
             if(targets.contains(leader))throw new IllegalArgumentException("Select followers only, not the leader");
@@ -217,6 +248,7 @@ public final class BotScheduler {
         t.add("package", checkedPackage(packaged)); t.add("args", args.deepCopy());
         for (UUID worker : targets.stream().sorted().toList()) { JsonObject r = new JsonObject(); r.addProperty("id", UUID.randomUUID().toString()); r.addProperty("status", "Queued"); r.addProperty("detail", "Waiting in queue"); runs.add(worker.toString(), r); }
         overrides.forEach((worker, p) -> priorities.addProperty(worker.toString(), p)); t.add("overrides", priorities); t.add("runs", runs);
+        dev.monocle.coordinator.CommandReceipts.request(t,UUID.randomUUID().toString(),"start",null);
         tasks.put(id, t); try { save(); } catch (RuntimeException e) { tasks.remove(id); throw e; } return id;
     }
     private JsonObject task(UUID id) { load(); JsonObject t = tasks.get(id); if (t == null) throw new IllegalArgumentException("Unknown task"); return t; }
@@ -246,11 +278,11 @@ public final class BotScheduler {
         }
         return readbacks.get(id,worker,System.currentTimeMillis());
     }
-    public void pause(UUID id) { hostOnly(); if (QueuePolicy.pause(task(id))) save(); }
+    public void pause(UUID id) { hostOnly();JsonObject t=task(id); if (QueuePolicy.pause(t)) {dev.monocle.coordinator.CommandReceipts.request(t,UUID.randomUUID().toString(),"pause",null);save();} }
     public JsonObject management(UUID id) {
         hostOnly();JsonObject task=task(id),value=new JsonObject();
         for(String key:List.of("status","detail","paused","cancelled","runs"))if(task.has(key))value.add(key,task.get(key).deepCopy());
-        value.addProperty("operatorGuidance",QueuePolicy.guidance(task));return value;
+        value.addProperty("operatorGuidance",QueuePolicy.guidance(task));value.addProperty("commandReceipt",dev.monocle.coordinator.CommandReceipts.summary(task));return value;
     }
     public void detach(UUID id,UUID worker,boolean detached) {
         hostOnly();JsonObject t=task(id),previous=t.deepCopy();
@@ -263,20 +295,24 @@ public final class BotScheduler {
             }
         }
         QueuePolicy.detach(t,worker,detached);
+        dev.monocle.coordinator.CommandReceipts.request(t,UUID.randomUUID().toString(),detached?"detach":"rejoin",worker);
         try{save();}catch(RuntimeException e){tasks.put(id,previous);throw e;}
     }
     public void configure(UUID id, UUID worker, JsonObject modules) {
         hostOnly(); JsonObject t = task(id), previous = t.deepCopy();
         TaskWire.configure(t, worker, modules);
+        dev.monocle.coordinator.CommandReceipts.request(t,UUID.randomUUID().toString(),"configure",worker);
         try { save(); } catch (RuntimeException e) { tasks.put(id, previous); throw e; }
     }
     public void resume(UUID id) {
         hostOnly(); JsonObject t = task(id); QueuePolicy.resume(t);
+        dev.monocle.coordinator.CommandReceipts.request(t,UUID.randomUUID().toString(),"resume",null);
         if (t.has("highway")) t.addProperty("nativeResumeRequested", true);
         save(); manageHighway(t);
     }
     public void cancel(UUID id) {
         hostOnly(); JsonObject t = task(id); if (!QueuePolicy.cancel(t)) return;
+        dev.monocle.coordinator.CommandReceipts.request(t,UUID.randomUUID().toString(),"cancel",null);
         for (UUID worker : workers(t)) commands.remove(runId(run(t, worker)));
         save();
         manageHighway(t);
@@ -348,11 +384,16 @@ public final class BotScheduler {
             load(); UUID worker = bots.allMembers().stream().filter(v -> connection(v.id()) == connection).map(SwarmCrew.MemberView::id).findFirst().orElseThrow(() -> new IllegalArgumentException("Worker must announce its identity first"));
             switch (type) {
                 case "task-worker" -> {
+                    kitCategorySupport.put(connection,m.has("kitCategoriesProtocol")&&integer(m,"kitCategoriesProtocol",1,1)==1);
                     String active = text(m, "current"); if (!active.isEmpty()) UUID.fromString(active); workerCurrent.put(worker, active); seen.put(worker, System.nanoTime());
                     JsonArray states = m.getAsJsonArray("runs"); if (states.size() > 64) throw new IllegalArgumentException("Too many worker states");
                     for (JsonElement value : states) updateStatus(worker, value.getAsJsonObject(), false);
                     reconcileWorker(worker, states, connection);
-                    if(m.has("stashCatalogProtocol")&&integer(m,"stashCatalogProtocol",1,1)==1)sendStashCatalog(connection,bots.workerCrew(worker));
+                    int stashLimit=m.has("stashContainerLimit")?integer(m,"stashContainerLimit",1,dev.monocle.coordinator.StashCatalog.MAX_CONTAINERS):dev.monocle.coordinator.StashCatalog.LEGACY_MAX_CONTAINERS;
+                    if(!Objects.equals(stashContainerLimits.put(connection,stashLimit),stashLimit)){stashWatches.remove(connection);stashCatalogAt.remove(connection);}
+                    if(m.has("stashLiveProtocol")&&integer(m,"stashLiveProtocol",1,1)==1&&!stashWatches.containsKey(connection))stashWatches.put(connection,new java.util.ArrayDeque<>(dev.monocle.coordinator.StashCatalog.watchFrames(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),stashLimit)));
+                    if(m.has("stashCatalogProtocol")&&integer(m,"stashCatalogProtocol",1,1)==1
+                        && System.nanoTime()-stashCatalogAt.getOrDefault(connection,0L)>=60_000_000_000L)sendStashCatalog(connection,bots.workerCrew(worker));
                 }
                 case "task-status" -> updateStatus(worker, m, true);
                 case "task-configuration-report" -> {
@@ -364,16 +405,36 @@ public final class BotScheduler {
                     JsonObject task=tasks.get(UUID.fromString(text(m,"task")));
                     if(task==null||!task.getAsJsonObject("runs").has(worker.toString()))throw new IllegalArgumentException("Unknown stash task");
                     JsonObject finding=m.deepCopy();if(m.has("observation")||m.has("observationGzip"))finding.add("observation",dev.monocle.coordinator.StashCatalog.readObservation(m));finding.remove("observationGzip");
-                    JsonObject ack=dev.monocle.coordinator.StashCatalog.accept(MonocleClient.FOLDER.toPath(),task,run(task,worker),worker.toString(),bots.workerCrew(worker),finding);
-                    if(ack!=null){dirty=true;save();connection.send(ack.toString());}
+                    boolean repeated=dev.monocle.coordinator.StashCatalog.scanFindingRecorded(run(task,worker),finding);
+                    JsonObject ack=dev.monocle.coordinator.StashCatalog.accept(MonocleClient.FOLDER.toPath(),task,run(task,worker),worker.toString(),bots.workerCrew(worker),finding,kitCategorySupport.getOrDefault(connection,false));
+                    if(ack!=null){
+                        if(text(finding.getAsJsonObject("action"),"type").equals("StashScan")){
+                            scanCheckpointDirty|=!repeated;if(scanAcks.isEmpty())scanAckAt=System.nanoTime();scanAcks.add(new ScanAck(connection,ack));
+                            if(scanAcks.size()>=32)flushScanAcks();
+                        }else {dirty=true;save();connection.send(ack.toString());}
+                    }
                 }
                 case "task-stash-definition" -> {
                     String scope=text(m,"scope");if(scope.length()>384||!scope.contains("\n"))throw new IllegalArgumentException("Invalid stash scope");
-                    dev.monocle.coordinator.StashCatalog.define(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,m.getAsJsonObject("stash"),worker.toString());sendStashCatalog(connection,bots.workerCrew(worker));
+                    if(m.has("exportId"))acceptStashExport(connection,worker,m);
+                    else try{dev.monocle.coordinator.StashCatalog.importDefinition(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,m.getAsJsonObject("stash"),worker.toString(),text(m,"definitionRevision"));}
+                    catch(dev.monocle.coordinator.StashCatalog.DefinitionConflict e){MonocleClient.LOG.warn("[Workers] Stash definition retained: {}",e.getMessage());}
+                    sendStashCatalog(connection,bots.workerCrew(worker));
+                }
+                case "task-stash-live-batch" -> {
+                    var report=reports.get(worker);
+                    connection.send(dev.monocle.coordinator.StashCatalog.acceptLiveBatch(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),worker.toString(),report==null?"":report.scope(),m).toString());
+                }
+                case "task-stash-live" -> {
+                    String scope=text(m,"scope");var report=reports.get(worker);
+                    if(scope.length()>384||!scope.contains("\n"))throw new IllegalArgumentException("Invalid live stash world");
+                    if(report==null||!scope.equals(report.scope())){JsonObject deferred=message("stash-live-ack");deferred.addProperty("eventId",text(m,"eventId"));deferred.addProperty("outcome","deferred");connection.send(deferred.toString());return true;}
+                    connection.send(dev.monocle.coordinator.StashCatalog.acceptLive(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,worker.toString(),m).toString());
                 }
                 case "task-stash-import" -> {
                     String scope=text(m,"scope");if(scope.length()>384||!scope.contains("\n"))throw new IllegalArgumentException("Invalid stash scope");
-                    dev.monocle.coordinator.StashCatalog.save(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,m.getAsJsonObject("stash"),dev.monocle.coordinator.StashCatalog.readObservation(m));
+                    if(m.has("exportId"))acceptStashExport(connection,worker,m);
+                    else dev.monocle.coordinator.StashCatalog.record(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),scope,m.getAsJsonObject("stash"),dev.monocle.coordinator.StashCatalog.readObservation(m));
                 }
                 default -> throw new IllegalArgumentException("Worker cannot send task commands: " + type);
             }
@@ -395,12 +456,16 @@ public final class BotScheduler {
                 JsonObject packaged = incoming.add(m);
                 if (packaged != null) { UUID id = incoming.run; JsonObject metadata = packaged.remove("dispatch").getAsJsonObject(); runtime.install(id, metadata, packaged, owner); }
             }
-            case "task-control" -> runtime.control(UUID.fromString(text(m, "run")), text(m, "command"), owner);
+            case "task-control" -> runtime.control(UUID.fromString(text(m, "run")), text(m, "command"), owner,text(m,"controlId"));
             case "task-configure" -> runtime.configure(UUID.fromString(text(m, "run")), m.getAsJsonObject("modules"), integer(m, "revision", 1, Integer.MAX_VALUE), owner);
             case "task-configuration-read" -> runtime.readConfiguration(m,owner);
             case "task-survey-ack" -> runtime.acknowledgeSurvey(UUID.fromString(text(m, "run")), text(m, "token"), integer(m, "delivery", 1, 1_048_576), owner);
             case "task-stash-ack" -> runtime.acknowledgeStash(UUID.fromString(text(m,"run")),text(m,"token"),m,owner);
-            case "task-stash-catalog" -> dev.monocle.coordinator.StashCatalog.cacheRemote(MonocleClient.FOLDER.toPath(),m.getAsJsonArray("stashes"));
+            case "task-stash-catalog" -> {dev.monocle.coordinator.StashCatalog.cacheRemote(MonocleClient.FOLDER.toPath(),m.getAsJsonArray("stashes"));bots.stashExporter.ready(m,connection.credentialId());bots.stashObserver.ready(m,connection);}
+            case "task-stash-export-ack" -> bots.stashExporter.acknowledge(m,connection.credentialId());
+            case "task-stash-watch" -> bots.stashObserver.watch(m,connection.credentialId());
+            case "task-stash-live-ack" -> bots.stashObserver.acknowledge(m,connection.credentialId());
+            case "task-stash-live-batch-ack" -> bots.stashObserver.acknowledgeBatch(m,connection.credentialId());
             case "task-result" -> runtime.external(UUID.fromString(text(m, "run")), text(m, "token"), flag(m, "success"), text(m, "detail"), m.has("result") ? m.getAsJsonObject("result") : new JsonObject());
             case "task-tpa-send" -> runtime.teleport(UUID.fromString(text(m, "run")), text(m, "token"), text(m, "name"), UUID.fromString(text(m, "target")), text(m, "dimension"));
             case "task-tpa-accept" -> acceptTeleport(m);
@@ -409,20 +474,28 @@ public final class BotScheduler {
         }
         return true;
     }
-    private void sendStashCatalog(SwarmConnection connection,String crew){JsonObject m=TaskWire.message("stash-catalog");JsonArray list=new JsonArray();for(JsonElement value:dev.monocle.coordinator.StashCatalog.list(MonocleClient.FOLDER.toPath())){JsonObject s=value.getAsJsonObject();if(!text(s,"crew").equals(crew))continue;JsonObject compact=dev.monocle.coordinator.StashCatalog.wireSummary(s);if(m.toString().length()+list.toString().length()+compact.toString().length()>14_000)break;list.add(compact);if(list.size()==64)break;}m.add("stashes",list);connection.send(m.toString());}
+    private void acceptStashExport(SwarmConnection connection,UUID worker,JsonObject m){
+        var report=reports.get(worker);JsonObject ack;
+        if(report==null||!text(m,"scope").equals(report.scope())){ack=message("stash-export-ack");ack.addProperty("exportId",text(m,"exportId"));ack.addProperty("outcome","deferred");}
+        else ack=dev.monocle.coordinator.StashCatalog.acceptExport(MonocleClient.FOLDER.toPath(),bots.workerCrew(worker),worker.toString(),m);
+        connection.send(ack.toString());
+    }
+    private void sendStashCatalog(SwarmConnection connection,String crew){JsonObject m=TaskWire.message("stash-catalog");m.addProperty("stashExportProtocol",1);m.addProperty("stashLiveBatchProtocol",1);JsonArray list=new JsonArray();for(JsonElement value:dev.monocle.coordinator.StashCatalog.list(MonocleClient.FOLDER.toPath())){JsonObject s=value.getAsJsonObject();if(!text(s,"crew").equals(crew))continue;JsonObject compact=dev.monocle.coordinator.StashCatalog.wireSummary(s);if(m.toString().length()+list.toString().length()+compact.toString().length()>14_000)break;list.add(compact);if(list.size()==64)break;}m.add("stashes",list);if(connection.send(m.toString()))stashCatalogAt.put(connection,System.nanoTime());if(stashWatches.containsKey(connection)&&stashWatches.get(connection).isEmpty())stashWatches.get(connection).addAll(dev.monocle.coordinator.StashCatalog.watchFrames(MonocleClient.FOLDER.toPath(),crew,stashContainerLimits.getOrDefault(connection,dev.monocle.coordinator.StashCatalog.LEGACY_MAX_CONTAINERS)));}
     private void updateStatus(UUID worker, JsonObject message, boolean full) {
         String id = text(message, "run"), state = text(message, "status"); UUID.fromString(id);
+        TaskWire.validateProgress(message,full);
         if (!Set.of("Ready", "Running", "Suspending", "Suspended", "Inspection required", "Complete", "Failed", "Cancelled").contains(state)) throw new IllegalArgumentException("Invalid task execution state");
         for (JsonObject t : tasks.values()) if (t.getAsJsonObject("runs").has(worker.toString())) {
             JsonObject r = run(t, worker); if (!text(r, "id").equals(id)) continue;
-            if(full&&message.has("stashWithdrawal")&&!text(r,"stashWithdrawalToken").equals(text(message,"token"))){JsonObject receipt=message.getAsJsonObject("stashWithdrawal");String catalogCrew=text(receipt,"catalogCrew");if(catalogCrew.isEmpty())catalogCrew=text(t,"crew");if(!catalogCrew.equals(text(t,"crew"))&&!catalogCrew.equals("Local"))throw new IllegalArgumentException("Withdrawal belongs to another crew");dev.monocle.coordinator.StashCatalog.invalidateWithdrawn(MonocleClient.FOLDER.toPath(),catalogCrew,text(t,"server")+"\n"+text(t,"dimension"),text(receipt,"stash"),receipt.getAsJsonArray("withdrawn"));r.addProperty("stashWithdrawalToken",text(message,"token"));}
-            if(full)dev.monocle.coordinator.StashCatalog.depositReceipt(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),r,message);
             if (!text(t, "crew").equals(bots.workerCrew(worker))) { if (terminal(text(r, "status"))) return; throw new IllegalArgumentException("Task status arrived through another crew"); }
             JsonObject checked = message.deepCopy();
             if (full && checked.has("action")) checked.add("action", BotActions.validate(checked.getAsJsonObject("action")));
             SwarmCrew highway = bots.coordinator(text(t, "crew"));
             boolean isolateInspection = t.has("nativeDefinition") && highway.assigned() && highway.independentSupplies();
+            JsonObject previousProgress=r.has("actionProgress")?r.getAsJsonObject("actionProgress"):null;
             if (!TaskWire.applyStatus(t, r, checked, full, isolateInspection)) return;
+            if(full){dev.monocle.coordinator.StashCatalog.beginTransfer(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),r,message);dev.monocle.coordinator.StashCatalog.withdrawalReceipt(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),r,message);dev.monocle.coordinator.StashCatalog.depositReceipt(MonocleClient.FOLDER.toPath(),text(t,"crew"),text(t,"server")+"\n"+text(t,"dimension"),r,message);}
+            if(dev.monocle.coordinator.ActionProgress.recoveryChanged(previousProgress,r.has("actionProgress")?r.getAsJsonObject("actionProgress"):null))MonocleClient.LOG.warn("[Workers] Action stall · worker {} · run {} · {}",worker,id,r.get("actionProgress"));
             if (Set.of("Running", "Suspending").contains(state)) workerCurrent.put(worker, id);
             else if (id.equals(workerCurrent.get(worker))) workerCurrent.put(worker, "");
             dirty = true; return;
@@ -434,13 +507,17 @@ public final class BotScheduler {
     }
     public void tick() {
         if (bots.mode.get() == Bots.Mode.Worker) { runtime.tick(); return; }
+        for(var entry:stashWatches.entrySet())if(entry.getKey().connected())for(int i=0;i<2&&!entry.getValue().isEmpty();i++){
+            if(!entry.getKey().send(entry.getValue().peek().toString()))break;entry.getValue().remove();
+        }
         load(); if (!bots.isHost()) return;
+        flushScanAcks();
         // Control delivery must not depend on gameplay readiness or another job's cleanup.
         for (JsonObject t : tasks.values()) if (flag(t, "cancelled")) dispatchCancellation(t);
         if (!Utils.canUpdate()) return;
         ticks++;
         for (JsonObject t : List.copyOf(tasks.values())) {
-            try { manageHighway(t); }
+            try { manageHighway(t);dirty|=dev.monocle.coordinator.CommandReceipts.confirmNative(t,bots.coordinator(text(t,"crew"))::workerWorking); }
             catch (RuntimeException e) {
                 t.addProperty("detail", "Native cleanup: " + e.getMessage()); dirty = true;
                 bots.reportConnectionFailure("Native cleanup will retry: " + e.getMessage());
@@ -491,9 +568,9 @@ public final class BotScheduler {
     private void dispatchCancellation(JsonObject task) {
         for (UUID worker : workers(task)) {
             JsonObject r = run(task, worker);
-            if (terminal(text(r, "status"))) continue;
+            if (QueuePolicy.cancellationAcknowledged(text(r, "status"))) continue;
             if (text(r, "status").equals("Queued")) {
-                r.addProperty("status", "Cancelled"); r.addProperty("detail", "Cancelled before dispatch"); dirty = true; continue;
+                r.addProperty("status", "Cancelled"); r.addProperty("detail", "Cancelled before dispatch"); dev.monocle.coordinator.CommandReceipts.noExecution(task,r);dirty = true; continue;
             }
             SwarmConnection c = connection(worker);
             if (c == null || !c.connected()) { r.addProperty("detail", "Cancellation retained; waiting for worker reconnect"); continue; }
@@ -518,8 +595,10 @@ public final class BotScheduler {
         if (!fresh(worker) || !workerCurrent.containsKey(worker)) return;
         JsonObject active = activeTask(worker), next = choose(tasks.values(), worker);
         if (active != null && !flag(active, "cancelled") && !flag(active, "paused")) {
+            if(next==active&&!QueuePolicy.detached(active,worker)&&text(run(active,worker),"status").equals("Running")&&dev.monocle.coordinator.CommandReceipts.pendingResume(active,run(active,worker)))control(worker,run(active,worker),"resume");
             JsonObject config = TaskWire.configurationToSend(run(active, worker), System.currentTimeMillis());
-            if (config != null) send(worker, config);
+            SwarmConnection connection=connection(worker);
+            if (config != null && connection!=null && connection.connected() && connection.send(config.toString()) && dev.monocle.coordinator.CommandReceipts.queued(active,run(active,worker),"configure"))save();
         }
         if (source(worker) == null && !returns.containsKey(worker) && !teleportPinned(worker)) {
             QueuePolicy.Dispatch dispatch = QueuePolicy.dispatch(active, next, worker);
@@ -632,6 +711,7 @@ public final class BotScheduler {
         JsonObject begin = TaskWire.begin(transfer.run, data);
         r.addProperty("status", "Sending"); r.addProperty("detail", "Sending immutable workflow and profiles"); save();
         if (!c.send(begin.toString())) transfers.remove(worker);
+        else if(dev.monocle.coordinator.CommandReceipts.queued(t,r,"transfer"))save();
     }
     private void flushTransfers() {
         for (var entry : List.copyOf(transfers.entrySet())) {
@@ -646,7 +726,12 @@ public final class BotScheduler {
         if (command.equals("resume") && !flag(r, "resumeSent")) {
             r.addProperty("resumeSent", true); save(); // An absent checkpoint after execution must never replay side effects.
         }
-        send(worker, TaskWire.control(id, command)); commands.put(id, now);
+        SwarmConnection connection=connection(worker);
+        if(connection!=null&&connection.connected()&&connection.send(dev.monocle.coordinator.CommandReceipts.control(r,command).toString())) {
+            boolean changed=false;
+            for(JsonObject task:tasks.values())if(task.getAsJsonObject("runs").asMap().values().stream().anyMatch(v->v==r))changed|=dev.monocle.coordinator.CommandReceipts.queued(task,r,command);
+            commands.put(id, now);if(changed)save();
+        }
     }
     private void send(UUID worker, JsonObject m) { SwarmConnection c = connection(worker); if (c != null && c.connected()) c.send(m.toString()); }
     private void receiveSurvey(UUID worker, JsonObject message) {
@@ -684,6 +769,14 @@ public final class BotScheduler {
     private void handleExternal(JsonObject task, UUID worker, JsonObject r) {
         if (!r.has("action")) return;
         try { switch (text(r.getAsJsonObject("action"), "type")) {
+            case "StashSortPlan" -> result(worker,r,false,"Write sorting currently requires the standalone host; no sorting move was authorized");
+            case "KitTransferPlan" -> {
+                boolean fresh=!text(r,"kitPlanToken").equals(text(r,"token"));JsonObject plan;
+                if(text(task.getAsJsonObject("package"),"entry").equals(dev.monocle.coordinator.StashTransferTeam.WORKFLOW)){
+                    String before=task.toString();try{plan=dev.monocle.coordinator.StashTransferTeam.next(MonocleClient.FOLDER.toPath(),task,r,worker.toString(),observations(text(task,"crew")),System.nanoTime(),System.currentTimeMillis());}finally{if(!before.equals(task.toString()))save();}if(plan==null)return;
+                }else{plan=dev.monocle.coordinator.StashCatalog.cachedKitTransferPlan(MonocleClient.FOLDER.toPath(),task,r,worker.toString());if(fresh)save();}
+                JsonObject m=message("result");m.addProperty("run",text(r,"id"));m.addProperty("token",text(r,"token"));m.addProperty("success",true);m.addProperty("detail","Kit transfer plan ready");m.add("result",plan);send(worker,m);
+            }
             case "Tpa" -> prepareTeleport(task, worker, r);
             case "Highway" -> {
                 if (pendingLateJoin(r)) admitPreparedWorker(task, worker, r);
@@ -691,9 +784,9 @@ public final class BotScheduler {
                 else if (!task.has("highway")) startHighway(task);
             }
             default -> { }
-        } } catch (IllegalArgumentException e) { result(worker, r, false, e.getMessage()); }
+        } } catch (IllegalArgumentException|IllegalStateException e) { result(worker, r, false, e.getMessage()); }
     }
-    public boolean nativeReady(UUID worker) { JsonObject t = activeTask(worker); if (t == null || flag(t, "cancelled") || flag(t, "paused") || terminal(text(t, "status"))) return false; JsonObject r = run(t, worker); return r.has("action") && text(r.getAsJsonObject("action"), "type").equals("Highway") && text(r, "status").equals("Running"); }
+    public boolean nativeReady(UUID worker) { JsonObject t = activeTask(worker); if (t == null || flag(t, "cancelled") || flag(t, "paused") || QueuePolicy.detached(t,worker) || terminal(text(t, "status"))) return false; JsonObject r = run(t, worker); return r.has("action") && text(r.getAsJsonObject("action"), "type").equals("Highway") && text(r, "status").equals("Running"); }
     /** Return false only for legacy native jobs without a captured runtime/profile package. */
     public boolean joinHighway(String crew, UUID worker) {
         hostOnly(); load();
@@ -1071,5 +1164,6 @@ public final class BotScheduler {
         detail = t.has("nativeWait") && !t.has("highway") && !terminal(state) ? text(t, "nativeWait") + " · " + detail : detail;
         if (!detail.equals(text(t, "detail"))) { t.addProperty("detail", detail); dirty = true; }
         dirty |= BotHistory.stamp(t, deletable(UUID.fromString(text(t, "id")), t), System.currentTimeMillis());
+        bots.notifications().observeTask(t);
     }
 }

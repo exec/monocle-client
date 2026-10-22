@@ -17,13 +17,14 @@ public final class OperationsLibrary {
         for (var definition : nativeLibrary.all()) {
             if (definition.id().equals("task-stash-hunt") || definition.id().equals("highway-supplies")) continue;
             JsonObject packet = nativeLibrary.packageWorkflows(definition.id()), profiles = new JsonObject();
-            profiles.add("Current", definition.id().equals(BotWorkflows.DEFAULT_ID) ? sixB6tHighwayProfile() : new JsonObject()); packet.add("profiles", profiles); packet.remove("profileNames");
+            boolean highway = !packet.getAsJsonObject("highways").isEmpty();
+            boolean workerJob = definition.folder().equals("Stash Management") || Set.of("task-travel", "task-tpa", "task-recover", "task-follow", "task-bodyguard", "task-crystal-guard").contains(definition.id());
+            profiles.add("Current", highway ? sixB6tHighwayProfile() : workerJob ? workerJobProfile() : new JsonObject()); packet.add("profiles", profiles); packet.remove("profileNames");
+            if(definition.folder().equals("Stash Management"))addProfile(profiles.getAsJsonObject("Current"),"auto-mend",true,"{groups:[{name:'General',settings:[{name:'auto-disable',value:0b},{name:'start-durability',value:30},{name:'target-durability',value:95}]}]}");
             if (Set.of("task-follow","task-bodyguard","task-crystal-guard").contains(definition.id())) {
                 JsonObject profile=profiles.getAsJsonObject("Current");
                 boolean guard=!definition.id().equals("task-follow");
-                for(String module:List.of("speed","elytra-fly","kill-aura","crystal-aura"))addProfile(profile,module,guard,"{}");
-                addProfile(profile,"auto-eat",true,"{}");
-                if(guard)for(String module:List.of("auto-gap","auto-totem","auto-armor","auto-tool"))addProfile(profile,module,true,"{}");
+                for(String module:List.of("speed","elytra-fly","kill-aura","crystal-aura"))profile.getAsJsonObject(module).addProperty("active",guard);
                 if(definition.id().equals("task-crystal-guard"))for(String module:List.of("kill-aura","crystal-aura","anchor-aura","bed-aura"))addProfile(profile,module,false,"{}");
             }
             if (!packet.getAsJsonObject("highways").isEmpty()) {
@@ -50,15 +51,26 @@ public final class OperationsLibrary {
     }
     /** The immutable built-in worker policy; users duplicate it before changing it. */
     private static JsonObject sixB6tHighwayProfile() {
-        JsonObject profile = new JsonObject();
+        JsonObject profile = workerJobProfile();
         addProfile(profile, "highway-builder", false, "{groups:[{name:'Digging',settings:[{name:'blocks-ahead-to-break',value:3},{name:'double-mine',value:1b},{name:'fast-break',value:1b},{name:'blocks-per-tick',value:10}]},{name:'Paving',settings:[{name:'place-range',value:7d},{name:'blocks-ahead-to-pave',value:5},{name:'placements-per-tick',value:10}]},{name:'Inventory',settings:[{name:'experimental-managed-inventory',value:1b},{name:'keep-shulkers',value:0b},{name:'search-ender-chest',value:1b},{name:'double-ender-chests',value:1b},{name:'max-shulkers-per-restock',value:4},{name:'mine-ender-chests',value:0b}]}]}");
-        addProfile(profile, "auto-eat", true, "{groups:[{name:'General',settings:[{name:'blacklist',value:['minecraft:golden_apple','minecraft:chorus_fruit','minecraft:poisonous_potato','minecraft:pufferfish','minecraft:chicken','minecraft:rotten_flesh','minecraft:spider_eye','minecraft:suspicious_stew']},{name:'protect-named-food',value:0b}]}]}");
         addProfile(profile, "speed", true, "{groups:[{name:'General',settings:[{name:'mode',value:'Vanilla'},{name:'vanilla-speed',value:5.5d}]}]}");
-        addProfile(profile, "elytra-fly", true, "{groups:[{name:'Flight',settings:[{name:'mode',value:'Vanilla'},{name:'horizontal-speed',value:3.618421052631582d}]},{name:'Acceleration',settings:[{name:'acceleration',value:1b},{name:'acceleration-step',value:1.25d}]}]}");
+        addProfile(profile, "elytra-fly", true, SettingsOverlay.merge(text(profile.getAsJsonObject("elytra-fly"), "settings"), "{groups:[{name:'Flight',settings:[{name:'horizontal-speed',value:3.618421052631582d}]}]}"));
+        return profile;
+    }
+    /** Job-scoped 6b6t baseline, shared by both hosts; persistent connection/security policies stay local. */
+    private static JsonObject workerJobProfile() {
+        JsonObject profile = new JsonObject();
+        addProfile(profile, "auto-eat", true, "{groups:[{name:'General',settings:[{name:'blacklist',value:['minecraft:golden_apple','minecraft:chorus_fruit','minecraft:poisonous_potato','minecraft:pufferfish','minecraft:chicken','minecraft:rotten_flesh','minecraft:spider_eye','minecraft:suspicious_stew']},{name:'protect-named-food',value:0b},{name:'search-inventory',value:1b},{name:'pause-baritone',value:1b}]}]}");
+        addProfile(profile, "auto-gap", true, "{groups:[{name:'General',settings:[{name:'allow-egap',value:1b},{name:'always',value:0b}]},{name:'Health',settings:[{name:'health-enabled',value:1b},{name:'health-threshold',value:20}]}]}");
         addProfile(profile, "velocity", true, "{}");
         addProfile(profile, "auto-tool", true, "{}");
-        addProfile(profile, "auto-armor", true, "{}");
-        addProfile(profile, "auto-totem", true, "{}");
+        addProfile(profile, "auto-armor", true, "{groups:[{name:'General',settings:[{name:'ignore-elytra',value:1b},{name:'anti-break',value:1b},{name:'remove-without-spare',value:0b}]}]}");
+        addProfile(profile, "auto-totem", true, "{groups:[{name:'General',settings:[{name:'mode',value:'Strict'},{name:'delay',value:0}]}]}");
+        addProfile(profile, "enderman-look", true, "{groups:[{name:'General',settings:[{name:'look-mode',value:'Away'},{name:'stun-hostiles',value:0b}]}]}");
+        addProfile(profile, "reach", true, "{groups:[{name:'General',settings:[{name:'extra-block-reach',value:1d},{name:'extra-entity-reach',value:0d}]}]}");
+        addProfile(profile, "speed", false, "{groups:[{name:'General',settings:[{name:'mode',value:'Vanilla'},{name:'vanilla-speed',value:5.5d}]}]}");
+        addProfile(profile, "elytra-fly", false, "{groups:[{name:'Flight',settings:[{name:'mode',value:'Vanilla'},{name:'horizontal-speed',value:5.3947368421052655d},{name:'vertical-speed',value:1.8026315789473712d},{name:'fall-multiplier',value:0d}]},{name:'Acceleration',settings:[{name:'acceleration',value:1b},{name:'acceleration-step',value:1.5d},{name:'acceleration-start',value:0d}]}]}");
+        for (String module : List.of("kill-aura", "crystal-aura", "anchor-aura", "bed-aura")) addProfile(profile, module, false, "{}");
         return profile;
     }
     private static void addProfile(JsonObject profile, String module, boolean active, String settings) {

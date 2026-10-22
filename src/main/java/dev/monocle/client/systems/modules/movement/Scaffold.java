@@ -217,6 +217,7 @@ public class Scaffold extends Module {
 
     private boolean anotherBuilder() {
         return Modules.get().get(HighwayBuilder.class).controlsPlayer() || Modules.get().get(PrinterHelper.class).controlsInventory()
+            || Modules.get().get(dev.monocle.client.systems.modules.world.StashBuilder.class).isActive()
             || Modules.get().get(dev.monocle.client.systems.modules.world.AutoWither.class).controlsPlayer();
     }
 

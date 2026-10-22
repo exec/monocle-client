@@ -2,11 +2,16 @@ package dev.monocle.host;
 
 import com.google.gson.*;
 import java.net.*;
+import java.net.http.*;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.function.Function;
 import dev.monocle.coordinator.TaskFiles;
 import dev.monocle.coordinator.StashCatalog;
+import dev.monocle.coordinator.KitTypes;
 import static dev.monocle.coordinator.TaskWire.text;
 
 /** Draft v1 operator resources. All decisions and persistence remain in HostService.control. */
@@ -27,8 +32,12 @@ final class ResourceApi {
         Map<String,String> query = query(uri);
         String resource = parts[2];
         if (method.equals("GET")) {
+            if (parts.length == 3 && resource.equals("incidents")) {
+                if (query.keySet().stream().anyMatch(key -> !Set.of("before", "limit", "kind", "search").contains(key))) throw new IllegalArgumentException("Unsupported incident filter");
+                return new Reply(200, host.incidentPage(query.get("before"), query.containsKey("limit") ? Integer.parseInt(query.get("limit")) : 100, query.getOrDefault("kind", ""), query.getOrDefault("search", "")));
+            }
             if (parts.length == 4 && resource.equals("operations") && query.isEmpty()) {
-                JsonObject operation = host.operatorOperations().get(parts[3]);
+                JsonObject operation = host.operatorOperation(parts[3]);
                 if (operation == null) return missing();
                 operation.remove("fingerprint");
                 return new Reply(200, operation);
@@ -42,6 +51,13 @@ final class ResourceApi {
         }
         JsonObject snapshot = host.control(op("status"));
         if (method.equals("GET")) {
+            if (parts.length == 5 && resource.equals("kits") && parts[4].equals("stock")) {
+                if (!query.isEmpty()) throw new IllegalArgumentException("Unexpected kit stock query parameter");
+                JsonObject stock = host.kitStock(snapshot, uuid(parts[3]));
+                return stock == null ? missing() : new Reply(200, stock);
+            }
+            if (parts.length == 4 && resource.equals("players") && query.isEmpty())
+                return new Reply(200, playerIdentity(snapshot, parts[3]));
             if (parts.length == 3 && Set.of("host", "health", "capabilities", "configuration-controls").contains(resource)) {
                 if (!query.isEmpty()) throw new IllegalArgumentException("Unexpected query parameter");
                 if(resource.equals("configuration-controls"))return new Reply(200,host.control(op("configuration-controls")));
@@ -67,11 +83,20 @@ final class ResourceApi {
             if(parts.length==5 && query.isEmpty() && resource.equals("stashes") && parts[4].equals("resources")) {
                 JsonObject stash=find(items,parts[3]);if(stash==null)return missing();
                 JsonObject result=new JsonObject();result.addProperty("stashId",parts[3]);result.add("items",stash.getAsJsonObject("items").deepCopy());
-                for(String key:List.of("observed","inferred","unscanned","observedAt"))if(stash.has(key))result.add(key,stash.get(key).deepCopy());
+                for(String key:List.of("observed","inferred","unscanned","observedAt","transferItems","transferStockUncertain"))if(stash.has(key))result.add(key,stash.get(key).deepCopy());
                 result.addProperty("complete",stash.has("observed") && stash.get("observed").getAsInt()>0
                     && (!stash.has("unscanned") || stash.get("unscanned").getAsInt()==0)
                     && (!stash.has("inferred") || stash.get("inferred").getAsInt()==0));
                 return new Reply(200,result);
+            }
+            if(parts.length==5 && resource.equals("stashes") && parts[4].equals("sort-preview")){
+                if(!Set.of("buffers","carrySlots","categoryIds","growthColumns").containsAll(query.keySet()))throw new IllegalArgumentException("Unsupported sorting preview parameter");
+                JsonObject saved=find(items,parts[3]);if(saved==null)return missing();JsonObject request=op("stash-sort-preview");
+                for(String key:List.of("crew","scope","name"))request.add(key,saved.get(key).deepCopy());
+                for(String key:query.keySet())if(key.equals("categoryIds")){
+                    JsonArray ids=new JsonArray();if(!query.get(key).isEmpty())for(String id:query.get(key).split(",",-1))ids.add(id);request.add(key,ids);
+                }else request.addProperty(key,Integer.parseInt(query.get(key)));
+                return new Reply(200,host.control(request));
             }
             if(parts.length==5 && query.isEmpty() && resource.equals("jobs") && parts[4].equals("configuration")) {
                 if(find(items,parts[3])==null)return missing();
@@ -102,6 +127,36 @@ final class ResourceApi {
         if (resource.equals("drafts")) return drafts(host, snapshot, method, parts, body);
         if (resource.equals("stashes")) return stashes(host, snapshot, method, parts, body, ifMatch);
         return missing();
+    }
+
+    /** Resolve names before dispatch, without a game dependency or holding the host's control lock. */
+    private static JsonObject playerIdentity(JsonObject snapshot, String name) {
+        if (!name.matches("[A-Za-z0-9_]{1,16}")) throw new IllegalArgumentException("Specify an exact Minecraft username");
+        Map<String,JsonObject> known = new LinkedHashMap<>();
+        for (JsonElement value : snapshot.getAsJsonArray("workers")) {
+            JsonObject worker = value.getAsJsonObject();
+            if (worker.get("connected").getAsBoolean() && (!worker.has("publicProtocol") || !worker.get("publicProtocol").getAsBoolean()) && text(worker,"name").equalsIgnoreCase(name)) {
+                JsonObject identity = new JsonObject(); identity.addProperty("id", uuid(text(worker,"id"))); identity.addProperty("name", text(worker,"name"));
+                known.put(text(identity,"id"), identity);
+            }
+        }
+        if (known.size() > 1) throw new IllegalStateException("Username matches multiple connected identities; inspect the roster first");
+        if (!known.isEmpty()) return known.values().iterator().next();
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build()) {
+            HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.mojang.com/users/profiles/minecraft/" + name)).timeout(Duration.ofSeconds(4)).GET().build();
+            var response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() == 404 || response.statusCode() == 204) throw new IllegalArgumentException("Minecraft username was not found; no delivery was submitted");
+            if (response.statusCode() != 200 || response.body().length() > 4096) throw new IllegalStateException("Minecraft profile lookup is unavailable; try again before dispatching");
+            return checkedPlayerIdentity(JsonParser.parseString(response.body()).getAsJsonObject(), name);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt(); throw new IllegalStateException("Minecraft profile lookup was interrupted; no delivery was submitted");
+        } catch (IOException e) { throw new IllegalStateException("Minecraft profile lookup is unavailable; no delivery was submitted"); }
+    }
+    static JsonObject checkedPlayerIdentity(JsonObject profile, String requested) {
+        String id = text(profile,"id"), name = text(profile,"name");
+        if (!id.matches("[0-9a-fA-F]{32}") || !name.matches("[A-Za-z0-9_]{1,16}") || !name.equalsIgnoreCase(requested))
+            throw new IllegalArgumentException("Minecraft profile lookup returned a different or invalid identity");
+        JsonObject result = new JsonObject();result.addProperty("id",uuid(id.substring(0,8)+"-"+id.substring(8,12)+"-"+id.substring(12,16)+"-"+id.substring(16,20)+"-"+id.substring(20)));result.addProperty("name",name);return result;
     }
 
     private static Reply crews(HostService host, JsonObject snapshot, String method, String[] parts, JsonObject body, String ifMatch) {
@@ -301,6 +356,14 @@ final class ResourceApi {
         if(parts.length<4)return missing();
         JsonObject saved=find(items(snapshot,"stashes"),parts[3]);
         if(saved==null)return missing();
+        if(parts.length==5 && parts[4].equals("column-reservations") && method.equals("PUT")) {
+            String kind=body.has("categoryId")?"categoryId":"kitTypeId";
+            if(body.size()!=2||!body.has("columns")||!body.get("columns").isJsonArray()||!body.has(kind)||!body.get(kind).isJsonPrimitive()||!body.getAsJsonPrimitive(kind).isString())throw new IllegalArgumentException("Specify columns and kitTypeId (empty to clear), or categoryId");
+            checkRevision(saved,ifMatch);JsonObject request=op("stash-reserve-columns");
+            for(String key:List.of("crew","scope","name"))request.add(key,saved.get(key).deepCopy());
+            request.addProperty("expected",text(saved,"revision"));request.add("columns",body.get("columns").deepCopy());request.add(kind,body.get(kind).deepCopy());
+            return new Reply(200,stash(host.control(request)));
+        }
         if(parts.length==4 && method.equals("PATCH")) {
             checkRevision(saved,ifMatch);
             JsonObject request=op("stash-update");
@@ -378,6 +441,7 @@ final class ResourceApi {
         if(source.has("publicAction")){view.add("action",source.get("publicAction").deepCopy());view.remove("publicAction");}
         JsonObject scope=new JsonObject();scope.addProperty("server",text(source,"server"));scope.addProperty("dimension",text(source,"dimension"));view.add("scope",scope);
         JsonArray workers=new JsonArray();source.getAsJsonObject("runs").keySet().forEach(workers::add);view.add("workerIds",workers);
+        for(JsonElement run:view.getAsJsonObject("runs").asMap().values())run.getAsJsonObject().remove("kitRoutePlans");
         return view;
     }
     private static JsonObject workflow(JsonObject source) {
@@ -397,6 +461,48 @@ final class ResourceApi {
         if(scope.length==2){JsonObject world=new JsonObject();world.addProperty("server",scope[0]);world.addProperty("dimension",scope[1]);view.add("world",world);}
         if(view.has("updatedAt"))view.addProperty("observedAt",Instant.ofEpochMilli(view.get("updatedAt").getAsLong()).toString());
         return view;
+    }
+    /** Compare a named kit family without mistaking a different contents variant for absent stock. */
+    static JsonObject kitStock(JsonObject snapshot, String requestedId, Function<JsonObject,JsonObject> readCatalog) {
+        uuid(requestedId);
+        JsonObject descriptor = null;
+        for (JsonElement value : snapshot.getAsJsonArray("stashes")) {
+            JsonObject stash = value.getAsJsonObject();
+            String local = KitTypes.canonical(stash, requestedId);
+            JsonObject types = stash.getAsJsonObject("kitTypes");
+            if (types != null && types.has(local)) { descriptor = types.getAsJsonObject(local); break; }
+        }
+        if (descriptor == null) return null;
+        String family = KitTypes.family(descriptor);
+        JsonObject result = new JsonObject();
+        result.addProperty("requestedKitTypeId", requestedId); result.addProperty("familyId", family);
+        result.addProperty("name", text(descriptor, "name")); result.addProperty("item", text(descriptor, "item"));
+        result.addProperty("basis", "RecordedObservations");
+        JsonArray stashes = new JsonArray(); result.add("stashes", stashes);
+        for (JsonElement value : snapshot.getAsJsonArray("stashes")) {
+            JsonObject summary = value.getAsJsonObject();
+            if(summary.getAsJsonObject("kitTypes").entrySet().stream().noneMatch(e->family.equals(KitTypes.family(e.getValue().getAsJsonObject()))))continue;
+            JsonObject source=readCatalog.apply(summary);
+            if(source.isEmpty())continue;
+            JsonObject view=stash(StashCatalog.summary(source)),counts=KitTypes.stockVariants(source,family);
+            String resolved = KitTypes.canonical(source, requestedId);
+            JsonObject row = new JsonObject();
+            for (String key : List.of("id", "name", "crewId", "world", "revision", "observedAt", "observed", "inferred", "unscanned"))
+                if (view.has(key)) row.add(key, view.get(key).deepCopy());
+            if (source.getAsJsonObject("kitTypes").has(resolved)) row.addProperty("resolvedKitTypeId", resolved);
+            row.addProperty("aliasResolved", !resolved.equals(requestedId));
+            counts.entrySet().forEach(e->row.add(e.getKey(),e.getValue().deepCopy()));
+            if(view.has("transferKitCounts")){
+                JsonObject estimates=new JsonObject();
+                for(var entry:view.getAsJsonObject("transferKitCounts").entrySet()){
+                    JsonObject type=source.getAsJsonObject("kitTypes").getAsJsonObject(entry.getKey());
+                    if(type!=null&&family.equals(KitTypes.family(type)))estimates.add(entry.getKey(),entry.getValue().deepCopy());
+                }
+                row.add("transferEstimates",estimates);row.add("transferStockUncertain",view.get("transferStockUncertain").deepCopy());
+            }
+            stashes.add(row);
+        }
+        return result;
     }
     private static JsonObject jobConfiguration(HostService host,String id) {
         JsonObject view=host.control(withId("task-configuration",id));view.addProperty("jobId",id);return view;

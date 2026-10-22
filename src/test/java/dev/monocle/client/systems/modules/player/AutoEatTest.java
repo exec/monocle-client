@@ -43,6 +43,20 @@ public final class AutoEatTest {
         var named = new ItemStack(Items.BREAD);
         named.set(DataComponents.CUSTOM_NAME, Component.literal("Save this"));
         assert !AutoEat.foodAllowed(named, List.of(), true) && AutoEat.foodAllowed(named, List.of(), false);
+        var foodInventory = new SimpleContainer(41);
+        var offhand = new ItemStack(Items.ENCHANTED_GOLDEN_APPLE, 42);
+        foodInventory.setItem(40, offhand);
+        assert AutoEat.foodCount(foodInventory, offhand, List.of(), false) == 42
+            : "A full offhand stack is usable food and is counted exactly once";
+        foodInventory.setItem(35, new ItemStack(Items.ENCHANTED_GOLDEN_APPLE, 22));
+        assert AutoEat.foodCount(foodInventory, offhand, List.of(), false) == 64
+            && AutoEat.foodCount(foodInventory, offhand, List.of(Items.ENCHANTED_GOLDEN_APPLE), false) == 0;
+        offhand.set(DataComponents.CUSTOM_NAME, Component.literal("Still edible"));
+        assert AutoEat.foodCount(foodInventory, offhand, List.of(), true) == 22
+            && AutoEat.foodCount(foodInventory, offhand, List.of(), false) == 64 : "Count uses the same named-food policy as eating";
+        foodInventory.setItem(35, ItemStack.EMPTY);foodInventory.setItem(36, new ItemStack(Items.BREAD, 16));
+        assert AutoEat.foodCount(foodInventory, ItemStack.EMPTY, List.of(), false) == 0
+            : "Armor/crafting and duplicated offhand slots are not extra carried food";
         assert !AutoEat.foodAllowed(named, List.of(Items.BREAD), false) : "Disabling named protection must not bypass blacklist";
         assert !AutoEat.foodAllowed(new ItemStack(Items.ENCHANTED_GOLDEN_APPLE), List.of(Items.ENCHANTED_GOLDEN_APPLE), true);
         var eating = new ItemStack(Items.COOKED_BEEF, 32);

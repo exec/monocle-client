@@ -16,9 +16,10 @@ import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.drafts.Draft_6455;
 import org.java_websocket.handshake.ServerHandshake;
 
-/** Durable RWP Wait and Travel execution; Minecraft movement remains in the client. */
+/** Durable RWP Wait, Travel and Monocle Follow; Minecraft movement remains in the client. */
 public final class RwpWorkerConnection implements AutoCloseable {
     public static final String PATH = "/v1/interop/workers", VERSION = "rwp/1-draft";
+    public static final String FOLLOW = "dev.monocle.follow.v1";
     private final UUID workerId;
     private final String implementationVersion;
     private final Path journal;
@@ -77,12 +78,62 @@ public final class RwpWorkerConnection implements AutoCloseable {
     public boolean active() { return !stopped; }
     public String failure() { return failure; }
     public String hostImplementation() { return hostImplementation; }
-    public synchronized String work() { return run == null ? "idle" : string(run, "phase") + (run.has("action") ? " · Travel" : " · " + run.get("remainingTicks").getAsInt() + " ticks remaining"); }
+    public synchronized String work() { return run == null ? "idle" : string(run, "phase") + (run.has("action") ? " · " + (FOLLOW.equals(string(run.getAsJsonObject("action"), "type")) ? "Follow" : "Travel") : " · " + run.get("remainingTicks").getAsInt() + " ticks remaining"); }
 
     /** A running, reconciled Travel assignment; null also revokes movement authority. */
     public synchronized JsonObject activeTravel() {
+        JsonObject active = activeMovement();
+        return active != null && string(active.getAsJsonObject("action"), "type").equals("workers.travel.v1") ? active : null;
+    }
+
+    public synchronized JsonObject activeMovement() {
         return connected() && allowed && run != null && run.has("action") && string(run, "phase").equals("running")
             && sameScope(run.getAsJsonObject("scope")) ? run.deepCopy() : null;
+    }
+
+    /** The game thread owns stopping movement before acknowledging cancellation. */
+    public synchronized void acknowledgeMovementCancellation() {
+        if (run == null || !string(run, "phase").equals("cancelling")) return;
+        run.addProperty("phase", "cancelled");
+        JsonObject report = reference(run); report.addProperty("cleanup", "acknowledged");
+        queueReport("execution.cancelled", report);
+    }
+
+    /** Count only ticks actually handed to the native Follow action; zero is unlimited. */
+    public synchronized boolean followTick() {
+        if (activeMovement() == null || !FOLLOW.equals(string(run.getAsJsonObject("action"), "type"))) return false;
+        if (run.getAsJsonObject("action").getAsJsonObject("arguments").get("ticks").getAsInt() == 0) return false;
+        int remaining = Math.max(0, run.get("remainingTicks").getAsInt() - 1);
+        run.addProperty("remainingTicks", remaining); save();
+        return remaining == 0;
+    }
+
+    /** Called after native control is released, not merely when the interval expires. */
+    public synchronized void completeFollow() {
+        if (activeMovement() == null || !FOLLOW.equals(string(run.getAsJsonObject("action"), "type"))) return;
+        if (run.get("remainingTicks").getAsInt() != 0 || run.getAsJsonObject("action").getAsJsonObject("arguments").get("ticks").getAsInt() == 0)
+            throw new IllegalStateException("Follow interval has not finished");
+        run.addProperty("phase", "completed"); queueReport("execution.completed", reference(run));
+    }
+
+    public synchronized boolean followFinished() {
+        return activeMovement() != null && FOLLOW.equals(string(run.getAsJsonObject("action"), "type"))
+            && run.getAsJsonObject("action").getAsJsonObject("arguments").get("ticks").getAsInt() > 0
+            && run.get("remainingTicks").getAsInt() == 0;
+    }
+
+    public static JsonObject nativeMovement(JsonObject execution) {
+        JsonObject action = execution.getAsJsonObject("action"), scope = execution.getAsJsonObject("scope");
+        validateMovement(action, scope);
+        JsonObject nativeAction = action.getAsJsonObject("arguments").deepCopy();
+        nativeAction.remove("scope"); nativeAction.addProperty("type", "Travel");
+        nativeAction.addProperty("dimension", string(scope, "dimension"));
+        if (FOLLOW.equals(string(action, "type"))) {
+            nativeAction.addProperty("follow", true);
+            nativeAction.addProperty("adaptiveFlight", true);
+            nativeAction.addProperty("ticks", 0); // RWP owns the durable interval across native restarts.
+        }
+        return nativeAction;
     }
 
     /** Called only after the Minecraft Travel action reports safe-footing arrival. */
@@ -100,14 +151,14 @@ public final class RwpWorkerConnection implements AutoCloseable {
     }
 
     public synchronized void failTravel() {
-        if (activeTravel() == null) return;
-        JsonObject report = reference(run); report.addProperty("code", "travel_failed");
+        if (activeMovement() == null) return;
+        JsonObject report = reference(run); report.addProperty("code", FOLLOW.equals(string(run.getAsJsonObject("action"), "type")) ? "follow_failed" : "travel_failed");
         run.addProperty("phase", "failed"); queueReport("execution.failed", report);
     }
 
     /** Replaceable operator telemetry; never used as completion evidence. */
     public synchronized void reportTravelProgress(String detail) {
-        if (activeTravel() != null) progress(detail, null);
+        if (activeMovement() != null) progress(detail, null);
     }
 
     /** Called on the game thread to publish current world and retry durable reports. */
@@ -140,7 +191,7 @@ public final class RwpWorkerConnection implements AutoCloseable {
         JsonObject implementation = new JsonObject(); implementation.addProperty("id", "dev.monocle.client");
         implementation.addProperty("version", implementationVersion); payload.add("implementation", implementation);
         JsonArray capabilities = new JsonArray();
-        for (String id : List.of("workers.wait.v1", "workers.travel.v1")) { JsonObject capability = new JsonObject(); capability.addProperty("id", id); capabilities.add(capability); }
+        for (String id : List.of("workers.wait.v1", "workers.travel.v1", FOLLOW)) { JsonObject capability = new JsonObject(); capability.addProperty("id", id); capabilities.add(capability); }
         payload.add("capabilities", capabilities); payload.addProperty("lastHostSequence", 0); payload.addProperty("lastWorkerSequence", 0);
         send("session.hello", payload, UUID.randomUUID());
     }
@@ -225,15 +276,21 @@ public final class RwpWorkerConnection implements AutoCloseable {
         if (!sameScope(payload.getAsJsonObject("scope"))) throw new IllegalArgumentException("Assignment world is not observed");
         JsonObject action = payload.getAsJsonObject("action");
         String type = string(action, "type");
-        if (!Set.of("workers.wait.v1", "workers.travel.v1").contains(type)) throw new IllegalArgumentException("Unsupported RWP assignment");
+        if (!Set.of("workers.wait.v1", "workers.travel.v1", FOLLOW).contains(type)) throw new IllegalArgumentException("Unsupported RWP assignment");
         int ticks = 0;
         if (type.equals("workers.wait.v1")) {
             ticks = action.getAsJsonObject("arguments").get("ticks").getAsBigDecimal().intValueExact();
             if (ticks < 0 || ticks > 1_728_000) throw new IllegalArgumentException("Invalid RWP Wait duration");
-        } else validateTravel(action, payload.getAsJsonObject("scope"));
+        } else {
+            validateMovement(action, payload.getAsJsonObject("scope"));
+            if (type.equals(FOLLOW)) {
+                if (workerId.toString().equals(string(action.getAsJsonObject("arguments"), "target"))) throw new IllegalArgumentException("Cannot follow this worker itself");
+                ticks = action.getAsJsonObject("arguments").get("ticks").getAsInt();
+            }
+        }
         JsonObject next = reference(payload); next.add("scope", payload.get("scope").deepCopy());
         next.addProperty("commandId", UUID.fromString(string(payload, "commandId")).toString());
-        if (type.equals("workers.travel.v1")) next.add("action", action.deepCopy());
+        if (!type.equals("workers.wait.v1")) next.add("action", action.deepCopy());
         next.addProperty("remainingTicks", ticks); next.addProperty("phase", "accepted");
         run = next; allowed = true; progressSentAt = 0; queueReport("execution.accepted", acceptedReference(next));
     }
@@ -244,6 +301,10 @@ public final class RwpWorkerConnection implements AutoCloseable {
             run = reference(payload); run.add("scope", observedScope == null ? new JsonObject() : observedScope.deepCopy());
             run.addProperty("commandId", UUID.fromString(string(payload, "commandId")).toString());
             run.addProperty("remainingTicks", 0);
+        }
+        if (run.has("action") && !Set.of("completed", "failed", "cancelled").contains(string(run, "phase"))) {
+            allowed = false; run.addProperty("phase", "cancelling"); run.remove("pending"); save();
+            return;
         }
         run.addProperty("phase", "cancelled");
         JsonObject report = reference(run); report.addProperty("cleanup", "acknowledged");
@@ -306,10 +367,10 @@ public final class RwpWorkerConnection implements AutoCloseable {
     private static String string(JsonObject object, String key) { return object.get(key).getAsString(); }
     private static void validateRun(JsonObject run) {
         reference(run); UUID.fromString(string(run, "commandId"));
-        if (!Set.of("accepted", "started", "running", "completed", "cancelled", "failed", "inspection").contains(string(run, "phase"))
+        if (!Set.of("accepted", "started", "running", "completed", "cancelling", "cancelled", "failed", "inspection").contains(string(run, "phase"))
             || run.get("remainingTicks").getAsInt() < 0 || run.get("remainingTicks").getAsInt() > 1_728_000
             || !run.get("scope").isJsonObject()) throw new IllegalStateException("Invalid RWP worker checkpoint; original left untouched");
-        if (run.has("action")) validateTravel(run.getAsJsonObject("action"), run.getAsJsonObject("scope"));
+        if (run.has("action")) validateMovement(run.getAsJsonObject("action"), run.getAsJsonObject("scope"));
         if (run.has("pending")) {
             JsonObject pending = run.getAsJsonObject("pending");
             UUID.fromString(string(pending, "messageId"));
@@ -318,7 +379,22 @@ public final class RwpWorkerConnection implements AutoCloseable {
         }
     }
 
-    private static void validateTravel(JsonObject action, JsonObject scope) {
+    private static void validateMovement(JsonObject action, JsonObject scope) {
+        if (FOLLOW.equals(string(action, "type"))) {
+            JsonObject args = action.getAsJsonObject("arguments");
+            if (!action.keySet().equals(Set.of("type", "arguments")) || args == null || !args.keySet().equals(Set.of("target", "radius", "ticks")))
+                throw new IllegalArgumentException("Follow requires only target, radius and ticks");
+            String target = string(args, "target");
+            if (!UUID.fromString(target).toString().equals(target)) throw new IllegalArgumentException("Follow needs a canonical player UUID");
+            double radius = args.get("radius").getAsDouble();
+            if (!args.getAsJsonPrimitive("radius").isNumber() || !Double.isFinite(radius) || radius < .15 || radius > 8
+                || !args.getAsJsonPrimitive("ticks").isNumber()) throw new IllegalArgumentException("Invalid Follow radius or interval");
+            int ticks;
+            try { ticks = args.get("ticks").getAsBigDecimal().intValueExact(); }
+            catch (ArithmeticException invalid) { throw new IllegalArgumentException("Follow interval must be an integer", invalid); }
+            if (ticks < 0 || ticks > 1_728_000) throw new IllegalArgumentException("Invalid Follow interval");
+            return;
+        }
         if (!string(action, "type").equals("workers.travel.v1")) throw new IllegalArgumentException("Invalid RWP Travel action");
         JsonObject args = action.getAsJsonObject("arguments");
         if (!args.getAsJsonObject("scope").equals(scope)) throw new IllegalArgumentException("Travel scope mismatch");

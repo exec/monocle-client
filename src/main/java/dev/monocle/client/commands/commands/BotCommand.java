@@ -18,6 +18,7 @@ import dev.monocle.client.commands.arguments.PlayerArgumentType;
 import dev.monocle.client.pathing.PathManagers;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
+import dev.monocle.client.systems.modules.movement.LobbySkip;
 import dev.monocle.client.systems.bots.Bots;
 import dev.monocle.coordinator.HighwayJobs;
 import dev.monocle.client.systems.modules.misc.swarm.SwarmConnection;
@@ -48,6 +49,21 @@ public class BotCommand extends Command {
 
     @Override
     public void build(LiteralArgumentBuilder<ClientSuggestionProvider> builder) {
+        var discord=literal("discord");
+        discord.executes(_->crewAction(()->mc.gui.setScreen(new dev.monocle.client.gui.screens.DiscordNotificationsScreen(dev.monocle.client.gui.GuiThemes.get(),Bots.get()))));
+        discord.then(literal("status").executes(_->crewAction(()->info("%s",Bots.get().notifications().status()))));
+        discord.then(literal("test").executes(_->crewAction(()->info("%s",Bots.get().notifications().test()))));
+        discord.then(literal("reload").executes(_->crewAction(()->{Bots.get().notifications().reload();info("%s",Bots.get().notifications().status());})));
+        builder.then(discord);
+        var hostile=literal("hostile");
+        hostile.then(literal("list").executes(_->{info("%s",Bots.get().hostiles().snapshot());return SINGLE_SUCCESS;}));
+        hostile.then(literal("reconnect").then(argument("enabled",BoolArgumentType.bool()).executes(c->crewAction(()->Bots.get().manageHostile("reconnect",String.valueOf(BoolArgumentType.getBool(c,"enabled")))))));
+        hostile.then(literal("cooldown").then(argument("seconds",IntegerArgumentType.integer(5,3600)).executes(c->crewAction(()->Bots.get().manageHostile("cooldown",String.valueOf(IntegerArgumentType.getInteger(c,"seconds")))))));
+        hostile.then(literal("incidents").executes(_->{info("%s",Bots.get().incidents().page(null,10,"",""));return SINGLE_SUCCESS;}));
+        hostile.then(literal("guard").then(argument("enabled",BoolArgumentType.bool()).executes(c->crewAction(()->Bots.get().manageHostile("guard",String.valueOf(BoolArgumentType.getBool(c,"enabled")))))));
+        hostile.then(literal("add").then(argument("name",StringArgumentType.word()).executes(c->crewAction(()->Bots.get().manageHostile("add",StringArgumentType.getString(c,"name"))))));
+        hostile.then(literal("remove").then(argument("entry-id",StringArgumentType.word()).executes(c->crewAction(()->Bots.get().manageHostile("remove",StringArgumentType.getString(c,"entry-id"))))));
+        builder.then(hostile);
         builder.executes(_ -> {
             dev.monocle.client.gui.tabs.Tabs.get(dev.monocle.client.gui.tabs.builtin.BotsTab.class).openScreen(dev.monocle.client.gui.GuiThemes.get());
             return SINGLE_SUCCESS;
@@ -55,6 +71,10 @@ public class BotCommand extends Command {
         builder.then(literal("host").executes(_ -> crewAction(() -> {
             Bots bots = Bots.get(); bots.mode.set(Bots.Mode.Host); bots.startHost(); bots.save();
         })));
+        builder.then(literal("lobby-skip")
+            .then(literal("start").executes(_ -> crewAction(() -> Modules.get().get(LobbySkip.class).startSkipping())))
+            .then(literal("stop").executes(_ -> crewAction(() -> Modules.get().get(LobbySkip.class).stopSkipping())))
+            .then(literal("status").executes(_ -> { info("Lobby Skip: %s", Modules.get().get(LobbySkip.class).status()); return SINGLE_SUCCESS; })));
         builder.then(literal("export-workflow").then(argument("workflow-id", StringArgumentType.word()).executes(context -> crewAction(() ->
             info("Exported workflow and captured gameplay profiles to %s", Bots.get().tasks().exportWorkflow(StringArgumentType.getString(context, "workflow-id")))))));
         builder.then(literal("highway")

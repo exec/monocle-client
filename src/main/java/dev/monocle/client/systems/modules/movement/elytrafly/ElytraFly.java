@@ -491,7 +491,8 @@ public class ElytraFly extends Module {
     }
 
     private boolean clearAutopilotBody(AABB box) {
-        if (box.minY < mc.level.getMinY() || box.maxY > mc.level.getMaxY() + 1
+        // Build height limits placement, not flight above a top-row chest.
+        if (box.minY < mc.level.getMinY()
             || !PrinterFlight.loaded(box, mc.level.getChunkSource()::hasChunk) || !mc.level.noCollision(mc.player, box)) return false;
         for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY, box.minZ),
             BlockPos.containing(Math.nextDown(box.maxX), Math.nextDown(box.maxY), Math.nextDown(box.maxZ)))) {

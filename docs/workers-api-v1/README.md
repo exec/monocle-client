@@ -4,6 +4,8 @@ Status: **proposal for cross-platform review, not frozen**. This package is the 
 
 RWP defines **how a host and worker agree on and track work, not which jobs every client must offer**. A job carries a namespaced, versioned action and its arguments. The worker advertises exact action capabilities; the host must refuse unsupported assignments. RWP governs identity, authority, assignment, reports, cancellation, retries, and reconciliation, while the action's own specification governs its arguments, permitted effects, and success criteria. Monocle highway and stash jobs remain Monocle-defined actions. A generic RWP host can transport an unfamiliar action for a capable worker without claiming to understand or independently verify its gameplay result.
 
+Monocle 0.14.10 also advertises the client-specific [`dev.monocle.follow.v1`](monocle-actions.md) extension, reusing native walking/adaptive flight with durable intervals and game-thread cancellation handoff. Full highway/stash workflow adapters are still pending; Follow does not expand RWP's mandatory core.
+
 ## Vocabulary
 
 | Term | Meaning |

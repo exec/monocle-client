@@ -20,7 +20,6 @@ import dev.monocle.client.systems.modules.movement.elytrafly.ElytraFlightModes;
 import dev.monocle.client.utils.Utils;
 import dev.monocle.client.utils.player.FindItemResult;
 import dev.monocle.client.utils.player.InvUtils;
-import dev.monocle.client.utils.player.Rotations;
 import dev.monocle.client.utils.world.BlockUtils;
 import dev.monocle.client.utils.world.PrinterFlight;
 import meteordevelopment.orbit.EventHandler;
@@ -61,23 +60,20 @@ public final class AutoWither extends Module {
         .description("Build Withers at reachable air sites as you move around.")
         .defaultValue(false).build());
     private final Setting<Boolean> autopilot = general.add(new BoolSetting.Builder().name("autopilot")
-        .description("Let Auto Wither steer between sites. Only applies while Spam is enabled.")
+        .description("Fly a line, completing Withers on both sides. Slows for placement confirmation. Only applies with Spam.")
         .defaultValue(false).visible(spam::get).build());
+    private final Setting<Integer> witherGap = general.add(new IntSetting.Builder().name("wither-gap")
+        .description("Empty blocks between successive Wither structures along each side of the line. Applied when enabled; does not guarantee safety from Withers.")
+        .defaultValue(4).range(0, 64).sliderRange(0, 16).visible(() -> spam.get() && autopilot.get()).build());
     private final Setting<Boolean> excludeThirdHead = general.add(new BoolSetting.Builder().name("exclude-third-head")
         .description("Leave each verified structure with two heads for manual completion; never summon it.")
         .defaultValue(false).build());
     private final Setting<Integer> witherCount = general.add(new IntSetting.Builder().name("wither-count")
         .description("Stop after this many completed Withers (or two-head structures). Zero means unlimited.")
         .defaultValue(0).range(0, 100000).sliderRange(0, 64).build());
-    private final Setting<Integer> withersPerStop = general.add(new IntSetting.Builder().name("withers-per-stop")
-        .description("Build this many nearby Withers before autopilot flies to the next area. Clusters are dangerous.")
-        .defaultValue(1).range(1, 32).sliderRange(1, 12).visible(() -> spam.get() && autopilot.get()).build());
     private final Setting<Integer> delay = general.add(new IntSetting.Builder().name("delay")
         .description("Minimum ticks between structures. Zero adds no artificial delay; placement still waits for server confirmation.")
         .defaultValue(0).range(0, 100).sliderRange(0, 40).visible(spam::get).build());
-    private final Setting<Integer> spacing = general.add(new IntSetting.Builder().name("spacing")
-        .description("Distance between autopilot sites. Manual flight may place closer together.")
-        .defaultValue(24).range(20, 64).sliderRange(20, 48).visible(() -> spam.get() && autopilot.get()).build());
 
     private enum Phase { Idle, Approach, Restock, Build, Spawn, Escape, Paused }
     private record Supply(int soulSand, int soulSoil, int skulls) {
@@ -90,12 +86,13 @@ public final class AutoWither extends Module {
     private Phase phase = Phase.Idle;
     private ClientLevel world;
     private Direction forward, side;
-    private BlockPos cursor, site, manualBase, spotOrigin;
-    private int manualSequence = -1, step, stepRetries, nextTick, launchTick = -1, noProgressTick, siteTick, completed, builtAtSpot;
+    private BlockPos site, manualBase, lineOrigin, prefetchedSite;
+    private int manualSequence = -1, step, stepRetries, nextTick, launchTick = -1, noProgressTick, siteTick, completed, lineIndex, lineGap;
+    private int placementTick = -1, placementsThisTick;
     private double flightRamp;
     private Vec3 lastPosition, lastTarget, escapeTarget, groundVelocity = Vec3.ZERO;
-    private Pending pending, secondPending;
-    private boolean sending, sendingSecond, manualConfirmed, queuedPlacement;
+    private Pending pending, secondPending, prefetchedPending;
+    private boolean sending, sendingSecond, manualConfirmed;
     private final Set<UUID> withersBefore = new HashSet<>();
     private final Map<BlockPos, Incomplete> incomplete = new LinkedHashMap<>();
     private final Map<BlockPos, Integer> rejectedSites = new LinkedHashMap<>();
@@ -108,19 +105,21 @@ public final class AutoWither extends Module {
 
     @Override public void onActivate() {
         if (mc.player == null || mc.level == null || mc.gameMode == null) { disable(); return; }
-        if (Modules.get().get(HighwayBuilder.class).isActive() || Modules.get().get(PrinterHelper.class).isActive()
+        if (Modules.get().get(HighwayBuilder.class).isActive() || Modules.get().get(PrinterHelper.class).isActive() || Modules.get().get(StashBuilder.class).isActive()
             || PathManagers.get().isPathing()) { error("Stop Highway Builder, Printer Helper, or pathing first."); disable(); return; }
         world = mc.level;
         phase = Phase.Idle;
-        cursor = site = manualBase = spotOrigin = null;
-        pending = secondPending = null; restock = null; queuedPlacement = false; escapeTarget = null;
+        site = manualBase = lineOrigin = prefetchedSite = null;
+        pending = secondPending = prefetchedPending = null; restock = null; escapeTarget = null;
         incomplete.clear();
         rejectedSites.clear();
         manualSequence = -1; step = stepRetries = nextTick = 0; launchTick = -1;
         withersBefore.clear();
+        placementTick = -1; placementsThisTick = 0;
         forward = mc.player.getDirection();
         side = forward.getClockWise();
-        completed = builtAtSpot = 0;
+        completed = lineIndex = 0;
+        lineGap = witherGap.get();
         flightRamp = 0;
         lastPosition = mc.player.position();
         noProgressTick = mc.player.tickCount;
@@ -134,7 +133,6 @@ public final class AutoWither extends Module {
             if (!fly.isActive()) fly.enable();
         }
         if (!spam.get()) { phase = Phase.Idle; status = "Place the bottom-center soul sand or soul soil block."; return; }
-        cursor = mc.player.blockPosition().relative(forward, 3);
         phase = Phase.Approach;
         status = "Finding a reachable air site.";
     }
@@ -147,7 +145,11 @@ public final class AutoWither extends Module {
         }
         if (site != null && step > 0 && mc.player != null)
             warning("A partial Wither structure may remain at %s.", site.toShortString());
-        restock = null; pending = secondPending = null; manualBase = site = cursor = spotOrigin = null; lastTarget = escapeTarget = null; queuedPlacement = false;
+        if (prefetchedSite != null && mc.player != null)
+            warning("A next Wither stem may remain at %s.", prefetchedSite.toShortString());
+        prefetchedSite = null;
+        prefetchedPending = null;
+        restock = null; pending = secondPending = null; manualBase = site = lineOrigin = null; lastTarget = escapeTarget = null;
         incomplete.clear();
         rejectedSites.clear();
         groundVelocity = Vec3.ZERO; phase = Phase.Idle; world = null;
@@ -185,37 +187,46 @@ public final class AutoWither extends Module {
         if (phase == Phase.Spawn) { awaitSpawn(); return; }
         if (phase == Phase.Escape) {
             if (moveTo(escapeTarget, false)) {
-                BlockPos departed = spotOrigin == null ? site : spotOrigin;
-                site = spotOrigin = null; step = builtAtSpot = 0;
-                if (countReached()) disable();
-                else {
-                    cursor = nextSite(departed, forward, spacing.get());
-                    phase = Phase.Approach;
-                    status = "Finding the next Wither area";
-                }
+                site = null; step = lineIndex = 0;
+                disable();
             }
             return;
         }
         if (phase != Phase.Build || site == null) return;
-        holdFlight();
-        if (pending != null) { verifyPending(); return; }
-        if (queuedPlacement) return;
+        if (steering() && !advanceLine()) return;
+        if (pending != null) {
+            while (pending != null && phase == Phase.Build) {
+                Pending before = pending;
+                verifyPending();
+                if (pending == before) return;
+            }
+            if (phase != Phase.Build) return;
+        }
         int limit = excludeThirdHead.get() ? 6 : 7;
         if (step >= limit) { finishSite(); return; }
         if (mc.player.tickCount < nextTick) return;
         if (!structureStillValid()) {
-            if (spam.get()) { site = null; step = 0; phase = Phase.Approach; status = "Structure changed; finding another site"; }
+            if (steering()) { beginEscape("Structure changed; inspect the unfinished Wither"); }
+            else if (spam.get()) { site = null; step = 0; phase = Phase.Approach; status = "Structure changed; finding another site"; }
             else stop("Structure changed at " + site.toShortString());
             return;
         }
-        if (queuePlacement(step, false) && pairable(step)) queuePlacement(step + 1, true);
+        if (queuePlacement(step, false)) {
+            if (pairable(step)) queuePlacement(step + 1, true);
+            else if (step == 6) prefetchNextStem();
+        }
     }
 
     static boolean pairable(int step) { return step >= 0 && step + 1 < 6; }
+    static boolean placementAllowed(int sent) { return sent < 2; }
 
     /** The first six blocks may be pipelined in pairs; the summoning skull is never speculative. */
     private boolean queuePlacement(int placementStep, boolean second) {
-        List<BlockPos> parts = parts(site, side);
+        return queuePlacement(placementStep, second, site);
+    }
+
+    private boolean queuePlacement(int placementStep, boolean second, BlockPos placementSite) {
+        List<BlockPos> parts = parts(placementSite, side);
         BlockPos target = parts.get(placementStep);
         Item item = placementStep < 4 ? soulItem() : Items.WITHER_SKELETON_SKULL;
         if (item == null || !InvUtils.find(item).found()) {
@@ -250,17 +261,17 @@ public final class AutoWither extends Module {
         if (!reachable(target)) {
             if (second) return false;
             if (spam.get() && !steering()) { rememberIncomplete(); phase = Phase.Approach; }
-            else if (steering()) moveTo(stance(site, side), false);
+            else if (steering()) advanceLine();
             else status = "Move within reach of " + target.toShortString();
             return false;
         }
         if (!mc.level.getBlockState(target).canBeReplaced()) {
             if (second) return false;
-            if (spam.get()) { rememberIncomplete(); phase = Phase.Approach; }
+            if (steering()) beginEscape("Placement blocked; inspect the unfinished Wither");
+            else if (spam.get()) { rememberIncomplete(); phase = Phase.Approach; }
             else status = "Placement blocked at " + target.toShortString();
             return false;
         }
-        int verifiedStep = step;
         int slot = found.slot();
         InteractionHand hand = found.isOffhand() ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND;
         if (placementStep == 6) {
@@ -268,46 +279,63 @@ public final class AutoWither extends Module {
             for (WitherBoss wither : world.getEntitiesOfClass(WitherBoss.class, new AABB(site).inflate(5)))
                 withersBefore.add(wither.getUUID());
         }
-        queuedPlacement = true;
-        Rotations.rotate(Rotations.getYaw(hit), Rotations.getPitch(hit), 50, () -> {
-            queuedPlacement = false;
-            if (!isActive() || phase != Phase.Build || step != verifiedStep || mc.level != world || site == null
-                || (second ? pending == null || pending.sequence < 0 || secondPending != null
-                    || !mc.level.getBlockState(pending.pos).is(pending.expected) : pending != null)
-                || !mc.level.getBlockState(target).canBeReplaced() || !(hand == InteractionHand.OFF_HAND
-                    ? mc.player.getOffhandItem() : mc.player.getInventory().getItem(slot)).is(item)) return;
-            if (hand == InteractionHand.MAIN_HAND) InvUtils.swap(slot, true);
-            sending = true; sendingSecond = second;
-            if (second) secondPending = new Pending(target, expected, -1, mc.player.tickCount, 0, false);
-            else pending = new Pending(target, expected, -1, mc.player.tickCount, stepRetries, false);
-            try {
-                mc.gameMode.useItemOn(mc.player, hand, new BlockHitResult(hit, face, clicked, false));
-            } finally { sending = false; if (hand == InteractionHand.MAIN_HAND) InvUtils.swapBack(); }
-            if (second && secondPending != null && secondPending.sequence < 0) secondPending = null;
-            if (!second && pending != null && pending.sequence < 0) pending = null;
-        });
+        if (!isActive() || phase != Phase.Build || mc.level != world
+            || (second ? pending == null || pending.sequence < 0 || secondPending != null
+                || !mc.level.getBlockState(pending.pos).is(pending.expected) : pending != null)) return false;
+        if (placementTick != mc.player.tickCount) { placementTick = mc.player.tickCount; placementsThisTick = 0; }
+        if (!placementAllowed(placementsThisTick)) return false;
+        placementsThisTick++;
+        if (hand == InteractionHand.MAIN_HAND) InvUtils.swap(slot, true);
+        sending = true; sendingSecond = second;
+        if (second) secondPending = new Pending(target, expected, -1, mc.player.tickCount, 0, false);
+        else pending = new Pending(target, expected, -1, mc.player.tickCount, stepRetries, false);
+        try {
+            mc.gameMode.useItemOn(mc.player, hand, new BlockHitResult(hit, face, clicked, false));
+        } finally { sending = false; if (hand == InteractionHand.MAIN_HAND) InvUtils.swapBack(); }
+        if (second && secondPending != null && secondPending.sequence < 0) secondPending = null;
+        if (!second && pending != null && pending.sequence < 0) pending = null;
         status = "Placing " + (placementStep + 1) + "/" + (excludeThirdHead.get() ? 6 : 7) + " at " + site.toShortString();
-        return true;
+        return second ? secondPending != null : pending != null;
+    }
+
+    static boolean boundaryPairAllowed(boolean steering, int delay, int completed, int limit) {
+        return steering && delay == 0 && !countReached(completed + 1, limit);
+    }
+
+    private void prefetchNextStem() {
+        if (prefetchedSite != null || !boundaryPairAllowed(steering(), delay.get(), completed, witherCount.get())
+            || !hasNeeded(carried(), 0)) return;
+        BlockPos next = lineSite(lineOrigin, forward, lineIndex + 1, lineGap);
+        if (rejected(next) || !siteValid(next, false) || !reachable(next)) return;
+        if (queuePlacement(0, true, next)) {
+            prefetchedSite = next;
+            prefetchedPending = secondPending;
+        }
     }
 
     private void approach() {
         if (site == null) {
-            site = resumedSite();
-            if (site == null && potential().capacity(excludeThirdHead.get(), false) == 0) { stop("No complete Wither materials remain"); return; }
-            if (site == null) site = findLocalSite();
-            if (site == null && steering()) site = spotOrigin == null ? findSite() : findClusterSite();
-            if (site == null && steering() && builtAtSpot > 0) {
-                escapeTarget = stance(spotOrigin.relative(forward, spacing.get()), side);
-                phase = Phase.Escape;
-                status = "No more clear cluster sites; leaving this area";
+            if (!steering()) site = resumedSite();
+            if (site == null && potential().capacity(excludeThirdHead.get(), false) == 0) {
+                if (steering() && completed > 0) beginEscape("No complete Wither materials remain; leaving the line");
+                else stop("No complete Wither materials remain");
                 return;
             }
+            if (steering()) {
+                if (lineOrigin == null) lineOrigin = mc.player.blockPosition().below(mc.player.isFallFlying() ? 1 : 0).relative(forward, 2);
+                side = forward;
+                site = lineSite(lineOrigin, forward, lineIndex, lineGap);
+                if (rejected(site) || !siteValid(site, false)) {
+                    beginEscape("Wither line is obstructed or unloaded; inspect before continuing"); return;
+                }
+            } else if (site == null) site = findLocalSite();
             if (site == null) { status = "Move near clear air to continue Wither Spam"; return; }
-            if (steering() && spotOrigin == null) spotOrigin = site;
             stepRetries = 0;
         }
-        if (!reachable(parts(site, side).get(step))) {
-            if (steering()) { if (!moveTo(stance(site, side), false)) return; }
+        if (steering() && !advanceLine()) return;
+        if (steering() ? parts(site, side).stream().anyMatch(part -> !reachable(part))
+            : !reachable(parts(site, side).get(step))) {
+            if (steering()) return;
             else {
                 BlockPos unfinished = site;
                 if (spam.get()) rememberIncomplete();
@@ -366,7 +394,8 @@ public final class AutoWither extends Module {
                 status = "Left an unfinished Wither; return within reach to retry"; return;
             }
             if (pending.attempts >= 3) {
-                if (spam.get()) {
+                if (steering()) beginEscape("Server did not confirm placement; inspect the unfinished Wither");
+                else if (spam.get()) {
                     rejectSite(); pending = secondPending = null; rememberIncomplete(); phase = Phase.Approach;
                     status = "Unconfirmed block; trying another site";
                 }
@@ -376,8 +405,10 @@ public final class AutoWither extends Module {
             if (mc.level.getBlockState(pending.pos).canBeReplaced()) {
                 stepRetries++;
                 pending = null;
+                secondPending = null;
                 status = "Retrying unconfirmed block";
-            } else if (spam.get()) {
+            } else if (steering()) beginEscape("Unconfirmed placement is occupied; inspect the unfinished Wither");
+            else if (spam.get()) {
                 rejectSite(); pending = secondPending = null; rememberIncomplete(); phase = Phase.Approach;
                 status = "Placement blocked; trying another site";
             } else stop("Unconfirmed block at " + pending.pos.toShortString() + " is occupied; inspect it");
@@ -398,8 +429,9 @@ public final class AutoWither extends Module {
     }
 
     private void awaitSpawn() {
-        holdFlight();
-        if (newWither() != null || summonedStructureGone()) {
+        if (steering() && !advanceLine()) return;
+        WitherBoss summoned = newWither();
+        if (summoned != null || summonedStructureGone()) {
             finishSite();
             return;
         }
@@ -407,7 +439,8 @@ public final class AutoWither extends Module {
             if (spam.get() && !steering()) {
                 warning("Wither spawn not confirmed at %s; returning there later if the structure remains.", site.toShortString());
                 step = 6; rememberIncomplete(); phase = Phase.Approach;
-            } else stop("The final head did not produce a visible Wither at " + site.toShortString());
+            } else if (steering()) beginEscape("The final head did not produce a visible Wither; inspect the structure");
+            else stop("The final head did not produce a visible Wither at " + site.toShortString());
         }
         else status = "Waiting for the new Wither to appear";
     }
@@ -416,13 +449,10 @@ public final class AutoWither extends Module {
         completed++;
         incomplete.remove(site);
         if (steering()) {
-            if (spotOrigin == null) spotOrigin = site;
-            builtAtSpot++;
-            if (leaveStop(builtAtSpot, withersPerStop.get(), countReached())) {
-                escapeTarget = stance(spotOrigin.relative(forward, spacing.get()), side);
+            lineIndex++;
+            if (countReached()) {
                 site = null; step = 0;
-                phase = Phase.Escape;
-                status = "Leaving this Wither cluster";
+                beginEscape("Wither count reached; leaving the line");
                 return;
             }
         }
@@ -434,14 +464,24 @@ public final class AutoWither extends Module {
             return;
         }
         if (countReached()) { site = null; step = 0; disable(); return; }
+        if (prefetchedSite != null) {
+            site = prefetchedSite;
+            prefetchedSite = null;
+            pending = prefetchedPending;
+            prefetchedPending = secondPending = null;
+            step = stepRetries = 0;
+            phase = Phase.Build;
+            siteTick = mc.player.tickCount;
+            status = "Continuing the next Wither stem";
+            return;
+        }
         site = null; step = 0; stepRetries = 0; pending = secondPending = null;
         nextTick = mc.player.tickCount + delay.get();
         phase = Phase.Approach;
-        status = steering() ? "Building another Wither in this area" : "Finding another reachable Wither site";
+        status = steering() ? "Building the next Wither beside the line" : "Finding another reachable Wither site";
     }
     private boolean countReached() { return countReached(completed, witherCount.get()); }
     static boolean countReached(int completed, int limit) { return limit > 0 && completed >= limit; }
-    static boolean leaveStop(int built, int perStop, boolean totalDone) { return totalDone || built >= perStop; }
 
     private void onManualBase() {
         if (manualBase == null || !manualConfirmed || phase != Phase.Idle) return;
@@ -480,14 +520,24 @@ public final class AutoWither extends Module {
         if (secondPending != null && secondPending.sequence >= 0 && sequence >= secondPending.sequence)
             secondPending = new Pending(secondPending.pos, secondPending.expected, secondPending.sequence,
                 secondPending.sentTick, secondPending.attempts, true);
+        if (prefetchedPending != null && prefetchedPending.sequence >= 0 && sequence >= prefetchedPending.sequence)
+            prefetchedPending = new Pending(prefetchedPending.pos, prefetchedPending.expected, prefetchedPending.sequence,
+                prefetchedPending.sentTick, prefetchedPending.attempts, true);
     }
     public void onServerBlockUpdate(BlockPos pos, BlockState state) {
         if (!isActive() || mc.level != world) return;
         if (manualBase != null && manualBase.equals(pos) && soul(state.getBlock())) { manualConfirmed = true; onManualBase(); }
-        if (pending != null && pending.pos.equals(pos) && state.is(pending.expected)) confirmed();
+        if (pending != null && pending.pos.equals(pos) && state.is(pending.expected)) {
+            if (phase == Phase.Spawn && prefetchedSite != null)
+                pending = new Pending(pending.pos, pending.expected, pending.sequence, pending.sentTick, pending.attempts, true);
+            else confirmed();
+        }
         if (secondPending != null && secondPending.pos.equals(pos) && state.is(secondPending.expected))
             secondPending = new Pending(secondPending.pos, secondPending.expected, secondPending.sequence,
                 secondPending.sentTick, secondPending.attempts, true);
+        if (prefetchedPending != null && prefetchedPending.pos.equals(pos) && state.is(prefetchedPending.expected))
+            prefetchedPending = new Pending(prefetchedPending.pos, prefetchedPending.expected, prefetchedPending.sequence,
+                prefetchedPending.sentTick, prefetchedPending.attempts, true);
     }
     public void onSupplyItemPickup(int itemId, int collectorId, int amount) {
         if (restock != null) restock.onSupplyItemPickup(itemId, collectorId, amount);
@@ -503,15 +553,15 @@ public final class AutoWither extends Module {
 
     private boolean moveTo(Vec3 target, boolean land) {
         Vec3 from = mc.player.position();
-        Vec3 waypoint = builtAtSpot > 0 && builtAtSpot < withersPerStop.get() ? target : avoidWithers(from, target);
-        if (waypoint == null) { stop("No clear route around a nearby Wither"); return false; }
-        boolean finalTarget = waypoint.equals(target);
-        target = waypoint;
+        boolean pacing = phase == Phase.Build || phase == Phase.Approach || phase == Phase.Spawn;
+        double distance = from.distanceTo(target);
+        if (distance < (land ? .3 : pacing ? .05 : .65) && (!land || mc.player.onGround())) {
+            noProgressTick = mc.player.tickCount;
+            holdFlight(); return true;
+        }
         if (!target.equals(lastTarget)) { lastTarget = target; lastPosition = from; noProgressTick = mc.player.tickCount; }
         if (from.distanceToSqr(lastPosition) > .25) { lastPosition = from; noProgressTick = mc.player.tickCount; }
         if (mc.player.tickCount - noProgressTick > 60) { stop("No movement progress toward " + BlockPos.containing(target).toShortString()); return false; }
-        double distance = from.distanceTo(target);
-        if (distance < (land ? .3 : .65) && (!land || mc.player.onGround())) { holdFlight(); return finalTarget; }
         ElytraFly fly = fly();
         if (mc.player.isFallFlying()) {
             if (land && Math.hypot(from.x - target.x, from.z - target.z) < .5) {
@@ -519,6 +569,7 @@ public final class AutoWither extends Module {
             }
             Vec3 delta = target.subtract(from);
             double speed = fly.horizontalSpeed.get();
+            if (pacing) speed = Math.min(speed, .5);
             if (fly.acceleration.get()) {
                 flightRamp = Math.min(speed, flightRamp + fly.accelerationMin.get() + fly.accelerationStep.get() * .1);
                 speed = flightRamp;
@@ -531,7 +582,7 @@ public final class AutoWither extends Module {
             else status = "Flying to " + BlockPos.containing(target).toShortString();
             return false;
         }
-        if (mc.player.onGround() && Math.abs(target.y - from.y) < .2 && distance < 6
+        if (land && mc.player.onGround() && Math.abs(target.y - from.y) < .2 && distance < 6
             && PrinterFlight.segmentClear(from, target, mc.player.getBbWidth() + .12, 1.8, this::clear)
             && supported(target)) {
             Vec3 delta = target.subtract(from);
@@ -556,24 +607,19 @@ public final class AutoWither extends Module {
         return false;
     }
 
-    private Vec3 avoidWithers(Vec3 from, Vec3 target) {
-        Vec3 travel = target.subtract(from);
-        if (travel.lengthSqr() < 1) return target;
-        for (WitherBoss wither : world.getEntitiesOfClass(WitherBoss.class, new AABB(from, target).inflate(16), WitherBoss::isAlive)) {
-            Vec3 danger = wither.position();
-            double fraction = Math.max(0, Math.min(1, danger.subtract(from).dot(travel) / travel.lengthSqr()));
-            if (danger.distanceToSqr(from.add(travel.scale(fraction))) >= 144
-                || danger.distanceToSqr(from) < 144 && danger.distanceToSqr(target) > danger.distanceToSqr(from)) continue;
-            double offset = danger.subtract(from).dot(new Vec3(side.getStepX(), 0, side.getStepZ())) > 0 ? -24 : 24;
-            Vec3 detour = new Vec3(danger.x + side.getStepX() * offset, target.y, danger.z + side.getStepZ() * offset);
-            if (clear(PrinterFlight.body(detour, mc.player.getBbWidth() + .12, mc.player.getBbHeight()))) return detour;
-            detour = new Vec3(danger.x - side.getStepX() * offset, target.y, danger.z - side.getStepZ() * offset);
-            if (clear(PrinterFlight.body(detour, mc.player.getBbWidth() + .12, mc.player.getBbHeight()))) return detour;
-            return null;
-        }
-        return target;
+    private boolean advanceLine() {
+        moveTo(linePosition(lineOrigin, forward, lineIndex, step, excludeThirdHead.get(), lineGap), false);
+        return isActive();
     }
-
+    private void beginEscape(String reason) {
+        if (site != null && step > 0) {
+            warning("Unfinished Wither retained at %s before leaving the line.", site.toShortString());
+            rememberIncomplete();
+        }
+        site = null; step = 0; pending = secondPending = null;
+        escapeTarget = mc.player.position().add(forward.getStepX() * 32, 0, forward.getStepZ() * 32);
+        phase = Phase.Escape; status = reason;
+    }
     private boolean clear(AABB box) {
         if (box.minY < world.getMinY() || box.maxY > world.getMaxY() + 1
             || !PrinterFlight.loaded(box, world.getChunkSource()::hasChunk)
@@ -662,8 +708,7 @@ public final class AutoWither extends Module {
         for (int distance = 2; distance <= 3; distance++) for (int lateral = 0; lateral <= 2; lateral++)
             for (int sign : new int[] {1, -1}) for (int down = 0; down <= 2; down++) {
                 BlockPos candidate = player.relative(facing, distance).relative(across, lateral * sign).below(down);
-                if (rejected(candidate) || !siteValid(candidate, false)
-                    || steering() && builtAtSpot == 0 && nearWither(candidate)) continue;
+                if (rejected(candidate) || !siteValid(candidate, false)) continue;
                 boolean reachable = true;
                 for (BlockPos part : parts(candidate, across)) if (!reachable(part)) { reachable = false; break; }
                 if (reachable) { side = across; return candidate; }
@@ -671,34 +716,6 @@ public final class AutoWither extends Module {
         return null;
     }
 
-    private BlockPos findSite() {
-        if (cursor == null) return null;
-        side = forward.getClockWise();
-        for (int i = 0; i < 64; i++) {
-            BlockPos candidate = cursor.relative(forward, i);
-            if (rejected(candidate) || !siteValid(candidate, false) || nearWither(candidate)) continue;
-            Vec3 stance = stance(candidate, side);
-            if (clear(PrinterFlight.body(stance, mc.player.getBbWidth() + .12, mc.player.getBbHeight()))) return candidate;
-        }
-        return null;
-    }
-    private BlockPos findClusterSite() {
-        if (spotOrigin == null) return null;
-        side = forward.getClockWise();
-        BlockPos nearest = null;
-        double distance = Double.POSITIVE_INFINITY;
-        for (int radius = 3; radius <= 8; radius++) for (Direction direction : Direction.Plane.HORIZONTAL) {
-            BlockPos candidate = spotOrigin.relative(direction, radius);
-            if (rejected(candidate) || !siteValid(candidate, false)) continue;
-            if (parts(candidate, side).stream().anyMatch(part -> !reachable(part))) continue;
-            double candidateDistance = candidate.distToCenterSqr(mc.player.getEyePosition());
-            if (candidateDistance < distance) { nearest = candidate; distance = candidateDistance; }
-        }
-        return nearest;
-    }
-    private boolean nearWither(BlockPos candidate) {
-        return !world.getEntitiesOfClass(WitherBoss.class, new AABB(candidate).inflate(20), wither -> wither.isAlive()).isEmpty();
-    }
     private boolean siteValid(BlockPos base, boolean starter) {
         if (!world.hasChunkAt(base) || !world.getWorldBorder().isWithinBounds(base) || base.getY() < world.getMinY()
             || base.getY() + 2 > world.getMaxY()) return false;
@@ -765,7 +782,14 @@ public final class AutoWither extends Module {
     static int capacity(int soulBlocks, int skulls, boolean excludeThirdHead, boolean starter) {
         return Math.max(0, Math.min((soulBlocks + (starter ? 1 : 0)) / 4, skulls / (excludeThirdHead ? 2 : 3)));
     }
-    static BlockPos nextSite(BlockPos base, Direction forward, int spacing) { return base.relative(forward, spacing); }
+    static BlockPos lineSite(BlockPos origin, Direction forward, int index, int gap) {
+        return origin.relative(forward, index / 2 * (3 + gap)).relative(forward.getClockWise(), index % 2 == 0 ? 2 : -2);
+    }
+    static Vec3 linePosition(BlockPos origin, Direction forward, int index, int step, boolean excludeThirdHead, int gap) {
+        int limit = excludeThirdHead ? 6 : 7;
+        double progress = index / 2 * (3 + gap) - 1 + (index % 2 + Math.clamp((double) step / limit, 0, 1)) * 1.5;
+        return Vec3.atBottomCenterOf(origin).add(forward.getStepX() * progress, 1, forward.getStepZ() * progress);
+    }
     static List<BlockPos> parts(BlockPos base, Direction side) {
         BlockPos center = base.above();
         return List.of(base, center, center.relative(side.getOpposite()), center.relative(side),
@@ -782,7 +806,6 @@ public final class AutoWither extends Module {
             default -> throw new IllegalArgumentException("Invalid Wither placement step");
         };
     }
-    private static Vec3 stance(BlockPos base, Direction side) { return Vec3.atBottomCenterOf(base.relative(side, 3)); }
 
     private void stop(String reason) {
         status = reason;

@@ -14,10 +14,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      release_name: ${{ steps.artifacts.outputs.release_name }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Check publication privacy
+        run: python3 .github/privacy-check.py
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -32,9 +36,11 @@ jobs:
       - name: Build
         run: ./gradlew build -Pcommit="$GITHUB_SHA" -Pbuild_number="$GITHUB_RUN_NUMBER"
       - name: Prepare release artifact
+        id: artifacts
         shell: bash
         run: |
           version=$(sed -n 's/^mod_version=//p' gradle.properties)
+          printf 'release_name=%s\n' "$(sed -n 's/^release_name=//p' gradle.properties)" >> "$GITHUB_OUTPUT"
           jar="monocle-v$version-26.2.jar"
           test -s "build/libs/$jar"
           unzip -t "build/libs/$jar"
@@ -73,4 +79,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "Monocle $GITHUB_REF_NAME" --generate-notes
+          RELEASE_NAME: ${{ needs.build.outputs.release_name }}
+        run: |
+          title="Monocle $GITHUB_REF_NAME"
+          if [ -n "$RELEASE_NAME" ]; then title="$title — $RELEASE_NAME"; fi
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$title" --generate-notes

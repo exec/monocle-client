@@ -66,7 +66,7 @@
       "type": "object", "required": ["id", "state", "acceptedAt", "correlationId"],
       "properties": {
         "id": {"$ref": "common.schema.json#/$defs/uuid"},
-        "state": {"enum": ["accepted", "delivered", "acknowledged", "completed", "uncertain", "failed"]},
+        "state": {"enum": ["host_accepted", "delivery_queued", "worker_acknowledged", "completed", "outcome_uncertain", "rejected", "superseded", "accepted", "delivered", "acknowledged", "uncertain", "failed"]},
         "acceptedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
         "correlationId": {"$ref": "common.schema.json#/$defs/uuid"},
         "gameServerConfirmation": {"type": "object", "required": ["source", "observedAt"], "properties": {"source": {"enum": ["server_packet", "worker_observation", "operator_assertion"]}, "observedAt": {"$ref": "common.schema.json#/$defs/timestamp"}}}

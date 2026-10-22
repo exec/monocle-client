@@ -26,6 +26,12 @@ final class OperatorOperations {
         JsonElement record = records.get(uuid(id));
         return record == null ? null : record.getAsJsonObject().deepCopy();
     }
+    synchronized boolean contains(String id) { return records.has(uuid(id)); }
+    synchronized List<String> crewWatches() { return records.keySet().stream().filter(id->records.getAsJsonObject(id).has("crewWatch")&&!Set.of("completed","rejected","superseded").contains(records.getAsJsonObject(id).get("state").getAsString())).toList(); }
+    synchronized void watchCrew(String id,UUID worker,String crew) {
+        JsonObject previous=records.deepCopy(),watch=new JsonObject();watch.addProperty("worker",worker.toString());watch.addProperty("crew",crew);records.getAsJsonObject(uuid(id)).add("crewWatch",watch);
+        try{checkpoint(id);}catch(RuntimeException e){records.entrySet().clear();previous.entrySet().forEach(entry->records.add(entry.getKey(),entry.getValue()));throw new JournalException(e);}
+    }
 
     synchronized JsonObject begin(String id, String fingerprint) {
         id = uuid(id);
@@ -54,13 +60,20 @@ final class OperatorOperations {
     synchronized JsonObject finish(String id, int status, JsonObject response, boolean asynchronous) {
         JsonObject record = records.get(uuid(id)).getAsJsonObject();
         JsonObject previous = records.deepCopy();
-        record.addProperty("state", asynchronous && status < 400 ? "host_accepted" : "completed");
+        record.addProperty("state",status>=400?"rejected":asynchronous?"host_accepted":"completed");
         record.addProperty("httpStatus", status);
         record.addProperty("updatedAt", Instant.now().toString());
         record.add("response", response.deepCopy());
         try { checkpoint(id); }
         catch (RuntimeException e) { records.entrySet().clear(); previous.entrySet().forEach(entry -> records.add(entry.getKey(), entry.getValue())); throw new JournalException(e); }
         return record.deepCopy();
+    }
+
+    synchronized void observe(String id,JsonObject receipt) {
+        JsonObject record=records.getAsJsonObject(uuid(id));if(record==null||receipt.equals(record.get("receipt")))return;
+        JsonObject previous=records.deepCopy();record.add("receipt",receipt.deepCopy());
+        record.addProperty("state",receipt.get("state").getAsString());record.add("updatedAtMillis",receipt.get("updatedAt").deepCopy());
+        try{checkpoint(id);}catch(RuntimeException e){records.entrySet().clear();previous.entrySet().forEach(entry->records.add(entry.getKey(),entry.getValue()));throw new JournalException(e);}
     }
 
     private void checkpoint(String current) {

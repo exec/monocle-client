@@ -1,5 +1,46 @@
 # Operator WebUI
 
+## Whitelist kitbot and category columns (0.14.33)
+
+Under **Kits**, open **Categories & whisper kitbot** to choose a source stash, seed/edit categories, select the courier, and configure exact username/UUID whitelist entries and a persistent requester cooldown. Requests use `/msg <courier> kit <category-slug> [count]`; quantity defaults to one and is capped at 36. Each eligible variant must have 250 complete directly observed kits after outstanding requests. Low-stock kits remain visible for management but are unavailable to kitbot. Incoming ready-world whispers are the only trigger; the standalone host queues the existing delivery-and-return workflow. Receipts show accepted/out-of-stock requests and job outcomes. Disable stops new requests; cancel already accepted deliveries in Jobs.
+
+In 0.14.34 the whitelist editor has a cooldown field for each person. New users default to **one hour**; **0 disables their cooldown**, while the duplicate and in-flight delivery guards remain. Existing entries without overrides retain the shared fallback until edited. Saving settings does not clear request history or restart jobs.
+
+In 0.14.35 **Maximum kits per request** is also configurable per person, from 1–36, default five. Requests above that person's cap get a limit reply and no delivery; they do not consume the personal cooldown. This setting is independent of cooldowns and does not limit operator-created jobs.
+
+The stash column-map reservation dropdown also lists categories. Click one column or shift-click a range, then reserve it for a category. Contents rules exclude unrelated loose stock and incidental resources inside other kits. Updated workers receive the category rule in the host's deposit acknowledgement; older clients skip those columns. See [stash columns and kits](stash-kits.md#categories-and-whitelist-whispers-01433) for validation, stock and server-trust limits.
+
+## Host-wide hostile warnings (0.14.4)
+
+**Known hostiles** shows live hostile sightings with observer, crew, server and position. Warnings reach all updated native clients; the disconnect policy protects all clients on the matching Minecraft server, not only the one that saw the player. Unsupported clients are called out separately from clients with only cached local detection. Detected lobbies generate no player sightings/combat incidents or alarms. See [behavior and limits](known-hostiles.md).
+
+## Discord owner notifications (0.14.3)
+
+The **Notifications** page configures a host-private Discord bot token and owner user ID, enables failure/completion/safety DMs, sends a test, and shows delivery health. A blank token keeps the saved credential. Neither status nor job profiles export the token. Both standalone and in-game hosts use the same asynchronous notifier. See [setup, API and limits](discord-notifications.md).
+
+## Known hostiles (0.14.1)
+
+**0.14.2:** the separate **Incidents** page adds bounded, persistent player-sighting/combat/reconnect history with filters and paging. **Known hostiles** adds an opt-in safe reconnect policy, with a five-minute default wait and explicit unsupported-client warnings. See [timeline, safe reconnect and API details](known-hostiles.md#incident-timeline-0142). Update host and workers together; live server testing remains pending.
+
+The **Known hostiles** sidebar page shows the host-shared server-scoped safety list, with manual add/remove controls and an opt-in disconnect policy. Updated workers report attributed attackers automatically, cache the list across reconnects and ignore sightings in a detected lobby. Crystal suspects are not automatically added. Connected clients missing support are explicitly marked unprotected. See [known-hostile controls, persistence and limits](known-hostiles.md).
+
+## Attack and death evidence (0.14.0 — The Reckoning Update)
+
+Open a worker's inspection to see its latest attack, death message and crystal evidence.
+Server-reported attackers and inferred suspects are kept separate; neither establishes stash ownership.
+Update both client and standalone host. See [evidence limits and logging](worker-combat-evidence.md).
+
+## Alternating stash transfers (0.13.59)
+
+In **New job → Transfer Stash Kits**, choose **Round Robin** and one worker.
+Add 2–16 source/kit/destination routes, set the per-trip cap (up to 36), then
+preview and dispatch. Each turn deposits one load before switching routes;
+source cursors and destination reservations remain separate. Routes for the
+same kit must share a destination so carried-kit recovery is unambiguous.
+Normal **Drain one type at a time** remains the default. Update host and worker
+to 0.13.59 and start a new job; existing captured jobs do not change.
+See [route behavior and limits](stash-kits.md#round-robin-sources-and-destinations-01359).
+
 ## Job presets (0.8.3)
 
 Open **Presets → Open preset library** to inspect captured packages, duplicate
@@ -30,6 +71,8 @@ until cancelled. It uses the existing Travel action lifecycle and cancellation.
 Future bodyguard behavior is not enabled by this preset.
 
 The standalone Java host now bundles a dark-and-gold operator dashboard. No Node, frontend server, or browser extension is needed. It uses the existing host coordinator and job controls; the in-game Workers GUI remains available without this dashboard.
+
+Job **Inspect** now shows the latest correlated command receipt and expandable per-worker acknowledgement/outcome evidence. A command accepted or queued by the host is not yet worker success; cancellation can be authoritative while cleanup acknowledgements remain pending. Worker **Manage** shows passive world readiness and its reason independently of Lobby Skip activation. See [command receipt semantics and compatibility](workers-api-v1/phase3-operator.md).
 
 ### Worker and crew management (0.8.4)
 
@@ -62,10 +105,69 @@ refresh timestamped configuration snapshots when a new reading is needed.
 
 Update the standalone host distribution between jobs, keeping the existing protected data directory, crew keys and journals. Start it normally, then open **http://127.0.0.1:6970/ui/** on the host machine (or the API port configured in `host-config.json`). Enter the **API token**, not a worker crew key. The token grants full host administration; do not share it with workers or clanmates.
 
-The token stays in memory in the open tab. Reloading or disconnecting requires entering it again. It is not saved in browser storage, cookies or URLs. The read-only demo works without connecting to any workers.
+The token is remembered in this tab's session storage across reloads. Disconnect console clears it; it is not stored in cookies, URLs, or persistent local storage. The read-only demo works without connecting to any workers.
+
+## Stash management desk
+
+**Stashes** contains two section tabs: **Stashes** and the all-stash **Kits** catalog.
+The Stashes tab is a searchable directory of links, each showing storage fullness.
+Click a stash for its own bookmarkable page; **All stashes** and browser Back return
+to the directory. Its **Columns** sub-tab opens by default, beside **Kits** (stock,
+direct delivery, incomplete-kit removal) and **Resources** (that stash's observed
+item totals). Global worker metrics are hidden here to leave room for storage
+management. Ordinary polling preserves the stash, sub-tab, column and map scroll.
+
+Fullness measures occupied **chest/barrel slots**, not the item quantities inside
+shulkers; even a partial stack occupies one slot. Hoppers are excluded. Updated
+clients record exact slot capacity and occupancy during scans and kit deposits.
+Older catalogs show an explicit estimate assuming double chests and counting
+observed shulker slots; unknown loose-item stack counts, changed containers and
+inferred contents produce an **At least** reading, not a claim of empty space.
+Only recorded storage is included: a column scan cannot establish the capacity
+of undiscovered upper containers. Counts are timestamped observations, not live
+inventory guarantees; a fresh full scan on the updated client removes legacy
+capacity assumptions.
+
+The map reads recorded chest observations on demand, at most once per five
+seconds while the catalog changes. Reading it does not scan Minecraft or move
+workers. Kit colors are stable for
+the same name/color/exemplar; hover for names, coordinates, recorded chest heights
+and uncertainty. Click to pin details and open the existing kit/delivery modal.
+Click one column, then **Shift-click** another to select every recorded column
+between them in map order (in either direction). Choose **Column reservation kit
+type** and **Reserve selected columns**; **Clear selected reservations** returns
+the selection to automatic allocation. The picker includes kit types known in
+this crew and world, even if this destination has none yet. Selection and kit
+choice survive polling. An uncertain save offers an exact retry, not another write.
+
+Manual reservations persist across jobs and restarts and take priority when a
+transfer chooses its destination column. The whole range is validated atomically:
+another kit's observed stock or loose items reject the range without a partial
+save, and a column currently leased for a worker's deposit cannot be changed.
+Unobserved stock is still unknown; the worker must confirm live contents before
+depositing, and a later conflict blocks rather than silently overwrites a manual
+reservation. No inventory is rearranged by these controls. Update the host for
+the UI, and clients to **0.13.51** for stashes whose recorded bottom chest row is
+above their selected minimum Y (such as `main`). Layout overrides remain display
+heuristics; only actual recorded bottom-row chest anchors can be reserved.
+Empty recorded columns are outlined, unknown/changed contents hatched, mixed
+contents striped, inferred data dashed, and reservation conflicts red. Upper
+unobserved stock is never asserted empty. Hoppers and loose placed shulker boxes
+are not shown as chest columns.
+
+Auto layout tests vertical and one-block-per-height stepped arrangements against
+the lowest recorded chest row. This is a **display heuristic**, not verified
+geometry; use the layout dropdown to override it for +X/-X/+Z/-Z steps or vertical
+storage. Coordinate gaps are compressed and unseen positions are not fabricated.
+**Fit columns** gives a compact overview; **Larger columns** provides wider
+interactive cells. Large maps scroll inside the panel, including on mobile.
+Kit search and the stash filter remain separate from the delivery executor picker.
 
 ## MVP controls
 
+- **Kits** is an all-stashes catalog, searchable by kit name, contained items, or stash name. Click a kit for its fullest observed contents and source stash names, server/dimension, bounds, and on-demand chest coordinates. Matching name/color with different exemplars remains separate. Global kit and resource totals deduplicate matching container coordinates within a server/dimension across stash names and crews. The latest non-inferred record wins, including an empty observation or a withdrawal/deposit invalidation; estimates cannot replace measured stock. Individual stash views retain their own saved counts. Counts remain observations, not live availability.
+- **Deliver** opens the same compact modal from Kits or the existing stash kit tables: choose a source stash, the connected worker running the job, 1–36 shulkers, and a recipient username. UUID lookup is automatic (connected Monocle roster first, otherwise Mojang's Java-account profile service). No job wizard is needed. This submits the existing Kit Delivery workflow at priority 100, preserves stash /home routing/warmup/cooldown, and waits for physical TPA arrival before dropping items. The recipient must accept; host Auto TPY remains restricted to eligible crewmates. Incomplete kits are opt-in. Unknown submission outcomes retain the exact job payload and idempotency key for **Retry same delivery**.
+- Whitelisted kitbot users can whisper `kits` or `kits <page>` for raw stocked-kit names and category labels without creating a job or consuming their delivery cooldown. Automated replies and operator DMs are queued at one per five seconds per worker; replies expire after two minutes and do not survive a host restart. Public operator chat keeps its existing throttle.
 - Overview and Crews show connection health, native highway progress, supply recovery and exchange state.
 - Click a worker name or Manage to open its management desk: resources, live game chat, new work, assigned job actions, worker priority and live module configuration. Click a crew name or Manage for combined resources, crew chat, all assigned jobs, renaming/deletion and membership management. Job pause/resume/cancel still affects the whole selected job, not just the worker whose panel is open.
 - Crews can be created directly. Moving an idle worker into a crew with a running highway carries that job through its authenticated reconnect and late admission. Active source jobs and unfinished cleanup still cannot be orphaned.

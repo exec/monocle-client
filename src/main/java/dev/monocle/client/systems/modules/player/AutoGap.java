@@ -255,8 +255,8 @@ public class AutoGap extends Module {
             }
         }
 
-        wasBaritone = pauseBaritone.get() && PathManagers.get().isPathing();
-        if (wasBaritone) PathManagers.get().pause();
+        wasBaritone = pauseBaritone.get() && PathManagers.hasNavigation();
+        if (wasBaritone) PathManagers.pause(this);
 
         return true;
     }
@@ -290,7 +290,7 @@ public class AutoGap extends Module {
         });
         wasAura.clear();
 
-        if (wasBaritone) PathManagers.get().resume();
+        if (wasBaritone) PathManagers.resume(this);
         wasBaritone = false;
     }
 

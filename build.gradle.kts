@@ -86,6 +86,8 @@ dependencies {
     compileOnly(libs.viafabricplus.api) { isTransitive = false }
 
     compileOnly(libs.baritone)
+    testCompileOnly(libs.baritone) { isTransitive = false }
+    testRuntimeOnly(libs.baritone) { isTransitive = false }
     compileOnly(libs.modmenu)
 
     // Optional Printer Helper integration: users install these mods separately.
@@ -281,6 +283,7 @@ tasks {
         "autoTotemCheck" to "dev.monocle.client.systems.modules.combat.AutoTotemTest",
         "chestSwapCheck" to "dev.monocle.client.systems.modules.player.ChestSwapTest",
         "elytraSettingsCheck" to "dev.monocle.client.systems.modules.movement.ElytraSettingsTest",
+        "lobbySkipCheck" to "dev.monocle.client.systems.modules.movement.LobbySkipTest",
         "scaffoldCheck" to "dev.monocle.client.systems.modules.movement.ScaffoldTest",
         "moduleHandoffCheck" to "dev.monocle.client.systems.modules.ModuleHandoffTest",
         "surroundCheck" to "dev.monocle.client.systems.modules.combat.SurroundTest",
@@ -303,6 +306,7 @@ tasks {
         "printerIntegrationCheck" to "dev.monocle.client.modintegration.PrinterIntegrationTest",
         "printerRestockCheck" to "dev.monocle.client.systems.modules.world.PrinterRestockTest",
         "autoWitherCheck" to "dev.monocle.client.systems.modules.world.AutoWitherTest",
+        "stashBuilderCheck" to "dev.monocle.client.systems.modules.world.StashBuilderTest",
         "playerProfileConcurrencyCheck" to "dev.monocle.client.mixin.PlayerProfileConcurrencyTest"
     ).map { (taskName, main) ->
         register<JavaExec>(taskName) {
@@ -314,6 +318,12 @@ tasks {
             javaLauncher.set(project.extensions.getByType<JavaToolchainService>().launcherFor(java.toolchain))
             enableAssertions = true
         }
+    }
+
+    register("unattendedReplayCheck") {
+        group = "verification"
+        description = "Runs worker inventory/checkpoint and combined coordinator fault replays without Minecraft."
+        dependsOn("botsCheck", ":coordinator-core:coordinatorCoreCheck", ":host-service:faultReplayCheck")
     }
 
     test {
@@ -347,6 +357,7 @@ tasks {
         exclude("**/HighwayMobTest*.class")
         exclude("**/Printer*Test*.class")
         exclude("**/AutoWitherTest*.class")
+        exclude("**/StashBuilderTest*.class")
         exclude("**/PlayerProfileConcurrencyTest*.class")
     }
 
@@ -387,6 +398,7 @@ tasks {
         inputs.property("archivesName", archivesBaseName)
         from("licenses/Java-WebSocket-MIT.txt") { into("META-INF/licenses") }
         from("licenses/Quiettee-Utils-NOTICE.txt") { into("META-INF/licenses") }
+        from(listOf("licenses/SQLite-JDBC-Apache-2.0.txt", "licenses/SQLite-JDBC-Zentus.txt")) { into("META-INF/licenses") }
 
         from("LICENSE") {
             rename { "${it}_$archivesBaseName" }

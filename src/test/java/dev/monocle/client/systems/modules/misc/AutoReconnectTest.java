@@ -33,9 +33,18 @@ public final class AutoReconnectTest {
             var calls = tick.code().orElseThrow().elementList().stream()
                 .filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
                 .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(i -> i.name().stringValue()).toList();
-            assert calls.containsAll(List.of("screen", "isActive", "stopReason", "nanoTime", "tryConnecting"));
+            assert calls.containsAll(List.of("screen", "retryEnabled", "safetyDeadline", "stopReason", "nanoTime", "tryConnecting"));
             assert calls.indexOf("stopReason") < calls.indexOf("tryConnecting");
         }
+        var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");field.setAccessible(true);
+        var unsafe=(sun.misc.Unsafe)field.get(null);var reconnect=(AutoReconnect)unsafe.allocateInstance(AutoReconnect.class);
+        reconnect.prepareSafeRetry("EXAMPLE.org:25565",300);
+        assert reconnect.retryEnabled()&&reconnect.safeRetryActive();assert reconnect.safetyDeadline()-System.nanoTime()>290_000_000_000L;
+        var event=reconnect.safetySnapshot().getAsJsonObject("lastEvent");assert event.get("phase").getAsString().equals("backoff")&&event.get("server").getAsString().equals("example.org");
+        reconnect.reconnect(false);assert reconnect.safeRetryActive() : "An early automatic attempt cannot clear the hold";
+        reconnect.cancelSafeRetry();assert !reconnect.safeRetryActive()&&!reconnect.retryEnabled();assert reconnect.safetyDeadline()==0;
+        assert reconnect.safetySnapshot().getAsJsonObject("lastEvent").get("phase").getAsString().equals("cancelled");
+        try{reconnect.prepareSafeRetry("example.org",0);throw new AssertionError("Unsafe wait accepted");}catch(IllegalArgumentException expected){}
         System.out.println("Auto Reconnect checks passed: adaptive/fixed delay, bounds, nested error keys, phrase filters and screen retry guards.");
     }
 }

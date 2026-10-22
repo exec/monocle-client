@@ -46,6 +46,9 @@ public final class AutoMendTest {
         elytra.setDamageValue(elytra.getMaxDamage() - 1);
         elytra.set(DataComponents.ENCHANTMENTS, enchantments.toImmutable());
         assert AutoMend.durability(elytra) < AutoMend.durability(pick) : "Rank by fraction, not raw damage";
+        assert AutoMend.highwayNeedsRepair(elytra,30);
+        elytra.setDamageValue(1);assert !AutoMend.highwayNeedsRepair(elytra,30):"A completed worker cycle must not immediately restart";
+        assert AutoMend.class.getDeclaredMethod("requestWorkerMaintenance",Object.class)!=null;
         assert AutoMend.highwayItem(elytra) && !AutoMend.highwayItem(new ItemStack(Items.NETHERITE_SWORD));
         assert AutoMend.class.getDeclaredMethod("onTick", dev.monocle.client.events.world.TickEvent.Pre.class)
             .getAnnotation(meteordevelopment.orbit.EventHandler.class).priority() < meteordevelopment.orbit.EventPriority.MEDIUM
@@ -59,6 +62,10 @@ public final class AutoMendTest {
                 assert calls.containsAll(method.equals("restore") ? List.of("inventoryReady", "safetyBusy", "ownsPair") : List.of("quickSwap", "fromId", "to"));
                 assert !calls.contains("drop") && !calls.contains("move");
             }
+            var worker=compiled.methods().stream().filter(m->m.methodName().equalsString("requestWorkerMaintenance")).findFirst().orElseThrow().code().orElseThrow();
+            var workerCalls=worker.elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c->c.name().stringValue()).toList();
+            assert !workerCalls.contains("swapOffhand"):"Stash elytra maintenance must preserve Strict Auto Totem";
         }
         System.out.println("Auto Mend checks passed: target boundaries, damage ranking, ownership identity and guarded native swaps.");
     }

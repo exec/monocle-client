@@ -14,6 +14,9 @@ import java.util.List;
 /** Profile validation must reject malformed settings before touching any live module. */
 public final class BotProfilesTest {
     public static void run() throws Exception {
+        unchangedModules();
+        effectiveCheckpoint();
+        builtinWorkerProfiles();
         String launcherSettings = """
             {"groups":[{"name":"General","settings":[{"name":"vanilla-speed","value":5d},{"name":"existing","value":["a]b"]},{"name":"mode","value":"Vanilla"}]}]}
             """;
@@ -116,10 +119,174 @@ public final class BotProfilesTest {
                 if(name.equals("fromTag"))assert calls.stream().anyMatch(c->c.name().equalsString("registerSaved")):"Rediscovery must preserve imported files";
             }
         }
-        System.out.println("Bot profile checks passed: structured settings, unchanged-state policy, bounded NBT, native-idle guards and rollback/persistence paths.");
+        System.out.println("Bot profile checks passed: structured settings, complete effective checkpoints, unchanged-state policy, bounded NBT, native-idle guards and rollback/persistence paths.");
     }
+    private static void builtinWorkerProfiles() throws Exception {
+        var library = new dev.monocle.coordinator.OperationsLibrary(Files.createTempDirectory("monocle-builtin-profiles-").resolve("operations.json"));
+        var classes = java.util.Map.ofEntries(
+            java.util.Map.entry("auto-eat", dev.monocle.client.systems.modules.player.AutoEat.class),
+            java.util.Map.entry("auto-gap", dev.monocle.client.systems.modules.player.AutoGap.class),
+            java.util.Map.entry("auto-totem", dev.monocle.client.systems.modules.combat.AutoTotem.class),
+            java.util.Map.entry("auto-armor", dev.monocle.client.systems.modules.combat.AutoArmor.class),
+            java.util.Map.entry("enderman-look", dev.monocle.client.systems.modules.world.EndermanLook.class),
+            java.util.Map.entry("reach", dev.monocle.client.systems.modules.player.Reach.class),
+            java.util.Map.entry("speed", dev.monocle.client.systems.modules.movement.speed.Speed.class),
+            java.util.Map.entry("elytra-fly", dev.monocle.client.systems.modules.movement.elytrafly.ElytraFly.class),
+            java.util.Map.entry("highway-builder", dev.monocle.client.systems.modules.world.HighwayBuilder.class));
+        for (var record : library.list()) {
+            var profile = library.get(record.getAsJsonObject().get("id").getAsString()).getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current");
+            BotProfiles.validate(profile);
+            for (var entry : profile.entrySet()) {
+                var module = classes.get(entry.getKey());
+                if (module == null) continue;
+                try (var bytes = module.getResourceAsStream(module.getSimpleName() + ".class")) {
+                    var constants = ClassFile.of().parse(bytes.readAllBytes()).methods().stream().filter(m -> m.code().isPresent())
+                        .flatMap(m -> m.code().orElseThrow().elementList().stream())
+                        .filter(java.lang.classfile.instruction.ConstantInstruction.class::isInstance)
+                        .map(java.lang.classfile.instruction.ConstantInstruction.class::cast).map(c -> (Object)c.constantValue()).toList();
+                    var settings = TagParser.parseCompoundFully(entry.getValue().getAsJsonObject().get("settings").getAsString());
+                    for (var value : settings.getListOrEmpty("groups")) {
+                        var group = (CompoundTag)value;
+                        String name = group.getStringOr("name", "");
+                        assert name.equals("General") || constants.contains(name) : module + " has no group " + name;
+                        for (var item : group.getListOrEmpty("settings"))
+                            assert constants.contains(((CompoundTag)item).getStringOr("name", "")) : module + " has no setting " + item;
+                    }
+                }
+            }
+        }
+    }
+
     private static JsonObject profile(String settings) {
         JsonObject module = new JsonObject(); module.addProperty("settings", settings); module.addProperty("active", false);
         JsonObject profile = new JsonObject(); profile.add("elytra-fly", module); return profile;
+    }
+
+    private static void unchangedModules() throws Exception {
+        var apply = BotProfiles.class.getDeclaredMethod("applyStates", java.util.Map.class, java.util.Map.class, boolean.class);
+        apply.setAccessible(true);
+        var module = countingModule();
+        var baseline = BotProfiles.fullSettings(module.settings);
+        assert module.settings.toTag().isEmpty() && !baseline.isEmpty() : "Real setting persistence omits defaults";
+        for (var patch : List.of(new CompoundTag(), TagParser.parseCompoundFully("{groups:[{name:'General',settings:[{name:'speed',value:6d}]}]}"))) {
+            apply.invoke(null, java.util.Map.of(module, BotProfiles.mergeSettings(baseline, patch)), java.util.Map.of(module, true), false);
+            assert module.disabled == 0 && module.enabled == 0 && module.writes == 0 && module.isActive()
+                : "An empty overlay or explicit unchanged default must not restart or reload an active module";
+        }
+        var changed = BotProfiles.mergeSettings(baseline, TagParser.parseCompoundFully("{groups:[{name:'General',settings:[{name:'speed',value:7d}]}]}"));
+        apply.invoke(null, java.util.Map.of(module, changed), java.util.Map.of(module, true), false);
+        assert module.speed.get() == 7 && module.disabled == 1 && module.enabled == 1 && module.writes > 0
+            : "Real changes still install settings while inactive, then reactivate once";
+        int writes = module.writes;
+        for (boolean restoring : List.of(false, true)) {
+            apply.invoke(null, java.util.Map.of(module, BotProfiles.fullSettings(module.settings)), java.util.Map.of(module, true), restoring);
+            assert module.disabled == 1 && module.enabled == 1 && module.writes == writes
+                : "Mixed default/nondefault settings must not cycle on reapplication or rollback";
+        }
+        apply.invoke(null, java.util.Map.of(module, changed), java.util.Map.of(module, false), false);
+        assert !module.isActive() && module.disabled == 2 && module.enabled == 1 && module.writes == writes
+            : "An activation-only disable still applies without reloading settings";
+        apply.invoke(null, java.util.Map.of(module, changed), java.util.Map.of(module, true), false);
+        assert module.isActive() && module.disabled == 2 && module.enabled == 2 && module.writes == writes;
+        apply.invoke(null, java.util.Map.of(module, baseline), java.util.Map.of(module, true), true);
+        assert module.speed.get() == 6 && module.disabled == 3 && module.enabled == 3
+            : "Rollback restores real changes, including defaults";
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static void effectiveCheckpoint() throws Exception {
+        var singleton = sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); singleton.setAccessible(true);
+        var allocator = (sun.misc.Unsafe) singleton.get(null);
+        var modules = (dev.monocle.client.systems.modules.Modules) allocator.allocateInstance(dev.monocle.client.systems.modules.Modules.class);
+        var module = countingModule();
+        var instances = dev.monocle.client.systems.modules.Modules.class.getDeclaredField("moduleInstances"); instances.setAccessible(true);
+        instances.set(modules, java.util.Map.of(CountingModule.class, module));
+        var registryField = dev.monocle.client.systems.Systems.class.getDeclaredField("systems"); registryField.setAccessible(true);
+        var registry = (java.util.Map) registryField.get(null);
+        var key = dev.monocle.client.systems.modules.Modules.class;
+        Object previous = registry.put(key, modules);
+        var apply = BotProfiles.class.getDeclaredMethod("applyStates", java.util.Map.class, java.util.Map.class, boolean.class); apply.setAccessible(true);
+        try {
+            var defaults = BotProfiles.fullSettings(module.settings);
+            assert BotProfiles.capture("Current").getAsJsonObject(module.name).get("settings").getAsString().equals("{}")
+                : "Workflow captures remain sparse overlays";
+            for (double speed : List.of(6d, 8d)) {
+                var jobSettings = BotProfiles.mergeSettings(defaults, TagParser.parseCompoundFully("{groups:[{name:'General',settings:[{name:'speed',value:" + speed + "d}]}]}"));
+                apply.invoke(null, java.util.Map.of(module, jobSettings), java.util.Map.of(module, true), false);
+                var checkpoint = com.google.gson.JsonParser.parseString(BotProfiles.captureEffective().toString()).getAsJsonObject();
+                var recorded = TagParser.parseCompoundFully(checkpoint.getAsJsonObject(module.name).get("settings").getAsString());
+                assert recorded.equals(jobSettings) : "Effective checkpoints include default and nondefault values";
+                assert checkpoint.getAsJsonObject(module.name).get("active").getAsBoolean();
+                assert !BotProfiles.leased() : "Reading a checkpoint must not acquire a settings lease";
+                var personal = BotProfiles.mergeSettings(defaults, TagParser.parseCompoundFully("{groups:[{name:'General',settings:[{name:'speed',value:7d},{name:'other',value:9d}]}]}"));
+                apply.invoke(null, java.util.Map.of(module, personal), java.util.Map.of(module, true), true);
+                assert recorded.equals(TagParser.parseCompoundFully(checkpoint.getAsJsonObject(module.name).get("settings").getAsString()))
+                    : "Checkpoint values remain detached from later personal restoration";
+                apply.invoke(null, java.util.Map.of(module, BotProfiles.mergeSettings(BotProfiles.fullSettings(module.settings), recorded)), java.util.Map.of(module, true), false);
+                assert module.speed.get() == speed && module.settings.get("other").get().equals(0d)
+                    : "Resume must restore job defaults rather than inherit personal values";
+                int disabled = module.disabled, enabled = module.enabled, writes = module.writes;
+                apply.invoke(null, java.util.Map.of(module, recorded), java.util.Map.of(module, true), false);
+                assert module.disabled == disabled && module.enabled == enabled && module.writes == writes
+                    : "Reapplying a complete checkpoint must not restart unchanged modules";
+            }
+            var name = dev.monocle.client.systems.modules.Module.class.getDeclaredField("name"); name.setAccessible(true);
+            name.set(module, "highway-builder");
+            assert !BotProfiles.captureEffective().getAsJsonObject(module.name).get("active").getAsBoolean()
+                : "Checkpoints cannot activate task-owned executors";
+            var category = dev.monocle.client.systems.modules.Module.class.getDeclaredField("category"); category.setAccessible(true);
+            category.set(module, dev.monocle.client.systems.modules.Categories.Misc);
+            assert BotProfiles.captureEffective().isEmpty() : "Non-gameplay modules remain outside task checkpoints";
+        } finally {
+            if (previous == null) registry.remove(key); else registry.put(key, previous);
+        }
+    }
+
+    // Module/Setting constructors initialize renderer helpers; bypass them only in this headless fixture.
+    private static CountingModule countingModule() throws Exception {
+        var singleton = sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); singleton.setAccessible(true);
+        var allocator = (sun.misc.Unsafe) singleton.get(null);
+        var module = (CountingModule) allocator.allocateInstance(CountingModule.class);
+        module.enabledState = true;
+        var settings = new dev.monocle.client.settings.Settings();
+        for (String name : List.of("speed", "other")) {
+            var setting = (dev.monocle.client.settings.DoubleSetting) allocator.allocateInstance(dev.monocle.client.settings.DoubleSetting.class);
+            for (String field : List.of("name", "defaultValue", "value", "onChanged")) {
+                var member = dev.monocle.client.settings.Setting.class.getDeclaredField(field); member.setAccessible(true);
+                member.set(setting, switch (field) {
+                    case "name" -> name;
+                    case "onChanged" -> (java.util.function.Consumer<Double>) value -> { assert !module.isActive() : "Settings installed before activation"; module.writes++; };
+                    default -> name.equals("speed") ? 6d : 0d;
+                });
+            }
+            for (String field : List.of("min", "max")) {
+                var member = dev.monocle.client.settings.DoubleSetting.class.getDeclaredField(field); member.setAccessible(true);
+                member.setDouble(setting, field.equals("min") ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY);
+            }
+            settings.getDefaultGroup().add(setting);
+            if (name.equals("speed")) module.speed = setting;
+        }
+        for (String field : List.of("name", "settings", "category")) {
+            var member = dev.monocle.client.systems.modules.Module.class.getDeclaredField(field); member.setAccessible(true);
+            member.set(module, switch (field) {
+                case "name" -> "elytra-fly";
+                case "category" -> dev.monocle.client.systems.modules.Categories.Movement;
+                default -> settings;
+            });
+        }
+        return module;
+    }
+
+    private static final class CountingModule extends dev.monocle.client.systems.modules.Module {
+        private boolean enabledState = true;
+        int disabled, enabled, writes;
+        dev.monocle.client.settings.Setting<Double> speed;
+
+        CountingModule() {
+            super(dev.monocle.client.systems.modules.Categories.Movement, "elytra-fly", "Profile test");
+        }
+        @Override public boolean isActive() { return enabledState; }
+        @Override public void disable() { disabled++; enabledState = false; }
+        @Override public void enable() { enabled++; enabledState = true; }
     }
 }

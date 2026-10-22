@@ -164,6 +164,7 @@ public final class PrinterHelper extends Module {
     }
 
     private String conflict() {
+        if(Modules.get().get(StashBuilder.class).isActive())return "Stop Stash Builder before starting Printer Helper.";
         if (Modules.get().get(HighwayBuilder.class).hasJob()) return "Stop Highway Builder before starting Printer Helper.";
         if (Modules.get().isActive(SchematicSelector.class)) return "Disable Schematic Selector so its wand does not consume Printer interactions.";
         if (Modules.get().isActive(Freecam.class) || PathManagers.get().isPathing()) return "Stop Freecam or the active pathing job before using Printer Helper.";

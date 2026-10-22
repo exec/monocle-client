@@ -72,10 +72,43 @@ public class AutoReconnect extends Module {
     private int attempts;
     private long joinedAt;
     private boolean retryConnecting;
+    private boolean safetyRetry;
+    private String safetyServer = "";
+    private long safetyDeadline;
+    private com.google.gson.JsonObject safetyEvent;
+
+    public boolean retryEnabled() { return isActive() || safetyRetry; }
+    public boolean safeRetryActive() { return safetyRetry; }
+    public long safetyDeadline() { return safetyRetry ? safetyDeadline : 0; }
+    public void prepareSafeRetry(String server, int seconds) {
+        if (seconds < 5 || seconds > 3600) throw new IllegalArgumentException("Invalid safety wait");
+        safetyServer = dev.monocle.coordinator.KnownHostiles.server(server);
+        safetyRetry = true;
+        safetyDeadline = System.nanoTime() + seconds * 1_000_000_000L;
+        safetyEvent("backoff");
+    }
+    public void cancelSafeRetry() {
+        if (safetyRetry) safetyEvent("cancelled");
+        safetyRetry = false; safetyDeadline = 0; safetyServer = "";
+    }
+    public com.google.gson.JsonObject safetySnapshot() {
+        var result = new com.google.gson.JsonObject();
+        result.addProperty("waiting", safetyRetry);
+        result.addProperty("remainingSeconds", Math.max(0, safetyDeadline() - System.nanoTime()) / 1_000_000_000.0);
+        if (safetyEvent != null) result.add("lastEvent", safetyEvent.deepCopy());
+        return result;
+    }
+    private void safetyEvent(String phase) {
+        safetyEvent = new com.google.gson.JsonObject();
+        safetyEvent.addProperty("id", java.util.UUID.randomUUID().toString());
+        safetyEvent.addProperty("at", System.currentTimeMillis());
+        safetyEvent.addProperty("phase", phase); safetyEvent.addProperty("server", safetyServer);
+        safetyEvent.addProperty("retryAt", System.currentTimeMillis() + Math.max(0, safetyDeadline - System.nanoTime()) / 1_000_000L);
+    }
 
     public int attempts() { return attempts; }
 
-    public double retryDelay() { return retryDelay(time.get(), maxDelay.get(), attempts, adaptive.get()); }
+    public double retryDelay() { return Math.max(retryDelay(time.get(), maxDelay.get(), attempts, adaptive.get()), Math.max(0, safetyDeadline() - System.nanoTime()) / 1_000_000_000.0); }
 
     public static double retryDelay(double base, double cap, int attempts, boolean adaptive) {
         // A zero-delay legacy setting must not create a tight reconnect loop.
@@ -114,6 +147,12 @@ public class AutoReconnect extends Module {
 
     public void reconnect(boolean manual) {
         if (lastServerConnection == null) return;
+        if (!manual && System.nanoTime() < safetyDeadline()) return;
+        if (safetyRetry) {
+            var lobby = dev.monocle.client.systems.modules.Modules.get().get(dev.monocle.client.systems.modules.movement.LobbySkip.class);
+            if (dev.monocle.client.systems.modules.movement.LobbySkip.supportedServer(safetyServer)) lobby.enable();
+            safetyEvent("connecting");
+        }
         if (manual) attempts = 0;
         else if (attempts < Integer.MAX_VALUE) attempts++;
         retryConnecting = true;
@@ -133,6 +172,7 @@ public class AutoReconnect extends Module {
     private class StaticListener {
         @EventHandler
         private void onGameJoined(ServerConnectBeginEvent event) {
+            if (safetyRetry && !dev.monocle.coordinator.KnownHostiles.server(event.info.ip).equals(safetyServer)) cancelSafeRetry();
             if (!retryConnecting) attempts = 0;
             joinedAt = 0;
             lastServerConnection = new ObjectObjectImmutablePair<>(event.address, event.info);
@@ -140,6 +180,7 @@ public class AutoReconnect extends Module {
 
         @EventHandler
         private void onJoined(GameJoinedEvent event) {
+            if (safetyRetry) { safetyEvent("joined"); safetyRetry = false; safetyDeadline = 0; }
             if (MonocleClient.mc.isLocalServer()) {
                 lastServerConnection = null;
                 attempts = 0;

@@ -53,7 +53,7 @@ public final class PrinterHelperTest {
         while (scan.hasNext()) assert seen.add(scan.next()) : "Every cell is visited once in one bounds box";
         assert seen.size() == 48 && seen.contains(new BlockPos(-2, -1, -3)) && seen.contains(new BlockPos(1, 1, 0));
         assert !seen.contains(new BlockPos(2, 2, 1)) : "AABB maxima are exclusive";
-        var huge = new PrinterSafety.Scan(List.of(new AABB(0, 0, 0, 1_000_000, 300, 1_000_000)));
+        var huge = new PrinterSafety.Scan(List.of(new AABB(0, 0, 0, 1_000_000, 300, 1_000_000))); // Synthetic coordinates for size limits.
         for (int i = 0; i < 4096; i++) assert huge.next().equals(new BlockPos(i, 0, 0));
         assert huge.hasNext() : "Large schematics stream in bounded batches without allocating their full volume";
         assert !new PrinterSafety.Scan(List.of()).hasNext();

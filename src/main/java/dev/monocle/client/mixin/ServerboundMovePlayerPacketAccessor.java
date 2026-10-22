@@ -13,6 +13,14 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 @Mixin(ServerboundMovePlayerPacket.class)
 public interface ServerboundMovePlayerPacketAccessor {
     @Mutable
+    @Accessor("yRot")
+    void monocle$setYaw(float yaw);
+
+    @Mutable
+    @Accessor("xRot")
+    void monocle$setPitch(float pitch);
+
+    @Mutable
     @Accessor("y")
     void monocle$setY(double y);
 

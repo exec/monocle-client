@@ -19,11 +19,18 @@ application {
     applicationName = "monocle-host"
 }
 distributions { main { distributionBaseName.set("monocle-host"); contents {
+    from(rootProject.file("docs/stash-sorting.md"))
     from("README.md"); from(rootProject.file("LICENSE"))
     from(rootProject.file("docs/bot-web-transport.md"))
     from(rootProject.file("docs/bot-webui.md"))
+    from(rootProject.file("docs/discord-notifications.md"))
     from(rootProject.file("docs/workers-api-v1/phase4-worker.md"))
+    from(rootProject.file("docs/workers-api-v1/monocle-actions.md"))
+    from(rootProject.file("docs/worker-job-defaults.md"))
+    from(rootProject.file("docs/stash-kits.md"))
+    from(rootProject.file("docs/stash-sqlite.md"))
     from(rootProject.file("licenses/Java-WebSocket-MIT.txt")) { into("licenses") }
+    from(listOf(rootProject.file("licenses/SQLite-JDBC-Apache-2.0.txt"), rootProject.file("licenses/SQLite-JDBC-Zentus.txt"))) { into("licenses") }
 } } }
 val hostServiceCheck = tasks.register<JavaExec>("hostServiceCheck") {
     group = "verification"
@@ -32,8 +39,18 @@ val hostServiceCheck = tasks.register<JavaExec>("hostServiceCheck") {
     mainClass.set("dev.monocle.host.HostServiceTest")
     enableAssertions = true
 }
-tasks.test { exclude("**/HostServiceTest*.class", "**/TlsProxy*.class", "**/WebUiTest*.class") }
+tasks.test { exclude("**/HostServiceTest*.class", "**/KitStockCheck*.class", "**/TlsProxy*.class", "**/WebUiTest*.class") }
+tasks.test { exclude("**/KitBotCheck*.class") }
 tasks.check { dependsOn(hostServiceCheck) }
+tasks.register<JavaExec>("faultReplayCheck") {
+    group = "verification"
+    description = "Replays combined job faults against isolated journals and authenticated worker sockets."
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.monocle.host.HostServiceTest")
+    args("--fault-replay")
+    enableAssertions = true
+}
 val distributionContentsCheck = tasks.register("distributionContentsCheck") {
     group = "verification"
     description = "Checks the standalone-host distribution includes its documentation and licenses."
@@ -41,9 +58,10 @@ val distributionContentsCheck = tasks.register("distributionContentsCheck") {
     doLast {
         ZipFile(tasks.distZip.get().archiveFile.get().asFile).use { archive ->
             val entries = archive.entries().asSequence().filterNot { it.isDirectory }.toList()
-            listOf("/README.md", "/LICENSE", "/licenses/Java-WebSocket-MIT.txt").forEach { suffix ->
+            listOf("/README.md", "/LICENSE", "/licenses/Java-WebSocket-MIT.txt", "/licenses/SQLite-JDBC-Apache-2.0.txt", "/licenses/SQLite-JDBC-Zentus.txt", "/stash-sqlite.md", "/stash-sorting.md").forEach { suffix ->
                 check(entries.any { it.name.endsWith(suffix) && it.size > 0 }) { "Host distribution is missing $suffix" }
             }
+            check(entries.any { it.name.contains("/lib/sqlite-jdbc-") && it.name.endsWith(".jar") }) { "Host distribution is missing the SQLite JDBC runtime" }
         }
     }
 }

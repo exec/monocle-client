@@ -10,6 +10,29 @@ final class OperationsLibraryTest {
         assert original.get("name").getAsString().equals("6b6t Highway Builder");
         String highwaySettings=original.getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("highway-builder").get("settings").getAsString();
         assert highwaySettings.contains("keep-shulkers',value:0b") && highwaySettings.contains("experimental-managed-inventory',value:1b");
+        for (String job : List.of("highway-default", "highway-excavate", "highway-pave", "task-stash-scan", "task-stash-resupply", "task-kit-delivery", "task-kit-remove-incomplete", "task-stash-transfer", "task-stash-transfer-team", "task-follow", "task-travel", "task-tpa", "task-recover", "task-bodyguard", "task-crystal-guard")) {
+            JsonObject profile = library.get(job).getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current");
+            for (String module : List.of("auto-eat", "auto-gap", "auto-totem", "auto-armor", "auto-tool", "velocity", "enderman-look", "reach"))
+                assert profile.getAsJsonObject(module).get("active").getAsBoolean() : job + " lacks " + module;
+            assert profile.getAsJsonObject("auto-eat").get("settings").getAsString().contains("protect-named-food',value:0b");
+            assert !profile.getAsJsonObject("auto-eat").get("settings").getAsString().contains("enchanted_golden_apple");
+            assert profile.getAsJsonObject("auto-totem").get("settings").getAsString().contains("Strict");
+            assert profile.getAsJsonObject("elytra-fly").get("settings").getAsString().contains("fall-multiplier");
+            assert !profile.has("lobby-skip") && !profile.has("auto-log") && !profile.has("stash-manager") && !profile.has("inventory-manager");
+            if (job.startsWith("highway-")) assert profile.getAsJsonObject("highway-builder").equals(original.getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("highway-builder"));
+            if (job.startsWith("task-stash-") || job.startsWith("task-kit-")) {
+                assert profile.getAsJsonObject("auto-mend").get("active").getAsBoolean();
+                assert profile.getAsJsonObject("auto-mend").get("settings").getAsString().contains("auto-disable',value:0b");
+                assert !profile.getAsJsonObject("speed").get("active").getAsBoolean();
+                assert !profile.getAsJsonObject("elytra-fly").get("active").getAsBoolean() : "Native stash movement enables flight on demand";
+                assert !profile.getAsJsonObject("kill-aura").get("active").getAsBoolean();
+            }
+        }
+        for (String job : List.of("task-wait", "task-modules", "task-profile", "task-drop"))
+            assert library.get(job).getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current").isEmpty() : "Utility jobs must not silently install a worker policy";
+        JsonObject detached = library.get("task-stash-scan");
+        detached.getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("auto-eat").addProperty("active", false);
+        assert library.get("task-stash-transfer").getAsJsonObject("package").getAsJsonObject("profiles").getAsJsonObject("Current").getAsJsonObject("auto-eat").get("active").getAsBoolean();
         JsonObject copy=library.save(id,"My highway","Highways/Nether",original.getAsJsonObject("package"));
         copy.getAsJsonObject("package").addProperty("entry","bad");assert !library.get(id).getAsJsonObject("package").get("entry").getAsString().equals("bad");
         assert new OperationsLibrary(file).get(id).get("name").getAsString().equals("My highway");

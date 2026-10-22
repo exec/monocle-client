@@ -8,6 +8,11 @@ public final class TaskWire {
     private TaskWire() { }
     public static String text(JsonObject object, String key) { return object.has(key) ? object.get(key).getAsString() : ""; }
     public static boolean flag(JsonObject object, String key) { return object.has(key) && object.get(key).getAsBoolean(); }
+    public static void validateProgress(JsonObject message, boolean full) {
+        if (!message.has("actionProgress")) return;
+        if (!full || !message.has("action") || !message.get("action").isJsonObject() || !message.get("actionProgress").isJsonObject()) throw new IllegalArgumentException("Action progress requires a full active-action report");
+        UUID.fromString(text(message,"token")); ActionProgress.checked(message.getAsJsonObject("actionProgress"));
+    }
     public static JsonObject message(String type) { JsonObject m = new JsonObject(); m.addProperty("type", "task-" + type); return m; }
     public static JsonObject envelope(JsonObject task, UUID worker) {
         JsonObject metadata = new JsonObject();
@@ -82,8 +87,13 @@ public final class TaskWire {
         UUID.fromString(text(message, "run"));
         if (!text(run, "id").equals(text(message, "run"))) throw new IllegalArgumentException("Wrong execution");
         if (!Set.of("Ready", "Running", "Suspending", "Suspended", "Inspection required", "Complete", "Failed", "Cancelled").contains(state)) throw new IllegalArgumentException("Invalid task execution state");
-        if (QueuePolicy.terminal(text(run, "status")) && !QueuePolicy.terminal(state)) return false;
+        boolean cancellationCleanup = text(run,"status").equals("Failed") && flag(task,"cancelled")
+            && text(message,"requestedStatus").equals("Cancelled") && Set.of("Inspection required","Suspending").contains(state);
+        if (QueuePolicy.terminal(text(run, "status")) && !QueuePolicy.terminal(state) && !cancellationCleanup) return false;
         JsonObject checked = message.deepCopy();
+        validateProgress(checked,full);
+        if(checked.has("controlId"))UUID.fromString(text(checked,"controlId"));
+        if(checked.has("worldReady")&&(!checked.get("worldReady").isJsonPrimitive()||!checked.getAsJsonPrimitive("worldReady").isBoolean()))throw new IllegalArgumentException("Invalid execution world readiness");
         if (checked.has("configRevision")) {
             int revision = checked.get("configRevision").getAsBigDecimal().intValueExact();
             if (revision < 1 || !run.has("configuration") || revision > run.getAsJsonObject("configuration").get("revision").getAsInt()
@@ -91,6 +101,11 @@ public final class TaskWire {
         }
         if (full) {
             if (text(checked, "detail").length() > 1024) throw new IllegalArgumentException("Task status is too large");
+            if(checked.has("stashTravel")){
+                JsonObject travel=checked.getAsJsonObject("stashTravel");
+                if(!checked.has("action")||!text(checked.getAsJsonObject("action"),"type").equals("StashVisit")||travel.size()!=3||!text(travel,"name").equals(text(checked.getAsJsonObject("action"),"name")))throw new IllegalArgumentException("Stash travel must match its active visit");
+                for(String key:List.of("homeSent","arrived"))if(!travel.has(key)||!travel.get(key).isJsonPrimitive()||!travel.getAsJsonPrimitive(key).isBoolean())throw new IllegalArgumentException("Invalid stash travel flag");
+            }
             if(checked.has("workflowResult")&&checked.get("workflowResult").toString().length()>32_768)throw new IllegalArgumentException("Workflow result is too large");
             if (checked.has("action")) {
                 if (!checked.get("action").isJsonObject() || checked.get("action").toString().length() > 32_768) throw new IllegalArgumentException("Native action is too large");
@@ -121,11 +136,23 @@ public final class TaskWire {
                 StashCatalog.telemetry(run,checked.getAsJsonObject("stashScan"));
             }
             if (checked.has("action")) {
+                if(!text(run,"token").equals(text(checked,"token"))){run.remove("tpaAccepted");run.remove("tpaSentAt");}
                 run.add("action", checked.get("action")); run.addProperty("token", text(checked, "token")); run.addProperty("commandSent", flag(checked, "commandSent"));
+                if(text(checked.getAsJsonObject("action"),"type").equals("Tpa")&&flag(checked,"commandSent")&&!run.has("tpaSentAt"))run.addProperty("tpaSentAt",System.currentTimeMillis());
             } else { run.remove("action"); run.remove("token"); }
+            if (checked.has("actionProgress")) {
+                JsonObject progress = checked.getAsJsonObject("actionProgress"); run.add("actionProgress", progress.deepCopy());
+                if (!flag(task,"cancelled") && !QueuePolicy.terminal(state) && text(progress,"state").equals("Paused") && !text(progress,"incidentId").equals(text(run,"dismissedStallId"))) {
+                    run.addProperty("stallPaused",true); run.addProperty("stallIncidentId",text(progress,"incidentId"));
+                }
+            } else if (!checked.has("action")) run.remove("actionProgress");
+            if(checked.has("stashTravel")){run.add("stashTravel",checked.get("stashTravel").deepCopy());run.addProperty("stashTravelToken",text(checked,"token"));}
+            else if(!text(run,"stashTravelToken").equals(text(run,"token"))){run.remove("stashTravel");run.remove("stashTravelToken");}
             if (checked.has("requestedStatus")) run.addProperty("requestedStatus", text(checked, "requestedStatus")); else run.remove("requestedStatus");
             run.addProperty("connectionSuspended", flag(checked, "connectionSuspended"));
         }
+        if(!full&&run.has("action"))checked.add("action",run.get("action"));
+        CommandReceipts.report(task,run,checked);
         return true;
     }
 }

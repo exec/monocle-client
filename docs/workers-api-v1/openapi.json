@@ -32,6 +32,55 @@
     }
   },
   "paths": {
+    "/v1/kits/{kitTypeId}/stock": {
+      "get": {
+        "operationId": "getMonocleKitStock",
+        "summary": "Compare recorded kit-family stock across stashes, with alias resolution and local variant breakdowns",
+        "description": "Monocle read-only reporting extension. A known kit UUID selects its name/color family. Per-stash counts reconstruct contents variants from recorded box manifests, ignoring historical alias merges. Variants expose reporting-only signatureId, items, complete/incomplete/ambiguous counts, boxes and catalogKitTypeIds. Complete is relative to the fullest recorded compatible exemplar; unknown contents are separate. Includes coverage and update metadata, not fresh physical stock. Does not migrate stored identities or change transfer matching. Omitted stashes are unknown for this family; overlapping stash totals must not be summed. No query parameters are supported.",
+        "parameters": [{"name": "kitTypeId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+        "responses": {
+          "200": {"description": "Recorded stock comparison and contents variants", "content": {"application/json": {"schema": {"type": "object", "required": ["requestedKitTypeId", "familyId", "name", "item", "basis", "stashes"], "properties": {"requestedKitTypeId": {"type": "string", "format": "uuid"}, "familyId": {"type": "string", "format": "uuid"}, "name": {"type": "string"}, "item": {"type": "string"}, "basis": {"const": "RecordedObservations"}, "stashes": {"type": "array", "items": {"type": "object"}}}}}}},
+          "400": {"$ref": "#/components/responses/Problem"},
+          "403": {"$ref": "#/components/responses/Problem"},
+          "404": {"$ref": "#/components/responses/Problem"}
+        }
+      }
+    },
+    "/v1/incidents": {
+      "get": {
+        "operationId": "listMonocleIncidents",
+        "summary": "Monocle extension: read bounded worker sightings, combat and safety reconnect evidence",
+        "description": "Authenticated, read-only receipt history, not a portable RWP event contract. Newest first; cursorExpired means restart paging from Latest. Disk writes are best-effort and logging health accompanies each page.",
+        "parameters": [
+          {"name": "before", "in": "query", "schema": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}},
+          {"name": "search", "in": "query", "schema": {"type": "string", "maxLength": 100}},
+          {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["", "sighting", "damage", "death", "crystal", "hostile_logout", "reconnect"]}}
+        ],
+        "responses": {"200": {"description": "Receipt page and logging health", "content": {"application/json": {"schema": {"type": "object"}}}}, "400": {"$ref": "#/components/responses/Problem"}, "403": {"$ref": "#/components/responses/Problem"}}
+      }
+    },
+    "/v1/stashes/{stashId}/column-reservations": {
+      "parameters": [{"$ref": "#/components/parameters/stashId"}],
+      "put": {
+        "operationId": "setStashColumnReservations",
+        "summary": "Atomically reserve or clear recorded chest columns; reject incompatible stock and active deposit leases",
+        "parameters": [{"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}}, {"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string"}}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {
+          "type": "object", "additionalProperties": false, "required": ["columns"],
+          "oneOf": [{"required": ["kitTypeId"], "not": {"required": ["categoryId"]}}, {"required": ["categoryId"], "not": {"required": ["kitTypeId"]}}],
+          "properties": {
+            "kitTypeId": {"type": "string", "description": "Known crew/world kit UUID, or empty string to clear reservations. Mutually exclusive with categoryId."},
+            "categoryId": {"type": "string", "format": "uuid", "description": "Crew/world category ID. Updated native workers validate its acknowledged contents rule; older workers skip category columns."},
+            "columns": {"type": "array", "minItems": 1, "maxItems": 4096, "items": {
+              "type": "object", "additionalProperties": false, "required": ["x", "y", "z", "axis"],
+              "properties": {"x": {"type": "integer", "minimum": -29900000, "maximum": 29900000}, "y": {"type": "integer", "minimum": -2048, "maximum": 2048}, "z": {"type": "integer", "minimum": -29900000, "maximum": 29900000}, "axis": {"type": "string", "enum": ["X", "Z", "Vertical"]}}
+            }}
+          }
+        }}}},
+        "responses": {"200": {"description": "Updated stash summary", "content": {"application/json": {"schema": {"type": "object"}}}}, "400": {"$ref": "#/components/responses/Problem"}, "409": {"$ref": "#/components/responses/Problem"}, "412": {"$ref": "#/components/responses/Problem"}, "428": {"$ref": "#/components/responses/Problem"}}
+      }
+    },
     "/v1/host": {"get": {"operationId": "getHost", "summary": "Read host identity and protocol versions", "responses": {"200": {"description": "Host details", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
     "/v1/health": {"get": {"operationId": "getHealth", "summary": "Read host health", "responses": {"200": {"description": "Health", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
     "/v1/capabilities": {"get": {"operationId": "getCapabilities", "summary": "List supported actions and versions", "responses": {"200": {"description": "Capabilities", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "./schemas/common.schema.json#/$defs/capability"}}}}}}}},
@@ -49,7 +98,7 @@
     "/v1/workflows": {"get": {"operationId": "listWorkflows", "parameters": [{"$ref": "#/components/parameters/cursor"}], "responses": {"200": {"description": "Workflow page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}}}, "post": {"operationId": "createWorkflow", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
     "/v1/workflows/{workflowId}": {"parameters": [{"$ref": "#/components/parameters/workflowId"}], "get": {"operationId": "getWorkflow", "responses": {"200": {"description": "Workflow", "content": {"application/json": {"schema": {"type": "object"}}}}}}, "put": {"operationId": "updateWorkflow", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "Updated workflow", "content": {"application/json": {"schema": {"type": "object"}}}}}}, "delete": {"operationId": "deleteWorkflow", "responses": {"202": {"$ref": "#/components/responses/Accepted"}}}},
     "/v1/stashes": {"get": {"operationId": "listStashes", "parameters": [{"$ref": "#/components/parameters/cursor"}], "responses": {"200": {"description": "Stash page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}}}, "post": {"operationId": "defineStash", "summary": "Define a bounded stash with a required home name", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"201": {"description": "Defined stash", "content": {"application/json": {"schema": {"type": "object"}}}}, "409": {"$ref": "#/components/responses/Problem"}}}},
-    "/v1/stashes/{stashId}": {"parameters": [{"$ref": "#/components/parameters/stashId"}], "get": {"operationId": "getStash", "responses": {"200": {"description": "Stash", "content": {"application/json": {"schema": {"type": "object"}}}}}}, "patch": {"operationId": "updateStash", "summary": "Edit home or scan settings; bounds can change only before observations exist", "parameters": [{"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "Updated stash", "content": {"application/json": {"schema": {"type": "object"}}}}, "412": {"$ref": "#/components/responses/Problem"}}}},
+    "/v1/stashes/{stashId}": {"parameters": [{"$ref": "#/components/parameters/stashId"}], "get": {"operationId": "getStash", "responses": {"200": {"description": "Stash", "content": {"application/json": {"schema": {"type": "object"}}}}}}, "patch": {"operationId": "updateStash", "summary": "Edit home or scan settings; observed bounds can expand outward but cannot shrink or move", "parameters": [{"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "Updated stash", "content": {"application/json": {"schema": {"type": "object"}}}}, "412": {"$ref": "#/components/responses/Problem"}}}},
     "/v1/stashes/{stashId}/scan": {"parameters": [{"$ref": "#/components/parameters/stashId"}], "post": {"operationId": "scanStash", "summary": "Dispatch a partitioned scan job", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "409": {"$ref": "#/components/responses/Problem"}}}},
     "/v1/operations/{operationId}": {"parameters": [{"$ref": "#/components/parameters/operationId"}], "get": {"operationId": "getOperation", "responses": {"200": {"description": "Operation receipt", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Operation"}}}}}}},
     "/v1/events": {"get": {"operationId": "listOperatorEvents", "parameters": [{"name": "cursor", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100}}], "responses": {"200": {"description": "Bounded event page with nextCursor", "content": {"application/json": {"schema": {"type": "object"}}}}, "409": {"$ref": "#/components/responses/Problem"}}}}

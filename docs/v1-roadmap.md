@@ -142,6 +142,17 @@ worker departures without losing job ownership or leaving unverified road gaps.
 Acceptance: bounded recovery or a clearly reported failure for every tested fault;
 no unresolved permanent waits, silent road gaps, or unsafe cancellation.
 
+The [worker reliability batches](worker-reliability.md) track the current work.
+`./gradlew unattendedReplayCheck` now combines native receipt/checkpoint checks,
+shared three-worker replays and complete simulated kit delivery over authenticated
+host sockets. Lost replies, host restart, stale observations, uncertain cancellation,
+missing checkpoints and retained offline-worker leases are covered. This does not
+close the live server-restart or five-hour unattended acceptance checks.
+0.14.6 adds action-aware active-time stall reports, bounded owned-route recovery,
+durable per-worker holds and owner notification through the shared host policy.
+The [reliability guide](worker-reliability.md) records coverage and live-test limits;
+Stash Quartermaster and a real Monocle workflow through RWP remain next.
+
 ## Stage 7 — 1.0 release candidates
 
 - [ ] Config migration/rollback tests and documented supported dependencies.

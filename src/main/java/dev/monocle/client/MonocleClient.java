@@ -125,6 +125,7 @@ public class MonocleClient implements ClientModInitializer {
 
         // Load systems
         Systems.init();
+        EVENT_BUS.subscribe(dev.monocle.client.utils.network.WorldReadiness.INSTANCE);
         EVENT_BUS.subscribe(dev.monocle.client.utils.render.Notifications.INSTANCE);
 
         // Subscribe after systems are loaded
@@ -144,7 +145,8 @@ public class MonocleClient implements ClientModInitializer {
 
         // Save on shutdown
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            Systems.save();
+            try { Systems.save(); }
+            finally { dev.monocle.client.systems.bots.Bots.get().closeNotifications(); }
             GuiThemes.save();
         }));
     }

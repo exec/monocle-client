@@ -15,6 +15,7 @@ public final class QueuePolicy {
     private QueuePolicy() { }
 
     public static boolean terminal(String status) { return Set.of("Complete", "Cancelled", "Failed").contains(status); }
+    public static boolean cancellationAcknowledged(String status) { return Set.of("Complete", "Cancelled").contains(status); }
     public static void checkedPriority(int value) {
         if (value < -1000 || value > 1000) throw new IllegalArgumentException("Priority must be -1000 through 1000");
     }
@@ -35,7 +36,7 @@ public final class QueuePolicy {
         return next != null && next != active && priority(next, worker) > priority(active, worker);
     }
     public record Dispatch(JsonObject task, String command) { }
-    public static boolean detached(JsonObject task, UUID worker) { return flag(run(task,worker),"operatorDetached"); }
+    public static boolean detached(JsonObject task, UUID worker) { return flag(run(task,worker),"operatorDetached") || flag(run(task,worker),"stallPaused"); }
     /** Host participation intent survives reconnects and never discards a checkpoint. */
     public static void detach(JsonObject task,UUID worker,boolean detached) {
         if(terminal(text(task,"status"))||flag(task,"cancelled"))throw new IllegalStateException("This job has ended; create a new job");
@@ -43,12 +44,14 @@ public final class QueuePolicy {
         JsonObject r=run(task,worker);
         if(terminal(text(r,"status")))throw new IllegalStateException("This worker's run has ended");
         r.addProperty("operatorDetached",detached);
+        if (!detached) dismissStall(r);
         if(!detached&&text(r,"status").equals("Inspection required"))r.addProperty("resumeInspection",true);
     }
     public static String guidance(JsonObject task) {
         if(flag(task,"cancelled"))return "Cancelled by host. Offline workers receive cancellation on reconnect; cleanup records remain until acknowledged. Start a new job to work again.";
         if(terminal(text(task,"status")))return "Finished. Start a new job from a preset; this execution cannot be resumed.";
         if(flag(task,"paused"))return "Paused by host. Resume continues saved work; separately detached workers stay detached.";
+        if(task.getAsJsonObject("runs").asMap().values().stream().anyMatch(v->flag(v.getAsJsonObject(),"stallPaused")))return "A worker stalled and is safely suspending. Inspect its action progress, then Resume or Rejoin; Cancel still settles cleanup. Other eligible workers continue.";
         if(task.getAsJsonObject("runs").asMap().values().stream().anyMatch(v->flag(v.getAsJsonObject(),"operatorDetached")))return "Host controls this job. Detached workers keep their checkpoints; Rejoin restores participation. Other eligible workers continue.";
         return "Host controls this job. Pause/Resume/Cancel affect the whole job. Detach affects only the selected worker; cleanup may delay release.";
     }
@@ -76,16 +79,37 @@ public final class QueuePolicy {
     public static void resume(JsonObject task) {
         if (terminal(text(task, "status"))) throw new IllegalStateException("Queue a new task to repeat finished work");
         if (flag(task, "cancelled")) throw new IllegalStateException("Cancellation is already pending; it cannot be resumed as work");
-        for (var entry : task.getAsJsonObject("runs").entrySet())
-            if (text(entry.getValue().getAsJsonObject(), "status").equals("Inspection required")) entry.getValue().getAsJsonObject().addProperty("resumeInspection", true);
+        for (var entry : task.getAsJsonObject("runs").entrySet()) {
+            JsonObject run = entry.getValue().getAsJsonObject(); dismissStall(run);
+            if (text(run, "status").equals("Inspection required")) run.addProperty("resumeInspection", true);
+        }
         task.addProperty("paused", false); task.addProperty("status", "Queued"); task.addProperty("detail", "Resuming saved workflow frames");
+        if(task.has("stashTeam"))task.getAsJsonObject("stashTeam").addProperty("phaseAt",System.currentTimeMillis()); // Operator pause time is not a batch stall.
     }
     public static boolean cancel(JsonObject task) {
-        if (terminal(text(task, "status"))) return false;
+        if (text(task,"status").equals("Complete") || text(task,"status").equals("Cancelled")
+            && task.getAsJsonObject("runs").asMap().values().stream().noneMatch(v -> text(v.getAsJsonObject(),"status").equals("Failed"))) return false;
+        // A failed worker may restore an uncertain receipt as Inspection required after restart.
+        // Explicit cancellation must still reach it; retain the original failure for diagnosis.
+        for (var entry : task.getAsJsonObject("runs").entrySet()) {
+            JsonObject run = entry.getValue().getAsJsonObject();
+            if (text(run, "status").equals("Failed")) {
+                if (!run.has("failureDetail")) run.addProperty("failureDetail", text(run, "detail"));
+                run.addProperty("status", "Inspection required");
+                run.addProperty("detail", "Cancellation requested for failed execution; awaiting worker acknowledgement");
+            }
+        }
         task.addProperty("cancelled", true); task.addProperty("paused", false);
         // The decision is authoritative now; run checkpoints retain delivery/cleanup debt.
         task.addProperty("status", "Cancelled"); task.addProperty("detail", "Cancelled by host. Offline workers reconcile on reconnect; resource recovery remains recorded.");
         return true;
+    }
+    private static void dismissStall(JsonObject run) {
+        if (run.has("stallIncidentId")) run.addProperty("dismissedStallId", text(run,"stallIncidentId"));
+        else if (run.has("actionProgress") && run.getAsJsonObject("actionProgress").has("incidentId"))
+            run.addProperty("dismissedStallId", text(run.getAsJsonObject("actionProgress"), "incidentId"));
+        run.remove("stallPaused");
+        run.remove("stallIncidentId");
     }
     public static void reconcileMissingRun(JsonObject task, JsonObject run) {
         if (terminal(text(run, "status"))) return;
@@ -94,7 +118,8 @@ public final class QueuePolicy {
         boolean unsent = !flag(run, "resumeSent") && Set.of("Queued", "Sending").contains(text(run, "status"));
         run.addProperty("status", cancel ? "Cancelled" : unsent ? "Queued" : "Inspection required");
         run.addProperty("detail", cancel ? "Worker confirms no saved execution; cancelled" : unsent ? "Worker needs the task package resent" : "Worker checkpoint missing; cancel this task and inspect prior effects before creating another");
-        if (!cancel && !unsent) { task.addProperty("paused", true); task.addProperty("status", "Inspection required"); }
+        if(cancel)CommandReceipts.noExecution(task,run);
+        if (!cancel && !unsent) { task.addProperty("paused", true); task.addProperty("status", "Inspection required");CommandReceipts.uncertain(task,run); }
     }
     public static String cancellationCommand(JsonObject run) {
         // Resume only saved cleanup intent, never the cancelled Lua workflow.

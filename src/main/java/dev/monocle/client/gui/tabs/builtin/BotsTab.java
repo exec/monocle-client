@@ -107,6 +107,9 @@ public class BotsTab extends Tab {
         }
 
         private void connectionPanel(WVerticalList parent) {
+            button(parent,"Discord owner notifications (host only)",()->perform(()->{
+                requireHostRole();mc.gui.setScreen(new dev.monocle.client.gui.screens.DiscordNotificationsScreen(theme,bots));
+            },"Discord settings opened."));
             WSection section = parent.add(theme.section("Connection & private crew key", !(tab instanceof WorkflowsTab))).expandX().minWidth(panelWidth).widget();
             connection = section.add(theme.label("", true, panelWidth - 16)).expandX().widget();
             connectionDetail = section.add(theme.label("", panelWidth - 16).color(theme.textSecondaryColor())).expandX().widget();

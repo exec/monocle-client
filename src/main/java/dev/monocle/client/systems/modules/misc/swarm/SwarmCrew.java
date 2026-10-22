@@ -7,6 +7,7 @@ import com.google.gson.JsonObject;
 import dev.monocle.coordinator.RowVerification;
 import dev.monocle.coordinator.HighwayJobs;
 import dev.monocle.coordinator.ResourceLedger;
+import dev.monocle.coordinator.PlayerObservation;
 import dev.monocle.client.MonocleClient;
 import dev.monocle.client.commands.Commands;
 import dev.monocle.client.events.packets.PacketEvent;
@@ -57,6 +58,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     private int facingTicks;
     private JsonObject pendingReturn;
     private final Set<SwarmConnection> reportedFailures = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Set<SwarmConnection> notifiedDisconnects = Collections.newSetFromMap(new IdentityHashMap<>());
     private CustomPlayerInput positioningInput;
     private ClientInput previousInput;
     private LocalPlayer positioningPlayer;
@@ -863,6 +865,8 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         int previousRow = actualRow;
         String previousPhase = phase;
         if (swarm.host != null) for (var c : connections()) drain(c, true);
+        if(swarm.mode.get()==Bots.Mode.Host)for(var entry:peers.entrySet())if(!entry.getKey().connected()&&notifiedDisconnects.add(entry.getKey()))
+            swarm.notifications().failure("worker-disconnected",str(entry.getValue(),"name"),crewName.isEmpty()?"Default":crewName);
         if (crewName.isEmpty() && swarm.worker != null) drain(swarm.worker, false);
         if (!resourceFailure().isEmpty()) { phase="failed";return; }
         // Cancellation must survive pauses, missing players and cleanup deadlocks. The existing
@@ -1042,6 +1046,9 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         hello.addProperty("taskProtocol", 1); // Supports host-declared action capabilities before native execution.
         hello.addProperty("supplyProtocol", 2);
         hello.add("diagnostics", builder().diagnosticSnapshot());
+        hello.add("combat",swarm.combat.snapshot());
+        swarm.addSafetyTelemetry(hello);
+        hello.addProperty("knownHostilesProtocol",1);
         hello.addProperty("id", me().toString()); hello.addProperty("name", mc.player == null ? mc.getUser().getName() : mc.player.getName().getString());
         hello.addProperty("scope", scope()); hello.addProperty("available", Utils.canUpdate() && swarm.acceptCrew.get() && !swarm.tasks().workerBusy() && !builder().hasJob() && !assigned() && !Files.exists(journal()));
         JsonObject recovered = assigned() ? assignment : recoveryRecord();
@@ -1181,6 +1188,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
                 if (swarm.handleManagement(c, m, hostSide)) continue;
                 if (hostSide) {
                     if (str(m, "type").equals("hello")) {
+                        PlayerObservation.fromHello(m,System.nanoTime());
                         UUID id = UUID.fromString(str(m, "id"));
                         if (peers.containsKey(c) && !str(peers.get(c), "id").equals(id.toString())) throw new IllegalArgumentException("Player identity changed");
                         if (str(m, "name").length() > 64 || str(m, "scope").length() > 1024) throw new IllegalArgumentException("Invalid peer metadata");
@@ -1190,7 +1198,9 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
                         reportedMining(m); // Validate bounded telemetry at the connection boundary, before controller ticks consume it.
                         if (m.has("currentRow")) RowVerification.Progress.fromReport(m);
                         if (participants.get(id) == c && matchesGeneration(job, generation, m) && workReportChanged(reports.get(id), m)) workChanged();
+                        m.addProperty("crew",crewName.isEmpty()?"Default":swarm.crewLabel(crewName));
                         peers.put(c, m); reports.put(id, m); reportTimes.put(id, System.nanoTime());
+                        swarm.observeHostiles(c,m);
                         swarm.tasks().observeWorker(c, m);
                         loadEndings();
                         for (String ending : pendingEnds.keySet()) sendPendingEnd(c, id, ending);
@@ -1566,9 +1576,9 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
     }
 
     public JsonObject workerDiagnostics(UUID worker) {
-        if (worker.equals(me())) return builder().diagnosticSnapshot();
+        if (worker.equals(me())) {JsonObject d=builder().diagnosticSnapshot();d.add("combat",swarm.combat.snapshot());return d;}
         return peers.entrySet().stream().filter(e -> e.getKey().connected() && worker.toString().equals(str(e.getValue(), "id")))
-            .map(e -> e.getValue().has("diagnostics") ? e.getValue().getAsJsonObject("diagnostics").deepCopy() : new JsonObject())
+            .map(e -> {JsonObject d=e.getValue().has("diagnostics") ? e.getValue().getAsJsonObject("diagnostics").deepCopy() : new JsonObject();if(e.getValue().has("combat"))d.add("combat",e.getValue().get("combat").deepCopy());return d;})
             .findFirst().orElseGet(JsonObject::new);
     }
 

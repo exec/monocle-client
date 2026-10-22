@@ -42,6 +42,111 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         .description("Allow the connected trusted host to temporarily configure and start Highway Builder when it is idle.")
         .defaultValue(true).build());
     public SwarmCrew crew = new SwarmCrew(this);
+    public final BotStashObserver stashObserver=new BotStashObserver(this);
+    public final BotStashExporter stashExporter=new BotStashExporter(this);
+    public final WorkerCombatTracker combat=new WorkerCombatTracker();
+    private dev.monocle.coordinator.KnownHostiles hostiles;
+    public final dev.monocle.coordinator.PlayerSightings sightings=new dev.monocle.coordinator.PlayerSightings();
+    private dev.monocle.coordinator.IncidentTimeline incidents;
+    private dev.monocle.coordinator.DiscordNotifications notifications;
+    public void closeNotifications(){if(notifications!=null)notifications.close();}
+    public dev.monocle.coordinator.DiscordNotifications notifications(){
+        if(mode.get()!=Mode.Host)throw new IllegalStateException("Discord notifications are managed by the host, not workers");
+        if(notifications==null)notifications=new dev.monocle.coordinator.DiscordNotifications(MonocleClient.FOLDER.toPath());
+        return notifications;
+    }
+    private net.minecraft.client.multiplayer.ClientLevel sightingWorld;
+    private long incidentSampleAt;
+    private boolean incidentWarning;
+    public dev.monocle.coordinator.IncidentTimeline incidents(){if(incidents==null){incidents=new dev.monocle.coordinator.IncidentTimeline(MonocleClient.FOLDER.toPath().resolve("incidents.telemetry.jsonl"));incidents.onEvent(e->{if(mode.get()==Mode.Host)notifications().incident(e);});}return incidents;}
+    public void addSafetyTelemetry(JsonObject report){
+        boolean lobby=Modules.get().get(dev.monocle.client.systems.modules.movement.LobbySkip.class).isInLobby();
+        report.addProperty("inLobby",lobby);report.addProperty("hostileWarningsProtocol",1);
+        report.add("worldReadiness",dev.monocle.client.utils.network.WorldReadiness.INSTANCE.snapshot());
+        report.add("playerSightings",lobby?new com.google.gson.JsonArray():sightings.snapshot());
+        report.add("playerChecks",sightings.checks(System.currentTimeMillis()));
+        report.add("safeReconnect",Modules.get().get(dev.monocle.client.systems.modules.misc.AutoReconnect.class).safetySnapshot());report.addProperty("safeReconnectProtocol",1);
+    }
+    private void observeLocalSafety(){
+        long now=System.currentTimeMillis();if(now>=incidentSampleAt&&now-incidentSampleAt<1000)return;incidentSampleAt=now;
+        boolean lobby=Modules.get().get(dev.monocle.client.systems.modules.movement.LobbySkip.class).isInLobby();
+        if(mc.level!=sightingWorld){sightings.resetView();sightingWorld=mc.level;}
+        if(mc.level==null||mc.player==null||mc.getCurrentServer()==null||lobby)sightings.resetView();
+        else{
+            var players=new com.google.gson.JsonArray();
+            for(var player:mc.level.players())if(player!=mc.player&&player.isAlive()&&!player.isSpectator()){
+                JsonObject p=new JsonObject();p.addProperty("uuid",player.getUUID().toString());p.addProperty("name",player.getName().getString());p.addProperty("trusted",dev.monocle.client.systems.friends.Friends.get().isFriend(player));p.addProperty("x",player.getX());p.addProperty("y",player.getY());p.addProperty("z",player.getZ());players.add(p);
+            }
+            sightings.observe(worldScope(),players,now);
+        }
+        JsonObject report=new JsonObject();report.add("combat",combat.snapshot());addSafetyTelemetry(report);
+        report.addProperty("scope",mc.player==null||mc.level==null?"":worldScope());
+        incidents().observe(mc.getUser().getProfileId(),mc.getUser().getName(),selectedCrew,report,hostileProtectedPlayers(),hostiles());
+        if(active&&mode.get()==Mode.Host){observeHostileChecks(mc.getUser().getProfileId(),mc.getUser().getName(),selectedCrew,report);syncHostiles();}
+    }
+    private boolean hostileGuardWarning;
+    private final Map<SwarmConnection,Long> hostileRevisions=new HashMap<>();
+    private final Set<SwarmConnection> hostileConnections=new HashSet<>();
+    private final Set<SwarmConnection> hostileWarningConnections=new HashSet<>();
+    private final dev.monocle.coordinator.HostileWarnings hostileWarnings=new dev.monocle.coordinator.HostileWarnings();
+    private record ReceivedWarning(JsonObject frame,long expires){}
+    private final Map<String,ReceivedWarning> receivedHostileWarnings=new LinkedHashMap<>();
+    public dev.monocle.coordinator.KnownHostiles hostiles(){if(hostiles==null)hostiles=new dev.monocle.coordinator.KnownHostiles(MonocleClient.FOLDER.toPath().resolve("known-hostiles.json"));return hostiles;}
+    public void observeHostiles(SwarmConnection connection,JsonObject report){
+        if(dev.monocle.coordinator.TaskWire.text(report,"knownHostilesProtocol").equals("1"))hostileConnections.add(connection);
+        if(dev.monocle.coordinator.TaskWire.text(report,"hostileWarningsProtocol").equals("1"))hostileWarningConnections.add(connection);
+        try{
+            hostiles().observe(UUID.fromString(dev.monocle.coordinator.TaskWire.text(report,"id")),dev.monocle.coordinator.TaskWire.text(report,"scope"),!dev.monocle.coordinator.TaskWire.flag(report,"inLobby")&&report.has("combat")?report.getAsJsonObject("combat"):null,hostileProtectedPlayers());
+            incidents().observe(UUID.fromString(dev.monocle.coordinator.TaskWire.text(report,"id")),dev.monocle.coordinator.TaskWire.text(report,"name"),dev.monocle.coordinator.TaskWire.text(report,"crew"),report,hostileProtectedPlayers(),hostiles());
+            observeHostileChecks(UUID.fromString(dev.monocle.coordinator.TaskWire.text(report,"id")),dev.monocle.coordinator.TaskWire.text(report,"name"),dev.monocle.coordinator.TaskWire.text(report,"crew"),report);
+            notifications().observeWorker(report);
+        }catch(RuntimeException e){MonocleClient.LOG.warn("[Workers] Hostile observation deferred",e);}
+        syncHostiles();
+        if(hostileWarningConnections.contains(connection)&&report.has("playerChecks"))connection.send(dev.monocle.coordinator.HostileWarnings.receipt(report,hostiles().revision()).toString());
+    }
+    private void observeHostileChecks(UUID id,String name,String crewId,JsonObject report){
+        for(JsonObject warning:hostileWarnings.observe(id,name,crewId,report,hostiles(),hostileProtectedPlayers(),System.currentTimeMillis())){
+            String detail=dev.monocle.coordinator.TaskWire.text(warning.getAsJsonObject("sighting").getAsJsonObject("player"),"name")+" sighted by "+name+" · "+crewId+" · "+dev.monocle.coordinator.TaskWire.text(warning,"server");
+            MonocleClient.LOG.warn("[Workers] Host-wide hostile warning: {}",detail);notifications().failure("hostile-sighted",name,detail);
+        }
+    }
+    private Set<UUID> hostileProtectedPlayers(){Set<UUID> ids=new HashSet<>();ids.add(mc.getUser().getProfileId());for(String crewId:presets.keySet())coordinator(crewId).members().forEach(m->ids.add(m.id()));return ids;}
+    private void syncHostiles(){
+        hostileConnections.removeIf(c->!c.connected());hostileRevisions.keySet().retainAll(hostileConnections);
+        hostileWarningConnections.retainAll(hostileConnections);
+        Set<Object> recipients=new HashSet<>(hostileConnections);recipients.add(mc.getUser().getProfileId());hostileWarnings.retainRecipients(recipients);
+        for(var c:hostileConnections){
+            if(hostileRevisions.getOrDefault(c,-1L)!=hostiles().revision()){
+                JsonObject frame=dev.monocle.coordinator.TaskWire.message("known-hostiles");frame.add("catalog",hostiles().snapshot());if(!c.send(frame.toString()))continue;hostileRevisions.put(c,hostiles().revision());
+            }
+            if(hostileWarningConnections.contains(c))for(JsonObject frame:hostileWarnings.pending(c,hostiles(),System.currentTimeMillis()))if(c.send(frame.toString()))hostileWarnings.delivered(c,frame);
+        }
+        if(active&&mode.get()==Mode.Host)for(JsonObject frame:hostileWarnings.pending(mc.getUser().getProfileId(),hostiles(),System.currentTimeMillis())){receiveHostileWarning(frame);hostileWarnings.delivered(mc.getUser().getProfileId(),frame);}
+    }
+    private void receiveHostileWarning(JsonObject frame){
+        dev.monocle.coordinator.HostileWarnings.validate(frame);
+        JsonObject warning=frame.getAsJsonObject("warning");String id=dev.monocle.coordinator.TaskWire.text(warning,"id");
+        boolean seen=receivedHostileWarnings.containsKey(id);
+        receivedHostileWarnings.put(id,new ReceivedWarning(frame.deepCopy(),System.nanoTime()+frame.get("remainingMs").getAsLong()*1_000_000L));
+        while(receivedHostileWarnings.size()>256)receivedHostileWarnings.remove(receivedHostileWarnings.keySet().iterator().next());
+        if(seen)return;
+        JsonObject player=warning.getAsJsonObject("sighting").getAsJsonObject("player");
+        warning("Host-wide warning: %s seen by %s (%s) on %s at %s, %s, %s.",dev.monocle.coordinator.TaskWire.text(player,"name"),dev.monocle.coordinator.TaskWire.text(warning,"observerName"),dev.monocle.coordinator.TaskWire.text(warning,"crew"),dev.monocle.coordinator.TaskWire.text(warning,"server"),dev.monocle.coordinator.TaskWire.text(player,"x"),dev.monocle.coordinator.TaskWire.text(player,"y"),dev.monocle.coordinator.TaskWire.text(player,"z"));
+    }
+    public void manageHostile(String operation,String value){
+        if(mode.get()==Mode.Worker&&active)throw new IllegalStateException("The connected host controls the shared hostile list");
+        if(operation.equals("guard"))hostiles().policy(Boolean.parseBoolean(value));
+        else if(operation.equals("reconnect"))hostiles().policy(hostiles().enabled(),Boolean.parseBoolean(value),hostiles().reconnectSeconds());
+        else if(operation.equals("cooldown"))hostiles().policy(hostiles().enabled(),hostiles().safeReconnect(),Integer.parseInt(value));
+        else if(operation.equals("add")){if(mc.getCurrentServer()==null)throw new IllegalStateException("Join a server first");String uuid="";if(mc.level!=null)for(var p:mc.level.players())if(p.getName().getString().equalsIgnoreCase(value)){uuid=p.getUUID().toString();break;}hostiles().add(mc.getCurrentServer().ip,value,uuid);}
+        else if(operation.equals("remove"))hostiles().remove(value);
+        syncHostiles();
+    }
+    public void reportHostileLogout(String name,String server){
+        combat.hostileLogout(name,server);incidentSampleAt=0;
+        try{observeLocalSafety();}catch(RuntimeException e){MonocleClient.LOG.warn("[Workers] Local logout history unavailable",e);}
+        if(isWorker())crew.announce();
+    }
     public final Setting<Integer> sectionLength = sgGeneral.add(new IntSetting.Builder().name("crew-road-length")
         .description("Total shared road length. Players divide the width and advance together. Cardinal directions only.")
         .defaultValue(128).range(16, HighwayJobs.MAX_LENGTH).sliderRange(16, 512).build());
@@ -79,6 +184,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     private RwpWorkerConnection rwpWorker;
     private BotActions rwpTravel;
     private String rwpTravelId;
+    private boolean rwpReleasing;
     private final dev.monocle.coordinator.BotChat chat = new dev.monocle.coordinator.BotChat();
     public com.google.gson.JsonArray chatFeed() { return chat.json(); }
     public final Setting<Integer> webPort = sgGeneral.add(new IntSetting.Builder().name("web-port")
@@ -304,6 +410,15 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     /** Authenticated host-only management message; never forwarded to other workers. */
     public boolean handleManagement(SwarmConnection connection, com.google.gson.JsonObject message, boolean hostSide) {
         String type=dev.monocle.coordinator.TaskWire.text(message,"type");
+        if(type.equals("task-known-hostiles")){
+            if(hostSide||connection!=worker||!connection.connected())throw new IllegalArgumentException("Hostile policy must come from the connected host");
+            hostiles().accept(message.getAsJsonObject("catalog"));return true;
+        }
+        if(type.equals("task-hostile-warning")||type.equals("task-player-check-result")){
+            if(hostSide||connection!=worker||!connection.connected())throw new IllegalArgumentException("Player checks must come from the connected host");
+            if(type.equals("task-hostile-warning"))receiveHostileWarning(message);else dev.monocle.coordinator.HostileWarnings.validateReceipt(message);
+            return true;
+        }
         if (type.equals("crew-join-request")) {
             if (!hostSide) throw new IllegalArgumentException("Crew join requests must come from a worker");
             try {
@@ -428,6 +543,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     private void onChat(dev.monocle.client.events.game.ReceiveMessageEvent event) {
         if(!active||!isWorker())return;
         String plain=event.getMessage().getString();
+        tasks.chat(plain);
         if(plain.length()>2048) {reportChat("received",plain);return;}
         var parts=new com.google.gson.JsonArray();
         event.getMessage().visit((style,text)-> {
@@ -879,6 +995,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     }
 
     public void close() {
+        receivedHostileWarnings.clear();hostileWarnings.clear();hostileConnections.clear();hostileWarningConnections.clear();hostileRevisions.clear();
         hostAutoTpy = false;
         clearRwpTravel();
         tasks.disconnected();
@@ -908,6 +1025,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     @EventHandler
     private void onGameLeft(GameLeftEvent event) {
+        combat.resetTracking();
         crew.disconnected();
         for (SwarmCrew coordinator : coordinators.values()) if (coordinator != crew) coordinator.disconnected();
         if (mode.get() == Mode.Worker) close();
@@ -915,6 +1033,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     @EventHandler
     private void onGameJoin(GameJoinedEvent event) {
+        combat.resetTracking();
         crew.disconnected();
         for (SwarmCrew coordinator : coordinators.values()) if (coordinator != crew) coordinator.disconnected();
         if (mode.get() == Mode.Worker) close();
@@ -932,11 +1051,38 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     private void onPreTick(TickEvent.Pre event) { if (active && crew.localAssigned()) crew.position(); }
 
     @EventHandler
+    private void onCombatPacket(dev.monocle.client.events.packets.PacketEvent.Receive event) {
+        if(!WorkerCombatTracker.relevant(event.packet))return;
+        var packet=event.packet;var connection=event.connection;var level=mc.level;
+        mc.execute(()->{
+            if(mc.getConnection()==null||mc.getConnection().getConnection()!=connection||mc.level!=level||mc.player==null)return;
+            long before=combat.sequence();
+            try{combat.receive(packet);}catch(RuntimeException e){MonocleClient.LOG.warn("[Workers] Combat evidence could not be decoded",e);}
+            if(isWorker()&&combat.sequence()!=before)crew.announce();
+            else if(combat.sequence()!=before&&mode.get()==Mode.Host)try{hostiles().observe(mc.player.getUUID(),worldScope(),combat.snapshot(),hostileProtectedPlayers());syncHostiles();}catch(RuntimeException e){MonocleClient.LOG.warn("[Workers] Local hostile observation deferred",e);}
+        });
+    }
+
+    @EventHandler
     private void onTick(TickEvent.Post event) {
+        try{
+            var reconnect=Modules.get().get(dev.monocle.client.systems.modules.misc.AutoReconnect.class);
+            if(reconnect.safeRetryActive()&&(!hostiles().enabled()||!hostiles().safeReconnect()))reconnect.cancelSafeRetry();
+            observeLocalSafety();
+            incidentWarning=false;
+        }catch(RuntimeException e){if(!incidentWarning){incidentWarning=true;MonocleClient.LOG.warn("[Workers] Incident observation deferred",e);}}
+        try{Modules.get().get(dev.monocle.client.systems.modules.combat.AutoLog.class).checkKnownHostiles(hostiles());hostileGuardWarning=false;}catch(RuntimeException e){if(!hostileGuardWarning){hostileGuardWarning=true;MonocleClient.LOG.warn("[Workers] Known-hostile guard unavailable; repair the saved list before relying on it",e);}}
+        try{
+            receivedHostileWarnings.values().removeIf(w->System.nanoTime()>=w.expires());
+            for(var warning:List.copyOf(receivedHostileWarnings.values()))Modules.get().get(dev.monocle.client.systems.modules.combat.AutoLog.class).checkHostileWarning(hostiles(),warning.frame());
+        }catch(RuntimeException e){MonocleClient.LOG.warn("[Workers] Shared hostile warning unavailable",e);}
+        try{stashObserver.tick();}catch(RuntimeException e){MonocleClient.LOG.warn("[Workers] Live stash observation deferred",e);}
+        try{stashExporter.tick();}catch(RuntimeException e){MonocleClient.LOG.warn("[Workers] Durable stash export deferred",e);}
         try { expireJobHistory(); } catch (RuntimeException e) { reportConnectionFailure("Job history cleanup deferred: " + e.getMessage()); }
         if (!active) { try { tasks.tick(); } catch (RuntimeException e) { reportConnectionFailure(e.getMessage()); } return; }
         tickConnection();
         if (mode.get() == Mode.Host) {
+            syncHostiles();
             for (var connection : allConnections()) if (!connection.failure().isEmpty()) reportConnectionFailure(connection.failure());
             for (String name : List.copyOf(presets.keySet())) tickCrew(coordinator(name));
             if (++catalogTicks % 20 == 0) try { syncJobs(); }
@@ -944,36 +1090,62 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         } else tickCrew(crew);
         try { tasks.tick(); }
         catch (RuntimeException e) { tasks.disconnected(); reportConnectionFailure("Task execution stopped: " + e.getMessage()); }
-        if (rwpWorker != null) rwpWorker.gameTick();
+        if (rwpWorker != null && Utils.canUpdate() && dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready()) rwpWorker.gameTick();
         tickRwpTravel();
         if (isWorker() && dev.monocle.client.utils.Utils.canUpdate()) worker.tick();
     }
     private void tickRwpTravel() {
-        JsonObject run = rwpWorker == null ? null : rwpWorker.activeTravel();
-        if (run == null || !Utils.canUpdate() || tasks.workerBusy()) { clearRwpTravel(); return; }
-        String id = run.get("executionId").getAsString() + ":" + run.get("generation").getAsInt();
+        JsonObject run = rwpWorker == null ? null : rwpWorker.activeMovement();
         try {
+            if (run == null || !Utils.canUpdate() || !dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready()) {
+                if (!releaseRwpMovement()) return;
+                if (rwpWorker != null) rwpWorker.acknowledgeMovementCancellation();
+                return;
+            }
+            if (rwpReleasing) {
+                if (!releaseRwpMovement()) return;
+                if (rwpWorker.followFinished()) { rwpWorker.completeFollow(); return; }
+            }
+            if (tasks.hasWork() || crew.localAssigned() || Modules.get().get(dev.monocle.client.systems.modules.world.HighwayBuilder.class).isActive()
+                || Modules.get().get(dev.monocle.client.systems.modules.world.PrinterHelper.class).isActive()
+                || Modules.get().get(dev.monocle.client.systems.modules.world.StashManager.class).isScanning()) {
+                clearRwpTravel(); rwpWorker.failTravel();
+                reportConnectionFailure("RWP movement refused: an existing native job owns this worker");
+                return;
+            }
+            String id = run.get("executionId").getAsString() + ":" + run.get("generation").getAsInt();
             if (!id.equals(rwpTravelId)) {
                 clearRwpTravel();
-                JsonObject action = run.getAsJsonObject("action").getAsJsonObject("arguments").deepCopy();
-                action.remove("scope"); action.addProperty("type", "Travel");
-                action.addProperty("dimension", run.getAsJsonObject("scope").get("dimension").getAsString());
+                JsonObject action = RwpWorkerConnection.nativeMovement(run);
                 rwpTravel = new BotActions(this); rwpTravel.start(action); rwpTravelId = id;
             }
             JsonObject status = rwpTravel.tick();
-            if (status.get("state").getAsString().equals("Running")) rwpWorker.reportTravelProgress(status.get("detail").getAsString());
+            if (status.get("state").getAsString().equals("Running")) {
+                rwpWorker.reportTravelProgress(status.get("detail").getAsString());
+                if (rwpWorker.followTick()) {
+                    if (releaseRwpMovement()) rwpWorker.completeFollow();
+                    return;
+                }
+            }
             switch (status.get("state").getAsString()) {
                 case "Complete" -> { rwpWorker.completeTravel(rwpObservation()); clearRwpTravel(); }
-                case "Failed" -> { rwpWorker.failTravel(); clearRwpTravel(); }
+                case "Failed" -> { clearRwpTravel(); rwpWorker.failTravel(); }
             }
         } catch (RuntimeException error) {
+            clearRwpTravel();
             if (rwpWorker != null) rwpWorker.failTravel();
-            clearRwpTravel(); reportConnectionFailure("RWP Travel stopped: " + error.getMessage());
+            reportConnectionFailure("RWP movement stopped: " + error.getMessage());
         }
     }
     private void clearRwpTravel() {
         if (rwpTravel != null) { rwpTravel.stop(); rwpTravel = null; }
-        rwpTravelId = null;
+        rwpTravelId = null; rwpReleasing = false;
+    }
+    private boolean releaseRwpMovement() {
+        rwpReleasing = true;
+        if (rwpTravel != null && Utils.canUpdate() && dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready()
+            && !rwpTravel.requestSuspend()) { rwpTravel.tick(); return false; }
+        clearRwpTravel(); return true;
     }
     private void tickCrew(SwarmCrew coordinator) {
         try { coordinator.tick(); }
@@ -1105,6 +1277,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     }
 
     public void reportConnectionFailure(String reason) {
+        if(mode.get()==Mode.Host)notifications().failure("host-error","",reason);
         long now = System.nanoTime();
         if (!reason.equals(lastNotice) || now >= noticeAt) {
             warning("Workers: %s", reason);
@@ -1131,6 +1304,15 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     @EventHandler
     private void onSend(dev.monocle.client.events.packets.PacketEvent.Send event) { if (active) crew.guard(event); }
+    @EventHandler private void stashSent(dev.monocle.client.events.packets.PacketEvent.Sent event){
+        if(active&&isWorker()){
+            if(event.packet instanceof net.minecraft.network.protocol.game.ServerboundChatCommandPacket p)tasks.sentCommand(p.command());
+            else if(event.packet instanceof net.minecraft.network.protocol.game.ServerboundChatCommandSignedPacket p)tasks.sentCommand(p.command());
+        }
+        stashObserver.sent(event.packet);
+    }
+    @EventHandler private void stashInventory(dev.monocle.client.events.packets.InventoryEvent event){stashObserver.inventory(event);}
+    @EventHandler private void stashSlot(dev.monocle.client.events.packets.ContainerSlotUpdateEvent event){stashObserver.slot(event);}
 
     public enum Mode {
         Host,

@@ -5,6 +5,7 @@ import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.world.StashFinder;
 import net.minecraft.world.phys.Vec3;
 import java.util.*;
+import static dev.monocle.client.MonocleClient.mc;
 
 /** Disjoint chunk strips, local scanning and a bounded, acknowledged findings outbox. */
 public final class BotStashHunt {
@@ -53,6 +54,11 @@ public final class BotStashHunt {
     private int lanes() { return Math.ceilDiv(chunk(plan, "maxX") - chunk(plan, "minX") + 1, width()); }
     public int totalRows() { return Math.max(0, Math.ceilDiv(lanes() - plan.get("workerIndex").getAsInt(), workers())) * rows(); }
     public boolean covered() { return cursor >= totalRows(); }
+    dev.monocle.coordinator.ActionProgress.Observation progress() {
+        Vec3 goal = covered() ? mc.player.position() : target();
+        return new dev.monocle.coordinator.ActionProgress.Observation("Stash survey", "Chunk coverage / findings acknowledgement", cursor + "/" + scanned,
+            goal.toString(), mc.player.position().distanceTo(goal), 0, false, false);
+    }
     public int[] row(int position) {
         if (position < 0 || position >= totalRows()) throw new IllegalArgumentException("Invalid survey row");
         int left = chunk(plan, "minX") + lane(position) * width(), right = Math.min(chunk(plan, "maxX"), left + width() - 1);

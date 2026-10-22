@@ -320,8 +320,9 @@ public class KillAura extends Module {
         }
 
         attacking = true;
-        if (pauseOnCombat.get() && PathManagers.get().isPathing() && !wasPathing) {
-            PathManagers.get().pause();
+        if(!pauseOnCombat.get())releasePathPause();
+        if (pauseOnCombat.get() && PathManagers.hasNavigation() && !wasPathing) {
+            PathManagers.pause(this);
             wasPathing = true;
         }
 
@@ -395,12 +396,10 @@ public class KillAura extends Module {
         }
     }
 
+    private void releasePathPause(){if(wasPathing){PathManagers.resume(this);wasPathing=false;}}
     private void stopAttacking() {
         attacking = false;
-        if (wasPathing) {
-            PathManagers.get().resume();
-            wasPathing = false;
-        }
+        releasePathPause();
         if ((swapBack.get() || toolSwapped) && swapped && previousSlot >= 0 && mc.player != null
             && !mc.player.isUsingItem() && mc.player.getInventory().getSelectedSlot() == equippedSlot
             && sameWeapon(mc.player.getMainHandItem(), equippedStack)) InvUtils.swap(previousSlot, false);

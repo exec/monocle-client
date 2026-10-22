@@ -2,6 +2,7 @@ package dev.monocle.host;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import dev.monocle.coordinator.TaskFiles;
 import java.nio.charset.StandardCharsets;
 import java.net.*;
@@ -25,10 +26,36 @@ final class WebUiTest {
             var index = send(http, origin + "/ui/", null, null, false);
             assert index.statusCode() == 200 && index.body().contains("Control Room") && !index.body().contains(TOKEN);
             assert index.body().contains("value=\"highway\"") && index.body().contains("highway-worker-position");
+            assert index.body().contains("data-page=\"hostiles\"") : "Known-hostile management has a dedicated sidebar page";
+            assert index.body().contains("data-page=\"incidents\"");
+            assert index.body().contains("data-page=\"notifications\"");
             assert index.body().contains("id=\"kit-field\"") && index.body().contains("id=\"kit-recipient-worker\"") : "Kit dispatch uses guided fields in the existing job review";
+            assert index.body().contains("id=\"kit-mode\"")&&index.body().contains("id=\"kit-routes\"")&&index.body().contains("value=\"RoundRobin\"") : "Solo transfers expose route-specific sources, kits and destinations";
+            assert index.body().contains("data-page=\"stashes\"") && index.body().contains("id=\"kit-dialog\"") && index.body().contains("id=\"delivery-worker\"")
+                : "Stash management and direct kit delivery expose a separate executor picker";
             assert index.headers().firstValue("content-security-policy").orElseThrow().contains("frame-ancestors 'none'")
                 && index.headers().firstValue("cache-control").orElseThrow().equals("no-store");
             String app = send(http, origin + "/ui/app.js", null, null, false).body();
+            assert app.contains("['Storage','Kitbot','Both']")&&app.contains("usage:usage.value")&&app.contains("usage.value=c.usage||'Both'")&&app.contains("c.usage!=='Kitbot'"):"Category usage must round-trip in the editor and separate new storage reservations";
+            assert app.contains("function stashSortPreview(stash)")&&app.contains("/sort-preview?buffers=")&&app.contains("This never changes reservations, moves kits or starts a job.")&&app.contains("stashSortReads.clear()") : "Sorting is a host-owned, explicitly read-only snapshot preview";
+            assert app.contains("function kitReserveBalance(stash,id)")&&app.contains("op:'stash-kit-reserve'")&&app.contains("Does not block deliveries") : "Per-kit floors are editable and explicitly advisory";
+            assert app.contains("bounds:{assumeEmpty:!emptyMode}")&&app.contains("assumed slots (not verified free space)") : "Empty storage is an explicit definition edit, never an observed stock claim";
+            assert app.contains("function renderNotifications()") && app.contains("'password'") && app.contains("discordDraft=null");
+            String botToken="fake_discord_bot_token_only_for_validation_123456789";
+            JsonObject discord=new JsonObject();discord.addProperty("op","discord-settings");discord.addProperty("enabled",false);discord.addProperty("ownerId","123456789012345678");discord.addProperty("botToken",botToken);
+            HttpRequest settings=HttpRequest.newBuilder(URI.create(origin+"/ui/api/control")).header("Authorization","Bearer "+TOKEN).header("Origin",origin).header("Content-Type","application/json").POST(HttpRequest.BodyPublishers.ofString(discord.toString())).build();
+            var settingsReply=http.send(settings,HttpResponse.BodyHandlers.ofString());assert settingsReply.statusCode()==200 && !settingsReply.body().contains(botToken);
+            assert JsonParser.parseString(settingsReply.body()).getAsJsonObject().get("configured").getAsBoolean();
+            String hostStatus=send(http,origin+"/ui/api/status",TOKEN,origin,false).body();assert !hostStatus.contains(botToken)&&hostStatus.contains("discordNotifications");
+            assert TaskFiles.read(directory.resolve("discord-notifications.json")).get("botToken").getAsString().equals(botToken);
+            discord.addProperty("botToken","");settings=HttpRequest.newBuilder(URI.create(origin+"/ui/api/control")).header("Authorization","Bearer "+TOKEN).header("Origin",origin).header("Content-Type","application/json").POST(HttpRequest.BodyPublishers.ofString(discord.toString())).build();
+            assert http.send(settings,HttpResponse.BodyHandlers.ofString()).statusCode()==200;
+            assert TaskFiles.read(directory.resolve("discord-notifications.json")).get("botToken").getAsString().equals(botToken):"Blank password input must not erase the saved token";
+            assert app.contains("function renderStashes()") && app.contains("[['stashes','Stashes'],['kits','Kits']]")
+                && app.contains("[['columns','Columns'],['kits','Kits'],['resources','Resources']]") && app.contains("function storageColumns(db,layout='auto')")
+                : "Storage sections expose the default per-stash column map and separate kit/resource views";
+            assert app.contains("link.href='#stashes/'")&&app.contains("window.addEventListener('hashchange',readRoute)")&&app.contains("function stashFullness(stash)")&&app.contains("Legacy capacity estimate; assumes double chests")
+                : "Stash directory links, page routing and clearly labeled storage fullness are bundled";
             assert app.contains("textContent") && app.contains("workflow-prepare") && app.contains("Auto TPY") && app.contains("public-join") && !app.contains("localStorage");
             assert app.contains("sessionStorage.getItem(tokenKey)") && app.contains("sessionStorage.setItem(tokenKey, token)")
                 && app.contains("sessionStorage.removeItem(tokenKey)") && app.contains("if (path === 'status' && body.error === 'Invalid API token' && attempt === generation) clearToken()")
@@ -41,6 +68,9 @@ final class WebUiTest {
                 : "Stash inspection must use its resource ID instead of legacy control";
             assert app.contains("kitUsage(snapshot)") && app.contains("task-kit-remove-incomplete") && app.contains("updateKitSources()")
                 : "Stash view exposes kit stock, usage, and guided dispatch";
+            assert app.contains("function kitCatalog(stashes)") && app.contains("function kitLocations(db,source)")
+                && app.contains("openKit(kit,stash,true)") && app.contains("pendingKitDelivery.body,pendingKitDelivery.key")
+                : "Stash and all-kit views share the direct modal and retry the identical durable submission";
             assert app.contains("transferAll:$('kit-all').checked")&&app.contains("count>36")&&app.contains("job.kitJob.delivered??")
                 : "Repeat kit jobs expose a 36-slot cap and count actual completed deliveries, not their per-trip cap";
             assert app.indexOf("if(context.preset){$('job-kind').value='preset'") < app.indexOf("$('job-dialog').showModal()")
@@ -58,6 +88,9 @@ final class WebUiTest {
             assert send(http, origin + "/ui/api/status", null, null, false).statusCode() == 403;
             assert send(http, origin + "/ui/api/status", "wrong", null, false).body().contains("Invalid API token");
             assert send(http, origin + "/ui/api/status", TOKEN, origin, false).statusCode() == 200;
+            assert send(http, origin + "/ui/api/v1/incidents?limit=10", null, origin, false).statusCode() == 403;
+            assert send(http, origin + "/ui/api/v1/incidents?limit=10", TOKEN, origin, false).statusCode() == 200;
+            assert send(http, origin + "/ui/api/v1/incidents?limit=101", TOKEN, origin, false).statusCode() == 400;
             assert send(http, origin + "/ui/api/status", TOKEN, "https://evil.invalid", false).statusCode() == 403;
             assert send(http, origin + "/ui/api/control", TOKEN, null, true).body().contains("UI origin is not accepted");
             assert send(http, origin + "/ui/api/control", TOKEN, "null", true).statusCode() == 403;

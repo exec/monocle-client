@@ -34,6 +34,9 @@
         <button data-page="overview" class="nav-button active"><span aria-hidden="true">◈</span> Overview</button>
         <button data-page="crews" class="nav-button"><span aria-hidden="true">◇</span> Crews <span id="crew-count" class="nav-count">0</span></button>
         <button data-page="workers" class="nav-button"><span aria-hidden="true">⊙</span> Workers <span id="worker-count" class="nav-count">0</span></button>
+        <button data-page="hostiles" class="nav-button"><span aria-hidden="true">⚑</span> Known hostiles</button>
+        <button data-page="incidents" class="nav-button"><span aria-hidden="true">◷</span> Incidents</button>
+        <button data-page="notifications" class="nav-button"><span aria-hidden="true">✉</span> Notifications</button>
         <button data-page="jobs" class="nav-button"><span aria-hidden="true">≡</span> Jobs <span id="job-count" class="nav-count">0</span></button>
         <button data-page="presets" class="nav-button"><span aria-hidden="true">◇</span> Presets</button>
         <button data-page="stashes" class="nav-button"><span aria-hidden="true">▦</span> Stashes</button>
@@ -55,6 +58,22 @@
     <div class="dialog-heading"><div><p class="eyebrow">MANAGEMENT DESK</p><h2 id="inspect-title">Job details</h2></div><button class="icon-button close-dialog" aria-label="Close inspection">×</button></div>
     <div id="inspect-content"></div>
   </dialog>
+  <dialog id="kit-dialog" class="inspect-dialog" aria-labelledby="kit-title">
+    <div class="dialog-heading"><div><p class="eyebrow">KIT CATALOG</p><h2 id="kit-title">Kit details & delivery</h2></div><button id="kit-close" class="icon-button" type="button" aria-label="Close kit details">×</button></div>
+    <div id="kit-details"></div>
+    <form id="kit-delivery-form">
+      <fieldset id="kit-delivery-fields">
+        <h3>Deliver to a player</h3>
+        <label for="delivery-source">Collect from stash</label><select id="delivery-source" required></select>
+        <div class="form-grid"><div><label for="delivery-worker">Worker running the delivery</label><select id="delivery-worker" required></select></div><div><label for="delivery-count">Quantity (shulkers)</label><input id="delivery-count" type="number" min="1" max="36" step="1" value="1" required></div></div>
+        <label for="delivery-recipient">Recipient username</label><input id="delivery-recipient" list="delivery-usernames" maxlength="16" pattern="[A-Za-z0-9_]{1,16}" autocomplete="off" required><datalist id="delivery-usernames"></datalist>
+        <label><input id="delivery-incomplete" type="checkbox"> Allow incomplete kits</label>
+        <label><input id="delivery-return-home" type="checkbox" checked> Return to source stash after delivery</label>
+        <p id="delivery-hint" class="hint"></p>
+      </fieldset>
+      <p id="delivery-error" class="error" role="alert"></p><div class="dialog-actions"><button id="delivery-submit" class="primary" type="submit">Deliver kits</button></div>
+    </form>
+  </dialog>
   <dialog id="job-dialog">
     <div class="dialog-heading"><div><p class="eyebrow">DISPATCH</p><h2>Assign the next job</h2></div><button class="icon-button close-dialog" aria-label="Close new job">×</button></div>
     <form id="job-form">
@@ -64,11 +83,15 @@
         <div id="preset-field" hidden><label for="job-preset">Preset</label><select id="job-preset"></select><p class="hint">Built-in or customized host snapshot. Inspect and edit defaults under Presets.</p></div>
         <div id="follow-field" hidden><label for="follow-leader">Subject (not assigned this job)</label><select id="follow-leader"></select><label for="follow-radius">Formation spacing</label><input id="follow-radius" type="number" min="1" max="8" step="1" value="3"><div id="crystal-target-field" hidden><label for="crystal-targets">Crystal targets (comma-separated usernames; blank = all non-friends)</label><input id="crystal-targets" type="text" maxlength="270" placeholder="All non-friends except subject and crew"></div><p class="hint">Workers track the subject's live model. Crystal Guard arms survival modules, auto-accepts its TPA, and uses Crystal Aura. Follow stays non-combat. Runs until cancelled.</p></div>
         <div id="kit-field" hidden>
-          <div class="form-grid"><div><label for="kit-source">Source stash</label><select id="kit-source"></select></div><div><label for="kit-type">Shulker type</label><select id="kit-type"></select></div></div>
+          <div id="kit-mode-field" hidden><label for="kit-mode">Transfer mode</label><select id="kit-mode"><option value="Drain">Drain one type at a time</option><option value="RoundRobin">Round Robin · one load per route</option><option value="Mixed">Mixed loads · fill spare slots with selected types</option></select></div>
+          <div id="kit-source-fields" class="form-grid"><div><label for="kit-source">Source stash</label><select id="kit-source"></select></div><div><label for="kit-type">Shulker type</label><select id="kit-type"></select></div></div>
+          <div id="kit-types-field" hidden><div id="kit-types-select"><label for="kit-types">Kit types (Mixed loads requires 2–16 selected types)</label><select id="kit-types" multiple size="6"></select><p class="hint">Ctrl/Cmd-click to select types. Mixed loads tops up short batches with other selected types; deposits use separate reserved columns. Drain mode permits no selection for all types.</p></div><label><input id="kit-deposit-carried" type="checkbox"> Deposit already-carried matching kits first (explicit recovery)</label></div>
+          <div id="kit-routes-field" hidden><div id="kit-routes"></div><button id="kit-route-add" type="button">Add route</button><p class="hint">Each turn collects up to one inventory load, deposits it at that route's destination, then rotates. Sources and destinations may differ. Verified-empty routes retire after two empty passes. Routes for the same kit must share a destination. Existing scan and source-size limits apply.</p></div>
+          <div id="kit-team-field" hidden><label for="kit-tpa-warmup">TPA warmup (seconds)</label><input id="kit-tpa-warmup" type="number" min="0" max="3600" step="0.05" value="15"><p class="hint">Choose 2–3 workers. The first selected worker leads. Followers TPA immediately after the leader sends /home; all must arrive before chest work starts.</p></div>
           <div class="form-grid"><div><label id="kit-count-label" for="kit-count">Boxes</label><input id="kit-count" type="number" min="1" max="36" step="1" value="1"></div><div><label for="kit-destination">Destination</label><select id="kit-destination"><option>Player</option><option>Ender Chest</option><option>Stash</option><option>Carry</option></select></div></div>
           <label><input id="kit-all" type="checkbox"> Transfer all to stash (full non-lazy source scan required)</label>
           <label><input id="kit-include-incomplete" type="checkbox"> Include incomplete kits of this type</label>
-          <div id="kit-recipient-field"><label for="kit-recipient-worker">Known crew member</label><select id="kit-recipient-worker"><option value="">Enter another player manually</option></select><div class="form-grid"><div><label for="kit-recipient-name">Player username</label><input id="kit-recipient-name" maxlength="16" autocomplete="off"></div><div><label for="kit-recipient-id">Player UUID</label><input id="kit-recipient-id" maxlength="36" autocomplete="off"></div></div></div>
+          <div id="kit-recipient-field"><label for="kit-recipient-worker">Known crew member</label><select id="kit-recipient-worker"><option value="">Enter another player manually</option></select><div class="form-grid"><div><label for="kit-recipient-name">Player username</label><input id="kit-recipient-name" maxlength="16" autocomplete="off"></div><div><label for="kit-recipient-id">Player UUID</label><input id="kit-recipient-id" maxlength="36" autocomplete="off"></div></div><label><input id="kit-return-home" type="checkbox" checked> Return to source stash after delivery</label></div>
           <div id="kit-target-field" hidden><label for="kit-target">Destination stash</label><select id="kit-target"></select></div>
           <p id="kit-hint" class="hint">Choose one worker. Kit counts are observed stock only; unscanned upper chests are not guaranteed.</p>
         </div>

@@ -19,6 +19,7 @@ import dev.monocle.client.systems.modules.Categories;
 import dev.monocle.client.systems.modules.Module;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.misc.AutoReconnect;
+import dev.monocle.client.systems.modules.movement.LobbySkip;
 import dev.monocle.client.utils.Utils;
 import dev.monocle.client.utils.entity.DamageUtils;
 import dev.monocle.client.utils.player.PlayerUtils;
@@ -100,7 +101,7 @@ public class AutoLog extends Module {
 
     private final Setting<Boolean> onlyTrusted = sgGeneral.add(new BoolSetting.Builder()
         .name("only-trusted")
-        .description("Disconnects when a player not on your friends list appears in render distance.")
+        .description("Disconnects when a player not on your friends list appears in render distance, except in a lobby detected by active Lobby Skip.")
         .defaultValue(false)
         .build()
     );
@@ -264,8 +265,11 @@ public class AutoLog extends Module {
             if (confirmed(mc.player.tickCount, reserveSince, reserveDelay.get())) { trigger(Component.literal(shortage), false); return; }
         }
 
-        if (!onlyTrusted.get()) strangerSince = -1;
-        if (!onlyTrusted.get() && !instantDeath.get() && entities.get().isEmpty())
+        boolean lobby = Modules.get().get(LobbySkip.class).isInLobby();
+        boolean checkUntrusted = onlyTrusted.get() && !lobby;
+        if (!checkUntrusted) strangerSince = -1;
+        if (onlyTrusted.get() && lobby) guardStatus = "Armed (lobby players ignored)";
+        if (!checkUntrusted && !instantDeath.get() && entities.get().isEmpty())
             return; // only check all entities if needed
 
         int totalEntities = 0;
@@ -276,7 +280,7 @@ public class AutoLog extends Module {
             if (entity == mc.player) continue;
 
             if (entity instanceof Player player) {
-                if (onlyTrusted.get() && player.isAlive() && !player.isSpectator() && !Friends.get().isFriend(player)
+                if (checkUntrusted && player.isAlive() && !player.isSpectator() && !Friends.get().isFriend(player)
                     && (playerRange.get() == 0 || PlayerUtils.isWithin(player, playerRange.get()))) {
                     if (nearestStranger == null || player.distanceToSqr(mc.player) < nearestStranger.distanceToSqr(mc.player)) nearestStranger = player;
                 }
@@ -320,12 +324,43 @@ public class AutoLog extends Module {
         }
     }
 
-    private void trigger(Component reason, boolean reenableWhenHealthy) {
-        if (!isActive() || disconnecting || mc.player == null) return;
+    /** Host policy is independent of job module overlays; it stays armed even when Auto Log is inactive. */
+    public void checkKnownHostiles(dev.monocle.coordinator.KnownHostiles hostiles){
+        if(!hostiles.enabled()||mc.player==null||mc.level==null||mc.player.isDeadOrDying()||mc.getCurrentServer()==null)return;
+        checkWorld();if(disconnecting||Modules.get().get(LobbySkip.class).isInLobby())return;
+        for(Player player:mc.level.players()){
+            if(player==mc.player||!player.isAlive()||player.isSpectator())continue;
+            String hostile=hostiles.match(mc.getCurrentServer().ip,player.getUUID(),player.getName().getString());
+            if(hostile==null)continue;
+            disconnectForHostile(hostiles,player.getName().getString(),"Known hostile " + player.getName().getString() + " is visible.");return;
+        }
+    }
+    public void checkHostileWarning(dev.monocle.coordinator.KnownHostiles hostiles,com.google.gson.JsonObject frame){
+        if(mc.player==null||mc.level==null||mc.player.isDeadOrDying()||mc.getCurrentServer()==null)return;
+        checkWorld();if(disconnecting||Modules.get().get(LobbySkip.class).isInLobby()||!hostileWarningMatches(hostiles,frame,mc.getCurrentServer().ip))return;
+        var warning=frame.getAsJsonObject("warning");String name=dev.monocle.coordinator.TaskWire.text(warning.getAsJsonObject("sighting").getAsJsonObject("player"),"name");
+        disconnectForHostile(hostiles,name,"Host-wide warning: "+name+" seen by "+dev.monocle.coordinator.TaskWire.text(warning,"observerName")+".");
+    }
+    static boolean hostileWarningMatches(dev.monocle.coordinator.KnownHostiles hostiles,com.google.gson.JsonObject frame,String server){
+        var warning=frame.getAsJsonObject("warning");var player=warning.getAsJsonObject("sighting").getAsJsonObject("player");
+        return hostiles.enabled()&&dev.monocle.coordinator.KnownHostiles.serverOf(server+"\nminecraft:overworld").equals(dev.monocle.coordinator.TaskWire.text(warning,"server"))
+            &&hostiles.match(server,java.util.UUID.fromString(dev.monocle.coordinator.TaskWire.text(player,"uuid")),dev.monocle.coordinator.TaskWire.text(player,"name"))!=null;
+    }
+    private void disconnectForHostile(dev.monocle.coordinator.KnownHostiles hostiles,String name,String reason){
+        AutoReconnect reconnect=Modules.get().get(AutoReconnect.class);
+        if(hostiles.safeReconnect())reconnect.prepareSafeRetry(mc.getCurrentServer().ip,hostiles.reconnectSeconds());else reconnect.cancelSafeRetry();
+        try{dev.monocle.client.systems.bots.Bots.get().reportHostileLogout(name,mc.getCurrentServer().ip);}
+        catch(RuntimeException e){dev.monocle.client.MonocleClient.LOG.warn("[Workers] Hostile logout report failed; disconnecting anyway",e);}
+        trigger(Component.literal(reason),false,true);
+    }
+    private void trigger(Component reason, boolean reenableWhenHealthy) {trigger(reason,reenableWhenHealthy,false);}
+    private void trigger(Component reason, boolean reenableWhenHealthy,boolean hostile) {
+        if ((!isActive()&&!hostile) || disconnecting || mc.player == null) return;
+        boolean alert=!hostile&&action.get()==Action.AlertOnly;
         reserveSince = strangerSince = -1;
         lastTrigger = reason.getString();
-        guardStatus = action.get() == Action.AlertOnly ? "Warning" : "Disconnecting";
-        if (action.get() == Action.AlertOnly) {
+        guardStatus = alert ? "Warning" : "Disconnecting";
+        if (alert) {
             if (warningDue(mc.player.tickCount, lastWarningTick)) {
                 warning("Survival guard: %s", lastTrigger);
                 lastWarningTick = mc.player.tickCount;
@@ -337,17 +372,17 @@ public class AutoLog extends Module {
         text.append(reason);
 
         AutoReconnect autoReconnect = Modules.get().get(AutoReconnect.class);
-        if (autoReconnect.isActive() && toggleAutoReconnect.get()) {
+        if (autoReconnect.isActive() && toggleAutoReconnect.get() && !(hostile && autoReconnect.safeRetryActive())) {
             text.append(Component.literal("\n\nINFO - AutoReconnect was disabled").withColor(CommonColors.GRAY));
             autoReconnect.toggle();
         }
 
         mc.player.connection.handleDisconnect(new ClientboundDisconnectPacket(text));
 
-        if (reenableWhenHealthy && smartToggle.get()) {
+        if (!hostile && reenableWhenHealthy && smartToggle.get()) {
             if (isActive()) toggle();
             enableHealthListener();
-        } else if (toggleOff.get() && isActive()) {
+        } else if (!hostile && toggleOff.get() && isActive()) {
             toggle();
         }
     }

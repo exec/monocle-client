@@ -88,14 +88,16 @@ public class BowAimbot extends Module {
     @Override
     public void onDeactivate() {
         target = null;
-        wasPathing = false;
+        releasePathPause();
     }
+    private void releasePathPause(){if(wasPathing){PathManagers.resume(this);wasPathing=false;}}
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (!PlayerUtils.isAlive() || !itemInHand()) return;
-        if (!mc.player.getAbilities().instabuild && !InvUtils.find(itemStack -> itemStack.getItem() instanceof ArrowItem).found())
-            return;
+        if (!PlayerUtils.isAlive() || !itemInHand()) {releasePathPause();return;}
+        if (!mc.player.getAbilities().instabuild && !InvUtils.find(itemStack -> itemStack.getItem() instanceof ArrowItem).found()){
+            releasePathPause();return;
+        }
 
         target = TargetUtils.get(entity -> {
             if (entity == mc.player || entity == mc.getCameraEntity()) return false;
@@ -113,21 +115,19 @@ public class BowAimbot extends Module {
         }, priority.get());
 
         if (target == null) {
-            if (wasPathing) {
-                PathManagers.get().resume();
-                wasPathing = false;
-            }
+            releasePathPause();
             return;
         }
 
         if (mc.options.keyUse.isDown() && itemInHand()) {
-            if (pauseOnCombat.get() && PathManagers.get().isPathing() && !wasPathing) {
-                PathManagers.get().pause();
+            if(!pauseOnCombat.get())releasePathPause();
+            if (pauseOnCombat.get() && PathManagers.hasNavigation() && !wasPathing) {
+                PathManagers.pause(this);
                 wasPathing = true;
             }
 
             aim();
-        }
+        }else releasePathPause();
     }
 
     private boolean itemInHand() {

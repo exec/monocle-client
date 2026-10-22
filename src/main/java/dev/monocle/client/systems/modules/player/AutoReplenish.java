@@ -106,6 +106,7 @@ public class AutoReplenish extends Module {
             || modules.get(dev.monocle.client.systems.modules.combat.KillAura.class).attacking
             || modules.isActive(dev.monocle.client.systems.modules.world.HighwayBuilder.class)
             || modules.get(dev.monocle.client.systems.modules.world.PrinterHelper.class).controlsInventory()
+            || modules.get(dev.monocle.client.systems.modules.world.StashBuilder.class).controlsInventory()
             || modules.get(dev.monocle.client.systems.modules.world.AutoWither.class).controlsInventory()) {
             fillItems(); // Do not later restore a slot deliberately changed by another module.
             return;

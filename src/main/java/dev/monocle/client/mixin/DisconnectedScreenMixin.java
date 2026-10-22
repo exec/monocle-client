@@ -62,7 +62,7 @@ public abstract class DisconnectedScreenMixin extends Screen {
             reconnectBtn = new Button.Builder(Component.literal("Reconnect Now"), _ -> tryConnecting(true)).build();
             layout.addChild(reconnectBtn);
             pauseBtn = layout.addChild(new Button.Builder(Component.literal("Pause Retries"), _ -> {
-                if (!autoReconnect.isActive() || cancelled) {
+                if (!autoReconnect.retryEnabled() || cancelled) {
                     autoReconnect.enable();
                     cancelled = paused = false;
                     deadline = System.nanoTime() + (long) (autoReconnect.retryDelay() * 1_000_000_000L);
@@ -77,6 +77,7 @@ public abstract class DisconnectedScreenMixin extends Screen {
             }).build());
             layout.addChild(new Button.Builder(Component.literal("Cancel Retries"), _ -> {
                 cancelled = true;
+                autoReconnect.cancelSafeRetry();
                 autoReconnect.disable();
                 updateStatus();
             }).build());
@@ -89,9 +90,9 @@ public abstract class DisconnectedScreenMixin extends Screen {
         AutoReconnect autoReconnect = Modules.get().get(AutoReconnect.class);
         if (mc.gui.screen() != (Object) this || connecting) return;
         updateStatus();
-        if (!autoReconnect.isActive() || autoReconnect.lastServerConnection == null || paused || cancelled
+        if (!autoReconnect.retryEnabled() || autoReconnect.lastServerConnection == null || paused || cancelled
             || !autoReconnect.stopReason(details.reason()).isEmpty()) return;
-        if (System.nanoTime() >= deadline) tryConnecting(false);
+        if (System.nanoTime() >= Math.max(deadline, autoReconnect.safetyDeadline())) tryConnecting(false);
     }
 
     @Unique
@@ -99,11 +100,11 @@ public abstract class DisconnectedScreenMixin extends Screen {
         if (retryStatus == null) return;
         AutoReconnect reconnect = Modules.get().get(AutoReconnect.class);
         String stop = reconnect.stopReason(details.reason());
-        String status = cancelled ? "Cancelled" : !reconnect.isActive() ? "Auto Reconnect off"
+        String status = cancelled ? "Cancelled" : !reconnect.retryEnabled() ? "Auto Reconnect off"
             : !stop.isEmpty() ? stop : paused ? "Paused"
-            : String.format(java.util.Locale.ROOT, "Retry in %.1fs", Math.max(0, deadline - System.nanoTime()) / 1_000_000_000.0);
+            : String.format(java.util.Locale.ROOT, reconnect.safeRetryActive() ? "Safety retry in %.1fs" : "Retry in %.1fs", Math.max(0, Math.max(deadline, reconnect.safetyDeadline()) - System.nanoTime()) / 1_000_000_000.0);
         retryStatus.setMessage(Component.literal(status + " · Attempts: " + reconnect.attempts()));
-        pauseBtn.setMessage(Component.literal(!reconnect.isActive() || cancelled ? "Enable Retries" : paused ? "Resume Retries" : "Pause Retries"));
+        pauseBtn.setMessage(Component.literal(!reconnect.retryEnabled() || cancelled ? "Enable Retries" : paused ? "Resume Retries" : "Pause Retries"));
         pauseBtn.active = stop.isEmpty();
     }
 

@@ -17,3 +17,22 @@ logs
 .idea/*
 !.idea/copyright/*
 !.idea/scopes/*
+
+# Operator reports and runtime state are private, not project source.
+/BUILDING_RESERVES.txt
+/BUILDING_RESOURCES.txt
+/BUILDING_RESOURCES.md
+host-config.json
+host-tasks.json
+bot-worker-tasks.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc

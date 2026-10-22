@@ -55,6 +55,7 @@ public final class LitematicExporterTest {
         assert LitematicExporter.bounds(a, a, -64, 319).volume() == 1;
         assert LitematicExporter.bounds(BlockPos.ZERO, new BlockPos(199, 99, 99), 0, 319).volume() == LitematicExporter.MAX_BLOCKS;
         invalid(() -> LitematicExporter.bounds(BlockPos.ZERO, new BlockPos(200, 99, 99), 0, 319));
+        // Synthetic coordinates exercise the full Minecraft world-border bounds.
         invalid(() -> LitematicExporter.bounds(new BlockPos(-29_999_999, 0, -29_999_999), new BlockPos(29_999_999, 319, 29_999_999), 0, 319));
         invalid(() -> LitematicExporter.bounds(BlockPos.ZERO, new BlockPos(0, 320, 0), -64, 319));
         invalid(() -> LitematicExporter.bounds(BlockPos.ZERO, new BlockPos(0, -65, 0), -64, 319));

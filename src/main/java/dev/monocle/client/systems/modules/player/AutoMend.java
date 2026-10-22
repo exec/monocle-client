@@ -67,7 +67,7 @@ public class AutoMend extends Module {
         .defaultValue(95).range(1, 100).sliderRange(1, 100).build());
 
     private final Setting<Integer> start = sgGeneral.add(new IntSetting.Builder()
-        .name("start-durability").description("During highway work, land and begin a maintenance cycle when a Mending pickaxe or elytra reaches this durability percentage.")
+        .name("start-durability").description("During highway or stash work, land and begin maintenance when Mending gear reaches this durability percentage.")
         .defaultValue(30).range(1, 100).sliderRange(1, 100).build());
 
     private int source = -1, previousDamage = -1, idleTicks, queued;
@@ -76,6 +76,8 @@ public class AutoMend extends Module {
     private Object owner;
     private String status = "Ready";
     private boolean highwayCycle;
+    private Object workerOwner;
+    private boolean workerYielding, workerCycle;
 
     public AutoMend() {
         super(Categories.Player, "auto-mend", "Repairs the most damaged carried Mending gear first, preserving your offhand when possible.");
@@ -87,6 +89,7 @@ public class AutoMend extends Module {
         repaired = 0;
         idleTicks = queued = 0;
         highwayCycle = false;
+        workerOwner = null; workerYielding = workerCycle = false;
         status = "Ready";
     }
 
@@ -95,6 +98,7 @@ public class AutoMend extends Module {
         if (source >= 0 && !restore()) warning("Offhand restoration deferred to you: inventory changed or is busy. Original item was left in slot %d.", source + 1);
         clearOwnership();
         highwayCycle = false;
+        workerOwner = null; workerYielding = workerCycle = false;
     }
 
     private boolean inventoryReady() {
@@ -106,7 +110,7 @@ public class AutoMend extends Module {
     private boolean safetyBusy() {
         Offhand offhand = Modules.get().get(Offhand.class);
         AutoEat eat = Modules.get().get(AutoEat.class);
-        return !highwayCycle && Modules.get().get(AutoTotem.class).isLocked()
+        return !(highwayCycle || workerCycle) && Modules.get().get(AutoTotem.class).isLocked()
             || (offhand.isActive() && offhand.locked)
             || eat.eating || eat.isActive() && eat.shouldEat()
             || Modules.get().get(AutoGap.class).isEating()
@@ -115,6 +119,7 @@ public class AutoMend extends Module {
 
     @EventHandler(priority = EventPriority.LOW)
     private void onTick(TickEvent.Pre event) {
+        if (workerOwner != null && (!workerCycle || !workerYielding)) { status = "Waiting for stash maintenance handoff"; return; }
         if (!inventoryReady()) { status = "Waiting for inventory / item use"; return; }
         if (source >= 0 && (owner != mc.player || !ownsPair())) {
             warning("Repair handoff changed; leaving inventory untouched. Check your original offhand item.");
@@ -127,19 +132,21 @@ public class AutoMend extends Module {
         boolean highwayJob = highway.isActive() && highway.hasJob();
         if (highwayJob && (!highwayCycle || !highway.autoMendYielding())
             || Modules.get().get(PrinterHelper.class).controlsInventory()
+            || Modules.get().get(dev.monocle.client.systems.modules.world.StashBuilder.class).controlsInventory()
             || Modules.get().get(dev.monocle.client.systems.modules.world.AutoWither.class).controlsInventory() || mc.player.isFallFlying()) {
             status = "Waiting for building / flight to stop";
             return;
         }
         queued = 0;
         ItemStack chest = mc.player.getItemBySlot(EquipmentSlot.CHEST);
-        if (highwayCycle && eligible(chest) && highwayItem(chest)) {
+        if ((highwayCycle || workerCycle) && eligible(chest) && highwayItem(chest)) {
             observeRepair(chest);
             status = (idleTicks >= 100 ? "Waiting for repair XP: " : "Mending: ")
                 + chest.getHoverName().getString() + " " + (int) durability(chest) + "% / " + target.get() + "%";
             throwExperience();
             return;
         }
+        if (workerCycle) { workerCycle = false; status = "Stash elytra maintenance complete"; return; }
         int best = -1;
         for (int i = 0; i < 36; i++) {
             ItemStack stack = mc.player.getInventory().getItem(i);
@@ -208,8 +215,26 @@ public class AutoMend extends Module {
         return highwayCycle;
     }
 
+    /** Stash actions keep their inventory lease; only the equipped elytra is repaired. */
+    public boolean requestWorkerMaintenance(Object requester) {
+        if (!isActive() || mc.player == null || source >= 0 || highwayCycle) return false;
+        if (workerOwner != null && workerOwner != requester) return false;
+        workerOwner = requester; workerYielding = false;
+        if (!workerCycle) workerCycle = highwayNeedsRepair(mc.player.getItemBySlot(EquipmentSlot.CHEST), Math.min(start.get(), target.get()));
+        return workerCycle;
+    }
+
+    public void workerYielding(Object requester, boolean yielding) {
+        if (workerOwner == requester) workerYielding = yielding;
+    }
+
+    public void releaseWorkerMaintenance(Object requester) {
+        if (workerOwner == requester) { workerOwner = null; workerYielding = workerCycle = false; }
+    }
+
     static boolean highwayNeedsRepair(ItemStack stack, int threshold) {
-        return highwayItem(stack) && belowTarget(stack, threshold) && Utils.hasEnchantments(stack, Enchantments.MENDING);
+        return highwayItem(stack) && belowTarget(stack, threshold) && stack.getOrDefault(DataComponents.ENCHANTMENTS, net.minecraft.world.item.enchantment.ItemEnchantments.EMPTY)
+            .entrySet().stream().anyMatch(e -> e.getKey().is(Enchantments.MENDING) && e.getIntValue() > 0);
     }
 
     private void observeRepair(ItemStack stack) {
@@ -225,7 +250,8 @@ public class AutoMend extends Module {
         if (!exp.found() || mc.gameMode == null) { status = "Put experience bottles in the hotbar to continue highway maintenance"; return; }
         int previous = mc.player.getInventory().getSelectedSlot();
         Rotations.rotate(mc.player.getYRot(), 90, () -> {
-            if (!isActive() || !highwayCycle || mc.gameMode == null || !mc.player.getInventory().getItem(exp.slot()).is(Items.EXPERIENCE_BOTTLE)) return;
+            if (!isActive() || !(highwayCycle || workerCycle && workerYielding) || !inventoryReady() || safetyBusy()
+                || !mc.player.isAlive() || mc.player.isFallFlying() || mc.gameMode == null || !mc.player.getInventory().getItem(exp.slot()).is(Items.EXPERIENCE_BOTTLE)) return;
             InvUtils.swap(exp.slot(), false);
             mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
             InvUtils.swap(previous, false);

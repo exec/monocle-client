@@ -23,7 +23,9 @@ public final class BotHistory {
     }
     public static boolean taskFinished(JsonObject task, boolean pendingReturn) {
         return QueuePolicy.terminal(TaskWire.text(task, "status")) && !task.has("highway") && !task.has("nativeDefinition") && !task.has("hostOriginal") && !pendingReturn
-            && task.getAsJsonObject("runs").entrySet().stream().allMatch(e -> QueuePolicy.terminal(TaskWire.text(e.getValue().getAsJsonObject(), "status")));
+            && task.getAsJsonObject("runs").entrySet().stream().allMatch(e -> TaskWire.flag(task,"cancelled")
+                ? QueuePolicy.cancellationAcknowledged(TaskWire.text(e.getValue().getAsJsonObject(),"status"))
+                : QueuePolicy.terminal(TaskWire.text(e.getValue().getAsJsonObject(), "status")));
     }
     public static boolean nativeFinished(JsonObject record) {
         return java.util.Set.of("Complete", "Cancelled").contains(TaskWire.text(record, "status")) && TaskWire.text(record, "crew").isEmpty();

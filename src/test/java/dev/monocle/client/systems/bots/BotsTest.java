@@ -32,7 +32,11 @@ public final class BotsTest {
         BotRuntimeTest.run();
         BotProfilesTest.run();
         BotActionsTest.main(args);
+        dev.monocle.client.pathing.StashNavigationTest.run();
+        dev.monocle.client.pathing.PathPauseTest.run();
+        BotStashObserverTest.run();
         FightEventStoreTest.run();
+        WorkerCombatTrackerTest.run();
         var banterLocal = UUID.randomUUID(); var banterOther = UUID.randomUUID();
         assert BotBanter.winner(banterLocal, java.util.Map.of(banterLocal, 3, banterOther, 5)).equals(banterOther);
         assert BotBanter.winner(banterOther, java.util.Map.of(banterLocal, 3, banterOther, 5)) == null;
@@ -98,6 +102,14 @@ public final class BotsTest {
         credentials();
 
         ClassModel bots = compiled("systems/bots/Bots");
+        var rwpMovement = calls(method(bots, "tickRwpTravel"));
+        assert rwpMovement.containsAll(List.of("dev/monocle/coordinator/RwpWorkerConnection.activeMovement",
+            "dev/monocle/coordinator/RwpWorkerConnection.nativeMovement", "dev/monocle/client/systems/bots/BotActions.start",
+            "dev/monocle/client/systems/bots/BotScheduler.hasWork", "dev/monocle/coordinator/RwpWorkerConnection.acknowledgeMovementCancellation"))
+            : "RWP movement must reuse native actions, guard native ownership and acknowledge client-thread cleanup";
+        assert calls(method(bots, "releaseRwpMovement")).containsAll(List.of("dev/monocle/client/systems/bots/BotActions.requestSuspend",
+            "dev/monocle/client/systems/bots/BotActions.tick", "dev/monocle/client/systems/bots/Bots.clearRwpTravel"))
+            : "RWP cancellation must use the native landing handoff before clearing its controller";
         assert bots.superclass().orElseThrow().asInternalName().equals("dev/monocle/client/systems/System")
             : "Bots must persist as an independent system, not a module";
         assert calls(method(compiled("systems/Systems"), "init")).contains("dev/monocle/client/systems/bots/Bots.<init>");
@@ -320,6 +332,12 @@ public final class BotsTest {
         assert calls(method(sharedCrew,"startPrepared")).stream().anyMatch(c -> c.endsWith(".hostIdentity"))
             : "Journal host identity is distinct from an offline-server player UUID";
         assert calls(method(crew,"hostIdentity")).contains("net/minecraft/client/User.getProfileId");
+        var exporterTick=calls(method(compiled("systems/bots/BotStashExporter"),"tick"));
+        assert exporterTick.stream().anyMatch(c->c.endsWith(".getUUID"))&&!exporterTick.contains("net/minecraft/client/User.getProfileId") : "Export outbox uses the same in-world worker UUID as stash definitions, including offline-mode servers";
+        assert exporterTick.stream().noneMatch(c->c.startsWith("java/nio/file/"))&&exporterTick.contains("java/util/concurrent/CompletableFuture.isDone") : "Outbox disk work stays off the game thread";
+        var observer=compiled("systems/bots/BotStashObserver");var observerTick=calls(method(observer,"tick"));
+        assert observerTick.stream().noneMatch(c->c.equals("dev/monocle/coordinator/StashCatalog.watchRecord")||c.equals("dev/monocle/coordinator/StashCatalog.localWatches")) : "Catalog hashing and disk reads stay off the game thread";
+        assert calls(observer).contains("dev/monocle/coordinator/StashCatalog.localWatches")&&!calls(observer).contains("dev/monocle/coordinator/StashCatalog.list") : "Passive watches skip operator aggregation and duplicate reads";
         var drain = calls(method(crew, "drain"));
         assert drain.indexOf("dev/monocle/client/systems/modules/misc/swarm/SwarmCrew.reportedMining") < drain.indexOf("dev/monocle/client/systems/bots/BotScheduler.observeWorker")
             : "Scheduler observations are published only after native validation";

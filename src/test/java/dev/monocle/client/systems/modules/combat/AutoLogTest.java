@@ -41,9 +41,16 @@ public final class AutoLogTest {
         assert !AutoLog.confirmed(120, 100, 1.01) && AutoLog.confirmed(121, 100, 1.01);
         assert AutoLog.warningDue(0, -200) && !AutoLog.warningDue(199, 0) && AutoLog.warningDue(200, 0);
         assert AutoLog.warningDue(0, 1000) : "A new world must not inherit the old warning cooldown";
+        var hostiles=new dev.monocle.coordinator.KnownHostiles(java.nio.file.Files.createTempDirectory("auto-log-hostile-").resolve("hostiles.json"));
+        var enemy=java.util.UUID.randomUUID();var entry=hostiles.add("example.org","Enemy",enemy.toString());
+        var frame=com.google.gson.JsonParser.parseString("{warning:{server:'example.org',sighting:{player:{uuid:'"+enemy+"',name:'Enemy'}}}}").getAsJsonObject();
+        assert !AutoLog.hostileWarningMatches(hostiles,frame,"example.org") : "Guard off means warning only";
+        hostiles.policy(true,true,300);assert AutoLog.hostileWarningMatches(hostiles,frame,"EXAMPLE.org:25565");
+        assert !AutoLog.hostileWarningMatches(hostiles,frame,"another.org") : "Never disconnect a client on a different server";
+        hostiles.remove(entry.get("id").getAsString());assert !AutoLog.hostileWarningMatches(hostiles,frame,"example.org") : "Forgiveness overrides an in-flight alarm";
         try (var bytes = AutoLog.class.getResourceAsStream("AutoLog.class")) {
             var compiled = java.lang.classfile.ClassFile.of().parse(bytes.readAllBytes());
-            var trigger = compiled.methods().stream().filter(m -> m.methodName().equalsString("trigger")).findFirst().orElseThrow();
+            var trigger = compiled.methods().stream().filter(m -> m.methodName().equalsString("trigger") && m.methodTypeSymbol().parameterCount()==3).findFirst().orElseThrow();
             var instructions = trigger.code().orElseThrow().elementList();
             int warning = -1, disconnect = -1;
             for (int i = 0; i < instructions.size(); i++) {
@@ -58,6 +65,24 @@ public final class AutoLogTest {
             var receive = compiled.methods().stream().filter(m -> m.methodName().equalsString("onReceivePacket")).findFirst().orElseThrow();
             assert receive.code().orElseThrow().elementList().stream().anyMatch(e -> e instanceof java.lang.classfile.instruction.InvokeInstruction call && call.name().equalsString("execute"))
                 : "Packet-driven actions must be dispatched to the client thread";
+            var tick = compiled.methods().stream().filter(m -> m.methodName().equalsString("onTick")).findFirst().orElseThrow();
+            var calls = tick.code().orElseThrow().elementList().stream()
+                .filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
+            assert calls.contains("isInLobby") && calls.indexOf("reserveReason") < calls.indexOf("isInLobby")
+                && calls.indexOf("isInLobby") < calls.indexOf("isFriend")
+                : "Lobby Skip exempts only nearby strangers after health and gear checks, not the whole survival guard";
+            var hostile = compiled.methods().stream().filter(m -> m.methodName().equalsString("checkKnownHostiles")).findFirst().orElseThrow();
+            var hostileCalls = hostile.code().orElseThrow().elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c -> c.name().stringValue()).toList();
+            assert hostileCalls.indexOf("isInLobby")<hostileCalls.indexOf("match") && hostileCalls.indexOf("match")<hostileCalls.indexOf("disconnectForHostile") : "Detect lobby before matching";
+            assert !hostileCalls.contains("isActive") : "Host policy must survive inactive Auto Log and job/profile changes";
+            var shared=compiled.methods().stream().filter(m->m.methodName().equalsString("checkHostileWarning")).findFirst().orElseThrow();
+            var sharedCalls=shared.code().orElseThrow().elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance).map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c->c.name().stringValue()).toList();
+            assert sharedCalls.indexOf("isInLobby")<sharedCalls.indexOf("hostileWarningMatches")&&sharedCalls.indexOf("hostileWarningMatches")<sharedCalls.indexOf("disconnectForHostile");
+            var logout=compiled.methods().stream().filter(m->m.methodName().equalsString("disconnectForHostile")).findFirst().orElseThrow();
+            var logoutCalls=logout.code().orElseThrow().elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance).map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c->c.name().stringValue()).toList();
+            assert logoutCalls.indexOf("prepareSafeRetry")<logoutCalls.indexOf("reportHostileLogout")&&logoutCalls.indexOf("reportHostileLogout")<logoutCalls.indexOf("trigger") : "Both paths prepare safety backoff and report before logout";
         }
         System.out.println("Auto Log checks passed: carried totem counts, gear reserves, confirmation windows, warning throttling and client-thread/alert-only guards.");
     }

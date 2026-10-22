@@ -30,10 +30,12 @@ Root `build` compiles the client, coordinator core, and host; runs their automat
 ## Documentation
 
 - [Road to 1.0 and staged testing](docs/v1-roadmap.md)
+- [Unattended reliability batches and fault replay](docs/worker-reliability.md)
 - [Workers control room and crew operation](docs/bots.md)
 - [Workflow API](docs/bot-workflows.md)
 - [Standalone host](host-service/README.md)
 - [Operator WebUI](docs/bot-webui.md)
+- [Discord owner notifications](docs/discord-notifications.md)
 - [Worker transport and API](docs/bot-web-transport.md)
 - [Telemetry and freeze diagnosis](docs/bot-telemetry.md)
 - [Stash Manager](docs/stash-manager.md)

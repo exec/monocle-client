@@ -151,23 +151,50 @@ public final class BotTaskScreen extends WindowScreen {
                 parameters=()->{JsonObject p=new JsonObject();p.addProperty("name",name.get());p.addProperty("homeName",home.get());p.addProperty("homeWarmupTicks",warmup.get()*20);p.addProperty("homeCooldownTicks",cooldown.get()*1200);p.addProperty("scanMode",scanMode.get());bounds.forEach((key,value)->p.addProperty(key,value.get()));return dev.monocle.coordinator.StashCatalog.plan(p);};
                 arguments.add(theme.label("Column Map opens only the bottom chest layer and assumes upper chests match, without counting their stock. Full observes contents throughout the cuboid. Workers inspect disjoint containers; no items or terrain are changed.",contentWidth-20));
             }
-            case "task-kit-delivery", "task-kit-remove-incomplete" -> {
+            case "task-kit-delivery", "task-kit-remove-incomplete", "task-stash-transfer", "task-stash-transfer-team" -> {
+                boolean team=selectedWorkflow.equals("task-stash-transfer-team"),transfer=team||selectedWorkflow.equals("task-stash-transfer");
                 boolean incompleteJob=selectedWorkflow.equals("task-kit-remove-incomplete");
-                WTextBox stash=string(fields,"Source stash name","Main stash"),typeId=string(fields,"Shulker Type ID","");
-                WIntEdit count=integer(fields,"Kit count / boxes per trip",1,1,36);
-                fields.add(theme.label("Transfer all (stash destination)"));var all=fields.add(theme.checkbox(false)).widget();fields.row();
+                WDropdown<String> transferMode=null;List<WTextBox[]> routeInputs=new ArrayList<>();
+                if(transfer&&!team){
+                    fields.add(theme.label("Transfer mode"));transferMode=fields.add(theme.dropdown(new String[]{"Drain types","Round Robin","Mixed loads"},"Drain types")).expandX().widget();fields.row();
+                    WSection routes=arguments.add(theme.section("Round Robin routes",false)).expandX().widget();
+                    routes.add(theme.label("One load per route, then repeat. Each source needs a full non-lazy scan. Same-kit routes must share a destination.",contentWidth-20));
+                    Runnable addRoute=()->{
+                        if(routeInputs.size()>=16)return;
+                        var cell=routes.add(theme.table()).expandX();WTable table=cell.widget();
+                        WTextBox[] inputs={string(table,"Source stash",""),string(table,"Shulker Type ID",""),string(table,"Destination stash","")};routeInputs.add(inputs);
+                        var remove=table.add(theme.button("Remove route")).widget();remove.action=()->{routeInputs.remove(inputs);routes.remove(cell);};
+                    };
+                    var add=routes.add(theme.button("Add route")).widget();add.action=addRoute;addRoute.run();addRoute.run();
+                }
+                final WDropdown<String> mode=transferMode;
+                WTextBox stash=string(fields,"Source stash name","Main stash"),typeId=string(fields,transfer?"Kit IDs (comma-separated; blank = all types)":"Shulker Type ID","");
+                WIntEdit count=integer(fields,"Kit count / boxes per trip",transfer?36:1,1,36);
+                fields.add(theme.label("Transfer all (stash destination)"));var all=fields.add(theme.checkbox(transfer)).widget();all.disabled=transfer;fields.row();
                 fields.add(theme.label("Include incomplete kits"));var includeIncomplete=fields.add(theme.checkbox(false)).widget();fields.row();
-                fields.add(theme.label("Destination"));var destination=fields.add(theme.dropdown(new String[]{"Player","Ender Chest","Stash","Carry"},incompleteJob?"Carry":"Player")).expandX().widget();fields.row();
+                fields.add(theme.label("Deposit already-carried matching kits first (solo transfer only)"));var depositCarried=fields.add(theme.checkbox(false)).widget();depositCarried.disabled=!transfer||team;fields.row();
+                if(mode!=null)mode.action=()->{depositCarried.disabled=mode.get().equals("Mixed loads");if(depositCarried.disabled)depositCarried.checked=false;};
+                WIntEdit tpaWarmup=team?integer(fields,"TPA warmup (ticks; starts with leader /home)",300,0,72_000):null;
+                if(team){fields.add(theme.label("Select 2–3 workers. The first selected worker leads; followers TPA as soon as its /home is sent.",contentWidth-20));fields.row();}
+                fields.add(theme.label("Destination"));var destination=fields.add(theme.dropdown(transfer?new String[]{"Stash"}:new String[]{"Player","Ender Chest","Stash","Carry"},transfer?"Stash":incompleteJob?"Carry":"Player")).expandX().widget();fields.row();
                 WTextBox recipient=string(fields,"Recipient UUID (Player only)",""),recipientName=string(fields,"Recipient username (Player only)","");
                 WTextBox targetStash=string(fields,"Destination stash (Stash only)","");
                 all.action=()->{if(all.checked){count.set(36);destination.set("Stash");}};
                 parameters=()->{
+                    if(mode!=null&&mode.get().equals("Round Robin")){
+                        JsonObject a=new JsonObject();JsonArray routes=new JsonArray();
+                        for(WTextBox[] row:routeInputs){JsonObject route=new JsonObject();route.addProperty("name",row[0].get().strip());route.addProperty("kitTypeId",UUID.fromString(row[1].get().strip()).toString());route.addProperty("targetStashName",row[2].get().strip());routes.add(route);}
+                        a.add("routes",routes);a.addProperty("count",count.get());a.addProperty("includeIncomplete",includeIncomplete.checked);a.addProperty("depositCarried",depositCarried.checked);return a;
+                    }
                     JsonObject source=null;String world=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();
                     for(var value:dev.monocle.client.systems.modules.Modules.get().get(StashManager.class).catalog()){
                         JsonObject candidate=value.getAsJsonObject();if(candidate.get("name").getAsString().equals(stash.get())&&candidate.get("scope").getAsString().equals(world)){source=candidate;break;}
                     }
                     if(source==null)throw new IllegalArgumentException("Save or import the source stash definition first");
                     JsonObject a=source.getAsJsonObject("bounds").deepCopy();a.addProperty("name",stash.get());a.addProperty("kitTypeId",typeId.get().strip());a.addProperty("count",count.get());a.addProperty("destination",destination.get());
+                    if(transfer){a.remove("kitTypeId");a.addProperty("depositCarried",depositCarried.checked);if(!typeId.get().isBlank()){JsonArray ids=new JsonArray();for(String id:typeId.get().split(","))ids.add(UUID.fromString(id.strip()).toString());a.add("kitTypeIds",ids);}}
+                    if(mode!=null&&mode.get().equals("Mixed loads")){if(!a.has("kitTypeIds")||a.getAsJsonArray("kitTypeIds").size()<2||a.getAsJsonArray("kitTypeIds").size()>16)throw new IllegalArgumentException("Select 2–16 kit IDs for mixed loads");a.addProperty("mixedLoads",true);}
+                    if(team){if(targets.size()<2||targets.size()>3)throw new IllegalArgumentException("Choose two or three transfer workers");a.addProperty("leader",targets.iterator().next().toString());a.addProperty("tpaWarmupTicks",tpaWarmup.get());}
                     if(incompleteJob)a.addProperty("incomplete",true);
                     a.addProperty("transferAll",all.checked);a.addProperty("includeIncomplete",includeIncomplete.checked);
                     if(destination.get().equals("Player")){a.addProperty("recipient",recipient.get().strip());a.addProperty("recipientName",recipientName.get().strip());}
@@ -307,7 +334,7 @@ public final class BotTaskScreen extends WindowScreen {
         var cancel = controls.add(theme.confirmedButton("Cancel job", "Cancel this whole job?")).widget();
         cancel.action = () -> perform(() -> { requireHost(); bots.tasks().cancel(id); }, "Cancellation requested. Native supply recovery remains protected.");
         var guidance=add(theme.label("",contentWidth)).expandX().widget();
-        controlRefresh.add(()->{var t=bots.tasks().management(id);boolean dead=current().history(),paused=t.has("paused")&&t.get("paused").getAsBoolean();pause.disabled=dead||paused;resume.disabled=dead;cancel.disabled=dead;guidance.set(t.get("operatorGuidance").getAsString());});
+        controlRefresh.add(()->{var t=bots.tasks().management(id);boolean dead=current().history(),paused=t.has("paused")&&t.get("paused").getAsBoolean();pause.disabled=dead||paused;resume.disabled=dead;cancel.disabled=dead;guidance.set(t.get("operatorGuidance").getAsString()+"\nLatest command: "+t.get("commandReceipt").getAsString());});
         historyVisible = false;
         history = add(theme.verticalList()).expandX().widget();
         refreshHistory(task);
@@ -315,15 +342,16 @@ public final class BotTaskScreen extends WindowScreen {
         priorityRow.add(theme.label("Default priority"));
         priority = priorityRow.add(theme.intEdit(task.priority(), -1000, 1000, true)).expandX().widget();
         priorityRow.add(theme.button("Apply")).widget().action = () -> perform(() -> { requireHost(); bots.tasks().priority(id, priority.get()); }, "Task priority updated. Preemption still waits for a safe checkpoint.");
-        WSection workers = add(theme.section("Per-worker priority", false)).expandX().widget();
+        WSection workers = add(theme.section("Worker status and controls", true)).expandX().widget();
         for (UUID worker : task.targets()) {
             WHorizontalList row = workers.add(theme.horizontalList()).expandX().widget();
             row.add(theme.label(workerName(bots, worker))).expandX();
             WIntEdit value = row.add(theme.intEdit(task.workerPriorities().getOrDefault(worker, task.priority()), -1000, 1000, true)).widget();
             row.add(theme.button("Apply")).widget().action = () -> perform(() -> { requireHost(); bots.tasks().workerPriority(id, worker, value.get()); }, "Worker-specific priority updated.");
             var detach=workers.add(theme.button("Detach "+workerName(bots,worker))).expandX().widget();
-            detach.action=()->perform(()->{var r=bots.tasks().management(id).getAsJsonObject("runs").getAsJsonObject(worker.toString());bots.tasks().detach(id,worker,!r.has("operatorDetached")||!r.get("operatorDetached").getAsBoolean());},"Participation updated. Wait for the worker's checkpoint acknowledgement.");
-            controlRefresh.add(()->{var r=bots.tasks().management(id).getAsJsonObject("runs").getAsJsonObject(worker.toString());boolean away=r.has("operatorDetached")&&r.get("operatorDetached").getAsBoolean();detach.set((away?"Rejoin ":"Detach ")+workerName(bots,worker));detach.disabled=current().history()||Set.of("Complete","Cancelled","Failed").contains(r.get("status").getAsString());});
+            detach.action=()->perform(()->{var r=bots.tasks().management(id).getAsJsonObject("runs").getAsJsonObject(worker.toString());bots.tasks().detach(id,worker,!(dev.monocle.coordinator.TaskWire.flag(r,"operatorDetached")||dev.monocle.coordinator.TaskWire.flag(r,"stallPaused")));},"Participation updated. Wait for the worker's checkpoint acknowledgement.");
+            var progress=workers.add(theme.label("",contentWidth)).expandX().widget();
+            controlRefresh.add(()->{var r=bots.tasks().management(id).getAsJsonObject("runs").getAsJsonObject(worker.toString());boolean away=dev.monocle.coordinator.TaskWire.flag(r,"operatorDetached")||dev.monocle.coordinator.TaskWire.flag(r,"stallPaused");detach.set((away?"Rejoin ":"Detach ")+workerName(bots,worker));detach.disabled=current().history()||Set.of("Complete","Cancelled","Failed").contains(r.get("status").getAsString());progress.set(r.has("actionProgress")?dev.monocle.coordinator.ActionProgress.describe(r.getAsJsonObject("actionProgress")):"Action progress unavailable on this worker");});
         }
         controlRefresh.forEach(Runnable::run);
     }

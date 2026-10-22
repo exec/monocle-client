@@ -563,6 +563,7 @@ public class Modules extends System<Modules> {
         add(new Nuker());
         add(new PacketMine());
         add(new SchematicSelector());
+        add(new StashBuilder());
         add(new PrinterHelper());
         add(new StashFinder());
         add(new StashManager());

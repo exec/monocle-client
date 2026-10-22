@@ -190,6 +190,11 @@ public class BaritonePathManager implements IPathManager {
         }
     }
 
+    /** Our temporary pause preserves the underlying goal; it is not a replacement job. */
+    public static boolean isPauseProcess(Object process) {
+        return process instanceof BaritonePathManager.BaritoneProcess;
+    }
+
     private class BaritoneProcess implements IBaritoneProcess {
         @Override
         public boolean isActive() {
