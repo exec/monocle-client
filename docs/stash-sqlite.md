@@ -4,7 +4,7 @@
 
 0.15.0 replaces stash JSON snapshots and delta directories with SQLite on workers, ingame hosts and standalone hosts. There is **no automatic import or migration**. Redefine each stash, including its required `/home` name, then scan or observe it normally. Existing JSON files remain untouched but are not listed or used for stock decisions.
 
-Old host-summary caches, passive-update outboxes and solo-export outboxes are not replayed. The new cache/outbox names contain `sqlite-v1`. Existing job/configuration/history JSON, kit-category definitions and credentials are otherwise unchanged. Cancel old stash jobs before upgrading; redefine storage and create new jobs afterward. Do not resume pre-0.15.0 scans to populate the fresh catalog.
+Old host-summary caches, passive-update outboxes and solo-export outboxes are not replayed. The new cache/outbox names contain `sqlite-v1`. Existing job/configuration/history JSON, kit-category definitions and credentials were otherwise unchanged in 0.15.0; execution journals migrate separately in 0.15.44 as described below. Cancel pre-0.15.0 stash jobs before upgrading; redefine storage and create new jobs afterward. Do not resume pre-0.15.0 scans to populate the fresh catalog.
 
 ## Layout
 
@@ -40,7 +40,21 @@ The standalone host refreshes its display and native-worker watch catalogs on a 
 
 The allocator skips columns with observed, non-inferred full chest rows at every height through the definition's top, as well as durable full-column markers from exhausted deposits. A full bottom chest alone is not sufficient proof. Known-full columns are not revisited as a last resort. Confirmed withdrawals remove matching full-column markers; newer observations of free space also restore eligibility. A reserved bottom chest invalidated by a confirmed withdrawal may be reopened for validation, but still requires a compatible server-confirmed observation before any deposit is permitted.
 
+### Passive observation reads (0.15.45)
+
+Local watch refreshes read only definition metadata before excluding other crews or baselines already supplied by a connected host. Eligible unchanged stashes reuse bounded compact watch snapshots; committed local or external SQL changes and database reopenings invalidate them. Changed eligible watches still read authoritative rows for exact observation hashes, and callers receive detached copies. Removed stashes disappear from the listing and new storage is picked up after a commit.
+
+Queued local observations load only the affected chest and normal metadata before ingestion, retaining double-chest alias handling in the shared transaction. Host-owned local mirrors keep their existing rebase behavior; standalone local watches retain stale-basis conflict checks. The durable outbox still commits before local application or network export. This client optimization needs no schema migration, host update or rescan; it does not change the host's separate summary/watch-frame refresh path.
+
 ## Inspection and backups
+
+### Execution checkpoints (0.15.44)
+
+The worker's `bot-worker-tasks.sqlite` and standalone host's `host-tasks.sqlite` store execution recovery separately from stash catalogs. Each has `records` (one dynamic JSON row per retained run/task), `packages` (immutable workflow/profile packages keyed by SHA-256), and `metadata` (original worker settings or public report receipts). A checkpoint writes changed rows in one transaction; unchanged history and packages are not serialized again. Inventory intent commits still precede clicks, and durable receipts still precede acknowledgement. WAL and `synchronous=FULL` remain enabled.
+
+On first use, the existing `bot-worker-tasks.json` or `host-tasks.json` is validated and imported, including pending native operations and cargo state. This import **does preserve execution history**, unlike the 0.15.0 stash catalog reset. Legacy JSON is left intact but stops receiving updates. A small `.sqlite.initialized` companion prevents fallback to that stale JSON if the database is later removed. Treat the database, its marker and any WAL/SHM files as one recovery set. Deletion, replacement or external modification stops execution for inspection.
+
+Do not downgrade by simply reinstalling an older JAR: after new execution, its legacy JSON is stale. Recovery into an older version requires an explicit export of the current SQL checkpoint while both runtimes are stopped. Configurations, delivery outboxes and other infrequent JSON stores are not changed by this update. SQL values are still JSON for the individual record, rather than a new public API format.
 
 Open an idle copy with a SQLite browser or `sqlite3`:
 

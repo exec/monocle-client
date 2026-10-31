@@ -32,6 +32,7 @@ Root `build` compiles the client, coordinator core, and host; runs their automat
 - [Road to 1.0 and staged testing](docs/v1-roadmap.md)
 - [Unattended reliability batches and fault replay](docs/worker-reliability.md)
 - [Workers control room and crew operation](docs/bots.md)
+- [Optional headless workers](docs/headless-workers.md)
 - [Workflow API](docs/bot-workflows.md)
 - [Standalone host](host-service/README.md)
 - [Operator WebUI](docs/bot-webui.md)

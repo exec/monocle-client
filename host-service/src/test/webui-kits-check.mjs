@@ -17,12 +17,24 @@ stashes[1].deduplicatedKitCounts=stashes[1].kitCounts;stashes[1].deduplicatedIte
 stashes[0].items=stashes[1].items={'minecraft:obsidian':64};
 const workers=ids.map((id,i)=>({id,name:['Courier','Courier2','Recipient'][i],crew:'Default',crewId:'public-crew',scope,connected:true,reconciled:true,current:'',lastSeen:Date.now()}));
 const state={status:'Running',workers:[...workers,{...workers[0],id:'offline',connected:false},{...workers[0],id:'foreign',crew:'Elsewhere'},{...workers[0],id:'portable',publicProtocol:true}],stashes,crews:['Default'],crewLabels:{Default:'Builders'},highways:{},tasks:[],history:[],activity:[],workflows:[]};
-let prepareCount=0,posted=[],failFirst=true,reservations=[],failReservation=true,kitbotSaved;
+let prepareCount=0,posted=[],failFirst=true,reservations=[],failReservation=true,kitbotSaved,serversSaved;
+const bankKeys=[],bankAccounts=[],bankAdjustments=[];let failBankAdjustment=true;
+let bankReviewOrder=null;const reviewCalls=[];
 const dbs=new Map(stashes.map(s=>[s.id,{...s,containers:{cell:{x:s.bounds.minX,y:100,z:0,status:'observed',items:{},shulkers:[{...s.kitTypes[kitId],quantity:3}],observedAt:Date.now()},changed:{x:s.bounds.minX,y:101,z:0,status:'unscanned',withdrawnKitTypes:[kitId],shulkers:[]},empty1:{x:s.bounds.minX+1,y:100,z:0,block:'minecraft:chest',status:'observed',items:{},shulkers:[]},empty2:{x:s.bounds.minX+2,y:100,z:0,block:'minecraft:chest',status:'observed',items:{},shulkers:[]}}}]));
 try {
   await page.route('**/ui/api/**',async route=>{
     const req=route.request(),url=new URL(req.url()),path=url.pathname.replace('/ui/api/','');let reply;
     if(path==='status')reply=state;
+    else if(path==='v1/balances')reply={items:bankAccounts};
+    else if(path==='v1/balance-api-keys'){
+      if(req.method()==='GET')reply={items:bankKeys};
+      else{const input=req.postDataJSON();assert.deepEqual(input.scopes,['balances:read']);assert.ok(req.headers()['idempotency-key']);const key={id:ids[0],name:input.name,scopes:input.scopes,createdAt:Date.now(),revoked:false};bankKeys.push(key);reply={...key,token:'synthetic-one-time-bank-secret'};}
+    }
+    else if(path.startsWith('v1/balance-api-keys/')){assert.equal(req.method(),'DELETE');bankKeys[0].revoked=true;reply={id:ids[0],revoked:true};}
+    else if(path===`v1/balances/${ids[2]}/transactions`){
+      if(req.method()==='GET')reply={items:bankAdjustments.map(a=>({...a.body,name:'Recipient',delta:a.body.amount,balance:a.body.amount,updatedAt:Date.now()}))};
+      else{const change={body:req.postDataJSON(),key:req.headers()['idempotency-key']};bankAdjustments.push(change);if(!bankAccounts.length)bankAccounts.push({playerId:ids[2],name:'Recipient',balance:change.body.amount});if(failBankAdjustment){failBankAdjustment=false;await route.abort('failed');return;}reply=bankAccounts[0];}
+    }
     else if(path==='v1/stashes?limit=100'||path==='v1/stashes')reply={items:stashes};
     else if(path.endsWith('/column-reservations')){
       assert.equal(req.method(),'PUT');const db=dbs.get(path.split('/')[2]),s=stashes.find(s=>s.id===db.id);reservations.push({body:req.postDataJSON(),key:req.headers()['idempotency-key'],revision:req.headers()['if-match']});
@@ -34,7 +46,7 @@ try {
     else if(path.startsWith('v1/stashes/stash-'))reply=dbs.get(path.split('/').at(-1));
     else if(path.startsWith('v1/workers/'))reply=workers.find(w=>w.id===path.split('/').at(-1));
     else if(path==='v1/players/Recipient')reply={id:ids[2],name:'Recipient'};
-    else if(path==='control'){const op=req.postDataJSON().op;if(op==='kit-categories-get')reply={categories:{'55555555-5555-4555-8555-555555555555':{id:'55555555-5555-4555-8555-555555555555',name:'Building',slug:'building',mode:'Kits',members:[kitId]}},revision:'categories-fixture',stock:{[kitId]:{...type,complete:250}}};else if(op==='kitbot-get')reply={config:{},requests:{},revision:'bot-fixture'};else if(op==='kitbot-save'){assert.equal(req.postDataJSON().expected,'bot-fixture');kitbotSaved=req.postDataJSON().config;reply={config:kitbotSaved,revision:'saved-bot-fixture'};}else {assert.equal(op,'workflow-prepare');prepareCount++;reply={version:1,entry:'task-kit-delivery',programs:{},profiles:{},highways:{}};}}
+    else if(path==='control'){const op=req.postDataJSON().op;if(op==='kit-credit-settle'){reviewCalls.push(req.postDataJSON());assert.equal(reviewCalls.at(-1).id,bankReviewOrder.id);assert.equal(reviewCalls.at(-1).delivered,1);if(bankReviewOrder.creditSettlement!=='Settled'){bankReviewOrder.creditSettlement='Settled';bankAccounts[0].balance+=1;}reply={creditSettlement:'Settled',creditsRefunded:1};}else if(op==='server-aliases-save'){serversSaved=req.postDataJSON();state.minecraftServers={revision:'updated-aliases',servers:serversSaved.servers};reply=state.minecraftServers;}else if(op==='kit-categories-get')reply={categories:{'55555555-5555-4555-8555-555555555555':{id:'55555555-5555-4555-8555-555555555555',name:'Building',slug:'building',mode:'Kits',members:[kitId]}},revision:'categories-fixture',stock:{[kitId]:{...type,complete:250}}};else if(op==='kitbot-get')reply={config:{},requests:bankReviewOrder?{[bankReviewOrder.id]:bankReviewOrder}:{},revision:'bot-fixture'};else if(op==='kitbot-save'){assert.equal(req.postDataJSON().expected,'bot-fixture');kitbotSaved=req.postDataJSON().config;reply={config:kitbotSaved,revision:'saved-bot-fixture'};}else {assert.equal(op,'workflow-prepare');prepareCount++;reply={version:1,entry:'task-kit-delivery',programs:{},profiles:{},highways:{}};}}
     else if(path==='v1/jobs'){
       posted.push({body:req.postDataJSON(),key:req.headers()['idempotency-key']});
       if(failFirst){failFirst=false;await route.abort('failed');return;}
@@ -95,7 +107,13 @@ try {
   assert.deepEqual(await page.evaluate(()=>storageColumns({kitTypes:{},containers:{a:{x:0,y:2,z:10,status:'observed',items:{},shulkers:[]},b:{x:0,y:3,z:11,status:'observed',items:{},shulkers:[]},c:{x:0,y:4,z:12,status:'observed',items:{},shulkers:[]}}}).columns.map(c=>c.records.length)),[3],'Auto layout projects stepped chests into one display column');
   assert.equal(await page.evaluate(()=>storageColumns({kitTypes:{},containers:{a:{x:0,y:0,z:0,status:'observed',items:{},shulkers:[]}}}).columns[0].state),'empty');
   assert.equal(await page.evaluate(()=>storageColumns({kitTypes:{},containers:{a:{x:0,y:0,z:0,status:'removed',block:'minecraft:chest',items:{},shulkers:[]}}}).columns.length),0,'Retired double-chest aliases do not appear as unknown columns');
-  await page.locator('[data-page=kits]').click();await page.getByRole('heading',{name:'All kits',exact:true}).waitFor();
+  assert.deepEqual(await page.evaluate(()=>{const containers={};for(const x of [0,2])for(let y=0;y<11;y++)containers[x+','+y]={x,y,z:y%2,status:'unscanned',block:'minecraft:chest',items:{},shulkers:[]};const model=storageColumns({containers});return [model.layout,...model.columns.map(c=>c.records.length)];}),['zigzag+Z',11,11],'Alternating chest rows project into their physical aisle columns');
+  await page.locator('.sidebar [data-page=servers]').click();await page.getByRole('button',{name:'Add Minecraft server',exact:true}).click();
+  await page.getByLabel('Server name',{exact:true}).fill('Synthetic server');await page.getByLabel('Primary Minecraft address').fill('primary.example.invalid');await page.getByLabel('Alias addresses (one per line)').fill('relay.example.invalid\nbackup.example.invalid');
+  await page.waitForTimeout(1200);assert.equal(await page.getByLabel('Primary Minecraft address').inputValue(),'primary.example.invalid');
+  await page.getByRole('button',{name:'Save Minecraft servers',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#notice')?.textContent.includes('aliases saved'));
+  assert.deepEqual(serversSaved.servers,[{name:'Synthetic server',address:'primary.example.invalid',aliases:['relay.example.invalid','backup.example.invalid']}]);
+  await page.locator('.sidebar [data-page=stashes]').click();await page.locator('[data-page=kits]').click();await page.getByRole('heading',{name:'All kits',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Build supplies',exact:true}).count(),2,'Different exemplars with the same name/color must not merge');
   assert.equal(await page.getByRole('button',{name:'Build supplies',exact:true}).first().locator('xpath=ancestor::tr').textContent().then(t=>t.includes('3 complete · 1 incomplete')),true,'Global kit totals use deduplicated contributions, including an explicit zero');
   assert.match(await page.evaluate(()=>overallResources(snapshot.stashes).textContent),/64$/,'Global resource totals do not add overlapping raw stash counts');
@@ -136,19 +154,47 @@ try {
   await page.locator('[data-page=kits]').click();await page.getByRole('button',{name:'Categories & whisper kitbot',exact:true}).click();
   await page.getByRole('button',{name:'Add whitelisted user',exact:true}).waitFor();
   assert.equal(await page.getByLabel('Enable whisper kitbot').isChecked(),false);
+  assert.equal(await page.getByLabel('Public access (any verified whisper sender)').isChecked(),false);
+  await page.getByLabel('Public access (any verified whisper sender)').check();
+  assert.equal(await page.getByLabel('Minimum complete kits per variant').inputValue(),'270');
+  await page.getByLabel('Second courier / whisper receiver (optional)').selectOption(ids[1]);
+  await page.getByLabel('Minimum complete kits per variant').fill('750');
+  await page.getByLabel('Category stock minimums (request-word = kits, one per line)').fill('synthetic-specialty = 0');
+  await page.getByLabel('Limited categories (request-word = cooldown seconds, one per line)').fill('synthetic-specialty = 86400');
+  assert.equal(await page.getByLabel('Enable Mike',{exact:true}).isChecked(),false);
+  assert.equal(await page.getByLabel('Ollama base URL').inputValue(),'https://ollama.com');
+  assert.equal(await page.getByLabel('Ollama model (tool calling required)').isDisabled(),true);
+  assert.equal(await page.getByLabel('Ollama API key (blank keeps saved key)').inputValue(),'');
+  assert.equal(await page.getByLabel('Ollama API key (blank keeps saved key)').getAttribute('type'),'password');
+  await page.getByLabel('Enable Mike',{exact:true}).check();
+  await page.getByLabel('Ollama model (tool calling required)').fill('synthetic-tool-model');
+  await page.getByLabel('Public kit provenance',{exact:true}).fill('Synthetic public donation project');
+  assert.equal(await page.getByLabel('Fictional stash coordinate replies').isChecked(),false);await page.getByLabel('Fictional stash coordinate replies').check();
+  await page.getByLabel('Ollama API key (blank keeps saved key)').fill('synthetic-cloud-key');
   await page.getByRole('button',{name:'Add whitelisted user',exact:true}).click();
   assert.equal(await page.getByLabel('User cooldown (hours; 0 disables)').inputValue(),'1');
-  assert.equal(await page.getByLabel('Maximum kits per request').inputValue(),'5');
-  await page.getByLabel('Minecraft username').fill('iotacism');await page.getByRole('dialog').getByLabel('Player UUID').fill(ids[2]);await page.getByLabel('User cooldown (hours; 0 disables)').fill('0');
+  assert.equal(await page.getByLabel('Maximum free kits per request').inputValue(),'5');
+  await page.getByLabel('Minecraft username').fill('ExampleUser');await page.getByRole('dialog').getByLabel('Player UUID').fill(ids[2]);await page.getByLabel('User cooldown (hours; 0 disables)').fill('0');
   assert.equal(await page.getByLabel('Request word / storage slug (lowercase)').inputValue(),'building');
   assert.equal(await page.getByLabel('Used for', {exact:true}).inputValue(),'Both');
   assert.ok((await page.getByLabel('Courier / whisper receiver').locator('option').allTextContents()).includes('Courier2'));
   await page.getByRole('button',{name:'Add whitelisted user',exact:true}).click();assert.equal(await page.getByLabel('User cooldown (hours; 0 disables)').nth(1).inputValue(),'1');
-  await page.getByLabel('Maximum kits per request').nth(1).fill('2');
+  await page.getByLabel('Maximum free kits per request').nth(1).fill('2');
   await page.getByLabel('Minecraft username').nth(1).fill('other');await page.getByRole('dialog').getByLabel('Player UUID').nth(1).fill(ids[0]);await page.getByLabel('User cooldown (hours; 0 disables)').nth(1).fill('2.5');
+  await page.getByRole('dialog').getByLabel('Role',{exact:true}).nth(0).selectOption('Administrator');
   await page.screenshot({path:'/tmp/monocle-kitbot-settings-desktop.png',fullPage:true});const jobsBefore=posted.length;await page.getByRole('button',{name:'Save kitbot settings',exact:true}).click();await page.waitForFunction(()=>!document.querySelector('dialog.management-section[open]')&&!document.querySelector('dialog[open]'));
-  assert.deepEqual(kitbotSaved.whitelist,[{name:'iotacism',uuid:ids[2],cooldownSeconds:0,maxKits:5},{name:'other',uuid:ids[0],cooldownSeconds:9000,maxKits:2}]);assert.equal(kitbotSaved.cooldownSeconds,3600);assert.equal(posted.length,jobsBefore);
+  assert.deepEqual(kitbotSaved.whitelist,[{name:'ExampleUser',uuid:ids[2],cooldownSeconds:0,maxKits:5,role:'Administrator'},{name:'other',uuid:ids[0],cooldownSeconds:9000,maxKits:2,role:'User'}]);assert.equal(kitbotSaved.cooldownSeconds,3600);assert.equal(posted.length,jobsBefore);
+  assert.equal(kitbotSaved.backupWorker,ids[1]);assert.equal(kitbotSaved.publicAccess,true);assert.equal(kitbotSaved.minimumStock,750);assert.deepEqual(kitbotSaved.sources,[]);assert.deepEqual(kitbotSaved.categoryMinimumStock,{'synthetic-specialty':0});assert.deepEqual(kitbotSaved.categoryCooldownSeconds,{'synthetic-specialty':86400});
+  assert.deepEqual(kitbotSaved.mike,{enabled:true,endpoint:'https://ollama.com',model:'synthetic-tool-model',provenance:'Synthetic public donation project',coordinateJokes:true,apiKey:'synthetic-cloud-key',clearApiKey:false});
+  await page.locator('[data-page=bank]').click();await page.getByText('No funded accounts yet.',{exact:false}).waitFor();
+  await page.getByRole('button',{name:'Generate balance API key',exact:true}).click();await page.getByLabel('Key name').fill('Synthetic rewards reader');await page.getByRole('button',{name:'Generate key',exact:true}).click();
+  const secret=page.getByRole('dialog').locator('input[readonly]');await secret.waitFor();assert.equal(await secret.inputValue(),'synthetic-one-time-bank-secret');assert.equal(await page.evaluate(()=>JSON.stringify(sessionStorage).includes('synthetic-one-time-bank-secret')),false);
+  await page.getByRole('dialog').getByRole('button',{name:'Close',exact:true}).click();await page.getByRole('button',{name:'Revoke key',exact:true}).click();await page.getByText('balances:read · Revoked',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'Gift or revoke credits',exact:true}).click();await page.getByRole('dialog').getByLabel('Player username',{exact:true}).fill('Recipient');await page.getByRole('dialog').getByLabel('Credit amount',{exact:true}).fill('12');await page.getByRole('dialog').getByLabel('Reason',{exact:true}).fill('Synthetic build reward');await page.getByRole('button',{name:'Apply credit adjustment',exact:true}).click();await page.getByRole('dialog').getByText('Could not confirm the host response:',{exact:false}).waitFor();
+  await page.getByRole('button',{name:'Apply credit adjustment',exact:true}).click();await page.getByText('Recipient now has 12 credits.',{exact:true}).waitFor();assert.equal(bankAdjustments.length,2);assert.equal(bankAdjustments[0].key,bankAdjustments[1].key);assert.deepEqual(bankAdjustments[0].body,bankAdjustments[1].body);assert.equal(posted.length,jobsBefore);
+  bankReviewOrder={id:ids[1],name:'Recipient',count:2,status:'Cancelled',payment:'Credits',creditsCharged:2,creditSettlement:'Pending'};await page.getByRole('button',{name:'Reload bank',exact:true}).click();await page.getByRole('button',{name:'Resolve charged order',exact:true}).click();await page.getByRole('dialog').getByLabel('Confirmed kits delivered',{exact:true}).fill('1');await page.getByRole('dialog').getByLabel('Review reason',{exact:true}).fill('Synthetic confirmed handoff');await page.getByRole('button',{name:'Confirm settlement',exact:true}).click();await page.getByText('Credit settlement recorded.',{exact:true}).waitFor();assert.equal(reviewCalls.length,1);assert.equal(bankAccounts[0].balance,13);assert.equal(await page.getByRole('button',{name:'Resolve charged order',exact:true}).count(),0);
+  await page.setViewportSize({width:1440,height:1000});await page.screenshot({path:'/tmp/monocle-credit-bank-ui.png',fullPage:true});
   assert.deepEqual(errors,[]);
-  console.log('Stash/Kit UI checks passed: range reservations, exact retry, clear, polling, column projection, stash tabs, delivery, search and mobile layout.');
+  console.log('Stash/Kit/Bank UI checks passed: role management, one-time scoped keys, revocation, idempotent adjustments, range reservations, exact retry, clear, polling, column projection, stash tabs, delivery, search and mobile layout.');
 }catch(error){await page.screenshot({path:'/tmp/monocle-stash-ui-failure.png',fullPage:true});console.error(await page.evaluate(()=>({url:location.href,tooltip:document.getElementById('column-tooltip')?.outerHTML,tiles:document.querySelectorAll('.column-tile').length})),errors);throw error;
 }finally{await browser.close();}

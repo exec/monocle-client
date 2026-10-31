@@ -66,6 +66,11 @@ public final class AutoMendTest {
             var workerCalls=worker.elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
                 .map(java.lang.classfile.instruction.InvokeInstruction.class::cast).map(c->c.name().stringValue()).toList();
             assert !workerCalls.contains("swapOffhand"):"Stash elytra maintenance must preserve Strict Auto Totem";
+            var throwing=compiled.methods().stream().filter(m->m.methodName().equalsString("throwExperience")).findFirst().orElseThrow().code().orElseThrow();
+            assert throwing.elementList().stream().filter(java.lang.classfile.instruction.InvokeInstruction.class::isInstance)
+                .map(java.lang.classfile.instruction.InvokeInstruction.class::cast)
+                .anyMatch(c->c.name().equalsString("rotate")&&c.type().equalsString("(DDIZLjava/lang/Runnable;)V"))
+                : "Bottle use temporarily applies the downward client pitch even behind another queued rotation";
         }
         System.out.println("Auto Mend checks passed: target boundaries, damage ranking, ownership identity and guarded native swaps.");
     }

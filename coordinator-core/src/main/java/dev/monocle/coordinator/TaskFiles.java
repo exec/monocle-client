@@ -43,6 +43,9 @@ public final class TaskFiles {
         catch (java.security.NoSuchAlgorithmException e) { throw new AssertionError(e); }
     }
     public static byte[] jsonBytes(JsonObject input, int limit) {
+        return jsonValueBytes(input,limit);
+    }
+    static byte[] jsonValueBytes(JsonElement input,int limit) {
         if (input == null) throw new IllegalArgumentException("Missing JSON object");
         try {
             String text = input.toString();

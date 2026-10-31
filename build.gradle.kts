@@ -198,6 +198,7 @@ tasks {
                     check(entry != null && entry.size > 0) { "Release JAR is missing required notice: $path" }
                 }
                 val metadata = archive.getInputStream(archive.getEntry("fabric.mod.json")).bufferedReader().use { it.readText() }
+                check(archive.getEntry("dev/monocle/client/headless/HeadlessSmokeClient.class") == null) { "The disposable smoke fixture must not ship in the client" }
                 jij.resolvedConfiguration.resolvedArtifacts.forEach { artifact ->
                     val id = artifact.moduleVersion.id
                     if (jijExcluded.none { "${id.group}:${id.name}:${id.version}".contains(it) }) {
@@ -272,6 +273,7 @@ tasks {
     }
 
     val moduleChecks = mapOf(
+        "kitBlockItemsCheck" to "dev.monocle.client.systems.bots.KitBlockItemsTest",
         "botsCheck" to "dev.monocle.client.systems.bots.BotsTest",
         "swarmCrewCheck" to "dev.monocle.client.systems.modules.misc.swarm.SwarmCrewTest",
         "crewInventoryCheck" to "dev.monocle.client.systems.modules.misc.swarm.CrewInventoryTest",
@@ -282,6 +284,7 @@ tasks {
         "ircCheck" to "dev.monocle.client.utils.network.IrcConnectionTest",
         "autoTotemCheck" to "dev.monocle.client.systems.modules.combat.AutoTotemTest",
         "chestSwapCheck" to "dev.monocle.client.systems.modules.player.ChestSwapTest",
+        "derpCheck" to "dev.monocle.client.systems.modules.player.DerpTest",
         "elytraSettingsCheck" to "dev.monocle.client.systems.modules.movement.ElytraSettingsTest",
         "lobbySkipCheck" to "dev.monocle.client.systems.modules.movement.LobbySkipTest",
         "scaffoldCheck" to "dev.monocle.client.systems.modules.movement.ScaffoldTest",
@@ -326,6 +329,16 @@ tasks {
         dependsOn("botsCheck", ":coordinator-core:coordinatorCoreCheck", ":host-service:faultReplayCheck")
     }
 
+    register<Jar>("headlessSmokeJar") {
+        group = "verification"
+        description = "Builds an opt-in disposable-world fixture for real no-display client smoke tests."
+        dependsOn(testClasses)
+        archiveBaseName.set("monocle-headless-smoke")
+        destinationDirectory.set(layout.buildDirectory.dir("headless-smoke"))
+        from(sourceSets["test"].output) { include("dev/monocle/client/headless/HeadlessSmokeClient*.class") }
+        from("src/test/resources/headless-smoke.fabric.mod.json") { rename { "fabric.mod.json" } }
+    }
+
     test {
         failOnNoDiscoveredTests = false // Assertion-based checks run through their JavaExec tasks.
         exclude("**/BotsTest*.class", "**/BotJobsTest*.class", "**/BotWorkflowsTest*.class", "**/BotLuaTest*.class", "**/BotRuntimeTest*.class", "**/BotSchedulerTest*.class", "**/BotTaskDataTest*.class", "**/BotProfilesTest*.class", "**/BotActionsTest*.class", "**/BotStashHuntTest*.class", "**/WorkflowCodeBoxTest*.class") // Run by botsCheck.
@@ -338,6 +351,7 @@ tasks {
         exclude("**/IrcConnectionTest*.class")
         exclude("**/AutoTotemTest*.class")
         exclude("**/ChestSwapTest*.class")
+        exclude("**/DerpTest*.class")
         exclude("**/ElytraSettingsTest*.class")
         exclude("**/ScaffoldTest*.class")
         exclude("**/ModuleHandoffTest*.class")
@@ -359,6 +373,7 @@ tasks {
         exclude("**/AutoWitherTest*.class")
         exclude("**/StashBuilderTest*.class")
         exclude("**/PlayerProfileConcurrencyTest*.class")
+        exclude("**/KitBlockItemsTest*.class") // Run by kitBlockItemsCheck.
     }
 
     check {

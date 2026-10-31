@@ -19,7 +19,7 @@ public final class StashManager extends Module {
     public enum ScanMode { Full, ColumnMap }
     private final SettingGroup definition=settings.getDefaultGroup(),route=settings.createGroup("Route"),scanning=settings.createGroup("Scanning");
     private final Setting<String> stashName=definition.add(new StringSetting.Builder().name("stash-name").description("Named stash in this world; later scans update observations at each container coordinate.").defaultValue("Main stash").build());
-    private final Setting<Boolean> assumeEmpty=definition.add(new BoolSetting.Builder().name("assume-empty-storage").description("Use discovered, unopened chests as destination candidates without a contents scan. Each chest is verified before depositing; known contents are never erased. Enable live storage updates to map loaded chests.").defaultValue(false).build());
+    private final Setting<Boolean> assumeEmpty=definition.add(new BoolSetting.Builder().name("assume-empty-storage").description("Empty aisle destination: map loaded chests without a contents scan, walk to the column, then fly vertically to deposit at the top. Each chest is verified before moving kits; known contents are never erased. Enable live storage updates.").defaultValue(false).build());
     private final Setting<String> homeName=route.add(new StringSetting.Builder().name("home-name").description("Required server /home name used to reach this stash. A definition cannot be saved or scanned without it.").defaultValue("").build());
     private final Setting<Integer> homeWarmup=route.add(new IntSetting.Builder().name("home-warmup").description("Seconds to wait after /home before scanning.").defaultValue(15).range(0,3600).sliderRange(0,60).build());
     private final Setting<Double> homeCooldown=route.add(new DoubleSetting.Builder().name("home-cooldown").description("Minutes before this home may be requested again; fractional minutes preserve second-level cooldowns.").defaultValue(10).range(0,1440).sliderRange(0,60).decimalPlaces(4).build());
@@ -41,7 +41,7 @@ public final class StashManager extends Module {
     public boolean ownsScanRead(net.minecraft.core.BlockPos pos){return scanner!=null&&scanner.ownsScanRead(pos);}
     public static int cooldownTicks(double minutes){return (int)Math.round(minutes*1200);}
     public static double cooldownMinutes(int ticks){return ticks/1200d;}
-    private String scope(){if(mc.level==null)throw new IllegalStateException("Join the stash world first");return (mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();}
+    private String scope(){if(mc.level==null)throw new IllegalStateException("Join the stash world first");return (mc.getCurrentServer()==null?"local":dev.monocle.client.utils.Utils.getServerIdentity())+"\n"+mc.level.dimension().identifier();}
     private JsonObject definitionPlan(){
         JsonObject p=Modules.get().get(SchematicSelector.class).selectionBounds(stashName.get());p.addProperty("type","StashScan");p.addProperty("assumeEmpty",assumeEmpty.get());p.addProperty("lazyMode",lazyMode.get());p.addProperty("scanMode",scanMode.get()==ScanMode.ColumnMap?"Column Map":"Full");p.addProperty("homeName",homeName.get());p.addProperty("homeWarmupTicks",homeWarmup.get()*20);p.addProperty("homeCooldownTicks",cooldownTicks(homeCooldown.get()));return StashCatalog.plan(p);
     }

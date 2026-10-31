@@ -2,10 +2,7 @@ package dev.monocle.host;
 
 import com.google.gson.*;
 import java.net.*;
-import java.net.http.*;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.function.Function;
@@ -56,8 +53,10 @@ final class ResourceApi {
                 JsonObject stock = host.kitStock(snapshot, uuid(parts[3]));
                 return stock == null ? missing() : new Reply(200, stock);
             }
-            if (parts.length == 4 && resource.equals("players") && query.isEmpty())
-                return new Reply(200, playerIdentity(snapshot, parts[3]));
+            if (parts.length == 4 && resource.equals("players")) {
+                if(!Set.of("workerId").containsAll(query.keySet()))throw new IllegalArgumentException("Unexpected player lookup query parameter");
+                return new Reply(200, playerIdentity(host,parts[3],query.getOrDefault("workerId","")));
+            }
             if (parts.length == 3 && Set.of("host", "health", "capabilities", "configuration-controls").contains(resource)) {
                 if (!query.isEmpty()) throw new IllegalArgumentException("Unexpected query parameter");
                 if(resource.equals("configuration-controls"))return new Reply(200,host.control(op("configuration-controls")));
@@ -129,34 +128,19 @@ final class ResourceApi {
         return missing();
     }
 
-    /** Resolve names before dispatch, without a game dependency or holding the host's control lock. */
-    private static JsonObject playerIdentity(JsonObject snapshot, String name) {
-        if (!name.matches("[A-Za-z0-9_]{1,16}")) throw new IllegalArgumentException("Specify an exact Minecraft username");
-        Map<String,JsonObject> known = new LinkedHashMap<>();
-        for (JsonElement value : snapshot.getAsJsonArray("workers")) {
-            JsonObject worker = value.getAsJsonObject();
-            if (worker.get("connected").getAsBoolean() && (!worker.has("publicProtocol") || !worker.get("publicProtocol").getAsBoolean()) && text(worker,"name").equalsIgnoreCase(name)) {
-                JsonObject identity = new JsonObject(); identity.addProperty("id", uuid(text(worker,"id"))); identity.addProperty("name", text(worker,"name"));
-                known.put(text(identity,"id"), identity);
-            }
-        }
-        if (known.size() > 1) throw new IllegalStateException("Username matches multiple connected identities; inspect the roster first");
-        if (!known.isEmpty()) return known.values().iterator().next();
-        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build()) {
-            HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.mojang.com/users/profiles/minecraft/" + name)).timeout(Duration.ofSeconds(4)).GET().build();
-            var response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 404 || response.statusCode() == 204) throw new IllegalArgumentException("Minecraft username was not found; no delivery was submitted");
-            if (response.statusCode() != 200 || response.body().length() > 4096) throw new IllegalStateException("Minecraft profile lookup is unavailable; try again before dispatching");
-            return checkedPlayerIdentity(JsonParser.parseString(response.body()).getAsJsonObject(), name);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt(); throw new IllegalStateException("Minecraft profile lookup was interrupted; no delivery was submitted");
-        } catch (IOException e) { throw new IllegalStateException("Minecraft profile lookup is unavailable; no delivery was submitted"); }
+    /** Resolve only the selected courier's current server player list, never an external name service. */
+    private static JsonObject playerIdentity(HostService host,String name,String workerId){
+        var lookup=host.playerIdentity(name,workerId);
+        try{return lookup.get(6,java.util.concurrent.TimeUnit.SECONDS);}
+        catch(java.util.concurrent.ExecutionException failure){if(failure.getCause() instanceof RuntimeException cause)throw cause;throw new IllegalStateException("Server player lookup failed");}
+        catch(java.util.concurrent.TimeoutException failure){lookup.cancel(false);throw new IllegalStateException("Server player lookup timed out");}
+        catch(InterruptedException failure){lookup.cancel(false);Thread.currentThread().interrupt();throw new IllegalStateException("Server player lookup interrupted");}
     }
-    static JsonObject checkedPlayerIdentity(JsonObject profile, String requested) {
-        String id = text(profile,"id"), name = text(profile,"name");
-        if (!id.matches("[0-9a-fA-F]{32}") || !name.matches("[A-Za-z0-9_]{1,16}") || !name.equalsIgnoreCase(requested))
-            throw new IllegalArgumentException("Minecraft profile lookup returned a different or invalid identity");
-        JsonObject result = new JsonObject();result.addProperty("id",uuid(id.substring(0,8)+"-"+id.substring(8,12)+"-"+id.substring(12,16)+"-"+id.substring(16,20)+"-"+id.substring(20)));result.addProperty("name",name);return result;
+    static JsonObject checkedPlayerIdentity(JsonObject profile,String requested){
+        if(profile==null||!profile.keySet().equals(Set.of("id","name"))||!profile.get("id").isJsonPrimitive()||!profile.getAsJsonPrimitive("id").isString()||!profile.get("name").isJsonPrimitive()||!profile.getAsJsonPrimitive("name").isString())throw new IllegalArgumentException("Invalid server player identity");
+        String id=text(profile,"id"),name=text(profile,"name");
+        if(!UUID.fromString(id).toString().equals(id)||!name.matches("[A-Za-z0-9_]{1,16}")||!name.equalsIgnoreCase(requested))throw new IllegalArgumentException("Server player lookup returned a different or invalid identity");
+        return profile.deepCopy();
     }
 
     private static Reply crews(HostService host, JsonObject snapshot, String method, String[] parts, JsonObject body, String ifMatch) {

@@ -349,7 +349,7 @@ public final class BotScheduler {
         return received != null && now - received >= 0 && now - received < PlayerObservation.MAX_AGE;
     }
     private SwarmConnection connection(UUID id) { String crew = bots.workerCrew(id); return crew.equals("Offline") ? null : bots.coordinator(crew).connectionForWorker(id); }
-    private String scope() { return !Utils.canUpdate() ? "" : (mc.getCurrentServer() == null ? "local" : mc.getCurrentServer().ip) + "\n" + mc.level.dimension().identifier(); }
+    private String scope() { return !Utils.canUpdate() ? "" : (mc.getCurrentServer() == null ? "local" : dev.monocle.client.utils.Utils.getServerIdentity()) + "\n" + mc.level.dimension().identifier(); }
     private static Position position(BlockPos pos) { return new Position(pos.getX(), pos.getY(), pos.getZ()); }
     private PlayerObservation localObservation() {
         return !Utils.canUpdate() ? null : new PlayerObservation(mc.player.getUUID(), mc.player.getName().getString(), scope(), position(mc.player.blockPosition()), System.nanoTime());

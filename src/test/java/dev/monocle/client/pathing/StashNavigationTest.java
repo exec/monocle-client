@@ -74,12 +74,24 @@ public final class StashNavigationTest {
         for(int i=0;i<100;i++)idle.moveTo(BlockPos.ZERO,-1);
         assert state.goalRequests==sent+3:"Unreachable goals cannot create an endless calculation loop";
         idle.release();
+        state.cancellable=false;state.calculating=false;
+        var falling=new BaritoneUtils.StashNavigation(state.bot,settings,events);falling.moveTo(BlockPos.ZERO,-1);state.path=true;
+        assert !falling.release()&&state.path : "A normal handoff still waits for a safe falling segment";
+        assert falling.releaseForFall()&&!state.path&&!BaritoneUtils.movementBusy(state.bot)&&state.forcedCancellations==1
+            &&settings.allowBreak.value&&settings.allowInventory.value : "Caught flight can release an unsafe falling path and restore the read-only lease";
+        var foreignFall=new BaritoneUtils.StashNavigation(state.bot,settings,events);foreignFall.moveTo(BlockPos.ZERO,-1);
+        state.goal=new baritone.api.pathing.goals.GoalBlock(8,8,8);state.goalActive=true;
+        assert foreignFall.releaseForFall()&&state.forcedCancellations==1&&state.goalActive : "Emergency cleanup never cancels a replacement goal";
+        state.goalActive=false;
+        var foreignProcess=new BaritoneUtils.StashNavigation(state.bot,settings,events);foreignProcess.moveTo(BlockPos.ZERO,-1);state.mineActive=true;
+        assert foreignProcess.releaseForFall()&&state.forcedCancellations==1&&state.mineActive : "Emergency cleanup preserves a newly active foreign process too";
+        state.mineActive=state.goalActive=false;
         System.out.println("Stash movement handoff checks passed: paused/calculating ownership, deferred cancellation, asynchronous cleanup, retained settings and foreign-goal preservation.");
     }
 
     private static final class State {
         boolean path,walking,calculating,goalActive,mineActive,forced,cancellable=true;
-        int cancellations,keysCleared,goalRequests;
+        int cancellations,forcedCancellations,keysCleared,goalRequests;
         Goal goal,recent;
         final Object finder=mock(baritone.api.pathing.calc.IPathFinder.class);
         final IBaritone bot=(IBaritone)Proxy.newProxyInstance(IBaritone.class.getClassLoader(),new Class<?>[]{IBaritone.class},(proxy,method,args)->{
@@ -90,6 +102,7 @@ public final class StashNavigationTest {
                 case "getInProgress" -> calculating?Optional.of(finder):Optional.empty();
                 case "getCurrent" -> null;
                 case "cancelEverything" -> {cancellations++;goal=null;goalActive=mineActive=false;if(cancellable)path=false;yield cancellable;}
+                case "forceCancel" -> {forcedCancellations++;goal=null;goalActive=path=calculating=false;yield null;}
                 case "setGoalAndPath" -> {goalRequests++;goal=recent=(Goal)a[0];goalActive=true;yield null;}
                 case "getGoal" -> goal;
                 case "mostRecentGoal" -> recent;

@@ -37,7 +37,7 @@ public final class BotStashExporter {
         if(!owner.equals(loadedOwner)||!worker.equals(loadedWorker)){flight=null;loadedOwner=owner;loadedWorker=worker;}
         if(loading!=null){if(!loading.isDone())return;try{JsonObject entry=loading.join();if(entry!=null&&owner.equals(TaskWire.text(entry,"owner"))&&worker.equals(TaskWire.text(entry,"worker"))){flight=entry;sentAt=0;}}catch(RuntimeException e){warn("Stash exports retained; outbox load failed: "+e.getMessage());}loading=null;}
         if(!owner.equals(readyOwner))return;
-        if(mc.level==null)return;String scope=(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();
+        if(mc.level==null)return;String scope=(mc.getCurrentServer()==null?"local":dev.monocle.client.utils.Utils.getServerIdentity())+"\n"+mc.level.dimension().identifier();
         if(flight!=null&&!scope.equals(TaskWire.text(flight.getAsJsonObject("message"),"scope"))){flight=null;loadAt=0;}
         if(flight==null){if(System.currentTimeMillis()-loadAt<1000)return;loadAt=System.currentTimeMillis();loading=CompletableFuture.supplyAsync(()->StashExports.next(MonocleClient.FOLDER.toPath(),owner,worker,scope),writer);return;}
         if(System.currentTimeMillis()-sentAt<5000)return;

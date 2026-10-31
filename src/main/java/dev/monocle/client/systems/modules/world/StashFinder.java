@@ -261,7 +261,7 @@ public class StashFinder extends Module {
 
     private String worldIdentity() {
         // Utils calls every Realm "realms"; use its actual server address so different Realms cannot share findings.
-        return !mc.isLocalServer() && mc.getCurrentServer() != null ? mc.getCurrentServer().ip : Utils.getWorldName();
+        return !mc.isLocalServer() && mc.getCurrentServer() != null ? Utils.getServerIdentity() : Utils.getWorldName();
     }
 
     @EventHandler

@@ -12,8 +12,10 @@ public final class StashTransferTeam {
     private StashTransferTeam() {}
     public static JsonObject prepare(Path root,String crew,String scope,JsonObject request,List<String> workers){
         if(workers.size()<2||workers.size()>3||new HashSet<>(workers).size()!=workers.size())throw new IllegalArgumentException("Crew stash transfer needs two or three distinct workers");
+        if(request.has("targetDimension")&&!text(request,"targetDimension").equals(scope.substring(scope.indexOf('\n')+1)))throw new IllegalArgumentException("Cross-dimension stash transfers currently require a solo courier");
         if(flag(request,"depositCarried"))throw new IllegalArgumentException("Deposit carried kits separately before a crew transfer");
         if(flag(request,"depositOnly"))throw new IllegalArgumentException("Deposit-only recovery uses one worker before the crew transfer");
+        if(flag(request,"enderTransport"))throw new IllegalArgumentException("Ender transport currently uses a solo courier");
         String leader=request.has("leader")?UUID.fromString(text(request,"leader")).toString():workers.getFirst();
         if(!workers.contains(leader))throw new IllegalArgumentException("The stash leader must be one of the selected workers");
         JsonObject args=StashCatalog.kitTransfer(root,crew,scope,request,leader);args.addProperty("leader",leader);
@@ -29,7 +31,7 @@ public final class StashTransferTeam {
         for(String key:List.of("ok","sourceExhausted"))if(r.has(key)&&(!r.get(key).isJsonPrimitive()||!r.getAsJsonPrimitive(key).isBoolean()))throw new IllegalArgumentException("Invalid "+key);
         if(r.has("picked"))StashCatalog.integer(r,"picked",0,36);
         for(String key:List.of("deposited","missing"))if(r.has(key))StashCatalog.integer(r,key,0,36);
-        if(r.has("nextPick"))StashCatalog.integer(r,"nextPick",0,54);
+        if(r.has("nextPick"))StashCatalog.integer(r,"nextPick",0,1024);
         if(r.has("sourceIssue")&&(!r.get("sourceIssue").isJsonPrimitive()||!r.getAsJsonPrimitive("sourceIssue").isString()||text(r,"sourceIssue").length()>1024))throw new IllegalArgumentException("Invalid source issue");
         return action.deepCopy();
     }
@@ -126,7 +128,7 @@ public final class StashTransferTeam {
     private static void planType(Path root,JsonObject task,JsonObject team,List<String> ids){
         JsonObject args=task.getAsJsonObject("args").deepCopy();String leader=text(args,"leader"),kit=args.getAsJsonArray("kitTypeIds").get(team.get("index").getAsInt()).getAsString();args.remove("kitTypeIds");args.remove("leader");args.remove("tpaWarmupTicks");args.remove("depositCarried");args.addProperty("kitTypeId",kit);
         JsonObject plan=StashCatalog.kitAction(root,text(task,"crew"),text(task,"server")+"\n"+text(task,"dimension"),args,leader);
-        var picks=plan.getAsJsonArray("picks").asList().stream().map(JsonElement::getAsJsonObject).sorted(Comparator.comparingInt((JsonObject p)->p.get("x").getAsInt()).thenComparingInt(p->p.get("z").getAsInt()).thenComparingInt(p->p.get("y").getAsInt())).toList();
+        var picks=plan.getAsJsonArray("picks").asList().stream().map(StashCatalog::sourcePosition).sorted(Comparator.comparingInt((JsonObject p)->p.get("x").getAsInt()).thenComparingInt(p->p.get("z").getAsInt()).thenComparingInt(p->p.get("y").getAsInt())).toList();
         team.addProperty("kit",kit);team.add("source",site(plan));team.add("destination",site(plan.getAsJsonObject("targetStash")));
         for(int i=0;i<ids.size();i++){
             JsonObject own=plan.deepCopy();JsonArray assigned=new JsonArray();for(int p=i;p<picks.size();p+=ids.size())assigned.add(picks.get(p).deepCopy());own.add("picks",assigned);

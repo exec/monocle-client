@@ -233,6 +233,7 @@ public class Hud extends System<Hud> implements Iterable<HudElement> {
 
     @EventHandler
     private void onTick(TickEvent.Post event) {
+        if (dev.monocle.client.utils.misc.HeadlessMode.enabled()) return;
         if (Utils.isLoading()) return;
 
         if (resetToDefaultElements) {
@@ -251,6 +252,7 @@ public class Hud extends System<Hud> implements Iterable<HudElement> {
 
     @EventHandler
     private void onRender(Render2DEvent event) {
+        if (dev.monocle.client.utils.misc.HeadlessMode.enabled()) return;
         if (Utils.isLoading()) return;
 
         if (!(active || HudEditorScreen.isOpen()) || shouldHideHud()) return;
@@ -282,7 +284,7 @@ public class Hud extends System<Hud> implements Iterable<HudElement> {
     }
 
     public boolean hasCustomFont() {
-        return customFont.get();
+        return !dev.monocle.client.utils.misc.HeadlessMode.enabled() && customFont.get();
     }
 
     public double getTextScale() {

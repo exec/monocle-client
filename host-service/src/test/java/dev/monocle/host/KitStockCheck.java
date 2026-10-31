@@ -27,7 +27,7 @@ final class KitStockCheck {
         String sourceId=UUID.randomUUID().toString(),targetId=UUID.randomUUID().toString();
         JsonObject a=json("{item:'minecraft:green_shulker_box',name:'TSR Redstone Kit',items:{'minecraft:piston':64,'minecraft:beacon':64}}");
         JsonObject b=json("{item:'minecraft:green_shulker_box',name:'TSR Redstone Kit',items:{'minecraft:piston':64,'minecraft:chest_minecart':1}}");
-        JsonObject source=catalog("tango2",sourceId,a,520),target=catalog("main",targetId,b,999);
+        JsonObject source=catalog("SyntheticSource",sourceId,a,520),target=catalog("main",targetId,b,999);
         target.getAsJsonObject("kitAliases").addProperty(sourceId,targetId);
         JsonObject snapshot=json("{stashes:[]}");snapshot.getAsJsonArray("stashes").add(source);snapshot.getAsJsonArray("stashes").add(target);
         JsonObject before=snapshot.deepCopy(),stock=ResourceApi.kitStock(snapshot,sourceId,s->s);

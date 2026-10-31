@@ -17,6 +17,7 @@ import dev.monocle.client.events.entity.player.SendMovementPacketsEvent;
 import dev.monocle.client.systems.modules.Modules;
 import dev.monocle.client.systems.modules.movement.*;
 import dev.monocle.client.systems.modules.player.LiquidInteract;
+import dev.monocle.client.systems.modules.player.Derp;
 import dev.monocle.client.systems.modules.player.NoMiningTrace;
 import dev.monocle.client.systems.modules.player.Portals;
 import dev.monocle.client.utils.entity.fakeplayer.FakePlayerEntity;
@@ -89,7 +90,7 @@ public abstract class LocalPlayerMixin extends AbstractClientPlayer {
     @ModifyExpressionValue(method = "tick", at = @At(value = "FIELD", target = "Lnet/minecraft/client/player/ClientInput;keyPresses:Lnet/minecraft/world/entity/player/Input;", opcode = Opcodes.GETFIELD))
     private Input isSneaking(Input original) {
         if (Modules.get().get(Sneak.class).doPacket() || Modules.get().get(NoSlow.class).airStrict()) {
-            return new Input(
+            original = new Input(
                 original.forward(),
                 original.backward(),
                 original.left(),
@@ -99,7 +100,8 @@ public abstract class LocalPlayerMixin extends AbstractClientPlayer {
                 original.sprint()
             );
         }
-        return original;
+        Derp derp = Modules.get().get(Derp.class);
+        return derp.teabagging() ? derp.serverInput(original) : original;
     }
 
     @Inject(method = "aiStep", at = @At("HEAD"))

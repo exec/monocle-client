@@ -30,9 +30,13 @@ tasks.test { exclude("**/KitCategoriesTest*.class") }
 tasks.test { exclude("**/WorkerSupplyStationsTest*.class") }
 tasks.test { exclude("**/StashSortPlannerTest*.class") }
 tasks.test { exclude("**/StashSortExecutionTest*.class") }
+tasks.test { exclude("**/EnderTransportCheck*.class") }
+tasks.test { exclude("**/TaskJournalCheck*.class") }
 tasks.check { dependsOn(coordinatorCoreCheck) }
 tasks.withType<Jar>().configureEach {
     from(rootProject.file("LICENSE"))
     from(rootProject.file("licenses/Java-WebSocket-MIT.txt")) { into("META-INF/licenses") }
     from(listOf(rootProject.file("licenses/SQLite-JDBC-Apache-2.0.txt"), rootProject.file("licenses/SQLite-JDBC-Zentus.txt"))) { into("META-INF/licenses") }
 }
+
+tasks.test { exclude("**/ServerAliasesTest*.class") }

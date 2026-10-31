@@ -7,11 +7,20 @@ import java.util.*;
 public final class BotChat {
     private final Deque<JsonObject> feed = new ArrayDeque<>();
     private final Set<UUID> executed = new LinkedHashSet<>();
+    private static final java.util.regex.Pattern WHISPER=java.util.regex.Pattern.compile("^(?:\\[(?:unknown player|[A-Za-z0-9_]{1,16}) head\\] )?([A-Za-z0-9_]{1,16}) whispers: (.{1,512})$");
+    public static String[] whisper(String raw){
+        if(raw==null||raw.chars().anyMatch(Character::isISOControl))return null;
+        var match=WHISPER.matcher(raw);return match.matches()?new String[]{match.group(1),match.group(2)}:null;
+    }
     public static String command(String text) {
         if (text == null || text.isBlank() || text.length() > 256 || text.chars().anyMatch(Character::isISOControl))
             throw new IllegalArgumentException("Use 1–256 printable chat characters");
         return text;
     }
+    public static boolean commandScope(String command,String expected,String actual){
+        return expected.equals(actual)||command.matches("(?is)^/(?:msg|tell|w|whisper)\\s.+")&&QueuePolicy.sameTeleportServer(expected,actual);
+    }
+    public boolean executed(UUID id){return executed.contains(id);}
     public boolean first(UUID id) { if (!executed.add(id)) return false; if (executed.size() > 128) executed.remove(executed.iterator().next()); return true; }
     public void append(UUID worker, String crew, String name, String scope, String direction, String text) {
         if (!Set.of("received", "sent", "error").contains(direction) || text == null || text.length() > 2048)

@@ -84,7 +84,9 @@ public class Utils {
     public static double frameTime;
     public static Screen screenToOpen;
 
-    private static final ProjectionMatrixBuffer matrixBuffer = new ProjectionMatrixBuffer("monocle-projection-matrix");
+    private static class ProjectionBuffer {
+        private static final ProjectionMatrixBuffer INSTANCE = new ProjectionMatrixBuffer("monocle-projection-matrix");
+    }
 
     private Utils() {
     }
@@ -228,7 +230,7 @@ public class Utils {
         proj.setupOrtho(-10, 100, width, height, true);
         var matrix = proj.getMatrix(new Matrix4f());
 
-        RenderSystem.setProjectionMatrix(matrixBuffer.getBuffer(matrix), ProjectionType.ORTHOGRAPHIC);
+        RenderSystem.setProjectionMatrix(ProjectionBuffer.INSTANCE.getBuffer(matrix), ProjectionType.ORTHOGRAPHIC);
         RenderUtils.projection.set(matrix);
 
         rendering3D = false;
@@ -242,7 +244,7 @@ public class Utils {
         proj.setupOrtho(-10, 100, width, height, true);
         var matrix = proj.getMatrix(new Matrix4f());
 
-        RenderSystem.setProjectionMatrix(matrixBuffer.getBuffer(matrix), ProjectionType.PERSPECTIVE);
+        RenderSystem.setProjectionMatrix(ProjectionBuffer.INSTANCE.getBuffer(matrix), ProjectionType.PERSPECTIVE);
         RenderUtils.projection.set(matrix);
 
         rendering3D = true;
@@ -455,6 +457,13 @@ public class Utils {
         } finally {
             IOUtils.closeQuietly(in);
         }
+    }
+
+    /** Logical multiplayer identity; transport connections retain the original address. */
+    public static String getServerIdentity(){
+        if(mc.getCurrentServer()==null)return "local";
+        var bots=dev.monocle.client.systems.bots.Bots.get();
+        return bots==null?mc.getCurrentServer().ip:bots.serverIdentity(mc.getCurrentServer().ip);
     }
 
     public static boolean canUpdate() {

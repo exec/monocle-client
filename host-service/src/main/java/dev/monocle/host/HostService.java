@@ -14,8 +14,8 @@ import static dev.monocle.coordinator.TaskWire.*;
 
 /** One coordinator thread/monitor, real worker protocol, no game or account in this process. */
 public final class HostService implements AutoCloseable {
-    public static final List<String> ACTIONS = List.of("Wait", "Travel", "DropItems", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies", "StashScan", "StashResupply", "StashDeposit", "KitTransferPlan", "StashVisit", "StashSortPlan");
-    private final Path journal;
+    public static final List<String> ACTIONS = List.of("Wait", "Travel", "DropItems", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies", "StashScan", "StashResupply", "StashDeposit", "StashBuffer", "KitTransferPlan", "StashVisit", "StashSortPlan");
+    private final TaskJournal journal;
     private final Path directory;
     private final ScheduledExecutorService catalogReader=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon().name("Monocle catalog reader").factory());
     private volatile JsonArray catalogSnapshot=new JsonArray();
@@ -25,6 +25,21 @@ public final class HostService implements AutoCloseable {
     private final Map<WatchRequest,List<JsonObject>> catalogWatches=new ConcurrentHashMap<>();
     private final OperationsLibrary library;
     private final KitBot kitBot;
+    private CreditBank creditBank;
+    private final DeliveryWatchdog deliveryWatchdog=new DeliveryWatchdog();
+    private ServerAliases serverAliases;
+    private MikeKitHandler mike;
+    private record MikeRequest(UUID worker,String crew,String scope,String name,String message,String revision,Set<String> categories,long at,JsonObject body,int reads,Map<String,JsonObject> inspected,boolean administrator) { }
+    private final Map<UUID,MikeRequest> mikeRequests=new LinkedHashMap<>();
+    private record GiftRequest(MikeRequest request,MikeKitHandler.Decision decision,CompletableFuture<JsonObject> identity) { }
+    private record MikeAck(UUID worker,String crew,String scope,String revision,JsonObject receipt,String incoming,long at) { }
+    private final Map<UUID,GiftRequest> giftRequests=new LinkedHashMap<>();
+    private record CreditRequest(MikeRequest request,JsonObject intent,CompletableFuture<JsonObject> identity) { }
+    private final Map<UUID,CreditRequest> creditRequests=new LinkedHashMap<>();
+    private final Map<UUID,MikeAck> mikeAcks=new LinkedHashMap<>();
+    private record PlayerLookup(SwarmConnection connection,String crew,String scope,String name,long at,CompletableFuture<JsonObject> result) {}
+    private final Map<UUID,PlayerLookup> playerLookups=new LinkedHashMap<>();
+    private final Map<String,Long> mikeAskedAt=new HashMap<>();
     private final KnownHostiles hostiles;
     private final HostileWarnings hostileWarnings = new HostileWarnings();
     private final IncidentTimeline incidents;
@@ -66,6 +81,9 @@ public final class HostService implements AutoCloseable {
     private record AutoTpy(UUID requester, UUID target, String requesterName, String crew, String scope, long due, long expires,boolean required) { }
     private static final class Peer {
         boolean chatSupported;
+        boolean playerLookupSupported;
+        boolean serverAliasesReady=true;
+        String serverAddress="";
         boolean stashCatalogSupported;
         boolean stashLiveSupported;
         boolean categoriesSupported;
@@ -138,7 +156,7 @@ public final class HostService implements AutoCloseable {
             if (selectors.put(SwarmConnection.credentialSelector(key), name) != null) throw new IllegalArgumentException("Every crew needs a distinct key");
         });
         Files.createDirectories(directory);
-        journal = directory.resolve("host-tasks.json");
+        journal = new TaskJournal(directory.resolve("host-tasks.sqlite"),directory.resolve("host-tasks.json"),"tasks");
         events = new CrewTelemetry(directory.resolve("host-events.telemetry.jsonl"));
         lockChannel = FileChannel.open(directory.resolve("host.lock"), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
         CrewListener opened = null;
@@ -147,7 +165,10 @@ public final class HostService implements AutoCloseable {
             if (lock == null) throw new IllegalStateException("Another host owns this data directory");
             operatorOperations = new OperatorOperations(directory.resolve("operator-operations.json"));
             library = new OperationsLibrary(directory.resolve("bot-operations.json"));
-            kitBot = new KitBot(directory);
+            serverAliases=ServerAliases.load(directory);
+            creditBank = new CreditBank(directory);
+            kitBot = new KitBot(directory,creditBank,this::kitCourier);
+            mike = new MikeKitHandler();
             hostiles = new KnownHostiles(directory.resolve("known-hostiles.json"));
             notifications = new DiscordNotifications(directory);
             incidents = new IncidentTimeline(directory.resolve("incidents.telemetry.jsonl"));
@@ -160,7 +181,7 @@ public final class HostService implements AutoCloseable {
             JsonObject savedRoster = TaskFiles.read(directory.resolve("worker-roster.json"));
             if (savedRoster.size() > 256) throw new IllegalArgumentException("Worker roster is too large");
             savedRoster.entrySet().forEach(e -> { JsonObject r=e.getValue().getAsJsonObject();r.addProperty("connected",false);r.addProperty("positionFresh",false);r.addProperty("reconciled",false);roster.put(UUID.fromString(e.getKey()),r); });
-            JsonObject saved = TaskFiles.read(journal);
+            JsonObject saved = journal.read();
             if (!saved.isEmpty()) {
                 if (integer(saved, "version", 1, 1) != 1 || !saved.has("tasks") || saved.getAsJsonObject("tasks").size() > 64) throw new IllegalArgumentException("Invalid host journal");
                 if(saved.has("publicReportReceipts")) {
@@ -191,7 +212,7 @@ public final class HostService implements AutoCloseable {
             persist();
             listener = opened = new CrewListener(bind, port, selector -> { String crew = selectors.get(selector); return crew == null ? null : this.crews.get(crew); }, webPort);
             for (String crew : crews.keySet()) highways.put(crew, new HighwayHost(directory, crew, id -> nativeReady(crew, id), this::highwayCheckpoint));
-        } catch (IOException | RuntimeException e) { catalogReader.shutdownNow();if(notifications!=null)notifications.close();if(opened!=null)opened.close();lockChannel.close(); ticker.shutdownNow(); throw e; }
+        } catch (IOException | RuntimeException e) { catalogReader.shutdownNow();if(mike!=null)mike.close();if(creditBank!=null)try{creditBank.close();}catch(RuntimeException close){e.addSuppressed(close);}if(notifications!=null)notifications.close();if(opened!=null)opened.close();try{journal.close();}catch(RuntimeException close){e.addSuppressed(close);}lockChannel.close(); ticker.shutdownNow(); throw e; }
         ticker.scheduleWithFixedDelay(this::tick, 0, 50, TimeUnit.MILLISECONDS);
         catalogReader.scheduleWithFixedDelay(this::refreshCatalog,0,1,TimeUnit.SECONDS);
     }
@@ -381,6 +402,7 @@ public final class HostService implements AutoCloseable {
         return value.deepCopy();
     }
     OperatorOperations operatorOperations() { return operatorOperations; }
+    CreditBank creditBank(){return creditBank;}
     private String operatorCommandId="";
     synchronized void operatorCommand(String id) { operatorCommandId=id; }
     private String commandReceiptId(){return operatorCommandId.isEmpty()?UUID.randomUUID().toString():operatorCommandId;}
@@ -438,7 +460,7 @@ public final class HostService implements AutoCloseable {
     private void persist() {
         JsonObject root = new JsonObject(), records = new JsonObject(); root.addProperty("version", 1);
         tasks.forEach((id, task) -> records.add(id.toString(), task)); root.add("tasks", records);
-        root.add("publicReportReceipts",publicReportReceipts);TaskFiles.write(journal, root);
+        root.add("publicReportReceipts",publicReportReceipts);journal.write(root);
         for(JsonObject task:tasks.values())if(task.has("controlReceipts"))for(var entry:task.getAsJsonObject("controlReceipts").entrySet())if(operatorOperations.contains(entry.getKey()))observeOperation(entry.getKey(),entry.getValue().getAsJsonObject());
         tasks.values().forEach(CommandReceipts::prune);
         tasks.values().forEach(notifications::observeTask);
@@ -474,17 +496,27 @@ public final class HostService implements AutoCloseable {
                 }
             }
             flushScanAcks();
+            finishPlayerLookups();
+            finishMikeRequests();
+            finishGiftRequests();
+            finishCreditRequests();
+            watchDeliveries();
             long now = System.nanoTime();
             for(JsonObject request:kitBot.pending()){
                 JsonObject submission=request.getAsJsonObject("submission");if(tasks.values().stream().anyMatch(t->StashSortExecution.sameScope(t,text(submission,"crew"),text(submission,"server")+"\n"+text(submission,"dimension"))))continue;
                 try{submit(request.getAsJsonObject("submission"));kitBot.state(text(request,"id"),"Queued","");}
-                catch(RuntimeException e){if(e.getMessage()!=null&&e.getMessage().startsWith("Task checkpoint failed"))throw e;kitBot.state(text(request,"id"),"Failed",String.valueOf(e.getMessage()));logEvent("kitbot-error","",text(request,"id"),String.valueOf(e.getMessage()));}
+                catch(RuntimeException e){if(e.getMessage()!=null&&e.getMessage().startsWith("Task checkpoint failed"))throw e;kitBot.submissionFailed(text(request,"id"),String.valueOf(e.getMessage()),!tasks.containsKey(UUID.fromString(text(request,"id"))));logEvent("kitbot-error","",text(request,"id"),String.valueOf(e.getMessage()));}
             }
             kitBot.reconcile(tasks);
+            List<JsonObject> notices=kitBot.pendingNotices(System.currentTimeMillis());
             for(var entry:peers.entrySet()){
-                Peer p=entry.getValue();if(!entry.getKey().connected()||!p.reconciled||!p.chatSupported||p.worldReadiness==null||!text(p.worldReadiness,"state").equals("Ready"))continue;
+                Peer p=entry.getValue();if(!entry.getKey().connected()||!p.reconciled||!p.serverAliasesReady||!p.chatSupported||p.worldReadiness==null||!text(p.worldReadiness,"state").equals("Ready"))continue;
+                for(JsonObject notice:notices)if(text(notice,"worker").equals(p.id.toString())&&text(notice,"crew").equals(p.crew)&&sameServer(text(notice,"scope"),p.observation.scope()))
+                    directMessages.add(p.id,p.crew,text(notice,"scope"),text(notice,"id"),MikeKitHandler.whisper(text(notice,"name"),text(notice,"text")),System.currentTimeMillis());
                 directMessages.drain(p.id,p.crew,p.observation.scope(),System.currentTimeMillis(),m->{
-                    JsonObject reply=new JsonObject();reply.addProperty("type","manage-chat");reply.addProperty("id",m.id());reply.addProperty("scope",m.scope());reply.addProperty("text",m.text());return entry.getKey().send(reply.toString());
+                    long at=System.currentTimeMillis();String outgoing=m.text(at);
+                    if(!m.cooldownRecipient().isEmpty()){String remaining=kitBot.cooldownMessage(m.cooldownRecipient(),at,m.creditCooldown());if(remaining==null)return true;outgoing=MikeKitHandler.whisper(m.cooldownRecipient(),remaining);}
+                    JsonObject reply=new JsonObject();reply.addProperty("type","manage-chat");reply.addProperty("id",m.id());reply.addProperty("scope",p.observation.scope());reply.addProperty("text",outgoing);boolean sent=entry.getKey().send(reply.toString());if(sent)kitBot.noticeAttempted(m.id(),at);return sent;
                 });
             }
             if (now-rosterAt >= 20_000_000_000L) {
@@ -501,7 +533,7 @@ public final class HostService implements AutoCloseable {
             schedulePublic();
             for (var entry : List.copyOf(peers.entrySet())) {
                 SwarmConnection c = entry.getKey(); Peer peer = entry.getValue();
-                if (!c.connected() || !peer.reconciled || now - peer.seen >= 5_000_000_000L) continue;
+                if (!c.connected() || !peer.reconciled || !peer.serverAliasesReady || now - peer.seen >= 5_000_000_000L) continue;
                 schedule(c, peer);
                 flush(c, peer);
             }
@@ -549,6 +581,17 @@ public final class HostService implements AutoCloseable {
             if (publicPeers.containsKey(observation.id())) throw new IllegalArgumentException("Worker identity is registered on the public endpoint");
             if (peer == null) { peer = new Peer(); peer.id = observation.id(); peer.crew = selectors.get(c.credentialId()); peers.put(c, peer); }
             if (peer.crew == null) throw new IllegalArgumentException("Unknown authenticated crew");
+            boolean aliasesSupported=message.has("serverAliasesProtocol")&&integer(message,"serverAliasesProtocol",1,1)==1;
+            String observed=observation.scope();int worldSplit=observed.indexOf('\n');
+            peer.serverAddress=aliasesSupported?text(message,"serverAddress"):worldSplit>0?observed.substring(0,worldSplit):"";
+            String expected=worldSplit>0?serverAliases.server(peer.serverAddress)+observed.substring(worldSplit):observed;
+            peer.serverAliasesReady=aliasesSupported?text(message,"serverAliasesRevision").equals(serverAliases.revision())&&expected.equals(observed):serverAliases.scope(observed).equals(observed);
+            if(!peer.serverAliasesReady){
+                peer.observation=observation;peer.seen=System.nanoTime();
+                peer.worldReadiness=message.has("worldReadiness")?message.getAsJsonObject("worldReadiness").deepCopy():null;
+                if(aliasesSupported){JsonObject policy=TaskWire.message("server-aliases");policy.add("catalog",serverAliases.snapshot());c.send(policy.toString());}
+                return;
+            }
             HighwayHost highway = highways.get(peer.crew);
             if (!highway.accepts(text(message,"job"))) throw new IllegalArgumentException("End the previous native crew job before switching hosts");
             highway.observe(c,message);
@@ -581,22 +624,35 @@ public final class HostService implements AutoCloseable {
             for(var entry:peers.entrySet())if(entry.getKey().connected())sendHostiles(entry.getKey(),entry.getValue());
             if(peer.hostileWarningsSupported&&message.has("playerChecks"))c.send(HostileWarnings.receipt(message,hostiles.revision()).toString());
             peer.chatSupported = message.has("chatProtocol") && integer(message,"chatProtocol",1,1)==1;
+            peer.playerLookupSupported=message.has("playerLookupProtocol")&&integer(message,"playerLookupProtocol",1,1)==1;
             return;
         }
         Peer peer = peers.get(c); if (peer == null) throw new IllegalArgumentException("Announce worker identity first");
-        if (type.equals("worker-chat")) {
+        if(type.equals("worker-player-lookup")){
+            UUID id=UUID.fromString(text(message,"id"));PlayerLookup pending=playerLookups.get(id);if(pending==null)return;
+            if(pending.connection()!=c||!pending.crew().equals(peer.crew)||!text(message,"name").equalsIgnoreCase(pending.name()))throw new IllegalArgumentException("Player lookup belongs to another request");
+            String status=text(message,"status");Set<String> fields=new HashSet<>(Set.of("type","id","name","scope","status"));if(status.equals("Found"))fields.add("player");
+            if(!message.keySet().equals(fields)||!Set.of("Found","Missing","Unavailable","Ambiguous").contains(status))throw new IllegalArgumentException("Invalid player lookup result");
+            JsonObject identity=status.equals("Found")?ResourceApi.checkedPlayerIdentity(message.getAsJsonObject("player"),pending.name()):null;
+            playerLookups.remove(id);
+            if(!lookupReady(c,peer)||!sameServer(pending.scope(),peer.observation.scope())||!sameServer(pending.scope(),text(message,"scope")))pending.result().completeExceptionally(new IllegalStateException("The courier's server player list is unavailable"));
+            else if(status.equals("Found"))pending.result().complete(identity);
+            else {logEvent("player-lookup-failed",peer.id.toString(),id.toString(),status+" · "+pending.name());pending.result().completeExceptionally(new IllegalArgumentException(status.equals("Missing")?"That player is not in the courier's current server player list":status.equals("Ambiguous")?"That name matches multiple server player profiles":"The courier's server player list is unavailable"));}
+        } else if (type.equals("worker-chat")) {
             chat.append(peer.id,peer.crew,peer.observation.name(),peer.observation.scope(),text(message,"direction"),text(message,"text"),message.has("parts")?message.getAsJsonArray("parts"):null);
             if(text(message,"direction").equals("sent")&&DirectMessages.isDm(text(message,"text")))directMessages.sent(peer.id,System.currentTimeMillis());
-            if(text(message,"direction").equals("received")&&peer.reconciled&&peer.worldReadiness!=null&&text(peer.worldReadiness,"state").equals("Ready")&&kitBot.receiver(peer.id.toString(),peer.crew,peer.observation.scope())){
+            if(text(message,"direction").equals("sent")&&message.has("commandId"))kitBot.noticeSent(UUID.fromString(text(message,"commandId")).toString(),peer.id.toString(),peer.crew,peer.observation.scope(),text(message,"text"),System.currentTimeMillis());
+            if(text(message,"direction").equals("received")&&peer.reconciled&&peer.serverAliasesReady&&peer.worldReadiness!=null&&text(peer.worldReadiness,"state").equals("Ready")&&kitBot.receiver(peer.id.toString(),peer.crew,peer.observation.scope())){
                 try {
-                    JsonObject accepted=kitBot.listing(text(message,"text"));
-                    if(accepted==null)accepted=kitBot.receive(text(message,"text"),System.currentTimeMillis(),library);
-                    if(accepted!=null){
-                        logEvent("kitbot-request",peer.id.toString(),text(accepted,"id"),text(accepted,"name")+" · "+text(accepted,"category")+" · "+text(accepted,"status"));
-                        String response=switch(text(accepted,"status")){case "Listing"->" "+text(accepted,"text");case "Pending"->" Gotchu—your kits are queued. It might take a minute.";case "LimitExceeded"->" Maximum kits per request: "+accepted.get("maxKits").getAsInt()+". Try: kit "+text(accepted,"category")+" "+accepted.get("maxKits").getAsInt();default->" Sorry, that kit is out of stock right now.";};
-                        String id=accepted.has("id")?text(accepted,"id"):UUID.randomUUID().toString();
-                        if(!directMessages.add(peer.id,peer.crew,peer.observation.scope(),id,"/msg "+text(accepted,"name")+response,System.currentTimeMillis()))logEvent("kitbot-reply-dropped",peer.id.toString(),id,"DM queue is full");
-                    }
+                    kitBot.observeSender(text(message,"text"),message.has("sender")?message.getAsJsonObject("sender"):null);
+                    JsonObject accepted=kitBot.unresolvedSender(text(message,"text"));
+                    if(accepted==null)accepted=kitBot.confirmCredits(text(message,"text"),System.currentTimeMillis(),library,peer.id.toString());
+                    if(accepted==null)accepted=kitBot.listing(text(message,"text"));
+                    if(accepted==null)accepted=kitBot.balanceReply(text(message,"text"));
+                    if(accepted==null)accepted=kitBot.receive(text(message,"text"),System.currentTimeMillis(),library,peer.id.toString());
+                    if(accepted==null&&(!kitBot.mayDiscussCredits(text(message,"text"))||MikeKitHandler.creditSpendingRequested(Objects.requireNonNullElse(KitBot.messageText(text(message,"text")),""))))accepted=kitBot.cooldownReply(text(message,"text"),System.currentTimeMillis());
+                    if(accepted!=null)kitBotReply(peer,accepted,"",KitBot.messageText(text(message,"text")));
+                    else beginMikeRequest(peer,text(message,"text"));
                 }catch(RuntimeException e){logEvent("kitbot-error",peer.id.toString(),"",String.valueOf(e.getMessage()));}
             }
         } else if (type.equals("task-worker")) {
@@ -752,6 +808,268 @@ public final class HostService implements AutoCloseable {
         if(peer.hostileWarningsSupported)for(JsonObject frame:hostileWarnings.pending(connection,hostiles,System.currentTimeMillis()))
             if(connection.send(frame.toString()))hostileWarnings.delivered(connection,frame);
     }
+    private boolean courierReady(SwarmConnection connection,Peer peer,JsonObject config){
+        return connection.connected()&&peer.reconciled&&peer.serverAliasesReady&&peer.chatSupported&&peer.observation!=null
+            &&peer.crew.equals(text(config,"crew"))&&sameServer(text(config,"scope"),peer.observation.scope())
+            &&System.nanoTime()-peer.seen<5_000_000_000L&&peer.worldReadiness!=null&&text(peer.worldReadiness,"state").equals("Ready");
+    }
+    private boolean courierBusy(Peer peer){
+        return !peer.current.isEmpty()||kitBot.hasPendingDelivery(peer.id.toString())||tasks.values().stream().anyMatch(t->workerJobPending(t,peer.id));
+    }
+    private KitBot.Courier kitCourier(String preferred){
+        JsonObject config=kitBot.view().getAsJsonObject("config");Set<String> configured=new HashSet<>(List.of(text(config,"worker"),text(config,"backupWorker")));configured.remove("");
+        if(!configured.contains(preferred))throw new IllegalArgumentException("Request receiver is not a configured courier");
+        List<Peer> ready=peers.entrySet().stream().filter(e->configured.contains(e.getValue().id.toString())&&courierReady(e.getKey(),e.getValue(),config)).map(Map.Entry::getValue).toList();
+        Peer receiver=ready.stream().filter(p->p.id.toString().equals(preferred)).findFirst().orElse(null),selected=receiver;
+        boolean busy=receiver!=null&&courierBusy(receiver);
+        if(selected==null||busy)selected=ready.stream().filter(p->!courierBusy(p)).findFirst().orElse(receiver);
+        return selected==null?null:new KitBot.Courier(selected.id.toString(),selected.observation.name(),courierBusy(selected));
+    }
+    private void kitBotReply(Peer peer,JsonObject accepted,String generated,String incoming){
+        if(text(accepted,"status").equals("Cooldown")){
+            if(!directMessages.cooldown(peer.id,peer.crew,peer.observation.scope(),text(accepted,"name"),accepted.get("cooldownUntil").getAsLong(),System.currentTimeMillis(),text(accepted,"payment").equals("Credits")))logEvent("kitbot-reply-dropped",peer.id.toString(),"","DM queue is full");
+            return;
+        }
+        if(text(accepted,"status").equals("Pending")&&accepted.has("worker")){
+            String courier=text(accepted,"courierName");boolean handoff=!text(accepted,"worker").equals(peer.id.toString());
+            if(handoff||flag(accepted,"courierQueued")&&!text(kitBot.view().getAsJsonObject("config"),"backupWorker").isEmpty()){
+                JsonObject receipt=ackReceipt(accepted);
+                String target=flag(receipt,"gift")?" to "+text(receipt,"recipientName"):"";
+                String acknowledgement=handoff?"I'm on a delivery right now; "+courier+" will take care of your delivery"+target+".":"I'm on a delivery right now; your delivery"+target+" is queued behind it.";
+                logEvent("kitbot-courier-assigned",text(accepted,"worker"),text(accepted,"id"),"Assigned delivery courier");
+                queueKitBotReply(peer,receipt,acknowledgement,incoming);return;
+            }
+        }
+        logEvent("kitbot-request",peer.id.toString(),text(accepted,"id"),text(accepted,"name")+" · "+text(accepted,"category")+" · "+text(accepted,"status"));
+        if(text(accepted,"status").equals("Pending")&&flag(kitBot.mikeSettings(),"enabled")&&mikeAcks.size()<8){
+            JsonObject receipt=ackReceipt(accepted);UUID id=UUID.randomUUID();
+            if(mike.submit(id,kitBot.mikeSettings(),MikeKitHandler.acknowledgementBody(kitBot.mikeSettings(),receipt,incoming,kitBot.administrator(text(accepted,"name"))))){mikeAcks.put(id,new MikeAck(peer.id,peer.crew,peer.observation.scope(),text(kitBot.view(),"revision"),receipt,incoming,System.currentTimeMillis()));return;}
+        }
+        queueKitBotReply(peer,ackReceipt(accepted),generated,incoming);
+    }
+    private static JsonObject ackReceipt(JsonObject accepted){
+        JsonObject receipt=new JsonObject();for(String key:List.of("id","name","category","count","recipientName","kitName","status","maxKits","text","payment","creditsCharged","worker","courierName","courierQueued"))if(accepted.has(key))receipt.add(key,accepted.get(key).deepCopy());
+        receipt.addProperty("gift",accepted.has("recipient")&&!KitBot.cooldownOwner(accepted).equals(text(accepted,"recipient")));return receipt;
+    }
+    private void queueKitBotReply(Peer peer,JsonObject accepted,String generated,String incoming){
+        boolean gift=flag(accepted,"gift")&&text(accepted,"status").equals("Pending");
+        if(text(accepted,"payment").equals("Credits")&&text(accepted,"status").equals("Pending")&&!generated.isBlank())generated="Paid with "+accepted.get("count").getAsInt()+" credits: "+generated;
+        if(gift&&!generated.isBlank()&&!MikeKitHandler.namesRecipient(generated,text(accepted,"recipientName")))generated="For "+text(accepted,"recipientName")+": "+generated;
+        String response=switch(text(accepted,"status")){
+            case "Listing"->text(accepted,"text");
+            case "IdentityUnavailable"->"Your player profile is not available to the courier yet. Please try again shortly; public service needs Monocle 0.15.48+.";
+            case "Pending"->generated.isBlank()?(gift?"Gotchu—kits for "+text(accepted,"recipientName")+" are queued.":"Gotchu—your kits are queued. It might take a minute."):generated;
+            case "DeliveryFailed"->"That delivery could not be completed. No extra order was created; please check with the operator.";
+            case "InsufficientCredits"->"You do not have enough kit credits for that order. Use balance to check your credits. Your free hourly kit is separate.";
+            case "LimitExceeded"->"Maximum kits per request: "+accepted.get("maxKits").getAsInt()+". Try: "+(text(accepted,"payment").equals("Credits")?"buy":"kit")+" "+text(accepted,"category")+" "+accepted.get("maxKits").getAsInt();
+            default->"Sorry, that kit is out of stock right now.";
+        };
+        String id=accepted.has("id")?text(accepted,"id"):UUID.randomUUID().toString();
+        String whisper;
+        try{whisper=MikeKitHandler.whisper(text(accepted,"name"),response);}
+        catch(IllegalArgumentException e){whisper=MikeKitHandler.whisper(text(accepted,"name"),"Your kit request is queued.");}
+        long now=System.currentTimeMillis();
+        List<DirectMessages.Message> messages=new ArrayList<>();messages.add(new DirectMessages.Message(peer.id,peer.crew,peer.observation.scope(),id,whisper,now));
+        if(gift){String kit=text(accepted,"kitName");if(kit.isBlank())kit=text(accepted,"category");int count=accepted.get("count").getAsInt();String courier=text(accepted,"courierName"),fromOther=!text(accepted,"worker").isEmpty()&&!text(accepted,"worker").equals(peer.id.toString())&&!courier.isEmpty()?courier+"'s":"my";String notice=text(accepted,"name")+" has gifted you "+count+" kit"+(count==1?"":"s")+": "+kit+". Accept "+fromOther+" TPA to receive "+(count==1?"it":"them")+".";String noticeId=UUID.nameUUIDFromBytes((id+":gift").getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();messages.add(new DirectMessages.Message(peer.id,peer.crew,peer.observation.scope(),noticeId,MikeKitHandler.whisper(text(accepted,"recipientName"),notice),now));}
+        if(!directMessages.addAll(messages,now))logEvent("kitbot-reply-dropped",peer.id.toString(),id,"DM queue is full");
+        else if(!text(accepted,"status").equals("IdentityUnavailable"))rememberMike(peer,text(accepted,"name"),incoming,whisper,now);
+    }
+    private void rememberMike(Peer peer,String name,String incoming,String whisper,long now){
+        if(incoming==null||!flag(kitBot.mikeSettings(),"enabled"))return;
+        String prefix="/msg "+name+" ";
+        mike.remember(MikeKitHandler.conversationKey(peer.crew,peer.observation.scope(),name,text(kitBot.view(),"revision")),incoming,whisper.substring(prefix.length()),now);
+    }
+    private void beginMikeRequest(Peer peer,String raw){
+        long now=System.currentTimeMillis();JsonObject request=kitBot.mikeRequest(raw,now);if(request==null){JsonObject cooldown=kitBot.cooldownReply(raw,now);if(cooldown!=null)kitBotReply(peer,cooldown,"",KitBot.messageText(raw));return;}
+        String name=text(request,"name"),key=name.toLowerCase(Locale.ROOT);
+        mikeAskedAt.entrySet().removeIf(e->now-e.getValue()>90_000);
+        if(mikeRequests.size()+giftRequests.size()+creditRequests.size()>=8||mikeRequests.values().stream().anyMatch(r->r.name().equalsIgnoreCase(name))||giftRequests.values().stream().anyMatch(r->r.request().name().equalsIgnoreCase(name))||creditRequests.values().stream().anyMatch(r->r.request().name().equalsIgnoreCase(name))||now-mikeAskedAt.getOrDefault(key,0L)<5000)return;
+        JsonArray catalog=kitBot.mikeCatalog(name);Set<String> categories=new HashSet<>();for(JsonElement row:catalog)categories.add(text(row.getAsJsonObject(),"category"));
+        String revision=text(kitBot.view(),"revision"),context=MikeKitHandler.conversationKey(peer.crew,peer.observation.scope(),name,revision);
+        boolean administrator=kitBot.administrator(name);
+        JsonObject settings=kitBot.mikeSettings(),body=MikeKitHandler.bankContext(MikeKitHandler.requestBody(settings,text(request,"message"),request.get("maxKits").getAsInt(),catalog,mike.conversation(context,now),name),administrator,kitBot.creditPolicy(name,now));UUID id=UUID.randomUUID();
+        if(mike.submit(id,settings,body)){
+            mikeAskedAt.put(key,now);mikeRequests.put(id,new MikeRequest(peer.id,peer.crew,peer.observation.scope(),name,text(request,"message"),revision,Set.copyOf(categories),now,body,0,Map.of(),administrator));
+            logEvent("kitbot-mike-request",peer.id.toString(),id.toString(),"Public menu submitted to Ollama");
+        }
+    }
+    private void finishMikeRequests(){
+        MikeKitHandler.Result result;
+        while((result=mike.poll())!=null){
+            MikeAck ack=mikeAcks.remove(result.id());if(ack!=null){finishMikeAck(ack,result);continue;}
+            MikeRequest request=mikeRequests.remove(result.id());if(request==null)continue;
+            long now=System.currentTimeMillis();
+            Peer peer=currentMikePeer(request);if(peer==null)continue;
+            try{
+                if(!result.error().isEmpty())throw new IllegalArgumentException("Mike inference unavailable");
+                MikeKitHandler.Decision decision;
+                try{decision=MikeKitHandler.decision(result.message(),request.categories(),flag(kitBot.mikeSettings(),"coordinateJokes"),request.administrator()&&kitBot.administrator(request.name()));}
+                catch(IllegalArgumentException invalid){
+                    String code=MikeKitHandler.errorCode(invalid);
+                    if(Set.of("multiple_tools","invalid_category","invalid_kit_reference").contains(code)){
+                        submitMikeStep(result.id(),request,MikeKitHandler.correctResponse(request.body()),request.inspected());
+                        logEvent("kitbot-mike-retry",peer.id.toString(),result.id().toString(),code+"; no action executed");continue;
+                    }
+                    throw invalid;
+                }
+                if(decision.bank()!=null){
+                    String target=text(decision.bank(),"player");
+                    if(target.isEmpty()||target.equalsIgnoreCase(request.name()))finishCredit(peer,result.id(),request,decision.bank(),kitBot.identity(request.name()));
+                    else{
+                        if(!request.administrator()||!kitBot.administrator(request.name()))throw new IllegalArgumentException("Credit tool is not authorized for this user");
+                        creditRequests.put(result.id(),new CreditRequest(request,decision.bank(),lookupPlayer(peer,target)));
+                    }
+                }else if(decision.inspection()!=null){
+                    inspectMikeStep(result.id(),request,decision.inspection(),kitBot.inspect(request.name(),decision.inspection()));
+                }else if(decision.menuPage()>0){
+                    JsonObject listing=kitBot.menu(request.name(),decision.menuPage());if(listing!=null)kitBotReply(peer,listing,"",request.message());
+                }else if(decision.category()!=null){
+                    if(!decision.kit().isEmpty()){
+                        JsonObject query=new JsonObject();query.addProperty("kit",decision.kit());query.addProperty("category",decision.category());JsonObject facts=kitBot.inspect(request.name(),query);JsonArray rows=facts.getAsJsonArray("kits");
+                        if(rows.size()!=1){JsonObject unavailable=new JsonObject();unavailable.addProperty("name",request.name());unavailable.addProperty("category",decision.category());unavailable.addProperty("status","OutOfStock");kitBotReply(peer,unavailable,"",request.message());continue;}
+                        if(!request.inspected().containsKey(decision.kit())||!rows.get(0).getAsJsonObject().getAsJsonObject("contentsPerKit").equals(request.inspected().get(decision.kit()))){
+                            inspectMikeStep(result.id(),request,query,facts);logEvent("kitbot-mike-retry",peer.id.toString(),result.id().toString(),"refresh_exact_selection; no action executed");continue;
+                        }
+                    }
+                    if(!decision.recipient().isEmpty()&&!decision.recipient().equalsIgnoreCase(request.name())){
+                        if(giftRequests.size()>=8)throw new IllegalArgumentException("Too many recipient lookups");
+                        giftRequests.put(result.id(),new GiftRequest(request,decision,lookupPlayer(peer,decision.recipient())));
+                    }else acceptMikeOrder(peer,request,decision,null);
+                }else{
+                    String whisper=MikeKitHandler.whisper(request.name(),decision.reply());
+                    if(directMessages.add(peer.id,peer.crew,peer.observation.scope(),result.id().toString(),whisper,now))rememberMike(peer,request.name(),request.message(),whisper,now);
+                }
+            }catch(RuntimeException e){
+                if(e.getMessage()!=null&&e.getMessage().startsWith("Task checkpoint failed"))throw e;
+                String code=MikeKitHandler.errorCode(e);mike.rejected(code);logEvent("kitbot-mike-error",peer.id.toString(),result.id().toString(),code+"; no provider response or private catalog logged");
+                directMessages.add(peer.id,peer.crew,peer.observation.scope(),result.id().toString(),MikeKitHandler.whisper(request.name(),"Mike couldn't handle that. Try: kit <category> <count>, or kits to see what's available."),now);
+            }
+        }
+    }
+    private Peer currentMikePeer(MikeRequest request){
+        long now=System.currentTimeMillis();if(now-request.at()>90_000||!text(kitBot.view(),"revision").equals(request.revision()))return null;
+        Peer peer=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().id.equals(request.worker())).map(Map.Entry::getValue).findFirst().orElse(null);
+        return peer!=null&&peer.reconciled&&peer.serverAliasesReady&&peer.worldReadiness!=null&&text(peer.worldReadiness,"state").equals("Ready")&&peer.crew.equals(request.crew())&&sameServer(request.scope(),peer.observation.scope())&&kitBot.receiver(peer.id.toString(),peer.crew,peer.observation.scope())&&kitBot.canAskMike(request.name(),now)&&!kitBot.requestedSince(request.name(),request.at())?peer:null;
+    }
+    private boolean lookupReady(SwarmConnection connection,Peer peer){
+        return connection.connected()&&peer!=null&&peer.reconciled&&peer.serverAliasesReady&&peer.playerLookupSupported&&peer.observation!=null&&System.nanoTime()-peer.seen<5_000_000_000L&&peer.worldReadiness!=null&&text(peer.worldReadiness,"state").equals("Ready");
+    }
+    private CompletableFuture<JsonObject> lookupPlayer(Peer peer,String name){
+        if(!name.matches("[A-Za-z0-9_]{1,16}"))return CompletableFuture.failedFuture(new IllegalArgumentException("Specify an exact Minecraft username"));
+        var connection=peers.entrySet().stream().filter(e->e.getValue()==peer&&lookupReady(e.getKey(),peer)).map(Map.Entry::getKey).findFirst().orElse(null);
+        if(connection==null)return CompletableFuture.failedFuture(new IllegalStateException("The courier's server player list is unavailable; use a ready Monocle 0.16.7+ worker"));
+        if(playerLookups.size()>=32)return CompletableFuture.failedFuture(new IllegalStateException("Too many pending server player lookups"));
+        UUID id=UUID.randomUUID();CompletableFuture<JsonObject> result=new CompletableFuture<>();
+        PlayerLookup pending=new PlayerLookup(connection,peer.crew,peer.observation.scope(),name,System.nanoTime(),result);playerLookups.put(id,pending);
+        JsonObject query=new JsonObject();query.addProperty("type","manage-player-lookup");query.addProperty("id",id.toString());query.addProperty("name",name);query.addProperty("scope",pending.scope());
+        if(!connection.send(query.toString())){playerLookups.remove(id);result.completeExceptionally(new IllegalStateException("The courier's server player list is unavailable"));}
+        return result;
+    }
+    synchronized CompletableFuture<JsonObject> playerIdentity(String name,String workerId){
+        if(!name.matches("[A-Za-z0-9_]{1,16}"))throw new IllegalArgumentException("Specify an exact Minecraft username");
+        String selected=workerId.isEmpty()?text(kitBot.view().getAsJsonObject("config"),"worker"):UUID.fromString(workerId).toString();
+        var candidates=peers.entrySet().stream().filter(e->lookupReady(e.getKey(),e.getValue())&&(selected.isEmpty()||e.getValue().id.toString().equals(selected))).map(Map.Entry::getValue).toList();
+        if(candidates.isEmpty())return CompletableFuture.failedFuture(new IllegalStateException("No ready worker can read its server player list; use Monocle 0.16.7+"));
+        if(candidates.stream().anyMatch(p->!p.crew.equals(candidates.getFirst().crew)||!sameServer(p.observation.scope(),candidates.getFirst().observation.scope())))throw new IllegalArgumentException("Select a workerId for the server player lookup");
+        return lookupPlayer(candidates.getFirst(),name);
+    }
+    private void finishPlayerLookups(){
+        for(var entry:List.copyOf(playerLookups.entrySet())){
+            PlayerLookup pending=entry.getValue();Peer peer=peers.get(pending.connection());
+            if(pending.result().isDone())playerLookups.remove(entry.getKey());
+            else if(!lookupReady(pending.connection(),peer)||!pending.crew().equals(peer.crew)||!sameServer(pending.scope(),peer.observation.scope())){playerLookups.remove(entry.getKey());pending.result().completeExceptionally(new IllegalStateException("The courier's server player list is unavailable"));}
+            else if(System.nanoTime()-pending.at()>=5_000_000_000L){playerLookups.remove(entry.getKey());logEvent("player-lookup-failed",peer.id.toString(),entry.getKey().toString(),"Timeout · "+pending.name());pending.result().completeExceptionally(new IllegalStateException("The courier's server player lookup timed out"));}
+        }
+    }
+    private static String playerLookupFailure(Throwable failure){
+        while(failure instanceof CompletionException&&failure.getCause()!=null)failure=failure.getCause();String message=failure.getMessage();
+        return message!=null&&Set.of("That player is not in the courier's current server player list","That name matches multiple server player profiles","The courier's server player list is unavailable","The courier's server player lookup timed out","The courier's server player list is unavailable; use a ready Monocle 0.16.7+ worker").contains(message)?message:"The courier could not confirm that server player profile";
+    }
+    private void acceptMikeOrder(Peer peer,MikeRequest request,MikeKitHandler.Decision decision,JsonObject recipient){
+        if(recipient!=null&&!decision.kit().isEmpty()){
+            JsonObject query=new JsonObject();query.addProperty("kit",decision.kit());query.addProperty("category",decision.category());JsonArray rows=kitBot.inspect(request.name(),query).getAsJsonArray("kits");
+            if(rows.size()!=1||!rows.get(0).getAsJsonObject().getAsJsonObject("contentsPerKit").equals(request.inspected().get(decision.kit())))throw new IllegalArgumentException("Gift kit changed during recipient lookup");
+        }
+        if(decision.payment().equals("Credits")&&!MikeKitHandler.creditSpendingRequested(request.message())){
+            JsonObject offer=kitBot.offerCredits(request.name(),decision.category(),decision.quantity(),decision.kit(),System.currentTimeMillis(),library,recipient);
+            if(offer!=null){kitBotReply(peer,offer,"",request.message());return;}
+            JsonObject reply=new JsonObject();reply.addProperty("name",request.name());reply.addProperty("status","Listing");reply.addProperty("text",MikeKitHandler.creditConfirmation(decision));
+            kitBotReply(peer,reply,"",request.message());logEvent("kitbot-credit-confirmation",peer.id.toString(),"","credit_authorization_required; no order created or credits spent");return;
+        }
+        JsonObject accepted=kitBot.receive(request.name(),decision.category(),decision.quantity(),decision.kit(),System.currentTimeMillis(),library,recipient,decision.payment(),peer.id.toString());
+        if(accepted!=null)kitBotReply(peer,accepted,"",request.message());
+    }
+    private void finishGiftRequests(){
+        for(var entry:List.copyOf(giftRequests.entrySet())){
+            GiftRequest gift=entry.getValue();Peer peer=currentMikePeer(gift.request());
+            if(peer==null){giftRequests.remove(entry.getKey());gift.identity().cancel(true);continue;}
+            if(!gift.identity().isDone())continue;giftRequests.remove(entry.getKey());
+            try{
+                JsonObject identity=gift.identity().join();MikeKitHandler.Decision decision=gift.decision();
+                if(!text(identity,"name").equalsIgnoreCase(decision.recipient()))throw new IllegalArgumentException("Recipient identity mismatch");
+                // The async lookup is not an admission: source selection and sender limits are checked now.
+                acceptMikeOrder(peer,gift.request(),decision,identity);
+            }catch(RuntimeException failure){
+                if(failure.getMessage()!=null&&failure.getMessage().startsWith("Task checkpoint failed"))throw failure;
+                boolean changed="Gift kit changed during recipient lookup".equals(failure.getMessage());String code=changed?"gift_selection_changed":"recipient_lookup_failed";mike.rejected(code);logEvent("kitbot-mike-error",peer.id.toString(),entry.getKey().toString(),code+"; no provider response or private catalog logged");
+                directMessages.add(peer.id,peer.crew,peer.observation.scope(),entry.getKey().toString(),MikeKitHandler.whisper(gift.request().name(),changed?"That exact kit changed while checking the recipient. No delivery was queued; please ask again.":playerLookupFailure(failure)+". No delivery was queued."),System.currentTimeMillis());
+            }
+        }
+    }
+    private void finishMikeAck(MikeAck ack,MikeKitHandler.Result result){
+        if(System.currentTimeMillis()-ack.at()>90_000||!text(kitBot.view(),"revision").equals(ack.revision()))return;
+        Peer peer=peers.entrySet().stream().filter(e->e.getKey().connected()&&e.getValue().id.equals(ack.worker())).map(Map.Entry::getValue).findFirst().orElse(null);
+        if(peer==null||!peer.reconciled||peer.observation==null||!peer.crew.equals(ack.crew())||!sameServer(ack.scope(),peer.observation.scope())||!kitBot.receiver(peer.id.toString(),peer.crew,peer.observation.scope()))return;
+        String generated="";
+        try{
+            if(!result.error().isEmpty()||result.message()==null||result.message().has("tool_calls")&&!result.message().getAsJsonArray("tool_calls").isEmpty())throw new IllegalArgumentException("Acknowledgement unavailable");
+            generated=MikeKitHandler.decision(result.message(),Set.of()).reply();
+        }catch(RuntimeException invalid){logEvent("kitbot-ack-fallback",peer.id.toString(),text(ack.receipt(),"id"),"acknowledgement_unavailable; accepted delivery is not replayed");}
+        JsonObject receipt=ack.receipt().deepCopy(),record=kitBot.view().getAsJsonObject("requests").getAsJsonObject(text(receipt,"id"));
+        if(record!=null&&Set.of("Failed","Cancelled","Canceled").contains(text(record,"status"))){receipt.addProperty("status","DeliveryFailed");generated="";}
+        queueKitBotReply(peer,receipt,generated,ack.incoming());
+    }
+    private void submitMikeStep(UUID id,MikeRequest request,JsonObject body,Map<String,JsonObject> inspected){
+        if(request.reads()>=4)throw new IllegalArgumentException("Mike read-tool budget exhausted");
+        if(!mike.submit(id,kitBot.mikeSettings(),body))throw new IllegalArgumentException("Mike inspection continuation unavailable");
+        mikeRequests.put(id,new MikeRequest(request.worker(),request.crew(),request.scope(),request.name(),request.message(),request.revision(),request.categories(),request.at(),body,request.reads()+1,Map.copyOf(inspected),request.administrator()));
+    }
+    private void finishCreditRequests(){
+        for(var entry:List.copyOf(creditRequests.entrySet())){
+            CreditRequest pending=entry.getValue();Peer peer=currentMikePeer(pending.request());
+            if(peer==null){creditRequests.remove(entry.getKey());pending.identity().cancel(true);continue;}
+            if(!pending.identity().isDone())continue;creditRequests.remove(entry.getKey());
+            JsonObject identity;
+            try{
+                identity=pending.identity().join();
+                if(!text(identity,"name").equalsIgnoreCase(text(pending.intent(),"player")))throw new IllegalArgumentException("Credit player identity did not match");
+            }catch(RuntimeException rejected){bankReply(peer,entry.getKey(),pending.request(),playerLookupFailure(rejected)+". No balance was changed.");continue;}
+            finishCredit(peer,entry.getKey(),pending.request(),pending.intent(),identity);
+        }
+    }
+    private void finishCredit(Peer peer,UUID id,MikeRequest request,JsonObject intent,JsonObject identity){
+        String operation=text(intent,"operation"),target=text(identity,"id"),username=text(identity,"name");
+        boolean administrator=request.administrator()&&kitBot.administrator(request.name());
+        if(!administrator&&(!operation.equals("get_credit_balance")||!target.equals(text(kitBot.identity(request.name()),"id")))){bankReply(peer,id,request,"That credit operation is not authorized for this user. No balance was changed.");return;}
+        if(operation.equals("get_credit_balance")){
+            JsonObject account=creditBank.account(target);bankReply(peer,id,request,username+" has "+account.get("balance").getAsLong()+" kit credits.");return;
+        }
+        long amount=CreditBank.amount(intent,"amount",CreditBank.MAX_ADJUSTMENT);String reason=intent.has("reason")?text(intent,"reason"):"Administrator adjustment";
+        JsonObject account;
+        try{account=creditBank.adjust(id.toString(),target,username,operation.equals("gift_credits")?amount:-amount,reason,"player:"+text(kitBot.identity(request.name()),"id"));}
+        catch(IllegalArgumentException|IllegalStateException rejected){bankReply(peer,id,request,rejected.getCause() instanceof java.sql.SQLException?"The credit outcome could not be confirmed. Check the bank ledger before repeating the request.":"Credit change rejected: "+rejected.getMessage());return;}
+        bankReply(peer,id,request,(operation.equals("gift_credits")?"Gifted "+amount+" kit credits to ":"Revoked "+amount+" kit credits from ")+username+". Balance: "+account.get("balance").getAsLong()+" credits.");
+        logEvent("kit-credit-adjusted",peer.id.toString(),id.toString(),"Administrator credit adjustment recorded");
+    }
+    private void bankReply(Peer peer,UUID id,MikeRequest request,String reply){
+        String whisper=MikeKitHandler.whisper(request.name(),reply);long now=System.currentTimeMillis();
+        if(directMessages.add(peer.id,peer.crew,peer.observation.scope(),id.toString(),whisper,now))rememberMike(peer,request.name(),request.message(),whisper,now);
+    }
+    private void inspectMikeStep(UUID id,MikeRequest request,JsonObject query,JsonObject facts){
+        Map<String,JsonObject> inspected=new HashMap<>(request.inspected());if(query.has("kit"))inspected.remove(text(query,"kit"));
+        for(JsonElement value:facts.getAsJsonArray("kits")){JsonObject row=value.getAsJsonObject();inspected.put(text(row,"kit"),row.getAsJsonObject("contentsPerKit").deepCopy());}
+        submitMikeStep(id,request,MikeKitHandler.continueInspection(request.body(),query,facts),inspected);
+    }
     private void tickAutoTpy() {
         long now=System.currentTimeMillis(),fresh=System.nanoTime();
         for(var entry:List.copyOf(autoTpyRequests.entrySet())) {
@@ -794,6 +1112,7 @@ public final class HostService implements AutoCloseable {
                 StashSortExecution.validateAction(task,action);
                 if(!ACTIONS.contains(type))throw new IllegalArgumentException("Unsupported native action");
                 if(Set.of("StashScan","StashDeposit","StashVisit").contains(type))StashCatalog.plan(action);
+                if(type.equals("StashBuffer"))StashCatalog.bufferAction(action);
                 if(type.equals("Highway")) {
                     JsonObject packaged=task.getAsJsonObject("package");
                     if(!packaged.has("geometry") || !packaged.getAsJsonObject("highways").has(text(action,"workflow"))) throw new IllegalArgumentException("Unknown Highway preset");
@@ -1013,7 +1332,27 @@ public final class HostService implements AutoCloseable {
         int a = first.indexOf('\n'), b = second.indexOf('\n');
         return a > 0 && b > 0 && first.substring(0, a).equalsIgnoreCase(second.substring(0, b));
     }
+    static boolean kitPickupBlocked(JsonObject task,UUID worker,Collection<JsonObject> tasks){
+        if(!DeliveryWatchdog.applies(task))return false;
+        for(JsonObject other:tasks){
+            if(other==task||text(other,"id").equals(text(task,"id"))||!DeliveryWatchdog.applies(other)||QueuePolicy.terminal(text(other,"status"))||flag(other,"cancelled")
+                ||!text(other,"crew").equals(text(task,"crew"))||!text(other,"server").equals(text(task,"server"))||!text(other,"dimension").equals(text(task,"dimension"))
+                ||!text(other.getAsJsonObject("args"),"name").equals(text(task.getAsJsonObject("args"),"name")))continue;
+            for(var entry:other.getAsJsonObject("runs").entrySet()){
+                JsonObject run=entry.getValue().getAsJsonObject();if(entry.getKey().equals(worker.toString())||QueuePolicy.terminal(text(run,"status"))||text(run,"status").equals("Queued"))continue;
+                String action=run.has("action")?text(run.getAsJsonObject("action"),"type"):"";
+                JsonObject own=task.getAsJsonObject("runs").getAsJsonObject(worker.toString());
+                if(action.isEmpty()&&text(run,"status").equals("Sending")&&own!=null&&text(own,"status").equals("Sending")&&text(task,"id").compareTo(text(other,"id"))<0)continue;
+                if(Set.of("","RecoverSupplies","StashVisit","StashResupply").contains(action))return true;
+            }
+        }
+        return false;
+    }
     private void transfer(SwarmConnection c, Peer peer, JsonObject task, JsonObject run) {
+        // Serialize source pickup, then allow couriers to travel and hand off independently.
+        if(kitPickupBlocked(task,peer.id,tasks.values())){
+            String waiting="Waiting for another courier to finish source pickup";if(!text(run,"detail").equals(waiting)){run.addProperty("detail",waiting);persist();}return;
+        }
         UUID id = UUID.fromString(text(run, "id"));
         if (peer.transfer != null || peer.transferred.contains(id)) return;
         JsonObject envelope = TaskWire.envelope(task, peer.id);
@@ -1213,13 +1552,32 @@ public final class HostService implements AutoCloseable {
             task.getAsJsonObject("stashSort").addProperty("status","Released");persist();logEvent("stash-sort-released","",text(task,"id"),"Operator confirmed cargo recovered; original ledger retained");return StashSortExecution.summary(task);
         }
         if(Set.of("stash-reserve-columns","stash-update","stash-delete","stash-clear","stash-clear-contents").contains(op)&&tasks.values().stream().anyMatch(t->StashSortExecution.sameScope(t,text(request,"crew"),text(request,"scope"))))throw new IllegalStateException("This crew/world has a sorting lease; finish it or explicitly release its stopped cargo record first");
-        if(op.equals("kitbot-get"))return kitBot.view();
+        if(op.equals("server-aliases-get"))return serverAliases.snapshot();
+        if(op.equals("server-aliases-save")){
+            if(tasks.values().stream().anyMatch(t->!BotHistory.taskFinished(t,t.has("nativeDefinition"))))throw new IllegalStateException("Finish jobs and cleanup before changing Minecraft server identities");
+            serverAliases=ServerAliases.save(directory,text(request,"expected"),request.getAsJsonArray("servers"));
+            for(Peer peer:peers.values())peer.serverAliasesReady=false;
+            mike.clearConversations();return serverAliases.snapshot();
+        }
+        if(op.equals("kitbot-get")){JsonObject out=kitBot.view();out.add("mikeStatus",mike.status());return out;}
+        if(op.equals("kit-credit-settle")){
+            if(!request.keySet().equals(Set.of("op","id","delivered","reason")))throw new IllegalArgumentException("Supply order ID, confirmed delivered count and reason");
+            if(!request.get("reason").isJsonPrimitive()||!request.getAsJsonPrimitive("reason").isString())throw new IllegalArgumentException("Review reason must be text");
+            UUID id=UUID.fromString(text(request,"id"));JsonObject task=tasks.get(id);
+            if(task!=null&&(!QueuePolicy.terminal(text(task,"status"))||task.getAsJsonObject("runs").entrySet().stream().anyMatch(r->!QueuePolicy.terminal(text(r.getValue().getAsJsonObject(),"status"))&&peer(text(task,"crew"),UUID.fromString(r.getKey()))!=null)))throw new IllegalStateException("Wait for the connected worker to acknowledge job cleanup before settling credits");
+            return kitBot.resolveCredit(id.toString(),integer(request,"delivered",0,36),text(request,"reason"));
+        }
         if(op.equals("kitbot-save")){
             JsonObject config=request.getAsJsonObject("config");String crew=text(config,"crew"),scope=text(config,"scope");
-            if(!crews.containsKey(crew)||StashCatalog.get(directory,crew,scope,text(config,"source")).isEmpty())throw new IllegalArgumentException("Choose a saved crew stash");
+            if(!crews.containsKey(crew)||KitBot.sourceNames(config).stream().anyMatch(name->StashCatalog.get(directory,crew,scope,name).isEmpty()))throw new IllegalArgumentException("Choose a saved crew stash");
             UUID worker=UUID.fromString(text(config,"worker"));JsonObject saved=roster.get(worker);
             if(saved==null||!text(saved,"crew").equals(crew))throw new IllegalArgumentException("Choose a worker from this crew");
-            return kitBot.configure(config,text(request,"expected"));
+            String backupId=config.has("backupWorker")?text(config,"backupWorker"):text(kitBot.view().getAsJsonObject("config"),"backupWorker");
+            if(!backupId.isEmpty()){
+                JsonObject backup=roster.get(UUID.fromString(backupId));
+                if(backup==null||!text(backup,"crew").equals(crew))throw new IllegalArgumentException("Choose a backup courier from this crew");
+            }
+            JsonObject savedConfig=kitBot.configure(config,text(request,"expected"));mike.clearConversations();return savedConfig;
         }
         if(op.startsWith("kit-categories-")){
             String crew=text(request,"crew"),scope=text(request,"scope");if(!crews.containsKey(crew)&&!crew.equals("Local"))throw new IllegalArgumentException("Unknown crew");
@@ -1229,7 +1587,7 @@ public final class HostService implements AutoCloseable {
                 JsonObject action=entry.getValue().getAsJsonObject().getAsJsonObject("action");if(action!=null&&text(action,"type").equals("StashDeposit")&&crew.equals(text(action,"catalogCrew").isEmpty()?text(task,"crew"):text(action,"catalogCrew")))throw new IllegalStateException("Wait until active deposits finish before editing categories");
             }
             if(op.equals("kit-categories-save"))return KitCategories.save(directory,crew,scope,text(request,"expected"),request.getAsJsonObject("category"));
-            if(op.equals("kit-categories-seed")){JsonObject source=StashCatalog.get(directory,crew,scope,text(request,"source"));if(source.isEmpty())throw new IllegalArgumentException("Unknown source stash");return KitCategories.seed(directory,crew,scope,source,250);}
+            if(op.equals("kit-categories-seed")){JsonObject source=StashCatalog.get(directory,crew,scope,text(request,"source"));if(source.isEmpty())throw new IllegalArgumentException("Unknown source stash");return KitCategories.seed(directory,crew,scope,source,request.has("minimumStock")?integer(request,"minimumStock",1,1_000_000):250);}
         }
         if(op.equals("discord-settings"))return notifications.configure(request);
         if(op.equals("discord-test"))return notifications.test();
@@ -1558,6 +1916,24 @@ public final class HostService implements AutoCloseable {
         for (JsonElement value : task.getAsJsonObject("runs").asMap().values()) commands.remove(UUID.fromString(text(value.getAsJsonObject(), "id")));
     }
 
+    private void watchDeliveries(){
+        long now=System.currentTimeMillis();
+        for(JsonObject task:tasks.values()){
+            if(!DeliveryWatchdog.applies(task))continue;
+            for(var entry:task.getAsJsonObject("runs").entrySet()){
+                JsonObject run=entry.getValue().getAsJsonObject();Peer worker=peer(text(task,"crew"),UUID.fromString(entry.getKey()));
+                boolean ready=worker!=null&&worker.reconciled&&worker.serverAliasesReady&&worker.observation!=null
+                    &&System.nanoTime()-worker.seen<5_000_000_000L&&worker.worldReadiness!=null&&text(worker.worldReadiness,"state").equals("Ready");
+                DeliveryWatchdog.Decision decision=deliveryWatchdog.check(task,run,ready,now);
+                if(decision.command().isEmpty())continue;
+                if(decision.command().equals("cancel"))cancelTask(task);
+                else QueuePolicy.resume(task);
+                task.addProperty("detail",decision.reason());persist();
+                logEvent("delivery-auto-"+decision.command(),entry.getKey(),text(task,"id"),decision.reason());
+            }
+        }
+    }
+
     JsonObject highwaySubmission(JsonObject request) {
         int x=integer(request,"x",-29_900_000,29_900_000),y=integer(request,"y",-2048,2048),z=integer(request,"z",-29_900_000,29_900_000);
         int length=integer(request,"length",16,HighwayJobs.MAX_LENGTH);String direction=text(request,"direction");
@@ -1670,7 +2046,8 @@ public final class HostService implements AutoCloseable {
         task.add("runs", runs); task.add("overrides", new JsonObject()); task.add("args", args);
         if(extension!=null)task.add("publicAction",extension);else task.add("package",packaged);
         boolean courierReturn=packaged!=null&&Set.of("task-kit-delivery","task-kit-remove-incomplete").contains(text(packaged,"entry"))&&flag(args,"returnHome");
-        task.add("supportedActions", new Gson().toJsonTree(packaged!=null&&text(packaged,"entry").equals(StashTransferTeam.WORKFLOW)?StashTransferTeam.ACTIONS:packaged!=null&&text(packaged,"entry").equals("task-stash-transfer")?List.of("Wait","KitTransferPlan","StashResupply","StashDeposit"):ACTIONS.stream().filter(a->!a.equals("KitTransferPlan")&&!a.equals("StashSortPlan")&&(!a.equals("StashVisit")||courierReturn)).toList()));
+        boolean enderTransport=flag(args,"enderTransport");
+        task.add("supportedActions", new Gson().toJsonTree(packaged!=null&&text(packaged,"entry").equals(StashTransferTeam.WORKFLOW)?StashTransferTeam.ACTIONS:packaged!=null&&text(packaged,"entry").equals("task-stash-transfer")?(enderTransport?List.of("Wait","KitTransferPlan","StashResupply","StashDeposit","StashBuffer","StashVisit"):List.of("Wait","KitTransferPlan","StashResupply","StashDeposit")):ACTIONS.stream().filter(a->!a.equals("KitTransferPlan")&&!a.equals("StashSortPlan")&&(!a.equals("StashVisit")||courierReturn||enderTransport)&&(!a.equals("StashBuffer")||courierReturn||enderTransport)).toList()));
         if(sortState!=null)task.add("supportedActions",new Gson().toJsonTree(List.of("StashSortPlan","StashScan","StashResupply","StashDeposit","Wait")));
         validateTask(id, task);
         if(!publicJob)for (String worker : runs.keySet()) TaskFiles.jsonBytes(TaskWire.envelope(task, UUID.fromString(worker)), TaskFiles.MAX_PACKAGE);
@@ -1702,6 +2079,7 @@ public final class HostService implements AutoCloseable {
         result.add("discordNotifications",notifications.status());
         result.add("crewLabels",new Gson().toJsonTree(crewLabels));result.add("workflows",library.list());result.add("drafts",library.drafts());
         result.add("activity",new Gson().toJsonTree(activity));
+        result.add("minecraftServers",serverAliases.snapshot());
         result.add("chat",chat.json());
         result.add("crewChat",dev.monocle.coordinator.BotChat.grouped(chat.json()));
         result.addProperty("workerPort", port()); result.addProperty("webPort", webPort()); result.add("capabilities", new Gson().toJsonTree(ACTIONS)); result.add("crews", new Gson().toJsonTree(crews.keySet()));
@@ -1715,7 +2093,8 @@ public final class HostService implements AutoCloseable {
             Peer peer = entry.getValue(); JsonObject worker = new JsonObject(); worker.addProperty("id", peer.id.toString()); worker.addProperty("name", peer.observation.name());
             worker.addProperty("crew", peer.crew); worker.addProperty("scope", peer.observation.scope()); worker.addProperty("connected", entry.getKey().connected());
             worker.addProperty("reconciled", peer.reconciled); worker.addProperty("current", peer.current); worker.addProperty("positionFresh", peer.observation.position() != null && peer.observation.fresh(System.nanoTime()));
-            worker.addProperty("chatSupported",peer.chatSupported);
+            worker.addProperty("chatSupported",peer.chatSupported);worker.addProperty("playerLookupSupported",peer.playerLookupSupported);
+            worker.addProperty("serverAddress",peer.serverAddress);worker.addProperty("serverAliasesReady",peer.serverAliasesReady);
             worker.addProperty("stashSortSupported",peer.sortSupported);
             if(peer.worldReadiness!=null)worker.add("worldReadiness",peer.worldReadiness.deepCopy());
             if (peer.observation.position() != null) {
@@ -1753,7 +2132,7 @@ public final class HostService implements AutoCloseable {
             if(task.has("package")&&Set.of("task-kit-delivery","task-kit-remove-incomplete","task-stash-transfer","task-stash-transfer-team").contains(text(task.getAsJsonObject("package"),"entry"))){
                 JsonObject kit=new JsonObject(),args=task.getAsJsonObject("args");
                 kit.addProperty("workflow",text(task.getAsJsonObject("package"),"entry"));
-                for(String key:List.of("name","kitTypeId","kitTypeIds","routes","count","destination","targetStashName","targetColumn","transferAll","includeIncomplete","depositCarried","leader","tpaWarmupTicks"))if(args.has(key))kit.add(key,args.get(key).deepCopy());
+                for(String key:List.of("name","kitTypeId","kitTypeIds","routes","count","destination","targetStashName","targetColumn","transferAll","includeIncomplete","depositCarried","enderTransport","fillAllocatedColumns","leader","tpaWarmupTicks"))if(args.has(key))kit.add(key,args.get(key).deepCopy());
                 long delivered=0;boolean reported=false;
                 for(var value:task.getAsJsonObject("runs").entrySet()){JsonObject run=value.getValue().getAsJsonObject();if(run.has("workflowResult")&&run.get("workflowResult").isJsonObject()&&run.getAsJsonObject("workflowResult").has("delivered")){delivered+=StashCatalog.integer(run.getAsJsonObject("workflowResult"),"delivered",0,10_000_000);reported=true;}}
                 if(reported)kit.addProperty("delivered",delivered);
@@ -1828,9 +2207,14 @@ public final class HostService implements AutoCloseable {
     @Override public synchronized void close() {
         if (closed) return; closed = true;
         checkpointRoster();
+        playerLookups.values().forEach(p->p.result().completeExceptionally(new IllegalStateException("Host closed during server player lookup")));playerLookups.clear();
         listener.close(); ticker.shutdownNow();catalogReader.shutdownNow();
         notifications.close();
+        mike.close();
+        creditBank.close();
         StashStore.close(directory);
-        try { lock.release(); lockChannel.close(); } catch (IOException e) { throw new IllegalStateException("Cannot release host lock", e); }
+        try{journal.close();}finally{
+            try { lock.release(); lockChannel.close(); } catch (IOException e) { throw new IllegalStateException("Cannot release host lock", e); }
+        }
     }
 }

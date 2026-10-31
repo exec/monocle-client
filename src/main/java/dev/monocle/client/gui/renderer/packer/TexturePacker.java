@@ -9,6 +9,7 @@ import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.platform.TextureUtil;
 import com.mojang.blaze3d.textures.FilterMode;
 import dev.monocle.client.renderer.Texture;
+import dev.monocle.client.utils.misc.HeadlessMode;
 import net.minecraft.resources.Identifier;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.stb.STBImage;
@@ -32,6 +33,11 @@ public class TexturePacker {
     private final List<Image> images = new ArrayList<>();
 
     public GuiTexture add(Identifier id) {
+        if (HeadlessMode.enabled()) {
+            GuiTexture texture = new GuiTexture();
+            texture.add(new TextureRegion(1, 1));
+            return texture;
+        }
         try {
             InputStream in = mc.getResourceManager().getResource(id).get().open();
             GuiTexture texture = new GuiTexture();
@@ -89,6 +95,8 @@ public class TexturePacker {
     }
 
     public Texture pack() {
+        if (HeadlessMode.enabled())
+            return new Texture(1, 1, GpuFormat.RGBA8_UNORM, FilterMode.LINEAR, FilterMode.LINEAR);
         // Calculate final width and height and image positions
         int width = 0;
         int height = 0;

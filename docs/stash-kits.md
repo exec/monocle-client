@@ -1,5 +1,17 @@
 # Stash columns and kits
 
+## Transfers with unread source containers (0.15.35)
+
+Sequential transfers can explicitly set `observedSourcesOnly: true` to collect verified stock from a full, non-lazy source scan that has unread containers. Unknown and inferred records remain unchanged and are omitted from the pickup manifest; confirmed-withdrawal source locations remain eligible for a revisit. Strict planning remains the default. Prepared arguments and final sequential-transfer results include `sourceScanGaps`; a nonzero count prevents the result from claiming the whole source is exhausted. Ender transport is supported; mixed loads and allocated-column rotation are not supported in this mode. This is an operator API option, not a new WebUI control.
+
+## Ender-chest transfer buffer (0.15.17)
+
+Solo sequential until-empty transfers accept `enderTransport: true`; the transfer form exposes this in Drain mode. An empty worker ender chest and a nearby accessible ender chest at each stash are required. The worker opens the nearest loaded ender chest, retries the adjacent same-facing half when a pair opens as 27 slots, and uses the actual server-confirmed 27/54-slot capacity. This version does not place a missing ender chest or enable buffering for crew, mixed-load, round-robin or single-column deliveries.
+
+At source, repeated normal withdrawals fill the ender buffer, then another carried inventory. At destination, normal deposits empty the carried load first, followed by inventory-sized ender withdrawals and deposits until the buffer is empty. With 34 available player slots and 54 ender slots this transports 88 kits, with two ender withdrawals (34 + 20) after the initial carried deposit. Sources advance upward through physically connected chests when necessary; destinations check connected chests downward before asking the host to allocate another compatible column. New columns are existing mapped storage, never newly constructed chests.
+
+Buffer clicks use the existing confirmed transfer bursts without container-close sleep timers. Journal checkpoints retain the phase and expected cargo. Reopening after an interrupted click must prove both matching cargo conservation and the bounded change between ender/player inventories before proceeding. Ambiguous changes stop with cargo retained. Cancelling does not discard ender cargo: resume the original job or empty that cargo before creating a fresh buffered job. Only actual stash withdrawal/deposit actions update stash totals; moving between player and ender inventories does not.
+
 ## Storage backend (0.15.0)
 
 Stashes now use SQLite on clients and hosts, with indexed container rows and atomic scan/observation recovery. There is intentionally **no migration** of prior stash data; redefine stashes and start new jobs. Old snapshots, delta directories and queued exports are ignored, not deleted. See [SQLite stash storage](stash-sqlite.md) for the schema, durability, inspection and backup requirements. Historical JSON-journal paths discussed below describe older releases; current passive/solo outboxes and host-summary caches use `sqlite-v1` names.
@@ -20,7 +32,7 @@ Availability requires **at least 250 complete directly observed kits of one exac
 
 Operator control operations: `kit-categories-get` (`crew`, `scope`, optional `source` for stock), `kit-categories-seed` (`crew`, `scope`, `source`), `kit-categories-save` (`crew`, `scope`, `expected` revision, `category` with `id`, `slug`, `name`, `mode`, `members`), `kitbot-get`, and `kitbot-save` (`expected` config revision, `config`). `PUT /v1/stashes/{id}/column-reservations` accepts `columns` plus **either** `kitTypeId` (empty clears) **or** `categoryId`, with existing revision/idempotency guards. Native worker checkpoints advertise `kitCategoriesProtocol: 1`; deposit acknowledgements optionally include `columnCategory`.
 
-Server whisper text is **not cryptographic player authentication**: this feature trusts the connected worker and server/plugin to report truthful incoming chat. There is no LLM, arbitrary chat-command execution, gear locker, or proof that the recipient picked up dropped kits.
+Server whisper text is **not cryptographic player authentication**: this feature trusts the connected worker and server/plugin to report truthful incoming chat. [Mike](kitbot-mike.md) is an optional standalone-host Ollama handler for natural-language requests; exact commands still work without a model. Neither path exposes arbitrary chat-command execution, a gear locker, or proof that the recipient picked up dropped kits.
 
 ## Player couriers (0.14.30; inventory bursts in 0.14.32)
 
@@ -43,9 +55,13 @@ The first approach planner uses short, directly supported corridors on approxima
 
 With return enabled, the workflow visits the source stash before reporting completion. It reuses the worker's configured `/home`, cooldown, warmup, source dimension and proximity checks; it can skip `/home` when already within the source's existing nearby threshold. In newly captured 0.14.34 workflows, a failed TPA or safely settled failed handoff returns and redeposits only the delivery's undelivered kits, using existing host column reservations and server-confirmed deposit receipts, then reports an unsuccessful delivery. Already delivered quantities are never restocked or reported twice. An unsafe return, uncertain drop or unverified deposit still needs attention. Updated clients recognize the exact server `Player not found!` response within ten seconds of an issued TPA; public chat and unrelated late messages cannot abort it. Other outcomes retain the existing warmup/timeout guards. Explicit cancellation stops the job, rather than initiating an unrequested return trip. Updates require a newly captured workflow; older in-flight packages remain immutable.
 
-This first courier pass does **not** secure the bot's inventory/equipment in a gear locker. Use a disposable or deliberately equipped worker for risky deliveries. Gear-locker recovery, observed recipient pickup and an LLM request classifier are later work. Explicit whitelist whispers and persisted requester cooldowns are available on the standalone host in 0.14.33. No `/kill` or respawn automation is issued.
+This first courier pass does **not** secure the bot's inventory/equipment in a gear locker. Use a disposable or deliberately equipped worker for risky deliveries. Gear-locker recovery and observed recipient pickup are later work. Explicit whitelist whispers and persisted requester cooldowns are available on the standalone host in 0.14.33; optional natural-language classification is described in [Mike](kitbot-mike.md). No `/kill` or respawn automation is issued.
 
 **Optional stash mending (0.14.29):** when XP is absent and no nearby registered cache or carried personal XP box is available, stash jobs defer mending while their equipped elytra has at least 64 durability remaining. Diagnostics expose `stashMendDeferred`; adding XP resumes the configured repair cycle. Below that takeoff reserve, a synchronized, cursor-clear native inventory handoff lands and swaps to the healthiest usable loose inventory elytra, preserving the worn one. Bound equipment is not removed and shulker kits are not opened for spares. Food shortages, uncertain issued withdrawals and malformed cache records still fail; the final glider's 64-durability takeoff and 32-durability landing reserves are unchanged.
+
+**Stalled maintenance (0.15.42):** if 200 maintenance ticks produce no elytra repair, workers with at least 64 durability continue cargo work and retry after 1,200 player ticks. This backoff spans native action handoffs and is ignored below the takeoff reserve. The log records remaining durability, bottle count and Auto Mend status; a stalled final glider below reserve still stops safely. Bottle use temporarily applies the downward client pitch as well as server rotation, so a preceding queued rotation cannot redirect its item-use packet.
+
+**Covered sources and recovery approaches (0.15.43):** withdrawals reuse the scan/deposit solid-lid check before travelling or opening. A blocked chest advances to another connected chest or source without recording emptiness; deferred contents remain unresolved. Outstanding inventory clicks still reconcile first. Flight clearance consults the active container even after recovery clears its cached route target, preserving collision-checked final approaches during chest interaction.
 
 **Unread sources (0.14.9):** until-empty solo carried-kit transfers skip a source for the current pass when movement, opening or initial contents stall for 200 ticks. Confirmed kits remain in the batch and later sources are tried before depositing. The workflow revisits unresolved sources with its existing bounded retry policy; it must not declare them empty. Unconfirmed clicks or held cursors still require safe reconciliation, not blind replay. This worker-side fix also applies to existing compatible jobs without replacing their scripts.
 
@@ -167,7 +183,7 @@ With `depositCarried: true`, the worker first checks every selected route's kit 
 
 A deferred source gets a bounded revisit. After two consecutive no-progress deferrals it parks while other routes continue. Once those routes finish, any parked route causes an explicit unresolved failure with retained verified totals, not a successful exhaustion claim. Unconfirmed inventory clicks and unsafe movement failures still stop safely; destination-capacity errors are not bypassed.
 
-Use workflow `task-stash-transfer` through the normal job API with arguments such as:
+Use workflow `task-stash-transfer` through the normal job API with independently invented synthetic stash names:
 
 ```json
 {
@@ -175,8 +191,8 @@ Use workflow `task-stash-transfer` through the normal job API with arguments suc
   "includeIncomplete": false,
   "depositCarried": true,
   "routes": [
-    {"name": "tango-obsidian", "kitTypeId": "<normal-obsidian-kit-UUID>", "targetStashName": "main"},
-    {"name": "tango-obsidian2", "kitTypeId": "<crying-obsidian-kit-UUID>", "targetStashName": "crying"}
+    {"name": "SyntheticSourceA", "kitTypeId": "<normal-obsidian-kit-UUID>", "targetStashName": "SyntheticDestinationA"},
+    {"name": "SyntheticSourceB", "kitTypeId": "<crying-obsidian-kit-UUID>", "targetStashName": "SyntheticDestinationB"}
   ]
 }
 ```
@@ -191,12 +207,12 @@ Choose **Transfer Stash Kits** (`task-stash-transfer`) under the WebUI's saved j
 
 This is one job with repeated trips, **one type at a time**, not mixed-type loads. It calls the existing `task-kit-delivery` workflow, including its two empty source passes and exact-kit destination column reservations. Filling a column uses the existing next-column allocator; exhausting suitable observed columns fails with remaining kits retained, rather than mixing stock. The same Full/non-lazy source requirements, 54-source-container bound **per type**, 24,000-character delivery-plan bound and non-overlapping selections apply. Plans resolve against the host catalog just before each type and are cached by action token for retries; no large multi-stash manifest is sent to Lua. Completion reports `delivered`, `byKit`, `typesCompleted`, `recovered` and `sourceExhausted`.
 
-Example workflow arguments (host and worker must both be updated):
+Example workflow arguments with synthetic stash names (host and worker must both be updated):
 
 ```json
 {
-  "name": "zungle1",
-  "targetStashName": "newstorage",
+  "name": "SyntheticSource",
+  "targetStashName": "SyntheticDestination",
   "count": 36,
   "includeIncomplete": false,
   "depositCarried": false
@@ -263,11 +279,21 @@ Disconnects and restored checkpoints discard stale home arrival/warmup state, no
 
 **0.14.20 single-kit recovery:** reopening/reselection compares shulker cargo rather than requiring every food/tool/non-kit slot to be unchanged. A fresh server menu, unchanged kit count and preserved existing shulkers still prove an unapplied pickup before reselection. A recovered cursor kit requires exactly one new matching shulker in a previously empty slot and a +1 carried count; unrelated non-kit changes do not obscure that proof. Incidental foreign-kit additions retain their opt-in handling but can coexist with food consumption. Changed/lost shulkers, held cursors, stale menus and uncertain restart records are not treated as harmless. Diagnostics retain both exact-inventory and cargo-only comparison flags and report each changed menu slot's items, counts, damage and cargo-change classification.
 
-Native kit pickup, stash deposit and ender-chest deposit share a burst planner. **0.14.19:** deposits plan the minimum of eligible carried kits, server-confirmed empty destinations and the job remainder, up to all 36 inventory slots; static withdrawals retain their four-kit limit. A batch needs at least four eligible, normally unstackable shulkers and four empty destination slots in a supported vanilla chest/hopper menu. Smaller amounts, limited destination space, static one-box resource picks and unfamiliar menus use the existing single-kit exact-slot moves. Personal/protected boxes and exact kit filters are unchanged; boxes of the same color are not automatically interchangeable. Small transfers reject the burst before cloning a full menu snapshot.
+Native kit pickup, stash deposit and ender-chest transport share a burst planner. **0.15.19:** both directions plan the minimum of eligible kits, server-confirmed empty destinations and the job remainder. There is no four/five-move cap: the whole capacity-sized plan is sent once, naturally limited to the available player/container slots. A normal batch needs at least four eligible, normally unstackable shulkers and four empty destinations; ender transport also handles smaller tails with the same verifier. Small ordinary transfers, static one-box resource picks and unfamiliar menus retain single-kit exact-slot moves. Personal/protected boxes and exact kit filters are unchanged; boxes of the same color are not automatically interchangeable.
 
-Capacity-sized plans send at most four moves per tick (four quick-move packets or eight pickup/place packets), retaining the previous packet budget. All issued moves require authoritative receipts before the next part is sent, never in the same tick. Every next part rechecks its sources, destinations, cursor and quick-move ordering against server contents. Newly opened capacity is handled by the next plan, not guessed in the current one. Unsent moves cannot be acknowledged or retired as uncertain deposits. Reopening stops further sends and uses the existing exact-slot reconciliation/fallback. Telemetry includes the planned size, sent count and verified count. This update is prepared but not deployed while the current transfer remains healthy.
+Every source, destination, cursor and quick-move ordering is checked before the burst is sent. All issued moves need authoritative receipts before another plan can start; repeated calls cannot send the same burst twice. Newly opened capacity belongs to the next plan. Unsent moves cannot be acknowledged or retired as uncertain deposits. Reopening stops sends and retains the existing reconciliation/fallback. Telemetry includes planned, sent and verified counts. A full exact-slot inventory burst can send 72 click packets, so live server packet tolerance and throughput must be measured.
 
-Normal static chest menus use a forced-confirmation `QUICK_MOVE` per kit, without client prediction. Vanilla shift-click fills player slots in reverse menu order on withdrawal and chest slots forwards on deposit; tests exercise Minecraft's real `ChestMenu` implementation. **0.14.7:** hopper-fed chest and hopper withdrawals use the existing single-kit exact-slot path, waiting for confirmation before selecting the next source. Preselecting four slots from a changing source proved too fragile in the wool transfer test. Hopper-fed deposits still use bounded pickup/place bursts: previously confirmed destinations may drain, but each newly counted box must be present in its intended, previously empty slot. No burst sends a whole inventory at once or exceeds the requested remaining quantity.
+Normal static chests use forced-confirmation `QUICK_MOVE` without client prediction; tests exercise vanilla `ChestMenu` ordering. Hopper-refilled bottom chests use exact source/destination pairs and permit already-picked source slots to refill without counting them twice. A hopper below either chest half can pull planned stock away, so those chests and hopper inventories retain single-kit withdrawals. This preserves the dynamic-source safeguard introduced after the earlier wool-transfer failures while batching stable refilling outlets. Hopper-fed deposits may drain previously confirmed destinations, but each newly acknowledged box must appear in its exact previously empty destination.
+
+Destination overflow requests another compatible host column after checking the current column's other chests. Blocked lids and unopened/unreadable chests are skipped only before any unverified move. If any chest was unreadable, `unavailableColumn` excludes the column for the current run without persisting a false full-column record. Retries are idempotent, other kits' reservations are preserved, and later jobs can retry that column. Explicit single-column/sorting jobs cannot overflow their assigned destination. Update both host and workers for this finding; remaining cargo stays carried if no compatible mapped space exists.
+
+**0.15.21:** a replaced or closed ender-cargo menu preserves all issued clicks and reopens for reconciliation. A replacement snapshot arriving first follows the same path. Counts across inventory and ender storage plus the exact cargo fingerprint must agree before continuing; the worker cannot replay uncertain moves or retire their checkpoint as ordinary finished history. Reopening retains the existing three-attempt bound.
+
+**0.15.22:** if a deposit slot becomes occupied while the exact picked kit remains on the server cursor, closing and reopening can return it to inventory. A fresh menu must prove that exact kit returned without other cargo changes before clearing the pending move and selecting fresh space. An occupied destination is never credited as a deposit on that evidence alone; normal full-column allocation and incompatible-stock checks still apply.
+
+**0.15.23:** an unlocked deposit receiving `capacityUnavailable: true` lands and asks the host again every ten seconds. Newly observed space or changed reservations can unblock the same job. Accepted findings advance their delivery ID; retries never replay a deposit or discard an uncertain move. The wait survives restart, keeps the normal reservation rules, and does not affect explicit single-column stops. A fully confirmed final deposit completes without requiring another column. Both host and client updates are required; the existing 4,096-finding bound still applies (about eleven hours of uninterrupted capacity waiting).
+
+**0.15.24 allocated-column policy:** operator-prepared sequential transfers can set `fillAllocatedColumns: true`. Each type uses its compatible mapped allocations until no usable capacity remains, then redeposits excess carried kits and drains any ender cargo back into the source through that worker's configured home. It proceeds only after those moves are confirmed. Results separate destination deliveries, source returns and missing kits, and list `destinationLimited` types without declaring Main emptied. This supports ender transport, requires a clean carried-kit start, and excludes mixed loads, round-robin routes and explicit single-column jobs. Incidental kit deposits retain normal capacity waiting. Update both host and client and prepare a new workflow; frozen running packages are unchanged.
 
 Until-empty solo carried-kit transfers also defer a source whose approach makes no useful progress for 200 ticks. This records unread/unresolved contents, not an empty source, advances to other candidates and retains the parent workflow's bounded revisit/failure policy. Chunk-approach stalls follow the same rule. Fixed-count, crew-local and ender-chest loading actions retain their requirements, and no pending inventory move or held cursor can be deferred.
 
@@ -295,8 +321,8 @@ Fresh observations of all arrivals gate parallel chest work. Source chests are p
 
 ```json
 {
-  "name": "zungle1",
-  "targetStashName": "newstorage",
+  "name": "SyntheticSource",
+  "targetStashName": "SyntheticDestination",
   "count": 36,
   "leader": "<selected-worker-UUID>",
   "tpaWarmupTicks": 300,
@@ -368,6 +394,50 @@ The current reader replays deltas on a cold restart. After 128 deltas or 8 MiB o
 
 ## Empty destination setup without a contents scan
 
+From **0.15.15**, same-server stash transfers accept `targetDimension` when the
+destination is in another world. The source job retains its own dimension;
+each `/home` action and its stock receipts use the corresponding stash dimension.
+Omitting this field preserves same-world behavior. The control panel includes
+the dimension beside destination names. Alternating stacks are mapped from
+adjacent observed chest positions rather than assuming that every row has the
+same X/Z. Their column descriptors retain `axis: "Vertical"` and one optional
+`alternateX` or `alternateZ` offset of `-1` or `1` for odd-height rows.
+Actual chest contents and hopper connectivity are still verified before deposits.
+
+Full transfers from **0.15.16** can retain up to 1,024 matching source containers
+using `compactPicks: true` and position-only `picks` when there are more than 54.
+Above 512 sources, positions use numeric `[x, y, z]` triples; workers expand them
+only inside the native collector. Older position objects remain accepted.
+The existing 24 KiB plan and 32 KiB workflow limits still apply; oversized plans
+are rejected rather than silently truncating the source. Ordinary fixed-count
+deliveries retain their 54-candidate bound. Cross-dimension travel uses a solo
+courier; the older synchronized crew transfer rejects it before dispatch.
+
+From **0.15.16**, manual reservations can select same-crew kit types from other
+dimensions on the same Minecraft server. Removed chests, smaller mapped capacity,
+or a corrected column footprint invalidate exact fill claims while retaining the
+receipt count. Interrupted couriers may land for profile recovery in the current
+stash action's dimension without granting movement in unrelated worlds.
+
+From client **0.15.14**, this destination mode also uses an aisle-first deposit
+approach: Baritone walks to supported space beside the assigned chest's X/Z,
+then the worker flies up a checked vertical shaft. It prefers top chests and
+descends that shaft before finishing or switching columns. The selected bottom
+chest layer must be at aisle floor height (one-block floor steps are allowed).
+Floor support, standing headroom, loaded chunks, a clear ascent and an opening
+view are checked; the worker never walks into the chest's occupied block or
+removes storage to make a path. Ordinary destination travel and source work are
+unchanged. Known contents and confirmed deposit accounting are never reset by
+the empty-storage flag.
+
+The host keeps a durable `columnFill` ledger for columns that start empty:
+confirmed kit deposits add to `kits`, and confirmed withdrawals subtract from
+the same counter. `capacity` is the sum of mapped physical chest slots, not a
+fabricated grid or hopper capacity. New jobs and restarts retain this ledger;
+receipt retries use existing deduplication. Column-map tooltips show this fill
+estimate. External observations mark it uncertain rather than pretending nobody
+else changed the column. Geometry beyond loaded/mapped chunks is still unknown.
+
 For genuinely empty storage, define the cuboid and required `/home` route, enable **assume-empty-storage** in the client Stash Manager, keep **live-storage-updates** and host export enabled, and choose **Validate and save**. Do not start a contents scan. The existing passive observer maps real chest block entities in loaded chunks without opening them; the host can allocate discovered unopened bottom chests as destination candidates. The WebUI stash detail page can enable/disable the same policy after a stash is defined.
 
 This is a definition flag `bounds.assumeEmpty` (boolean, off when absent), not a fake full scan. Capacity is labeled `assumedEmptyContainers` / `assumedEmptySlots`, separate from observed free space. Only newly discovered, unscanned real chest geometry with no contents is eligible under the assumption; stale/invalidated observations, removed chests, inferred rows and known incompatible contents remain ineligible. Existing scans and inventory counts are never erased. There is no synthetic chest grid inferred from the selection: fly through the storage to load its chunks if the cuboid extends beyond render distance. Only mapped physical geometry is available for allocation.
@@ -391,3 +461,15 @@ This first version is **advisory only**: it does not block withdrawal workflows,
 A locked `targetColumn` delivery may also supply `columnKitTypeIds`, an array of 2–16 distinct canonical kit UUIDs including `kitTypeId`. This opts only that physical column into storing those types together. Its persisted reservation remembers the whole group; each later shared delivery must supply the same group. The original primary kit remains the map label. Ordinary single-kit allocation skips shared columns.
 
 Host and worker both reject unrelated kits, loose items and uncertain contents. A full shared column stops with the existing `columnFull`/`retained` receipt and never allocates overflow. Sharing does not combine withdrawal actions automatically: a workflow can collect different types with separate carried pickup actions before returning once and issuing the verified per-type deposits. Both client and host must support this option. It is currently an operator API/workflow feature, not a WebUI category control.
+
+### Advanced workflow: one column per turn
+
+A `task-stash-transfer` request can provide `columnAllocations`, an object mapping
+selected kit type IDs to ordered arrays of destination column descriptors. The
+workflow fills one allocated column per kit in `kitTypeIds` order before beginning
+the next round. Allocating adjacent columns keeps each kit grouped spatially.
+This mode uses inventory transport and returns overflow to the source before
+switching types; it cannot be combined with ender transport, mixed loads, routes,
+or deposit-first recovery. Exhausted sources leave the rotation. Unavailable
+sources and allocations with no further usable columns are reported separately
+in the final result rather than being claimed as verified source exhaustion.

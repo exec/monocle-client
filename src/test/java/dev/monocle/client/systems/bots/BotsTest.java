@@ -31,7 +31,7 @@ public final class BotsTest {
         BotLuaTest.run();
         BotRuntimeTest.run();
         BotProfilesTest.run();
-        BotActionsTest.main(args);
+        BotActionsTest.main(args);BotRespawnReturnCheck.run();
         dev.monocle.client.pathing.StashNavigationTest.run();
         dev.monocle.client.pathing.PathPauseTest.run();
         BotStashObserverTest.run();
@@ -188,8 +188,15 @@ public final class BotsTest {
         assert method(bots, "isWorker").code().orElseThrow().elementList().stream()
             .anyMatch(i -> i instanceof FieldInstruction field && field.field().name().equalsString("workerWasConnected"))
             : "Do not send status/chat before the fresh hello";
-        for (String name : List.of("reportChat", "onChat", "sendToHost"))
+        for (String name : List.of("reportCommandChat", "onChat", "sendToHost"))
             assert calls(method(bots, name)).contains("dev/monocle/client/systems/bots/Bots.isWorker") : "Worker messages must wait for identity: " + name;
+        assert calls(method(bots,"reportChat")).contains("dev/monocle/client/systems/bots/Bots.reportCommandChat") : "Ordinary chat and host-command acknowledgements share the same identity guard";
+        var managedChat=calls(method(bots,"handleManagement"));
+        assert constants(method(bots,"handleManagement")).containsAll(List.of("manage-player-lookup","worker-player-lookup","Found","Missing","Unavailable","Ambiguous"));
+        assert managedChat.contains("net/minecraft/client/multiplayer/ClientPacketListener.getOnlinePlayers") : "Named player lookups must read the actual server player list";
+        assert constants(method(bots,"addSafetyTelemetry")).contains("playerLookupProtocol") : "Player lookup support is advertised before the host requests it";
+
+        assert managedChat.contains("dev/monocle/coordinator/BotChat.executed")&&managedChat.indexOf("dev/monocle/client/utils/player/ChatUtils.sendPlayerMsg")<managedChat.indexOf("dev/monocle/coordinator/BotChat.first") : "Mark commands only after dispatch; duplicate commands are acknowledged without a second send";
         for (String event : List.of("onGameLeft", "onGameJoin")) {
             assert calls(method(bots, event)).stream().noneMatch(call -> call.endsWith(".disable") || call.endsWith(".toggle"))
                 : "World transitions must not disable the worker's reconnect loop";

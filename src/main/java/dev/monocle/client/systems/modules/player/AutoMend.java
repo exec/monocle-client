@@ -249,7 +249,8 @@ public class AutoMend extends Module {
         FindItemResult exp = InvUtils.findInHotbar(Items.EXPERIENCE_BOTTLE);
         if (!exp.found() || mc.gameMode == null) { status = "Put experience bottles in the hotbar to continue highway maintenance"; return; }
         int previous = mc.player.getInventory().getSelectedSlot();
-        Rotations.rotate(mc.player.getYRot(), 90, () -> {
+        // Item-use packets carry the client's pitch even when another rotation runs first.
+        Rotations.rotate(mc.player.getYRot(), 90, 0, true, () -> {
             if (!isActive() || !(highwayCycle || workerCycle && workerYielding) || !inventoryReady() || safetyBusy()
                 || !mc.player.isAlive() || mc.player.isFallFlying() || mc.gameMode == null || !mc.player.getInventory().getItem(exp.slot()).is(Items.EXPERIENCE_BOTTLE)) return;
             InvUtils.swap(exp.slot(), false);

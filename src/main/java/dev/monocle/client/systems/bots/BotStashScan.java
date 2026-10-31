@@ -81,7 +81,7 @@ public final class BotStashScan {
     private long lastProgress=System.currentTimeMillis();
     private double approachBest=Double.POSITIVE_INFINITY;
     private String scope="";
-    private static String currentScope(){return mc.level==null?"":(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();}
+    private static String currentScope(){return mc.level==null?"":(mc.getCurrentServer()==null?"local":dev.monocle.client.utils.Utils.getServerIdentity())+"\n"+mc.level.dimension().identifier();}
     private int previousMissing;
     dev.monocle.coordinator.ActionProgress.Observation progress() {
         return BotActions.progress("Scan: " + phase, captured != null ? "Container close confirmation" : approaching() ? "Reach scan container" : phase.equals("Draining") ? "Durable scan outbox / host receipts" : "Container contents / discovery",

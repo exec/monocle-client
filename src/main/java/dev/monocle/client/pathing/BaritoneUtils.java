@@ -117,7 +117,9 @@ public class BaritoneUtils {
         public boolean closing(){return closing;}
         @Override public void close(){release();}
         @EventHandler private void onTick(TickEvent.Post event){release();}
-        @SuppressWarnings({"rawtypes", "unchecked"}) public boolean release() {
+        public boolean release(){return release(false);}
+        public boolean releaseForFall(){return release(true);}
+        @SuppressWarnings({"rawtypes", "unchecked"}) private boolean release(boolean caughtFall) {
             if(closed)return true;
             closing=true;
             var process=baritone.getCustomGoalProcess();
@@ -126,7 +128,8 @@ public class BaritoneUtils {
                 ||baritone.getPathingControlManager().mostRecentInControl().filter(p->foreignStashController(process,p,p.isActive())).isPresent();
             if (goal != null && retainsStashGoal(goal,process.getGoal(),process.mostRecentGoal())&&!foreign) {
                 var path=baritone.getPathingBehavior();
-                boolean cancelled=path.cancelEverything();
+                boolean cancelled;
+                if(caughtFall){path.forceCancel();cancelled=true;}else cancelled=path.cancelEverything();
                 if(!cancelled||path.hasPath()||path.getInProgress().isPresent()){
                     if(!subscribed){events.subscribe(this);subscribed=true;}
                     return false;

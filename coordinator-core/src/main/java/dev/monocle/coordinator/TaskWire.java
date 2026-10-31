@@ -106,9 +106,18 @@ public final class TaskWire {
                 if(!checked.has("action")||!text(checked.getAsJsonObject("action"),"type").equals("StashVisit")||travel.size()!=3||!text(travel,"name").equals(text(checked.getAsJsonObject("action"),"name")))throw new IllegalArgumentException("Stash travel must match its active visit");
                 for(String key:List.of("homeSent","arrived"))if(!travel.has(key)||!travel.get(key).isJsonPrimitive()||!travel.getAsJsonPrimitive(key).isBoolean())throw new IllegalArgumentException("Invalid stash travel flag");
             }
+            if(checked.has("deliveryReceipt")){
+                if(!task.has("package")||!text(task.getAsJsonObject("package"),"entry").equals("task-kit-delivery")||!text(task.getAsJsonObject("args"),"destination").equals("Player"))throw new IllegalArgumentException("Delivery receipts require a player kit job");
+                JsonObject receipt=DeliveryReceipt.checked(checked.getAsJsonObject("deliveryReceipt"),StashCatalog.integer(task.getAsJsonObject("args"),"count",1,1000000));
+                if(run.has("deliveryReceipt")){
+                    JsonObject previous=run.getAsJsonObject("deliveryReceipt");receipt.addProperty("delivered",Math.max(receipt.get("delivered").getAsInt(),previous.get("delivered").getAsInt()));
+                    if(previous.has("failureReason")&&!receipt.get("uncertain").getAsBoolean())receipt.add("failureReason",previous.get("failureReason").deepCopy());
+                }
+                checked.add("deliveryReceipt",DeliveryReceipt.checked(receipt,receipt.get("expected").getAsInt()));
+            }
             if(checked.has("workflowResult")&&checked.get("workflowResult").toString().length()>32_768)throw new IllegalArgumentException("Workflow result is too large");
             if (checked.has("action")) {
-                if (!checked.get("action").isJsonObject() || checked.get("action").toString().length() > 32_768) throw new IllegalArgumentException("Native action is too large");
+                if (!checked.get("action").isJsonObject() || checked.get("action").toString().length() > dev.monocle.client.systems.bots.BotLua.MAX_STATE) throw new IllegalArgumentException("Native action is too large");
                 UUID.fromString(text(checked, "token"));
             }
         }
@@ -130,6 +139,7 @@ public final class TaskWire {
         if (!state.equals("Inspection required")) run.remove("resumeInspection");
         if (full) {
             run.addProperty("detail", text(checked, "detail"));
+            if(checked.has("deliveryReceipt"))run.add("deliveryReceipt",checked.get("deliveryReceipt").deepCopy());
             if(checked.has("workflowResult"))run.add("workflowResult",checked.get("workflowResult").deepCopy());
             if (checked.has("stashScan")) {
                 if (!checked.has("action") || !text(checked.getAsJsonObject("action"),"type").equals("StashScan")) throw new IllegalArgumentException("Stash telemetry requires its active scan action");

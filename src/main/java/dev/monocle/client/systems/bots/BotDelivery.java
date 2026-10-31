@@ -5,7 +5,7 @@ import net.minecraft.world.phys.Vec3;
 import java.util.List;
 import java.util.function.Predicate;
 
-/** Small, fixed-location handoff; no terrain edits or recipient chasing. */
+/** Bounded local handoff; no terrain edits or recipient chasing. */
 final class BotDelivery {
     static JsonObject anchor(Vec3 position,float yaw,String dimension){
         JsonObject a=new JsonObject();a.addProperty("x",position.x);a.addProperty("y",position.y);a.addProperty("z",position.z);
@@ -28,12 +28,16 @@ final class BotDelivery {
     static Vec3 goal(Vec3 from,JsonObject anchor,Predicate<Vec3> safe){
         Vec3 target=position(anchor);
         if(from.distanceToSqr(target)>64)return null;
-        for(double turn:new double[]{0,45,-45,90,-90,135,-135,180}){
-            Vec3 goal=front(target,anchor.get("yaw").getAsDouble(),turn);
-            if(Math.abs(goal.y-from.y)>.6||!corridor(from,goal,safe))continue;
+        for(double distance:new double[]{3,2,1.25})for(double turn:new double[]{0,45,-45,90,-90,135,-135,180}){
+            Vec3 goal=target.add(front(Vec3.ZERO,anchor.get("yaw").getAsDouble(),turn).scale(distance/3));
+            goal=new Vec3(goal.x,from.y,goal.z);
+            if(Math.abs(target.y-from.y)>.6||!corridor(from,goal,safe))continue;
             return goal;
         }
         return null;
+    }
+    static boolean holdPosition(Vec3 from,Vec3 original,Vec3 current,boolean walking){
+        return current.distanceToSqr(original)>.75*.75||!walking&&from.multiply(1,0,1).distanceToSqr(current.multiply(1,0,1))>=1.25*1.25;
     }
     static boolean corridor(Vec3 from,Vec3 goal,Predicate<Vec3> safe){
         if(from.distanceToSqr(goal)>64)return false;

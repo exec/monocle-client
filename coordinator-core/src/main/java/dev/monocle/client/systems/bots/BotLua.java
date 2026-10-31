@@ -9,7 +9,7 @@ import java.util.*;
 
 /** Shared, Minecraft-free Lua evaluator. Package retained for client compatibility; no live coroutine is persisted. */
 public final class BotLua {
-    public static final int MAX_SOURCE = 32_768, MAX_STATE = 32_768;
+    public static final int MAX_SOURCE = 32_768, MAX_STATE = 65_536;
     private static final LuaValue JSON_NULL = new LuaUserdata(new Object()) { @Override public String tojstring() { return "null"; } };
     public record Decision(JsonObject state, JsonObject action) { }
     private static final Map<String, Prototype> CACHE = new LinkedHashMap<>() {
@@ -66,7 +66,7 @@ public final class BotLua {
             JsonElement saved = toJson(context.get("state"), arrays, new IdentityHashMap<>(), 0, new int[2]);
             JsonElement requested = toJson(action, arrays, new IdentityHashMap<>(), 0, new int[2]);
             if (!saved.isJsonObject() || !requested.isJsonObject()) throw new IllegalArgumentException("Lua must keep ctx.state as an object and return one bot action.");
-            if (saved.toString().length() > MAX_STATE || requested.toString().length() > MAX_STATE) throw new IllegalArgumentException("Lua state/action exceeds 32 KiB.");
+            if (saved.toString().length() > MAX_STATE || requested.toString().length() > MAX_STATE) throw new IllegalArgumentException("Lua state/action exceeds 64 KiB.");
             return new Decision(saved.getAsJsonObject(), requested.getAsJsonObject());
         } catch (QuotaExceeded | StackOverflowError e) { throw new IllegalArgumentException("Lua workflow exceeded its instruction, allocation or call-depth budget.", e); }
         catch (LuaError e) { throw new IllegalArgumentException("Lua workflow: " + e.getMessage(), e); }
@@ -81,6 +81,7 @@ public final class BotLua {
         Map<String, String> actions = Map.ofEntries(Map.entry("travel","Travel"),Map.entry("stash_hunt","StashHunt"),Map.entry("stash_scan","StashScan"),Map.entry("stash_resupply","StashResupply"),Map.entry("stash_store","StashDeposit"),Map.entry("drop","DropItems"),Map.entry("modules","Modules"),Map.entry("tpa","Tpa"),Map.entry("highway","Highway"),Map.entry("recover","RecoverSupplies"));
         bot.set("kit_transfer_plan",new OneArgFunction(){@Override public LuaValue call(LuaValue argument){LuaTable value=argument.checktable();value.set("type","KitTransferPlan");return value;}});
         bot.set("stash_visit",new OneArgFunction(){@Override public LuaValue call(LuaValue argument){LuaTable value=argument.checktable();value.set("type","StashVisit");return value;}});
+        bot.set("stash_buffer",new OneArgFunction(){@Override public LuaValue call(LuaValue argument){LuaTable value=argument.checktable();value.set("type","StashBuffer");return value;}});
         bot.set("stash_sort_plan",new OneArgFunction(){@Override public LuaValue call(LuaValue argument){LuaTable value=argument.checktable();value.set("type","StashSortPlan");return value;}});
         actions.forEach((name, type) -> bot.set(name, new OneArgFunction() {
             @Override public LuaValue call(LuaValue argument) {
@@ -103,7 +104,7 @@ public final class BotLua {
     }
     private static LuaTable action(String type) { LuaTable value = new LuaTable(); value.set("type", type); return value; }
     private static LuaValue fromJson(JsonElement json, IdentityHashMap<LuaValue, Boolean> arrays, int depth, int[] budget) {
-        if (depth > 16 || ++budget[0] > 4096) throw new IllegalArgumentException("Workflow data exceeds its size/nesting limit.");
+        if (depth > 16 || ++budget[0] > 16_384) throw new IllegalArgumentException("Workflow data exceeds its size/nesting limit.");
         if (json == null) return LuaValue.NIL;
         if (json.isJsonNull()) return JSON_NULL;
         if (json.isJsonObject()) {
@@ -123,18 +124,18 @@ public final class BotLua {
         if (value.isNumber()) {
             double number = value.getAsDouble(); if (!Double.isFinite(number)) throw new IllegalArgumentException("Non-finite workflow number."); return LuaValue.valueOf(number);
         }
-        if ((budget[1] += value.getAsString().length()) > MAX_STATE) throw new IllegalArgumentException("Workflow strings exceed 32 KiB.");
+        if ((budget[1] += value.getAsString().length()) > MAX_STATE) throw new IllegalArgumentException("Workflow strings exceed 64 KiB.");
         return LuaValue.valueOf(value.getAsString());
     }
     private static JsonElement toJson(LuaValue value, IdentityHashMap<LuaValue, Boolean> arrays, IdentityHashMap<LuaValue, Boolean> path, int depth, int[] count) {
-        if (++count[0] > 4096 || depth > 16) throw new IllegalArgumentException("Workflow data exceeds its size/nesting limit.");
+        if (++count[0] > 16_384 || depth > 16) throw new IllegalArgumentException("Workflow data exceeds its size/nesting limit.");
         if (value.isnil() || value == JSON_NULL) return JsonNull.INSTANCE;
         if (value.isboolean()) return new JsonPrimitive(value.toboolean());
         if (value.type() == LuaValue.TNUMBER) {
             double number = value.todouble(); if (!Double.isFinite(number)) throw new IllegalArgumentException("Non-finite workflow number."); return new JsonPrimitive(number);
         }
         if (value.type() == LuaValue.TSTRING) {
-            if ((count[1] += value.rawlen()) > MAX_STATE) throw new IllegalArgumentException("Workflow strings exceed 32 KiB."); return new JsonPrimitive(value.tojstring());
+            if ((count[1] += value.rawlen()) > MAX_STATE) throw new IllegalArgumentException("Workflow strings exceed 64 KiB."); return new JsonPrimitive(value.tojstring());
         }
         if (!value.istable() || path.put(value, true) != null) throw new IllegalArgumentException("Only acyclic JSON data can be checkpointed; no functions or game objects.");
         LuaTable table = value.checktable(); LuaValue[] keys = table.keys();
@@ -148,7 +149,7 @@ public final class BotLua {
             JsonObject object = new JsonObject();
             for (LuaValue key : keys) {
                 if (key.type() != LuaValue.TSTRING || key.rawlen() > 256) throw new IllegalArgumentException("Object keys must be strings up to 256 bytes.");
-                if ((count[1] += key.rawlen()) > MAX_STATE) throw new IllegalArgumentException("Workflow object keys exceed 32 KiB.");
+                if ((count[1] += key.rawlen()) > MAX_STATE) throw new IllegalArgumentException("Workflow object keys exceed 64 KiB.");
                 object.add(key.tojstring(), toJson(table.get(key), arrays, path, depth + 1, count));
             }
             result = object;

@@ -9,6 +9,7 @@ import dev.monocle.client.MonocleClient;
 import dev.monocle.client.renderer.Fonts;
 import dev.monocle.client.renderer.text.*;
 import dev.monocle.client.utils.files.ByteBufferUtils;
+import dev.monocle.client.utils.misc.HeadlessMode;
 import net.minecraft.util.Util;
 import org.jspecify.annotations.NullMarked;
 import org.jspecify.annotations.Nullable;
@@ -74,6 +75,19 @@ public final class FontUtils {
         if (buffer.remaining() < 12) return null;
         int signature = buffer.duplicate().order(ByteOrder.BIG_ENDIAN).getInt();
         if (signature != 0x00010000 && signature != 0x4F54544F) return null; // TrueType / OTTO
+
+        if (HeadlessMode.enabled()) {
+            // HeadlessMC replaces STB calls, but the JDK can read font metadata without a display.
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.duplicate().get(bytes);
+            try {
+                java.awt.Font font = java.awt.Font.createFont(java.awt.Font.TRUETYPE_FONT, new java.io.ByteArrayInputStream(bytes));
+                String family = font.getFamily(Locale.ENGLISH), name = font.getFontName(Locale.ENGLISH).replace(" ", "").replace("-", "");
+                String compactFamily = family.replace(" ", "").replace("-", "");
+                String style = name.startsWith(compactFamily) ? name.substring(compactFamily.length()) : "";
+                return new FontInfo(family, FontInfo.Type.fromString(style));
+            } catch (java.awt.FontFormatException | java.io.IOException e) { return null; }
+        }
 
         STBTTFontinfo fontInfo = STBTTFontinfo.create();
         if (!STBTruetype.stbtt_InitFont(fontInfo, buffer)) return null;

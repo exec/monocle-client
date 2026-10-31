@@ -17,6 +17,24 @@ import java.util.List;
 
 /** Small native boundary/journal/route checks, without constructing a Minecraft window. */
 public final class BotActionsTest {
+    private static void persistedOccupancy(){
+        JsonObject saved=json("{x:0,y:64,z:0,status:'observed',block:'minecraft:chest',slotCount:54,occupiedSlots:54}");
+        saved.addProperty("observedAt",System.currentTimeMillis());
+        JsonObject record=StashCatalog.watchRecord(saved);
+        assert BotStashObserver.observedOccupancy(record,true)&&!BotStashObserver.observedOccupancy(record,false) : "A replacement job receives fullness from the durable catalog";
+        JsonObject empty=saved.deepCopy();empty.addProperty("occupiedSlots",0);
+        JsonObject pending=json("{queueKey:'chest'}");pending.add("observation",empty);
+        JsonObject latest=BotStashObserver.latest(record,pending,List.of(),"chest");
+        assert !BotStashObserver.observedOccupancy(latest,true)&&BotStashObserver.observedOccupancy(latest,false) : "A newer withdrawal immediately makes a full chest usable";
+        empty.addProperty("occupiedSlots",1);
+        assert !BotStashObserver.observedOccupancy(empty,true)&&!BotStashObserver.observedOccupancy(empty,false);
+        empty.addProperty("occupiedSlots",0);empty.addProperty("inferred",true);
+        assert !BotStashObserver.observedOccupancy(StashCatalog.watchRecord(empty),false) : "Inferred emptiness never hides possible stock";
+        for(String status:List.of("unscanned","removed")){empty.addProperty("status",status);assert !BotStashObserver.observedOccupancy(empty,false);}
+        JsonObject stale=saved.deepCopy();stale.addProperty("observedAt",System.currentTimeMillis()-86_400_001L);assert !BotStashObserver.observedOccupancy(stale,true) : "Old full observations cannot hide newly available capacity indefinitely";
+        stale.addProperty("observedAt",Long.MAX_VALUE);assert !BotStashObserver.observedOccupancy(stale,true);
+        assert !BotStashObserver.observedOccupancy(json("{status:'observed'}"),false)&&!BotStashObserver.observedOccupancy(null,true) : "Older hosts without occupancy retain physical checks";
+    }
     private static void writeSortBoundaries(){
         BlockPos cell=new BlockPos(0,65,0);assert BotStashScan.unsafeSortHopperLink(cell,cell.below(),net.minecraft.core.Direction.DOWN,java.util.Set.of(cell)):"An external hopper can pull from below without pointing at the chest";
         assert BotStashScan.unsafeSortHopperLink(cell,cell.east(),net.minecraft.core.Direction.WEST,java.util.Set.of(cell));assert !BotStashScan.unsafeSortHopperLink(cell,cell.below(),net.minecraft.core.Direction.DOWN,java.util.Set.of(cell,cell.below()));
@@ -29,7 +47,82 @@ public final class BotActionsTest {
         }
         JsonObject scan=bounds.deepCopy();scan.addProperty("type","StashScan");scan.add("scanCells",JsonParser.parseString("[{x:0,y:64,z:0},{x:0,y:64,z:0}]"));try{BotActions.validate(scan);throw new AssertionError("Duplicate targeted cell accepted");}catch(IllegalArgumentException expected){}
     }
+    private static void aisleDeposits() throws Exception{
+        BlockPos chest=new BlockPos(0,80,0);
+        AABB left=new AABB(0,64,-3,1,90,4),right=new AABB(3,64,-3,4,90,4);
+        java.util.function.Predicate<AABB> clear=b->b.minY>=64&&!b.intersects(left)&&!b.intersects(right);
+        java.util.function.Function<BlockPos,net.minecraft.world.phys.shapes.VoxelShape> floor=p->p.getY()==63?net.minecraft.world.phys.shapes.Shapes.block():net.minecraft.world.phys.shapes.Shapes.empty();
+        var approach=BotActions.stashAisleApproach(new Vec3(1.5,64,4.5),chest,64,.72,floor,clear,p->p.distanceTo(Vec3.atCenterOf(chest))<4.4);
+        assert approach!=null&&approach.ground().y==64&&approach.hover().y==80.25;
+        assert approach.ground().x>1&&approach.ground().x<3&&approach.ground().x==approach.hover().x&&approach.ground().z==approach.hover().z
+            : "A narrow store aisle has a supported walking stop and a vertical, not diagonal, flight shaft";
+        assert dev.monocle.client.utils.world.PrinterFlight.segmentClear(approach.ground(),approach.hover(),.72,.6,clear);
+        var hopperAisle=BotActions.stashAisleApproach(new Vec3(.5,64,3.5),chest,64,.72,floor,
+            b->b.minY>=64&&(b.maxY<=65.8||b.minZ>=3&&b.maxZ<=4),p->true);
+        assert hopperAisle!=null&&hopperAisle.ground().z==3.5
+            &&hopperAisle.hover().distanceToSqr(Vec3.atCenterOf(chest))<=4.4*4.4
+            : "A clear shaft three blocks beyond the chest can avoid hopper overhangs without exceeding interaction reach";
+        assert BotActions.stashAisleApproach(new Vec3(4.5,64,4.5),chest,64,.72,floor,
+            b->b.minY>=64&&(b.maxY<=65.8||b.minX>=4&&b.minZ>=4),p->true)==null
+            : "A wider search cannot select a visible shaft outside chest reach";
+        Vec3 offCenter=approach.ground().add(.45,0,0);
+        Vec3 centerStep=BotActions.stashAisleCenterStep(offCenter,approach.ground(),p->clear.test(dev.monocle.client.utils.world.PrinterFlight.body(p,.72,1.8)));
+        assert centerStep.length()<=.100001&&centerStep.x<0&&centerStep.y==0&&centerStep.z==0
+            : "Baritone's near-enough endpoint is centered in bounded supported steps before ascending";
+        assert BotActions.stashAisleCenterStep(approach.ground().add(.03,0,0),approach.ground(),p->true).length()<.031
+            &&BotActions.stashAisleCenterStep(offCenter,approach.ground(),p->false).equals(Vec3.ZERO)
+            : "Centering cannot overshoot the shaft or step onto unsupported ground";
+        var slab=net.minecraft.world.phys.shapes.Shapes.box(0,0,0,1,.5,1);
+        assert BotActions.stashAisleFooting(new Vec3(.5,64.5,.5),.6,p->p.getY()==64?slab:net.minecraft.world.phys.shapes.Shapes.empty(),b->b.minY>=64.5)
+            &&!BotActions.stashAisleFooting(new Vec3(.5,65,.5),.6,p->p.getY()==64?slab:net.minecraft.world.phys.shapes.Shapes.empty(),b->true)
+            : "Centering uses actual collision tops, including fractional support, and never bridges a gap below the feet";
+        assert BotActions.stashAisleApproach(Vec3.ZERO,chest,64,.72,p->net.minecraft.world.phys.shapes.Shapes.empty(),clear,p->true)==null
+            : "Unsupported chest-side positions cannot become walking destinations";
+        assert BotActions.stashAisleApproach(Vec3.ZERO,chest,64,.72,floor,b->clear.test(b)&&b.maxY<70,p->true)==null
+            : "A roof blocking the shaft is not a route through the bank";
+        var state=net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState();
+        var low=new net.minecraft.world.level.block.entity.ChestBlockEntity(new BlockPos(0,64,0),state);
+        var high=new net.minecraft.world.level.block.entity.ChestBlockEntity(chest,state);
+        var candidates=List.of(low,high);BlockPos min=new BlockPos(-1,64,-1),max=new BlockPos(1,80,1);Vec3 from=new Vec3(1.5,64,.5);
+        assert BotStashDeposit.destinationChest(candidates,min,max,from,java.util.Set.of(),true).equals(chest);
+        assert BotStashDeposit.nearestChest(candidates,min,max,from,java.util.Set.of()).equals(low.getBlockPos());
+        assert BotStashDeposit.destinationChest(candidates,min,max,from,java.util.Set.of(chest.asLong()),true).equals(low.getBlockPos())
+            : "A full tried top chest advances downward; ordinary stash deposits retain their prior ordering";
+        JsonObject column=json("{x:0,y:64,z:0,axis:'Vertical',height:3}");
+        var chain=new BotStashScan.HopperColumn(List.of(new BlockPos(0,64,0),new BlockPos(0,65,0),new BlockPos(0,66,0)));
+        var full=new java.util.HashSet<Long>();
+        for(int y=66;y>=64;y--){
+            var next=BotStashDeposit.nextColumnChest(chain,column,full);
+            assert next.equals(new BlockPos(0,y,0)) : "Full upper inputs must advance to lower chests before reserving another column";
+            full.add(next.asLong());
+        }
+        assert BotStashDeposit.nextColumnChest(chain,column,full)==null;
+        var deferred=deposit(json("{count:20}"));
+        java.lang.reflect.Field targetField=BotStashDeposit.class.getDeclaredField("target"),columnField=BotStashDeposit.class.getDeclaredField("column"),findingField=BotStashDeposit.class.getDeclaredField("pendingFinding");
+        targetField.setAccessible(true);columnField.setAccessible(true);findingField.setAccessible(true);
+        targetField.set(deferred,new BlockPos(0,64,0));columnField.set(deferred,column);findingField.set(deferred,null);
+        deferred.deferChest();var checkpoint=deferred.snapshot();
+        assert checkpoint.get("columnUnreadable").getAsBoolean()&&checkpoint.getAsJsonArray("tried").size()==1&&checkpoint.get("confirmed").getAsInt()==0;
+        var restored=deposit(json("{count:20}"));restored.restore(checkpoint);
+        assert restored.snapshot().get("columnUnreadable").getAsBoolean() : "Reconnect must not turn an unreadable destination into proof of fullness";
+        try(var bytes=BotStashDeposit.class.getResourceAsStream("BotStashDeposit.class")){
+            var tickCalls=calls(ClassFile.of().parse(bytes.readAllBytes()),"tick");
+            assert tickCalls.indexOf("blockedChestLid")>=0&&tickCalls.indexOf("blockedChestLid")<tickCalls.indexOf("approaching")
+                : "Skip known blocked lids before flying toward an unusable chest";
+        }
+        try(var bytes=BotActions.class.getResourceAsStream("BotActions.class")){
+            var code=ClassFile.of().parse(bytes.readAllBytes());
+            assert calls(code,"aisleCenterMove").containsAll(List.of("stashAisleCenterStep","onGround","monocle$set"))
+                : "Exact ground alignment is applied after speed modules through the guarded movement owner";
+            var retry=calls(code,"moveToAisleDeposit");assert retry.contains("landInStashAisle")&&retry.contains("stashFlightRetryAllowed");
+        }
+        targetField.set(deferred,new BlockPos(0,65,0));var pending=BotStashDeposit.class.getDeclaredField("pendingBefore");pending.setAccessible(true);pending.setInt(deferred,20);
+        try{deferred.deferChest();throw new AssertionError("Unconfirmed deposit skipped");}catch(IllegalStateException expected){}
+        try{BotStashDeposit.nextColumnChest(new BotStashScan.HopperColumn(List.of(new BlockPos(1,64,0),new BlockPos(0,66,0))),column,java.util.Set.of());throw new AssertionError("Deposit chain escaped its reservation");}catch(IllegalStateException expected){}
+    }
     public static void main(String[] args) throws Exception {
+        persistedOccupancy();
+        workerFallRecovery();
         JsonObject rwpFollow = json("{scope:{server:'play.example.org',dimension:'minecraft:the_nether'},action:{type:'dev.monocle.follow.v1',arguments:{target:'00000000-0000-0000-0000-000000000002',radius:2,ticks:100}}}");
         JsonObject nativeFollow = BotActions.validate(dev.monocle.coordinator.RwpWorkerConnection.nativeMovement(rwpFollow));
         assert nativeFollow.get("follow").getAsBoolean() && nativeFollow.get("adaptiveFlight").getAsBoolean()
@@ -38,6 +131,28 @@ public final class BotActionsTest {
         endermanLook();
         stashScan();
         writeSortBoundaries();
+        aisleDeposits();
+        destinationCapacityWait();
+        var enderState=net.minecraft.world.level.block.Blocks.ENDER_CHEST.defaultBlockState();
+        var buriedEnder=new net.minecraft.world.level.block.entity.EnderChestBlockEntity(new BlockPos(0,121,0),enderState);
+        var floorEnder=new net.minecraft.world.level.block.entity.EnderChestBlockEntity(new BlockPos(30,236,0),enderState);
+        var inReachEnder=new net.minecraft.world.level.block.entity.EnderChestBlockEntity(new BlockPos(1,237,0),enderState);
+        Vec3 enderEye=new Vec3(.5,239,.5);
+        assert BotStashBuffer.nearest(List.of(buriedEnder,floorEnder),enderEye,237,255).equals(floorEnder.getBlockPos()) : "Reach a loaded ender chest across the stash instead of an old one far below its floor";
+        assert BotStashBuffer.nearest(List.of(floorEnder,inReachEnder),enderEye,237,255).equals(inReachEnder.getBlockPos()) : "An ender chest already in reach needs no travel";
+        assert BotStashBuffer.nearest(List.of(buriedEnder),enderEye,237,255)==null;
+        var pairedEnder=new net.minecraft.world.level.block.entity.EnderChestBlockEntity(floorEnder.getBlockPos().east(),enderState);
+        var enderViews=List.of(inReachEnder,floorEnder,pairedEnder);
+        assert BotStashBuffer.nearest(enderViews,enderEye,237,255).equals(floorEnder.getBlockPos()) : "Prefer a double view over a closer single view that can hide buffered cargo";
+        var rejected=java.util.Set.of(floorEnder.getBlockPos(),pairedEnder.getBlockPos());
+        assert BotStashBuffer.nearest(enderViews,enderEye,237,255,rejected).equals(inReachEnder.getBlockPos()) : "Read-only view recovery skips both previously inspected halves";
+        assert BotStashBuffer.nearest(enderViews,enderEye,237,255,java.util.Set.of(inReachEnder.getBlockPos(),floorEnder.getBlockPos(),pairedEnder.getBlockPos()))==null;
+        var wrongFacingEnder=new net.minecraft.world.level.block.entity.EnderChestBlockEntity(pairedEnder.getBlockPos(),enderState.setValue(net.minecraft.world.level.block.EnderChestBlock.FACING,net.minecraft.core.Direction.SOUTH));
+        assert BotStashBuffer.nearest(List.of(inReachEnder,floorEnder,wrongFacingEnder),enderEye,237,255).equals(inReachEnder.getBlockPos()) : "Unpaired adjacent chests do not outrank a reachable single view";
+        assert BotStashBuffer.reconciledMove(34,0,0,34,30,34,true)==34;
+        assert BotStashBuffer.reconciledMove(20,34,54,0,32,34,false)==34;
+        assert BotStashBuffer.reconciledMove(54,0,20,33,30,34,true)==-1 : "Lost cargo is not a verified ender withdrawal";
+        assert BotStashBuffer.reconciledMove(54,0,19,35,30,34,true)==-1 : "Never claim more moves than were sent";
         BotScanCoverageTest.run();
         portalTravel();
         successfulTakeoff();
@@ -191,6 +306,22 @@ public final class BotActionsTest {
             &&BotActions.stashHomeRetry(2,75_001,15_000)&&BotActions.stashHomeRetry(3,75_001,15_000)
             &&!BotActions.stashHomeRetry(0,75_001,15_000)&&!BotActions.stashHomeRetry(3,75_001,0)
             : "Interrupted homes retry only after a sent command's arrival deadline, without a terminal attempt cap";
+        JsonObject compact=json("{type:'StashResupply',name:'Synthetic',homeName:'synthetic',dimension:'minecraft:overworld',minX:0,maxX:100,minY:64,maxY:64,minZ:0,maxZ:0,kitTypeId:'00000000-0000-4000-8000-000000000001',kitItem:'minecraft:blue_shulker_box',kitExemplar:{'minecraft:obsidian':1728},incomplete:false,count:36,transferAll:true,compactPicks:true,depositMode:'Carry',picks:[]}");
+        JsonObject landing=json("{dimension:'minecraft:the_end',stack:[{action:{type:'StashDeposit',dimension:'minecraft:overworld'}}]}");
+        assert BotRuntime.profileLandingWorld(landing,"minecraft:overworld")&&BotRuntime.profileLandingWorld(landing,"minecraft:the_end")&&!BotRuntime.profileLandingWorld(landing,"minecraft:the_nether") : "A cross-dimension courier can land before resuming in either its job world or the current stash action world";
+        landing.getAsJsonArray("stack").get(0).getAsJsonObject().getAsJsonObject("action").addProperty("type","Travel");assert !BotRuntime.profileLandingWorld(landing,"minecraft:overworld") : "Unrelated travel cannot grant another landing world";
+        for(int x=0;x<100;x++){JsonObject p=new JsonObject();p.addProperty("x",x);p.addProperty("y",64);p.addProperty("z",0);compact.getAsJsonArray("picks").add(p);}
+        BotActions.validate(compact);JsonArray expanded=BotStashResupply.sourcePicks(compact);assert expanded.size()==100&&expanded.get(99).getAsJsonObject().get("dynamic").getAsBoolean()&&expanded.get(0).getAsJsonObject().get("resource").getAsString().equals("minecraft:blue_shulker_box")&&compact.getAsJsonArray("picks").get(0).getAsJsonObject().size()==3 : "Large compact manifests expand only inside the native collector";
+        JsonObject invalidCompact=compact.deepCopy();invalidCompact.addProperty("transferAll",false);try{BotActions.validate(invalidCompact);throw new AssertionError("Compact ordinary withdrawal accepted");}catch(IllegalArgumentException expected){}
+        compact.addProperty("maxX",1024);compact.add("picks",new JsonArray());for(int x=0;x<613;x++){JsonArray xyz=new JsonArray();xyz.add(x);xyz.add(64);xyz.add(0);compact.getAsJsonArray("picks").add(xyz);}
+        BotActions.validate(compact);expanded=BotStashResupply.sourcePicks(compact);assert expanded.size()==613&&expanded.get(612).getAsJsonObject().get("x").getAsInt()==612&&compact.getAsJsonArray("picks").get(0).isJsonArray() : "Large numeric manifests expand without mutating their durable action";
+        compact.addProperty("maxX",2048);for(int x=613;x<2048;x++){JsonArray xyz=new JsonArray();xyz.add(x);xyz.add(64);xyz.add(0);compact.getAsJsonArray("picks").add(xyz);}
+        BotActions.validate(compact);assert BotStashResupply.sourcePicks(compact).size()==2048;
+        compact.getAsJsonArray("picks").add(JsonParser.parseString("[2048,64,0]"));try{BotActions.validate(compact);throw new AssertionError("Oversized source manifest accepted");}catch(IllegalArgumentException expected){}
+        compact.getAsJsonArray("picks").remove(2048);
+        assert BotActions.localStashTrip(compact,new dev.monocle.coordinator.PlayerObservation.Position(0,64,0));
+        assert BotActions.stashHomeLoading(true,false,74_999,15_000)&&!BotActions.stashHomeLoading(true,false,75_001,15_000)
+            &&!BotActions.stashHomeLoading(true,true,16_000,15_000)&&!BotActions.stashHomeLoading(false,false,16_000,15_000) : "Only an outstanding bounded /home tolerates temporary world loading";
         assert BotActions.stashHomeWaiting(1,75_001,15_000,31_000)&&BotActions.stashHomeWaiting(3,150_000,0,31_000)
             &&BotActions.stashHomeWaiting(0,10_000,15_000,31_000)&&BotActions.stashHomeWaiting(0,10_000,0,31_000)
             &&!BotActions.stashHomeWaiting(0,32_000,0,31_000) : "Warmup, cooldown and pending home retries do not trip the generic stall watchdog";
@@ -424,21 +555,22 @@ public final class BotActionsTest {
         }
     }
     private static void recoveryArea() {
-        Vec3 origin = new Vec3(-81953.5, 116, .5);
+        // Independently invented synthetic recovery sites and execution IDs.
+        Vec3 origin = new Vec3(640.5, 80, .5);
         var frame = json("{\"action\":{\"type\":\"RecoverSupplies\"},\"native\":{\"action\":{\"type\":\"RecoverSupplies\"}}}");
         assert BotRuntime.anchorRecovery(frame, origin);
         assert frame.get("action").equals(frame.getAsJsonObject("native").get("action")) : "Legacy resume migrates both copies of the checkpointed action";
         var restored = json(frame.toString());
         assert !BotRuntime.anchorRecovery(restored, origin.add(100, 0, 0));
         assert restored.equals(frame) : "Walking/restarting cannot shift the search area farther down a chain of historical records";
-        var explicit = json("{\"action\":{\"type\":\"RecoverSupplies\",\"x\":-81954,\"y\":116,\"z\":0}}");
+        var explicit = json("{\"action\":{\"type\":\"RecoverSupplies\",\"x\":640,\"y\":80,\"z\":0}}");
         assert !BotRuntime.anchorRecovery(explicit, origin.add(100, 0, 0));
-        String job = "9cebee5a-4fb0-4a0f-981e-f08d4c8aace5";
-        var nearby = json("{\"x\":-81954,\"y\":116,\"z\":0,\"execution\":\"" + job + "\"}");
-        var edge = nearby.deepCopy(); edge.addProperty("x", -81938);
-        var outside = nearby.deepCopy(); outside.addProperty("x", -81937);
-        var oldSite = nearby.deepCopy(); oldSite.addProperty("x", -53250);
-        var otherJob = nearby.deepCopy(); otherJob.addProperty("execution", "486ebbc6-37f7-4280-b863-51cdb39b82ab");
+        String job = "00000000-0000-0000-0000-000000000201";
+        var nearby = json("{\"x\":640,\"y\":80,\"z\":0,\"execution\":\"" + job + "\"}");
+        var edge = nearby.deepCopy(); edge.addProperty("x", 656);
+        var outside = nearby.deepCopy(); outside.addProperty("x", 657);
+        var oldSite = nearby.deepCopy(); oldSite.addProperty("x", -2400);
+        var otherJob = nearby.deepCopy(); otherJob.addProperty("execution", "00000000-0000-0000-0000-000000000202");
         var records = List.of(nearby, edge, outside, oldSite, otherJob);
         var before = records.toString();
         assert BotSupplyRecovery.selectedRecords(records, origin, 16, "").equals(List.of(nearby, edge, otherJob));
@@ -770,7 +902,7 @@ public final class BotActionsTest {
                 : "Takeoff, missing opening routes and clearance failures all use the bounded flight retry budget";
             assert calls(code,"snapshot").contains("diagnostic") : "Walking goal/executor diagnostics survive into checkpoints";
             assert calls(code,"flyToStashChest").contains("stashFinalApproach")
-                &&calls(code,"maintainStashClearance").containsAll(List.of("stashFinalApproach","clearBody"))
+                &&calls(code,"maintainStashClearance").containsAll(List.of("target","stashFinalApproach","clearBody"))
                 : "The clearance maintainer cannot lift a collision-checked final approach back out of opening reach";
             assert calls(code,"maintainStashClearance").contains("stashFlightWidth")
                 : "Clearance recovery and cruise routing must use the same padded player width";
@@ -808,9 +940,12 @@ public final class BotActionsTest {
             assert calls(code,"tick").containsAll(List.of("settleDeposit","sameContents","reconcileInterruptedDeposit"))&&calls(code,"settleDeposit").containsAll(List.of("canReopen","beginReopen","close","open","canRetry","retryDeposit","moveConfirmed"))
                 &&calls(code,"inventory").contains("recordVerification")
                 : "Stalled deposits use a fresh-menu barrier and exact inventory reconciliation before a bounded retry";
-            assert calls(code,"findChest").containsAll(List.of("blockEntities","nearestChest"))&&!calls(code,"findChest").contains("betweenClosedStream")
+            assert calls(code,"tick").indexOf("canMoveConfirmed")<calls(code,"tick").indexOf("beginDeposit")
+                &&calls(code,"settleDeposit").indexOf("canMoveConfirmed")<calls(code,"settleDeposit").indexOf("retryDeposit")
+                : "A changed local slot must request fresh contents before an initial move or retry is marked pending";
+            assert calls(code,"findChest").containsAll(List.of("blockEntities","destinationChest"))&&!calls(code,"findChest").contains("betweenClosedStream")
                 : "Choosing the next deposit chest must not rescan every air block in a large stash";
-            assert calls(code,"findChest").containsAll(List.of("hopperColumn","top"))&&calls(code,"tick").contains("waitingForDrain")
+            assert calls(code,"findChest").containsAll(List.of("hopperColumn","nextColumnChest"))&&calls(code,"tick").contains("waitingForDrain")
                 : "Hopper-fed deposits select the top and wait for drainage, not lower-chest fallback";
         }
         try(var bytes=BotStashResupply.class.getResourceAsStream("BotStashResupply.class")){
@@ -845,7 +980,7 @@ public final class BotActionsTest {
         }
     }
 
-    private static void stashBlockedLids(){
+    private static void stashBlockedLids() throws Exception {
         var states=new java.util.HashMap<BlockPos,net.minecraft.world.level.block.state.BlockState>();
         var air=net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
         var world=new net.minecraft.world.level.BlockGetter(){
@@ -875,6 +1010,24 @@ public final class BotActionsTest {
         assert BotStashScan.blockedChestLid(world,p)==null : "An absent partner cannot falsely block a surviving chest";
         states.put(p,net.minecraft.world.level.block.Blocks.HOPPER.defaultBlockState());states.put(p.above(),net.minecraft.world.level.block.Blocks.OBSIDIAN.defaultBlockState());
         assert BotStashScan.blockedChestLid(world,p)==null : "Hoppers have no chest lid";
+        var action=json("{name:'Source',kitTypeId:'00000000-0000-0000-0000-000000000001',count:36,transferAll:true,depositMode:'Carry',picks:[{x:0,y:64,z:0,resource:'minecraft:blue_shulker_box'},{x:8,y:64,z:0,resource:'minecraft:blue_shulker_box'}]}");
+        var emptyMemory=new java.util.LinkedHashMap<String,Long>();var work=new BotStashResupply(action,emptyMemory,"scope");
+        var chain=new BotStashScan.HopperColumn(List.of(p,p.above(2)));
+        assert work.refreshSourceColumn(chain);
+        work.skipBlockedSource(p.above());
+        assert work.target().equals(p.above(2))&&work.snapshot().get("sourceBlocked").getAsBoolean()
+            &&work.snapshot().getAsJsonArray("deferredSources").size()==1&&emptyMemory.isEmpty()
+            &&!work.emptySourceColumn(List.of()) : "A blocked outlet advances upstream without erasing its contents or inferring an empty chain";
+        var sent=BotStashResupply.class.getDeclaredField("withdrawSent");sent.setAccessible(true);sent.setInt(work,10);
+        try{work.skipBlockedSource(p.above(3));throw new AssertionError("Skipped an uncertain pickup");}catch(IllegalStateException expected){}
+        sent.setInt(work,-1);work.skipBlockedSource(p.above(3));
+        assert work.snapshot().get("index").getAsInt()==1&&work.target()==null&&emptyMemory.isEmpty()
+            &&!work.result().get("sourceExhausted").getAsBoolean() : "A fully blocked chain continues to the next source and remains unresolved";
+        try(var bytes=BotStashResupply.class.getResourceAsStream("BotStashResupply.class")){
+            var tickCalls=calls(ClassFile.of().parse(bytes.readAllBytes()),"tick");
+            assert tickCalls.indexOf("blockedChestLid")>=0&&tickCalls.indexOf("blockedChestLid")<tickCalls.indexOf("approaching")
+                &&tickCalls.indexOf("skipBlockedSource")<tickCalls.indexOf("open") : "Check source lids before travelling or spending an opening timeout";
+        }
     }
     private static void interleavedEmptySources() throws Exception {
         var bottom=new BlockPos(0,64,0);var chain=new BotStashScan.HopperColumn(List.of(bottom,bottom.above(2),bottom.above(4)));
@@ -1162,6 +1315,11 @@ public final class BotActionsTest {
         states.put(bottom.above(),hopper);
         assert BotStashResupply.sourceMayRefill(world,bottom)&&BotStashResupply.sourceMayRefill(world,bottom.above())
             : "A physically fed single-container sort must allow identical source-slot refill";
+        assert !BotStashResupply.sourceMayDrain(world,bottom)&&BotStashResupply.sourceMayDrain(world,bottom.above()) : "A refilling bottom chest is stable for batching; a hopper can empty itself";
+        states.put(bottom.below(),hopper.setValue(net.minecraft.world.level.block.HopperBlock.FACING,net.minecraft.core.Direction.EAST));
+        assert BotStashResupply.sourceMayDrain(world,bottom) : "A hopper below pulls from the source regardless of its output direction";
+        states.put(bottom.below(),hopper.setValue(net.minecraft.world.level.block.HopperBlock.ENABLED,false));
+        assert !BotStashResupply.sourceMayDrain(world,bottom);states.remove(bottom.below());
         states.put(bottom.above(),hopper.setValue(net.minecraft.world.level.block.HopperBlock.ENABLED,false));
         assert !BotStashResupply.sourceMayRefill(world,bottom) : "A locked hopper does not feed a chest";
         states.put(bottom.above(),hopper.setValue(net.minecraft.world.level.block.HopperBlock.FACING,net.minecraft.core.Direction.EAST));
@@ -1188,6 +1346,7 @@ public final class BotActionsTest {
         assert first.fed()&&first.equals(second)&&first.top().equals(top) : "A hopper connected to either double-chest half feeds the whole inventory";
         assert BotStashResupply.sourceMayRefill(world,bottom)&&BotStashResupply.sourceMayRefill(world,partner)
             : "Either double-chest half receives the partner's feed, independent of the action's leased route";
+        states.put(partner.below(),hopper);assert BotStashResupply.sourceMayDrain(world,bottom)&&BotStashResupply.sourceMayDrain(world,partner) : "An outlet below either half prevents racing a draining double chest";states.remove(partner.below());
         states.put(bottom.above(2),chest);states.put(bottom.above(),hopper);
         assert !BotStashScan.hopperColumn(world,bottom,bounds).fed() : "Two independent inputs are a branch, not a homogeneous column";
         assert BotStashResupply.sourceMayRefill(world,bottom) : "Ambiguous routing still permits physical refill, never bulk withdrawal";
@@ -1449,6 +1608,8 @@ public final class BotActionsTest {
                 &&calls(code,"handleCorrection").containsAll(List.of("getSource","stopStashNavigation","brakeFlight"))
                 &&calls(code,"maintainStashClearance").containsAll(List.of("stashCollisionWalking","landBeforeHandoff"))
                 &&calls(code,"moveToStashContainer").contains("stashCollisionWalking")
+                &&calls(code,"moveToAisleDeposit").indexOf("stashCollisionWalking")>=0
+                &&calls(code,"moveToAisleDeposit").indexOf("stashCollisionWalking")<calls(code,"moveToAisleDeposit").indexOf("flyToStashChest")
                 &&calls(code,"flyToStashChest").contains("stashFlightWidth")
                 &&!calls(code,"landBeforeHandoff").contains("stashFlightWidth")
                 : "Server wall damage lands before a bounded walking retry; flight margin never changes partial-surface landing support";
@@ -1500,7 +1661,13 @@ public final class BotActionsTest {
     }
     private static void closedSourceMenus() throws Exception {
         var source=new BotStashResupply(json("{picks:[]}"));
-        var opening=BotStashResupply.class.getDeclaredField("openingRequested");opening.setAccessible(true);opening.setBoolean(source,true);
+        var opening=BotStashResupply.class.getDeclaredField("openingRequested");opening.setAccessible(true);
+        var initial=source.snapshot();
+        assert !source.resetClosedMenu(0,true)&&!source.resetClosedMenu(40,false);
+        assert source.resetClosedMenu(40,true)&&source.snapshot().equals(initial)&&!source.acceptMenu(40)
+            : "A container inherited from the previous action closes without a pickup, then needs an explicit fresh opening";
+        opening.setBoolean(source,true);
+        assert !source.resetClosedMenu(41,true) : "The menu just requested by this action can arrive before its contents snapshot";
         assert source.acceptMenu(41);
         var receipt=BotStashResupply.class.getDeclaredField("receipt");receipt.setAccessible(true);((JsonArray)receipt.get(source)).add(json("{x:1,y:64,z:1}"));
         var contents=BotStashResupply.class.getDeclaredField("serverMenuContents");contents.setAccessible(true);contents.set(source,List.of(new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.STONE)));
@@ -1517,6 +1684,8 @@ public final class BotActionsTest {
             var pending=BotStashResupply.class.getDeclaredField(name);pending.setAccessible(true);pending.setInt(source,1);
             assert !source.resetClosedMenu(0,true)&&source.acceptMenu(46)&&!source.acceptMenu(47) : "An uncertain "+name+" stays bound to its original menu";
             pending.setInt(source,-1);
+            var inherited=new BotStashResupply(json("{picks:[]}"));pending.setInt(inherited,1);
+            assert !inherited.resetClosedMenu(47,true) : "An unbound pending "+name+" cannot be discarded as an inherited idle menu";
         }
         var slots=new ArrayList<net.minecraft.world.item.ItemStack>(java.util.Collections.nCopies(63,net.minecraft.world.item.ItemStack.EMPTY));for(int i=0;i<4;i++)slots.set(i,new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.SHULKER_BOX));
         var bulk=BotStashBulk.plan(slots,27,4,10,true,false,false,i->true);assert bulk!=null;
@@ -1785,10 +1954,83 @@ public final class BotActionsTest {
         depositReconciliation(first,second);
         depositRestart(first,second);
     }
+    private static void destinationCapacityWait() throws Exception{
+        var ack=json("{deposit:true,delivery:1,error:'No compatible capacity',capacityUnavailable:true,permit:false}");
+        var waiting=deposit(json("{count:20}"));assert waiting.deferCapacity(ack)&&waiting.waitingForCapacity();
+        var saved=waiting.snapshot();assert saved.get("delivery").getAsInt()==2&&!saved.has("finding")&&saved.get("confirmed").getAsInt()==0;
+        assert !waiting.deferCapacity(ack)&&waiting.snapshot().equals(saved) : "Duplicate capacity acknowledgements cannot consume another delivery";
+        var restored=deposit(json("{count:20}"));restored.restore(saved);
+        assert restored.waitingForCapacity()&&!restored.retryCapacity(Long.MIN_VALUE)&&restored.retryCapacity(Long.MAX_VALUE)
+            &&restored.pending().isEmpty()&&restored.delivery()==2 : "Restart retains cargo and issues a fresh request after the delay";
+        var next=ack.deepCopy();next.addProperty("delivery",2);assert restored.deferCapacity(next)&&restored.delivery()==3;
+        var locked=deposit(json("{count:20,targetColumn:{x:0,y:64,z:0,axis:'Vertical'}}"));assert !locked.deferCapacity(ack);
+        var allocated=deposit(json("{name:'Depot',count:20,fillAllocatedColumns:true}"));assert allocated.finishAllocation(ack,20);
+        assert allocated.result().get("retained").getAsInt()==20&&allocated.result().get("deposited").getAsInt()==0&&!allocated.waitingForCapacity();
+        var loaded=deposit(json("{name:'Depot',count:20,fillAllocatedColumns:true}"));loaded.restore(allocated.snapshot());
+        assert loaded.result().get("retained").getAsInt()==20&&loaded.snapshot().get("finished").getAsBoolean()
+            : "Allocated-column completion retains overflow across restart without claiming it was deposited";
+        var pending=deposit(json("{count:20}"));var before=BotStashDeposit.class.getDeclaredField("pendingBefore");before.setAccessible(true);before.setInt(pending,1);
+        assert !pending.deferCapacity(ack) : "Capacity recovery cannot retire an unconfirmed move";
+        var pendingAllocation=deposit(json("{count:20,fillAllocatedColumns:true}"));before.setInt(pendingAllocation,1);assert !pendingAllocation.finishAllocation(ack,20);
+        var complete=deposit(json("{count:20}"));var confirmed=BotStashDeposit.class.getDeclaredField("confirmed");confirmed.setAccessible(true);confirmed.setInt(complete,20);
+        assert complete.deferCapacity(ack)&&!complete.waitingForCapacity()&&complete.snapshot().get("finished").getAsBoolean()
+            : "A confirmed final deposit does not need another column to finish";
+        var bad=ack.deepCopy();bad.addProperty("capacityUnavailable","true");assert !deposit(json("{count:20}")).deferCapacity(bad);
+        bad=ack.deepCopy();bad.addProperty("permit",true);assert !deposit(json("{count:20}")).deferCapacity(bad);
+        try(var bytes=BotActions.class.getResourceAsStream("BotActions.class")){
+            assert calls(ClassFile.of().parse(bytes.readAllBytes()),"depositStash").containsAll(List.of("waitingForCapacity","landInStashAisle","landBeforeHandoff"))
+                : "Capacity waits land through the existing checked aisle/ordinary landing paths";
+        }
+    }
     private static void bulkTransfers() throws Exception {
         var empty=net.minecraft.world.item.ItemStack.EMPTY;
         var kit=new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.SHULKER_BOX);
         kit.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME,net.minecraft.network.chat.Component.literal("Bulk kit"));
+        for(int n=1;n<=3;n++)for(boolean take:List.of(true,false)){
+            var contents=new ArrayList<>(java.util.Collections.nCopies(54+36,empty));
+            for(int i=0;i<n;i++)contents.set((take?0:54)+i,kit.copy());
+            var tail=BotStashBulk.plan(contents,54,n,10,take,false,false,s->true,1);
+            assert tail!=null&&tail.moves.size()==n : "Ender buffer tails use the same exact-slot confirmation as larger bursts";
+            var next=tail.nextMoves(10,contents,empty);assert next.size()==n;
+            for(var move:next){contents.set(move.source(),empty);contents.set(move.destination(),move.stack());}
+            assert tail.observe(contents,empty)==n&&tail.complete();
+        }
+        JsonObject buffer=json("{type:'StashBuffer',name:'Depot',homeName:'depot',dimension:'minecraft:the_end',minX:0,maxX:2,minY:64,maxY:80,minZ:0,maxZ:2,operation:'Inspect',buffered:0,count:36,kitTypeId:'00000000-0000-0000-0000-000000000001',kitExemplar:{'minecraft:obsidian':64}}");
+        BotActions.validate(buffer);var savedBuffer=new BotStashBuffer(buffer).snapshot();new BotStashBuffer(buffer).restore(savedBuffer);
+        JsonObject stow=buffer.deepCopy();stow.addProperty("operation","Stow");BotActions.validate(stow);
+        JsonObject savedStow=new BotStashBuffer(stow).snapshot();savedStow.addProperty("initialBuffer",7);savedStow.addProperty("limit",5);savedStow.addProperty("moved",2);savedStow.addProperty("sent",2);savedStow.addProperty("slots",54);
+        var stowed=new BotStashBuffer(stow);stowed.restore(savedStow);assert stowed.result().get("buffered").getAsInt()==9 : "Existing personal cargo is retained across a stow checkpoint";
+        savedStow.addProperty("initialBuffer",-1);try{new BotStashBuffer(stow).restore(savedStow);throw new AssertionError("Stow cannot resume issued moves without the initial cargo count");}catch(IllegalArgumentException expected){}
+
+        var exhaustedViews=new BotStashBuffer(buffer);var triedViews=BotStashBuffer.class.getDeclaredField("triedViews");triedViews.setAccessible(true);
+        @SuppressWarnings("unchecked") var tried=(java.util.Set<BlockPos>)triedViews.get(exhaustedViews);
+        for(int i=0;i<8;i++)tried.add(new BlockPos(i,64,0));
+        var nextView=BotStashBuffer.class.getDeclaredMethod("nextView",int.class);nextView.setAccessible(true);
+        assert !(boolean)nextView.invoke(exhaustedViews,0) : "Wrong-view recovery stops at eight read-only probes, without touching the player or sending clicks";
+        savedBuffer.addProperty("pending",true);savedBuffer.addProperty("inventoryBefore",34);savedBuffer.addProperty("fingerprint","a".repeat(64));savedBuffer.addProperty("limit",34);savedBuffer.addProperty("sent",4);
+        var resumedBuffer=new BotStashBuffer(buffer);resumedBuffer.restore(savedBuffer);assert resumedBuffer.snapshot().get("pending").getAsBoolean() : "Reconnect keeps pending ender clicks for read-only reconciliation";
+        for(boolean take:List.of(true,false)){
+            var contents=new ArrayList<>(java.util.Collections.nCopies(90,empty));
+            for(int i=0;i<34;i++)contents.set((take?0:54)+i,kit.copy());
+            var pending=BotStashBulk.plan(contents,54,34,10,take,false,false,s->true);
+            var moves=pending.nextMoves(10,contents,empty);assert moves.size()==34;
+            for(var move:moves.subList(0,8)){contents.set(move.source(),empty);contents.set(move.destination(),move.stack());}
+            assert pending.observe(contents,empty)==8;
+            var changing=new BotStashBuffer(buffer);var before=savedBuffer.deepCopy();before.addProperty("moved",8);before.addProperty("sent",34);changing.restore(before);
+            var field=BotStashBuffer.class.getDeclaredField("bulk");field.setAccessible(true);field.set(changing,pending);
+            changing.retainPendingMoves();changing.retainPendingMoves();var checkpoint=changing.snapshot();
+            assert checkpoint.get("moved").getAsInt()==8&&checkpoint.get("sent").getAsInt()==34&&checkpoint.get("pending").getAsBoolean()
+                : "Menu replacement retains the verified prefix and all issued clicks exactly once";
+            var reopened=new BotStashBuffer(buffer);reopened.restore(checkpoint);assert reopened.snapshot().equals(checkpoint);
+            assert BotStashBuffer.reconciledMove(take?54:0,take?0:34,take?20:34,take?34:0,8,34,take)==34
+                : "Reopened conserved cargo confirms the old burst rather than sending it again";
+        }
+        try(var bytes=BotStashBuffer.class.getResourceAsStream("BotStashBuffer.class")){
+            var code=ClassFile.of().parse(bytes.readAllBytes());
+            assert calls(code,"tick").contains("reopen")&&calls(code,"inventory").contains("retainPendingMoves")
+                &&calls(code,"close").contains("retainPendingMoves") : "Tick and packet menu changes preserve the same pending cargo";
+            assert calls(code,"tick").contains("nextView")&&!calls(code,"nextView").contains("send") : "Alternate ender views are inspected without sending cargo clicks";
+        }
         var wrong=kit.copy();wrong.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME,net.minecraft.network.chat.Component.literal("Other kit"));
         var click=dev.monocle.client.utils.player.InvUtils.confirmedQuickMove(7,80);
         assert click.containerId()==7&&click.stateId()==-1&&click.slotNum()==80&&click.buttonNum()==0
@@ -1821,16 +2063,14 @@ public final class BotActionsTest {
             }
             assert batch.complete()&&menu.getSlot(menu.slots.size()-1).getItem().getCount()==3;
         }
-        // Dynamic withdrawals use single-kit confirmation; hopper-fed deposits can still burst.
+        // Refilling bottom chests can batch exact slots without counting their refills twice.
         for(boolean withdrawal:List.of(true,false)){
             int start=5;
             var before=new ArrayList<>(java.util.Collections.nCopies(start+36,empty));
             for(int i=0;i<4;i++)before.set((withdrawal?0:start)+i,kit.copy());
             var batch=startedBulk(before,start,36,100,withdrawal,false,true,s->true);
             if(withdrawal){
-                assert batch==null : "A changing hopper source must confirm one box before selecting another";
                 assert BotStashBulk.plan(before,start,36,100,true,true,true,s->true)==null : "Quick-move cannot bypass the dynamic-source guard";
-                continue;
             }
             assert batch!=null&&!batch.quick;
             var after=new ArrayList<>(before);
@@ -1990,25 +2230,25 @@ public final class BotActionsTest {
     }
     private static void capacityBatches(net.minecraft.world.item.ItemStack kit,net.minecraft.world.item.ItemStack wrong){
         var empty=net.minecraft.world.item.ItemStack.EMPTY;
-        for(int slots:List.of(5,27,54))for(boolean quick:List.of(false,true)){
+        for(int slots:List.of(5,27,54))for(boolean quick:List.of(false,true))for(boolean take:List.of(false,true)){
             var contents=new ArrayList<>(java.util.Collections.nCopies(slots+36,empty));
-            for(int i=slots;i<contents.size();i++)contents.set(i,kit.copy());
+            for(int i=take?0:slots;i<(take?slots:contents.size());i++)contents.set(i,kit.copy());
             int capacity=Math.min(slots,36);
-            var batch=BotStashBulk.plan(contents,slots,36,100,false,quick,false,s->true);
+            var batch=BotStashBulk.plan(contents,slots,36,100,take,quick,false,s->true);
             assert batch!=null&&batch.moves.size()==capacity : "Plan the full carried inventory or exactly the available container capacity";
             assert batch.observe(contents,empty)==0&&batch.sent==0 : "A plan alone never issues or verifies a move";
             int tick=100;
             while(!batch.complete()){
                 int before=batch.sent;
                 var next=batch.nextMoves(tick,contents,empty);
-                assert next.size()==Math.min(4,capacity-before)&&batch.sentTick==tick;
+                assert next.size()==capacity-before&&batch.sentTick==tick : "Send every move that fits, without a four/five-item cap";
                 assert batch.nextMoves(tick+1,contents,empty).isEmpty() : "A second part cannot precede authoritative receipts for the first";
                 assert batch.sentTick==tick : "Waiting must not extend the confirmation timeout";
                 for(var move:next){
                     contents.set(move.source(),empty);contents.set(move.destination(),move.stack());
                     assert batch.observe(contents,empty)==1;
                 }
-                assert batch.nextMoves(tick,contents,empty).isEmpty() : "Receipts arriving this tick cannot exceed the per-tick packet budget";
+                assert batch.nextMoves(tick,contents,empty).isEmpty() : "A fully issued batch cannot be sent again";
                 tick++;
             }
             assert batch.verified==capacity&&batch.sent==capacity&&batch.nextMoves(tick,contents,empty).isEmpty();
@@ -2028,16 +2268,18 @@ public final class BotActionsTest {
         var changed=new ArrayList<>(contents);changed.set(0,wrong.copy());
         assert blocked.nextMoves(100,changed,empty).isEmpty()&&blocked.sent==0 : "Do not send into a destination occupied since planning";
         assert blocked.nextMoves(100,contents,kit).isEmpty()&&blocked.sent==0 : "A held cursor blocks the entire click pair";
+        changed=new ArrayList<>(contents);changed.set(blocked.moves.get(4).source(),wrong.copy());
+        assert blocked.nextMoves(100,changed,empty).isEmpty()&&blocked.sent==0 : "Every source, including beyond the old cap, is checked before sending anything";
         blocked.nextMoves(100,contents,empty);
         for(var move:blocked.moves.subList(0,4)){contents.set(move.source(),empty);contents.set(move.destination(),move.stack());}
         assert blocked.observe(contents,empty)==4;
         changed=new ArrayList<>(contents);changed.set(blocked.moves.get(4).source(),wrong.copy());
-        assert blocked.nextMoves(101,changed,empty).isEmpty()&&blocked.sent==4 : "Unsent kit identity must still match";
+        assert blocked.nextMoves(101,changed,empty).isEmpty()&&blocked.sent==20 : "An outstanding capacity-sized burst is never repeated";
         blocked.reopen(10);
         assert blocked.nextMoves(102,contents,empty).isEmpty()&&blocked.canFallback(contents,empty)
             &&blocked.missingAfterReopen(contents,empty)==0 : "Reopening retires the plan instead of issuing its unsent remainder";
         changed=new ArrayList<>(contents);changed.set(blocked.moves.get(4).source(),empty);
-        assert blocked.missingAfterReopen(changed,empty)==-1 : "An unsent source cannot be retired as an uncertain issued deposit";
+        assert blocked.missingAfterReopen(changed,empty)==1&&blocked.verified==4 : "An issued but lost box stays uncertain rather than becoming a confirmed deposit";
         var unissued=BotStashBulk.plan(contents,54,16,100,false,false,false,s->true);
         changed=new ArrayList<>(contents);
         for(var move:unissued.moves){changed.set(move.source(),empty);changed.set(move.destination(),move.stack());}
@@ -2048,14 +2290,17 @@ public final class BotActionsTest {
         var fed=BotStashBulk.plan(contents,54,16,100,false,false,true,s->true);
         var next=fed.nextMoves(100,contents,empty);
         for(var move:next){contents.set(move.source(),empty);contents.set(move.destination(),move.stack());}
-        assert fed.observe(contents,empty)==4;
+        assert fed.observe(contents,empty)==16;
         contents.set(next.getFirst().destination(),empty);
-        assert fed.nextMoves(101,contents,empty).size()==4&&fed.sentTick==101
-            : "Previously verified destinations may drain while later exact-slot deposits continue";
+        assert fed.complete()&&fed.nextMoves(101,contents,empty).isEmpty()
+            : "A draining destination cannot cause the completed burst to be replayed";
         var source=new ArrayList<>(java.util.Collections.nCopies(54+36,empty));
         for(int i=0;i<54;i++)source.set(i,kit.copy());
-        assert BotStashBulk.plan(source,54,36,100,true,true,false,s->true).moves.size()==4
-            : "Withdrawal batch size is unchanged";
+        assert BotStashBulk.plan(source,54,36,100,true,true,false,s->true).moves.size()==36
+            : "Withdraw all 36 kits when the inventory has room";
+        source.set(88,new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.ENCHANTED_GOLDEN_APPLE,64));
+        source.set(89,new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.EXPERIENCE_BOTTLE,64));
+        assert BotStashBulk.plan(source,54,36,100,true,false,true,s->true).moves.size()==34 : "Refilling chests respect the two occupied personal-supply slots";
     }
     private static List<net.minecraft.world.item.ItemStack> pickupContents(net.minecraft.world.item.ItemStack kit,net.minecraft.world.item.ItemStack empty){
         var result=new ArrayList<>(java.util.Collections.nCopies(27+36,empty));
@@ -2161,6 +2406,21 @@ public final class BotActionsTest {
         assert relocated.snapshot().getAsJsonObject("verification").get("sourceInventorySlot").getAsInt()==0
             &&relocated.canReopen(contents,returned,empty) : "Retry uses the returned kit's actual slot and a new exact inventory baseline";
         relocated.observeContents(List.of(empty,box),0);assert relocated.snapshot().get("confirmed").getAsInt()==1;
+        for(var occupied:List.of(List.of(empty,box),List.of(wrong,box))){
+            var raced=depositOpeningGuards();raced.beginDeposit(1,1,box,10,contents,8,original);
+            assert raced.canReopen(occupied,held,box)&&!raced.canReopen(occupied,original,empty)
+                : "An occupied destination permits closing only when the exact original kit is still held";
+            assert !raced.recoverOccupiedDestination(occupied,original,empty) : "An old menu cannot prove a cursor return";
+            raced.beginReopen(30);opening.setInt(raced,0);assert !raced.acceptMenu(10)&&raced.acceptMenu(11);
+            assert !raced.recoverOccupiedDestination(occupied,held,empty)&&!raced.recoverOccupiedDestination(occupied,original,box)
+                &&!raced.recoverOccupiedDestination(occupied,replaced,empty) : "Missing, held or changed cargo cannot be retired as recovered";
+            assert raced.recoverOccupiedDestination(occupied,returned,empty);
+            assert !raced.snapshot().get("pending").getAsBoolean()&&raced.snapshot().get("confirmed").getAsInt()==0&&raced.snapshot().get("missing").getAsInt()==0
+                : "Returned cargo is replanned; neither the hopper's kit nor the retained kit counts as our deposit";
+            assert !raced.recoverOccupiedDestination(occupied,returned,empty) : "Recovery cannot be applied twice";
+            var next=List.of(empty,box);raced.beginDeposit(1,0,box,31,next,0,returned);raced.observeContents(List.of(box,box),0);
+            assert raced.snapshot().get("confirmed").getAsInt()==1 : "A fresh deposit in another slot still needs its own exact receipt";
+        }
     }
     private static void roundRobinActions() throws Exception {
         var root=java.nio.file.Files.createTempDirectory("monocle-round-robin-actions-");String scope="server\nminecraft:the_end",worker=java.util.UUID.randomUUID().toString();
@@ -2463,8 +2723,20 @@ public final class BotActionsTest {
         extra.set(3,empty);assert !incidental.onlyIncidentalAdditions(extra) : "Incidental additions never mask existing cargo loss";
     }
     private static void personalSupplyCaches() throws Exception {
+        assert !BotActions.stashFoodRestockRequired(json("{destination:'Player'}"),0)
+            &&!BotActions.stashFoodRestockRequired(json("{type:'StashDeposit',destination:'Player'}"),0)
+            : "Player deliveries and returned cargo do not require a personal food reserve";
+        assert BotActions.stashFoodRestockRequired(json("{destination:'Stash'}"),0)
+            &&BotActions.stashFoodRestockRequired(json("{}"),8)
+            &&!BotActions.stashFoodRestockRequired(json("{}"),9)
+            : "Stash transfers and scans retain their existing food reserve";
         var apples=net.minecraft.world.item.Items.ENCHANTED_GOLDEN_APPLE;
         var xp=net.minecraft.world.item.Items.EXPERIENCE_BOTTLE;
+        assert BotActions.stashMendCoolingDown(100,1300,64)&&BotActions.stashMendCoolingDown(1299,1300,156)
+            : "A stalled optional mend can finish cargo work before a bounded retry";
+        assert !BotActions.stashMendCoolingDown(100,1300,63)&&!BotActions.stashMendCoolingDown(1300,1300,156)
+            &&!BotActions.stashMendCoolingDown(0,1300,156)
+            : "Mending backoff never bypasses the last-glider reserve or survives an invalid tick epoch";
         assert BotActions.stashMendMayDefer(xp,false,64)&&BotActions.stashMendMayDefer(xp,false,156)
             : "Unavailable XP is optional while the elytra retains the takeoff reserve";
         assert !BotActions.stashMendMayDefer(xp,false,63)&&!BotActions.stashMendMayDefer(xp,true,156)
@@ -2597,6 +2869,19 @@ public final class BotActionsTest {
         Vec3 fallback=BotDelivery.goal(from,anchor,p->p.z<=.00001);
         assert fallback!=null&&fallback.z<=.00001 : "An unsafe front uses a supported side instead";
         assert BotDelivery.goal(from,anchor,p->false)==null : "Unknown or unsupported ground cannot authorize movement";
+        Vec3 tight=BotDelivery.goal(from,anchor,p->Math.abs(p.x)<.4&&p.z>=-1.1&&p.z<=1.3);
+        assert tight!=null&&Math.abs(tight.z-1.25)<1e-6 : "A narrow supported space uses a short handoff instead of waiting for three clear blocks";
+        assert BotDelivery.holdPosition(Vec3.ZERO,Vec3.ZERO,new Vec3(4,0,2),true) : "A recipient who walked away stops the bot's approach";
+        assert BotDelivery.holdPosition(new Vec3(0,0,3),Vec3.ZERO,Vec3.ZERO,false) : "Already separated on arrival needs no ceremonial extra walk";
+        assert !BotDelivery.holdPosition(new Vec3(0,0,1.5),Vec3.ZERO,Vec3.ZERO,true) : "The bot's own approach does not look like recipient movement";
+        // Synthetic handoff terrain, independent of any observed delivery location.
+        assert BotDelivery.goal(from,BotDelivery.anchor(new Vec3(0,.5,0),0,"minecraft:the_nether"),p->p.y==0).y==0 : "A recipient on a slightly different surface cannot pull the walking route off its supported floor";
+        java.util.function.Function<BlockPos,net.minecraft.world.phys.shapes.VoxelShape> slab=p->p.getY()==0?net.minecraft.world.phys.shapes.Shapes.box(0,0,0,1,.5,1):net.minecraft.world.phys.shapes.Shapes.empty();
+        assert BotActions.stashAisleFooting(new Vec3(.5,.5,.5),.62,slab,b->true) : "Slab tops are real support despite their fractional height";
+        assert !BotActions.stashAisleFooting(new Vec3(.5,.75,.5),.62,slab,b->true) : "Air above a slab does not authorize walking";
+        assert !BotActions.stashAisleFooting(new Vec3(.5,.5,.5),.62,slab,b->false) : "Support cannot override obstructed body clearance";
+        assert !BotActions.stashAisleFooting(new Vec3(.95,.5,.5),.62,p->p.getX()==0?slab.apply(p):net.minecraft.world.phys.shapes.Shapes.empty(),b->true) : "The whole footprint must be supported at a ledge";
+
         assert !BotDelivery.corridor(Vec3.ZERO,new Vec3(1,0,0),p->p.x<.4||p.x>.6) : "Check intervening footing, not only endpoints";
         assert BotDelivery.goal(new Vec3(20,0,0),anchor,p->true)==null : "Never chase a distant frozen recipient position";
         assert BotDelivery.goal(new Vec3(0,2,0),anchor,p->true)==null : "Do not walk off a ledge to reach the recipient's height";
@@ -2613,21 +2898,29 @@ public final class BotActionsTest {
         assert !BotActions.teleportMayArrive(external,"minecraft:the_end","minecraft:the_nether",true,300,false);
         assert !BotActions.teleportMayArrive(crew,"minecraft:the_end","minecraft:the_nether",true,300,true) : "Known crew/stash dimensions retain their guard";
         assert BotActions.teleportMayArrive(crew,"minecraft:the_end","minecraft:the_end",true,300,true);
+        assert BotActions.returnByDeath(json("{type:'StashVisit',returnByDeath:true}"));
+        assert !BotActions.returnByDeath(json("{type:'StashResupply',returnByDeath:true}"))&&!BotActions.returnByDeath(json("{type:'StashVisit'}")) : "Only the explicit successful return action may discard inventory";
+        JsonObject deadline=json("{timeoutTicks:1200}");
+        assert !BotActions.teleportExpired(deadline,1000,60999)&&BotActions.teleportExpired(deadline,1000,61000)&&BotActions.teleportExpired(deadline,1000,90000) : "External delivery deadline is wall time and does not reset after reconnect";
+        assert !BotActions.teleportExpired(deadline,0,90000)&&!BotActions.teleportExpired(deadline,1000,999);
         assert BotActions.teleportRejected("Running","Tpa",true,10,"Player not found!");
         assert !BotActions.teleportRejected("Running","Tpa",false,10,"Player not found!");
         assert !BotActions.teleportRejected("Running","Tpa",true,201,"Player not found!");
         assert !BotActions.teleportRejected("Complete","Tpa",true,10,"Player not found!");
-        assert !BotActions.teleportRejected("Running","Tpa",true,10,"[iotacism head] iotacism » Player not found!");
-        assert BotRuntime.teleportReplyCurrent("token","token","tpa iotacism","tpa Iotacism");
-        assert !BotRuntime.teleportReplyCurrent("old-token","new-token","tpa iotacism","tpa iotacism");
-        assert !BotRuntime.teleportReplyCurrent("token","token","tpa iotacism","msg other Gotchu"):"An unrelated DM failure must not abort the pending recipient's teleport";
-        assert !BotRuntime.teleportReplyCurrent("token","token","tpa iotacism",""):"Restored or unissued commands retain uncertainty guards";
+        assert !BotActions.teleportRejected("Running","Tpa",true,10,"[ExampleUser head] ExampleUser » Player not found!");
+        assert BotRuntime.teleportReplyCurrent("token","token","tpa ExampleUser","tpa EXAMPLEUSER");
+        assert !BotRuntime.teleportReplyCurrent("old-token","new-token","tpa ExampleUser","tpa ExampleUser");
+        assert !BotRuntime.teleportReplyCurrent("token","token","tpa ExampleUser","msg other Gotchu"):"An unrelated DM failure must not abort the pending recipient's teleport";
+        assert !BotRuntime.teleportReplyCurrent("token","token","tpa ExampleUser",""):"Restored or unissued commands retain uncertainty guards";
         try{BotActions.validate(json("{type:DropItems,item:'minecraft:stone',count:1,handoff:true}"));throw new AssertionError("Handoff without recipient accepted");}catch(IllegalArgumentException expected){}
         try(var stream=BotActions.class.getResourceAsStream("BotActions.class")){
             var code=ClassFile.of().parse(stream.readAllBytes());
             assert calls(code,"deliveryMove").containsAll(List.of("corridor","onGround","monocle$set")) : "The actual move, after speed modules, must be checked and capped";
             assert calls(code,"drop").indexOf("send")<calls(code,"drop").indexOf("handleContainerInput") : "Send the throw direction before its inventory packet";
             assert calls(code,"prepareDelivery").containsAll(List.of("goal","corridor","aimRecipient"));
+            assert calls(code,"aimRecipient").contains("deliveryRecipient")&&calls(code,"prepareDelivery").contains("holdPosition") : "Actual outgoing drops use the latest observed recipient and stop pursuit";
+            assert calls(code,"prepareStashHome").contains("courierAtStash")&&calls(code,"drop").contains("courierCelebration") : "Server-confirmed drops celebrate, stash arrival ends it";
+
             assert calls(code,"drop").containsAll(List.of("planDropBurst","sendDropBurst"))&&calls(code,"inventory").containsAll(List.of("confirmedDropSwap","confirmedDropBurst"))
                 : "Production bursts use the tested planner and server receipt; legacy issued swaps remain observable";
             assert calls(code,"sendDropBurst").indexOf("send")<calls(code,"sendDropBurst").indexOf("handleContainerInput");
@@ -2710,5 +3003,25 @@ public final class BotActionsTest {
     private static List<String> calls(ClassModel type, String method) {
         return type.methods().stream().filter(m -> m.methodName().equalsString(method)).flatMap(m->m.code().orElseThrow().elementList().stream())
             .filter(InvokeInstruction.class::isInstance).map(InvokeInstruction.class::cast).map(call -> call.name().stringValue()).toList();
+    }
+    private static void workerFallRecovery() throws Exception {
+        assert BotActions.workerFallDanger(1.5,-.5,false,false,false,false) : "A worker falling off a floating platform catches before a damaging fall";
+        assert BotActions.workerFallDanger(12,-1.5,false,false,false,false) : "Fast or late-detected falls still get a rescue attempt";
+        assert !BotActions.workerFallDanger(.8,-.3,false,false,false,false)
+            &&!BotActions.workerFallDanger(2,.1,false,false,false,false)
+            &&!BotActions.workerFallDanger(2,-.35,false,false,false,false) : "Normal jumps, ascent and a controlled slow descent are not fall emergencies";
+        assert !BotActions.workerFallDanger(2,-.5,true,false,false,false)
+            &&!BotActions.workerFallDanger(2,-.5,false,true,false,false)
+            &&!BotActions.workerFallDanger(2,-.5,false,false,true,false)
+            &&!BotActions.workerFallDanger(2,-.5,false,false,false,true) : "Ground, existing flight, unavailable gliders and nearby verified landings are excluded";
+        assert !BotActions.workerFallDanger(Double.NaN,-.5,false,false,false,false)
+            &&!BotActions.workerFallDanger(2,Double.NEGATIVE_INFINITY,false,false,false,false);
+        try(var in=BotActions.class.getResourceAsStream("BotActions.class")){
+            var code=ClassFile.of().parse(in.readAllBytes());
+            assert calls(code,"tick").indexOf("catchWorkerFall")<calls(code,"tick").indexOf("closing")
+                : "An unfinished Baritone cancellation cannot block the fall guard";
+            assert calls(code,"catchWorkerFall").containsAll(List.of("workerFallDanger","tryToStartFallFlying","send","brakeFlight","releaseForFall","resetStashFlightProgress"))
+                : "The native fall guard deploys the elytra, sends the server request, brakes and releases the owned falling path before replanning";
+        }
     }
 }

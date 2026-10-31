@@ -2791,11 +2791,11 @@ public class HighwayBuilder extends Module {
     }
 
     private String worldScope() {
-        return (mc.getCurrentServer() == null ? "local:" + Utils.getWorldName() : mc.getCurrentServer().ip)
+        return (mc.getCurrentServer() == null ? "local:" + Utils.getWorldName() : dev.monocle.client.utils.Utils.getServerIdentity())
             + "\n" + mc.level.dimension().identifier() + "\n" + mc.player.getUUID();
     }
 
-    private String stashScope(){return (mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();}
+    private String stashScope(){return (mc.getCurrentServer()==null?"local":dev.monocle.client.utils.Utils.getServerIdentity())+"\n"+mc.level.dimension().identifier();}
     static int soloRefillTarget(int resource,int emptyEnderSlots,int toolBoxes){int boxes=resource==CrewInventory.MATERIALS?Math.max(1,emptyEnderSlots):resource==CrewInventory.PICKS?toolBoxes:1;return Math.multiplyExact(boxes,resource==CrewInventory.PICKS?27:1728);}
     private boolean beginSoloStash(int resource){
         if(crewAssigned||!soloStashRestock.get()||soloStashAction!=null)return false;String home=soloReturnHome.get().strip();if(!home.matches("[A-Za-z0-9_-]{1,48}")){error("Solo return home must use letters, numbers, underscores or dashes.");return false;}

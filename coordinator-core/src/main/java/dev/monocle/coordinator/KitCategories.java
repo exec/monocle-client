@@ -89,9 +89,15 @@ public final class KitCategories {
     public static JsonObject definition(String slug,String name,String mode,Collection<String> members){
         JsonObject c=new JsonObject();c.addProperty("id",UUID.nameUUIDFromBytes(("monocle-category-v1\n"+slug).getBytes(StandardCharsets.UTF_8)).toString());c.addProperty("slug",slug);c.addProperty("name",name);c.addProperty("mode",mode);JsonArray list=new JsonArray();members.forEach(list::add);c.add("members",list);return checked(c);
     }
-    /** Explicit operator action, not a scan side effect; never changes existing definitions or column reservations. */
+    /** Explicit operator action; preserves storage matching and gives building kits specific request words. */
     public static synchronized JsonObject seed(Path root,String crew,String scope,JsonObject source,int minimum){
+        if(minimum<1||minimum>1_000_000)throw new IllegalArgumentException("Category discovery minimum must be 1–1000000");
         JsonObject db=get(root,crew,scope),stock=stock(source);List<JsonObject> proposed=new ArrayList<>();
+        // The broad building rule remains useful for storage, while requests select a specific kit.
+        for(var entry:db.getAsJsonObject("categories").deepCopy().entrySet())if(text(entry.getValue().getAsJsonObject(),"slug").equals("building")&&usedFor(entry.getValue().getAsJsonObject(),"Kitbot")){
+            JsonObject storage=entry.getValue().getAsJsonObject().deepCopy();storage.addProperty("usage","Storage");db=save(root,crew,scope,text(db,"revision"),storage);
+        }
+        List<JsonObject> existing=db.getAsJsonObject("categories").entrySet().stream().map(e->e.getValue().getAsJsonObject()).toList();
         for(String[] item:List.of(new String[]{"obsidian","Obsidian","minecraft:obsidian"},new String[]{"crying-obsidian","Crying obsidian","minecraft:crying_obsidian"},new String[]{"gapples","Enchanted golden apples","minecraft:enchanted_golden_apple"},new String[]{"xp","Experience bottles","minecraft:experience_bottle"}))
             proposed.add(definition(item[0],item[1],"Items",List.of(item[2])));
         List<String> pvp=new ArrayList<>();for(var e:stock.entrySet()){
@@ -99,11 +105,11 @@ public final class KitCategories {
             if(row.get("complete").getAsLong()>=minimum&&items.has("minecraft:end_crystal")&&(items.has("minecraft:netherite_sword")||items.has("minecraft:diamond_sword")))pvp.add(e.getKey());
         }
         if(!pvp.isEmpty())proposed.add(definition("pvp","PvP","Kits",pvp));
-        for(String[] group:List.of(new String[]{"building","Building"},new String[]{"tools","Tools"},new String[]{"redstone","Redstone"},new String[]{"trims","Armor trims"},new String[]{"shulkers","Shulker supplies"},new String[]{"storage","Chests and hoppers"},new String[]{"hunter","Hunter"},new String[]{"grief","Grief supplies"})){
+        for(String[] group:List.of(new String[]{"tools","Tools"},new String[]{"redstone","Redstone"},new String[]{"trims","Armor trims"},new String[]{"shulkers","Shulker supplies"},new String[]{"storage","Chests and hoppers"},new String[]{"hunter","Hunter"},new String[]{"grief","Grief supplies"})){
             List<String> ids=new ArrayList<>();for(var e:stock.entrySet()){
                 JsonObject row=e.getValue().getAsJsonObject(),items=row.getAsJsonObject("items");if(row.get("complete").getAsLong()<minimum)continue;String name=text(row,"name").toLowerCase(Locale.ROOT);
                 boolean match=switch(group[0]){
-                    case "building"->name.contains("build kit");case "tools"->name.contains("tools")&&!items.has("minecraft:end_crystal");case "redstone"->name.contains("redstone kit");
+                    case "tools"->name.contains("tools")&&!items.has("minecraft:end_crystal");case "redstone"->name.contains("redstone kit");
                     case "trims"->items.keySet().stream().anyMatch(k->k.endsWith("_armor_trim_smithing_template"));case "shulkers"->items.keySet().equals(Set.of("minecraft:shulker_shell","minecraft:chest"));
                     case "storage"->items.keySet().equals(Set.of("minecraft:chest","minecraft:hopper"));case "hunter"->name.contains("hunter kit");case "grief"->items.has("minecraft:soul_sand")&&items.has("minecraft:wither_skeleton_skull");default->false;};
                 if(match)ids.add(e.getKey());
@@ -115,17 +121,19 @@ public final class KitCategories {
         }
         for(var e:stock.entrySet()){
             JsonObject row=e.getValue().getAsJsonObject();if(row.get("complete").getAsLong()<minimum)continue;
-            if(proposed.stream().anyMatch(c->matches(c,e.getKey(),row.getAsJsonObject("items"))))continue;
-            Set<String> items=row.getAsJsonObject("items").keySet();String label=items.size()==1?items.iterator().next().replace("minecraft:","").replace('_',' '):text(row,"name");
+            boolean build=text(row,"name").toLowerCase(Locale.ROOT).contains("build");
+            if(existing.stream().anyMatch(c->usedFor(c,"Kitbot")&&(!build||text(c,"mode").equals("Kits")&&c.getAsJsonArray("members").size()==1&&!text(c,"slug").equals("building"))&&matches(c,e.getKey(),row.getAsJsonObject("items")))
+                ||!build&&proposed.stream().anyMatch(c->existing.stream().noneMatch(old->text(old,"slug").equals(text(c,"slug")))&&matches(c,e.getKey(),row.getAsJsonObject("items"))))continue;
+            Set<String> items=row.getAsJsonObject("items").keySet();String label=!build&&items.size()==1?items.iterator().next().replace("minecraft:","").replace('_',' '):text(row,"name");
             String slug=label.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+","-").replaceAll("^-|-$","");if(slug.isEmpty()||!Character.isLetter(slug.charAt(0)))slug="kit-"+e.getKey().substring(0,8);if(slug.length()>38)slug=slug.substring(0,38);
-            final String base=slug;if(proposed.stream().anyMatch(c->text(c,"slug").equals(base)))slug+="-"+e.getKey().substring(0,8);
+            final String base=slug;if(proposed.stream().anyMatch(c->text(c,"slug").equals(base))||existing.stream().anyMatch(c->text(c,"slug").equals(base)))slug+="-"+e.getKey().substring(0,8);
             label=label.replaceAll("[\\p{Cntrl}]","");if(label.length()>64)label=label.substring(0,64);
             proposed.add(definition(slug,label.isBlank()?"Kit "+e.getKey().substring(0,8):label,"Kits",List.of(e.getKey())));
         }
         for(JsonObject c:proposed){
             boolean stocked=stock.entrySet().stream().anyMatch(e->e.getValue().getAsJsonObject().get("complete").getAsLong()>=minimum&&matches(c,e.getKey(),e.getValue().getAsJsonObject().getAsJsonObject("items")));
             if(!stocked||db.getAsJsonObject("categories").entrySet().stream().anyMatch(e->text(e.getValue().getAsJsonObject(),"slug").equals(text(c,"slug"))))continue;
-            db=save(root,crew,scope,text(db,"revision"),c);
+            c.addProperty("usage","Kitbot");db=save(root,crew,scope,text(db,"revision"),c);
         }
         return db;
     }

@@ -7,12 +7,13 @@ package dev.monocle.client.renderer.text;
 
 import dev.monocle.client.renderer.Fonts;
 import dev.monocle.client.systems.config.Config;
+import dev.monocle.client.utils.misc.HeadlessMode;
 import dev.monocle.client.utils.render.color.Color;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 
 public interface TextRenderer {
     static TextRenderer get() {
-        return Config.get().customFont.get() ? Fonts.RENDERER : VanillaTextRenderer.INSTANCE;
+        return !HeadlessMode.enabled() && Config.get().customFont.get() ? Fonts.RENDERER : VanillaTextRenderer.INSTANCE;
     }
 
     void setAlpha(double a);

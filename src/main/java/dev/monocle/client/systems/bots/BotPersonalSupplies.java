@@ -45,7 +45,7 @@ final class BotPersonalSupplies {
         return owner + "\n" + scope + "\n" + BuiltInRegistries.ITEM.getKey(resource);
     }
     private String key() { return key(mc.player.getUUID().toString(), scope(), resource); }
-    private static String scope() { return (mc.getCurrentServer() == null ? "local:" + Utils.getWorldName() : mc.getCurrentServer().ip) + "\n" + mc.level.dimension().identifier(); }
+    private static String scope() { return (mc.getCurrentServer() == null ? "local:" + Utils.getWorldName() : dev.monocle.client.utils.Utils.getServerIdentity()) + "\n" + mc.level.dimension().identifier(); }
     private JsonObject records() {
         if (records == null) {
             JsonObject saved = TaskFiles.read(file);

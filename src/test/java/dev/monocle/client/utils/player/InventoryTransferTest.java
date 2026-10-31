@@ -28,6 +28,17 @@ public final class InventoryTransferTest {
         Bootstrap.bootStrap();
         BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(VanillaRegistries.createLookup()).forEach(DataComponentInitializers.PendingComponents::apply);
 
+        Menu raced=new Menu(new ItemStack[90]);raced.slots.get(81).set(new ItemStack(Items.SHULKER_BOX));
+        assert InvUtils.canMoveSlotsConfirmed(raced,81,0) : "A returned hotbar kit can move into the reopened empty destination";
+        raced.slots.get(0).set(new ItemStack(Items.SHULKER_BOX));
+        assert !InvUtils.canMoveSlotsConfirmed(raced,81,0)&&raced.clicks==0&&raced.getCarried().isEmpty()
+            : "A hopper filling the local destination after the full snapshot causes a read-only refresh, not a click";
+        raced.slots.get(0).set(ItemStack.EMPTY);raced.setCarried(new ItemStack(Items.SHULKER_BOX));
+        assert !InvUtils.canMoveSlotsConfirmed(raced,81,0) : "A held cursor must be reconciled first";
+        raced.setCarried(ItemStack.EMPTY);raced.slots.get(81).set(ItemStack.EMPTY);
+        assert !InvUtils.canMoveSlotsConfirmed(raced,81,0)&&!InvUtils.canMoveSlotsConfirmed(raced,-1,0)
+            &&!InvUtils.canMoveSlotsConfirmed(raced,81,90)&&!InvUtils.canMoveSlotsConfirmed(raced,0,0);
+
         for (int amount : new int[] { 1, 2, 15, 31, 32, 63, 64 }) {
             for (int existing : new int[] { 0, 64 - amount }) {
                 Menu menu = new Menu(new ItemStack(Items.OBSIDIAN, 64), new ItemStack(Items.OBSIDIAN, existing));

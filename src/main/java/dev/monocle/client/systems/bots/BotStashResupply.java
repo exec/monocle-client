@@ -45,7 +45,11 @@ final class BotStashResupply {
     private boolean bulkDisabled;
     private int serverState=-1,snapshotReopens;
     BotStashResupply(JsonObject action){this(action,new LinkedHashMap<>(),"");}
-    BotStashResupply(JsonObject action,Map<String,Long> emptySources,String scope){this.action=action;this.emptySources=emptySources;this.emptyScope=scope+"\n";this.picks=action.getAsJsonArray("picks");index=action.has("pickIndex")?action.get("pickIndex").getAsInt():0;}
+    BotStashResupply(JsonObject action,Map<String,Long> emptySources,String scope){this.action=action;this.emptySources=emptySources;this.emptyScope=scope+"\n";this.picks=sourcePicks(action);index=action.has("pickIndex")?action.get("pickIndex").getAsInt():0;}
+    static JsonArray sourcePicks(JsonObject action){
+        JsonArray picks=action.getAsJsonArray("picks");if(!dev.monocle.coordinator.TaskWire.flag(action,"compactPicks"))return picks;
+        JsonArray expanded=new JsonArray();for(JsonElement value:picks){JsonObject p=dev.monocle.coordinator.StashCatalog.sourcePosition(value).deepCopy();p.addProperty("slot",0);p.addProperty("dynamic",true);p.add("kitTypeId",action.get("kitTypeId").deepCopy());p.add("incomplete",action.get("incomplete").deepCopy());p.add("resource",action.get("kitItem").deepCopy());expanded.add(p);}return expanded;
+    }
     boolean done(){return finished&&mc.player.containerMenu==mc.player.inventoryMenu;}
     boolean canYieldInventory(){return bulk==null&&withdrawSent<0&&depositBefore<0&&discardSlot<0&&serverCursor.isEmpty()&&!sourceAdvancePending;}
     boolean personalBox(ItemStack stack){
@@ -65,6 +69,16 @@ final class BotStashResupply {
         return false;
     }
     BlockPos navigationTarget(){return BotStashScan.navigationTarget(target);}
+    static boolean sourceMayDrain(net.minecraft.world.level.BlockGetter world,BlockPos target){
+        if(world.getBlockState(target).getBlock() instanceof net.minecraft.world.level.block.HopperBlock)return true;
+        for(BlockPos half:BotStashScan.chestHalves(world,target)){
+            BlockPos below=half.below();
+            if(world instanceof net.minecraft.world.level.Level level&&!level.getChunkSource().hasChunk(below.getX()>>4,below.getZ()>>4))return true;
+            var state=world.getBlockState(below);
+            if(state.getBlock() instanceof net.minecraft.world.level.block.HopperBlock&&state.getValue(net.minecraft.world.level.block.HopperBlock.ENABLED))return true;
+        }
+        return false;
+    }
     boolean approaching(){return bulk==null&&withdrawSent<0&&depositBefore<0&&target!=null&&!finished&&(mc.player.getEyePosition().distanceToSqr(Vec3.atCenterOf(target))>20.25||!targetIsHopper()&&!BotStashScan.visibleFrom(mc.player.getEyePosition(),target));}
     BlockPos target(){return target;}
     boolean hasWithdrawal(){return !receipt.isEmpty();}
@@ -208,6 +222,15 @@ final class BotStashResupply {
         if(sourceColumn==null||!advanceSourceChest())advanceSourcePick();
         waiting="Skipped missing source at "+missing.toShortString()+" ("+block+"); continuing";
     }
+    void skipBlockedSource(BlockPos obstruction){
+        if(target==null||bulk!=null||withdrawSent>=0||depositBefore>=0||discardSlot>=0||depositing||!serverCursor.isEmpty())
+            throw new IllegalStateException("Cannot skip a blocked stash source during an unconfirmed inventory move");
+        BlockPos blocked=target;
+        recordDeferredSource(blocked,List.of(),"Chest lid blocked at "+obstruction.toShortString()+"; contents unread");
+        sourceBlocked=true;resetEmptyOutletCheck();
+        if(sourceColumn==null||!advanceSourceChest())advanceSourcePick();
+        waiting="Skipped blocked source at "+blocked.toShortString()+"; contents retained as unknown";
+    }
     private String sourceKey(BlockPos position){return position.asLong()+":"+picks.get(index).getAsJsonObject().get("resource").getAsString();}
     BlockPos nextSourceChest(BotStashScan.HopperColumn column){
         long now=System.currentTimeMillis();
@@ -227,7 +250,10 @@ final class BotStashResupply {
     }
     private boolean skipKnownEmpty(BlockPos position,long now){
         if(action.has("sortBatch"))return false;
-        if(recheckingEmptySources||sourceUncertain||sourceBlocked||action.has("requireLocal")&&action.get("requireLocal").getAsBoolean()||!sourceKnownEmpty(position,now))return false;
+        if(recheckingEmptySources||sourceUncertain||sourceBlocked||action.has("requireLocal")&&action.get("requireLocal").getAsBoolean())return false;
+        if(!sourceKnownEmpty(position,now)){
+            Bots bots=Bots.get();if(bots==null||!bots.stashObserver.knownOccupancy(action,position,false))return false;
+        }
         cachedEmptyUsed=true;return true;
     }
     private void rememberSource(BlockPos position){
@@ -306,7 +332,7 @@ final class BotStashResupply {
         JsonArray boxes=BotStashScan.classify(contents,action);
         for(JsonElement e:boxes){JsonObject box=e.getAsJsonObject();String label=box.get("item").getAsString()+"/"+box.get("name").getAsString()+"/"+dev.monocle.coordinator.StashCatalog.kitTypeId(box);observed.merge(label,box.get("quantity").getAsInt(),Integer::sum);}
         String note=(reason.isEmpty()?"":reason+" · ")+"Outlet "+position.toShortString()+" expects "+expected+"; observed "+observed;
-        deferredSources.add(note.substring(0,Math.min(512,note.length())));
+        if(deferredSources.size()<54)deferredSources.add(note.substring(0,Math.min(512,note.length())));
         return note;
     }
     boolean approachTimedOut(double distance){
@@ -393,6 +419,13 @@ final class BotStashResupply {
             }return;
         }
         unavailableTicks=0;waiting="";
+        BlockPos blocked=depositing?null:BotStashScan.blockedChestLid(mc.level,target);
+        if(blocked!=null){
+            if(!mc.player.containerMenu.getCarried().isEmpty()){waiting="Clear the cursor before skipping a blocked source chest";return;}
+            skipBlockedSource(blocked);
+            dev.monocle.client.MonocleClient.LOG.info("[Workers] {} · stash {}",waiting,action.get("name"));
+            close();return;
+        }
         if(approaching()){
             if(approachTimedOut(mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(target))))sourceApproachProblem("No useful approach progress after 200 ticks");return;
         }
@@ -485,12 +518,13 @@ final class BotStashResupply {
             throw new IllegalStateException("Kit pickup has no empty carried slot; existing kits retained");
         }
         boolean mayRefill=sourceMayRefill(mc.level,target);
-        if(repeat&&!bulkDisabled&&BotStashBulk.supportedMenu(mc.player.containerMenu)){
+        if(repeat&&!bulkDisabled&&!sourceMayDrain(mc.level,target)&&BotStashBulk.supportedMenu(mc.player.containerMenu)){
             bulk=BotStashBulk.plan(serverMenuContents,serverContents.size(),wanted()-receipt.size(),mc.player.tickCount,true,
                 !mayRefill&&mc.player.containerMenu.getClass()==net.minecraft.world.inventory.ChestMenu.class,
                 mayRefill,slot->matches(serverMenuContents.get(slot),pick));
             if(bulk!=null){bulk.send(menu,mc.player.tickCount,serverMenuContents,serverCursor);verification=bulk.diagnostic();return;}
         }
+        if(!InvUtils.canMoveSlotsConfirmed(sourceSlot,destination)){requestSync();return;}
         withdrawnBox=BotStashScan.classify(List.of(mc.player.containerMenu.getSlot(sourceSlot).getItem()),action).get(0).getAsJsonObject();
         beginWithdrawal(serverCarried,sourceSlot,destination,mc.player.containerMenu.getSlot(sourceSlot).getItem(),mc.player.tickCount,serverMenuContents,mayRefill,serverContents.size());
         InvUtils.moveSlotsConfirmed(sourceSlot,destination);
@@ -545,6 +579,7 @@ final class BotStashResupply {
                     mc.player.containerMenu.getClass()==net.minecraft.world.inventory.ChestMenu.class,false,slot->matchesAny(serverMenuContents.get(slot)));
                 if(bulk!=null){bulk.send(menu,mc.player.tickCount,serverMenuContents,serverCursor);verification=bulk.diagnostic();return;}
             }
+            if(!InvUtils.canMoveConfirmed(inventory,empty)){requestSync();return;}
             depositBefore=serverCarried;depositSlot=empty;depositContents=BotStashDeposit.copyContents(serverContents);depositStack=mc.player.getInventory().getItem(inventory).copy();depositAt=mc.player.tickCount;InvUtils.moveConfirmed(inventory,empty);return;
         }
         if(inventory<0||empty<0){finished=true;close();return;}InvUtils.shiftClick().slot(inventory);wait=0;
@@ -624,8 +659,8 @@ final class BotStashResupply {
         menu=id;menuReady=true;return true;
     }
     boolean resetClosedMenu(int currentMenu,boolean cursorEmpty){
-        if(menu<0||menu==currentMenu||!cursorEmpty||bulk!=null||withdrawSent>=0||depositBefore>=0||discardSlot>=0)return false;
-        // An idle menu lease is obsolete after Escape; transfer evidence and receipts remain untouched.
+        if((menu<0?(openingRequested||currentMenu==0):menu==currentMenu)||!cursorEmpty||bulk!=null||withdrawSent>=0||depositBefore>=0||discardSlot>=0)return false;
+        // Close an idle inherited/replaced menu; an awaited opening or uncertain move keeps its lease.
         forgetMenu();wait=0;return true;
     }
     private boolean freshWithdrawalMenu(){return withdrawReopening&&openingRequested&&menuReady&&menu>=0&&menu!=withdrawRecoveryMenu;}

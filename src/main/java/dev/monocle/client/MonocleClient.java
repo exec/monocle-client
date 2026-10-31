@@ -94,6 +94,7 @@ public class MonocleClient implements ClientModInitializer {
         }
 
         LOG.info("Initializing {}", NAME);
+        if (dev.monocle.client.utils.misc.HeadlessMode.enabled()) LOG.info("Headless compatibility enabled; graphics backend is supplied by the launcher.");
 
         // Pre-load
         if (!FOLDER.exists()) {

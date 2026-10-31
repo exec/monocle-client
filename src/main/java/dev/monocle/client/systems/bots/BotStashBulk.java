@@ -12,7 +12,7 @@ import java.util.function.IntPredicate;
 
 /** A bounded click burst; only exact post-move server snapshots produce receipts. */
 final class BotStashBulk {
-    static final int MIN_SIZE = 4, MOVES_PER_TICK = 4;
+    static final int MIN_SIZE = 4;
     record Move(int source, int destination, ItemStack stack) {}
     final List<Move> moves;
     final int inventoryStart;
@@ -31,13 +31,18 @@ final class BotStashBulk {
 
     static BotStashBulk plan(List<ItemStack> contents, int inventoryStart, int remaining, int tick,
                              boolean withdrawal, boolean quick, boolean mayRefill, IntPredicate eligible) {
-        // Live hopper sources can change between slot pairs; verify each pickup before choosing the next.
-        if (withdrawal && mayRefill) return null;
-        if (remaining < MIN_SIZE || inventoryStart < 1 || inventoryStart > 54 || contents.size() != inventoryStart + 36) return null;
+        return plan(contents,inventoryStart,remaining,tick,withdrawal,quick,mayRefill,eligible,MIN_SIZE);
+    }
+    static BotStashBulk plan(List<ItemStack> contents, int inventoryStart, int remaining, int tick,
+                             boolean withdrawal, boolean quick, boolean mayRefill, IntPredicate eligible,int minimum) {
+        if(minimum<1||minimum>MIN_SIZE)throw new IllegalArgumentException("Invalid minimum transfer burst");
+        // Refilling sources use explicit destinations; vanilla quick-move ordering is not assumed.
+        if (withdrawal && mayRefill && quick) return null;
+        if (remaining < minimum || inventoryStart < 1 || inventoryStart > 54 || contents.size() != inventoryStart + 36) return null;
         int destinationStart = withdrawal ? inventoryStart : 0, destinationEnd = withdrawal ? contents.size() : inventoryStart;
         int capacity=(int)contents.subList(destinationStart,destinationEnd).stream().filter(ItemStack::isEmpty).count();
-        int limit=Math.min(remaining,Math.min(capacity,withdrawal?MIN_SIZE:36));
-        if(limit<MIN_SIZE)return null;
+        int limit=Math.min(remaining,capacity);
+        if(limit<minimum)return null;
         int sourceStart = withdrawal ? 0 : inventoryStart, sourceEnd = withdrawal ? inventoryStart : contents.size();
         List<Integer> sources = new ArrayList<>();
         for (int source = sourceStart; source < sourceEnd && sources.size() < limit; source++) {
@@ -45,7 +50,7 @@ final class BotStashBulk {
             if (stack.getCount() == 1 && stack.getMaxStackSize() == 1 && stack.getItem() instanceof BlockItem item
                 && item.getBlock() instanceof ShulkerBoxBlock && eligible.test(source)) sources.add(source);
         }
-        if (sources.size() < MIN_SIZE) return null;
+        if (sources.size() < minimum) return null;
         List<ItemStack> simulated = new ArrayList<>(BotStashDeposit.copyContents(contents));
         List<Move> moves = new ArrayList<>();
         List<List<ItemStack>> states = new ArrayList<>();
@@ -64,15 +69,15 @@ final class BotStashBulk {
             simulated.set(source, ItemStack.EMPTY); simulated.set(destination, stack);
             states.add(List.copyOf(simulated.subList(inventoryStart, simulated.size())));
         }
-        return moves.size() < MIN_SIZE ? null : new BotStashBulk(moves, inventoryStart, tick, withdrawal, quick, mayRefill, states);
+        return moves.size() < minimum ? null : new BotStashBulk(moves, inventoryStart, tick, withdrawal, quick, mayRefill, states);
     }
 
-    /** Keep the old packet burst budget, and confirm it before sending the next part of a larger deposit. */
+    /** Issue the entire capacity-sized plan once; only server receipts can retire it. */
     List<Move> nextMoves(int tick,List<ItemStack> contents,ItemStack cursor) {
         if(reopening||sent>=moves.size()||verified!=sent||sent>0&&tick<=sentTick||!cursor.isEmpty()
             ||contents.size()!=inventoryStart+36||!sameKitInventory(inventoryStates.get(sent),contents.subList(inventoryStart,contents.size())))return List.of();
         List<ItemStack> simulated=new ArrayList<>(contents);
-        int end=Math.min(sent+MOVES_PER_TICK,moves.size());
+        int end=moves.size();
         for(int step=sent;step<end;step++){
             Move move=moves.get(step);
             if(!ItemStack.matches(simulated.get(move.source()),move.stack())||!simulated.get(move.destination()).isEmpty())return List.of();
@@ -186,7 +191,7 @@ final class BotStashBulk {
     }
     JsonObject diagnostic() {
         JsonObject value = new JsonObject(); value.addProperty("bulk", true); value.addProperty("size", moves.size());
-        value.addProperty("sent",sent);value.addProperty("movesPerTick",MOVES_PER_TICK);
+        value.addProperty("sent",sent);value.addProperty("movesPerTick",moves.size());
         value.addProperty("verified", verified); value.addProperty("quickMove", quick); value.addProperty("reopening", reopening);
         value.addProperty("startedTick", sentTick); value.addProperty("previousMenu", previousMenu);
         com.google.gson.JsonArray slots=new com.google.gson.JsonArray();

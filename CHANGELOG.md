@@ -1,5 +1,297 @@
 # Changelog
 
+## 0.16.10 — The Credit Union Update
+
+- Keep public reliability notes technical: replace operational incident records with summaries and use synthetic identities and stash names in examples and tests.
+
+- Allow zero-cooldown users to order deliveries to different recipients while an earlier gift is waiting for teleport acceptance. Keep same-recipient duplicate protection, shared queue limits, stock reservations and per-category availability.
+- Reply explicitly when an active delivery or full queue prevents admission, instead of silently discarding a Mike order. Keep normal free and credit cooldowns and the five-second duplicate guard.
+
+## 0.16.9 — The Credit Union Update
+
+- Support a second whisper receiver and delivery courier on the same host. Route new orders to a ready idle courier while another is busy, persist the assigned worker before charging, and keep credits, user cooldowns, stock reservations and limited-category slots shared.
+- Run up to two bounded Mike provider requests concurrently. Announce courier handoffs accurately, name the actual courier in gift TPA notices, and serialize source pickup while allowing travel and player handoffs in parallel. Keep accepted jobs bound to their worker across disconnects and host restarts.
+
+## 0.16.8 — The Credit Union Update
+
+- Add shared limited-category availability: one kit per configured interval across free, paid, gifted and whitelist requests. Reserve the slot before dispatch, start the durable timer at confirmed handoff, release confirmed zero-delivery failures, and retain uncertain handoffs for review. Aliases and exact kit requests share the limit.
+- Allow category stock floors of zero while requiring real complete stock. Apply availability to menus, raw listings and contents inspection; edit global category cooldowns in kitbot settings.
+
+## 0.16.7 — The Credit Union Update
+
+- Resolve kit recipients and named credit targets only from the selected courier's current server player list. Remove the external profile-service and connected-roster fallbacks; use the server-provided UUID without guessing identities.
+- Add bounded, on-demand native worker lookups with connection/server binding, explicit missing/ambiguous/unavailable results and timeout diagnostics. Web UI kit deliveries query their selected worker; operator player lookup accepts an optional workerId.
+
+## 0.16.6 — The Credit Union Update
+
+- Allow per-category confirmed-stock minimums for specialty kits while preserving the normal default and expanded project-user access. Apply the same floor to compact menus, raw listings, contents inspection and exact free or paid orders, including pending reservations and family exclusions.
+- Edit category stock floors in whisper kitbot settings. Older settings clients preserve existing overrides; explicit empty settings clear them. These settings do not alter storage-category rules or turn transfer estimates into confirmed stock.
+
+## 0.16.5 — The Credit Union Update
+
+- Offer a credit purchase when a free kit request is on cooldown and the requester can afford it. A two-minute, single-use yes/no confirmation preserves the exact kit, quantity and gift recipient, then rechecks current stock, balance and purchase cooldown before charging.
+- Keep unaccepted offers outside the order and bank journals; declining, expiry, changed conversation, configuration changes and host restart cannot authorize a later purchase. Explicit buy commands remain available.
+
+## 0.16.4 — The Credit Union Update
+
+- Notify the requester, including gift senders, when a player-delivery TPA times out. Refund notices are committed with the confirmed settlement, retain cooldowns and use a durable outbox with courier acknowledgements and the normal DM queue. Free orders state that no credits were spent.
+- Report a validated timeout reason independently of cleanup errors, and acknowledge retried host chat commands without re-sending them during the same client session.
+
+## 0.16.3 — The Credit Union Update
+
+- Add persistent kit-family exclusions across all kitbot menus, content lookup, category selection and direct orders, without changing stash inventory or operator transfers. Preserve exclusions when older settings clients save.
+
+- Return successful kitbot deliveries by /kill and automatic respawn, keeping incidental pickups away from storage. Verify the respawn is within the source stash and disable the courier celebration before completing.
+- Persist a separate per-server 61-second /kill cooldown, including manually issued commands. Send at the first eligible tick; checkpoint intent before issuing, retain it across reconnects, and bound failed attempts. Failed deliveries still secure undelivered cargo without killing the courier.
+
+## 0.16.2 — The Credit Union Update
+
+- Explain the cost and provide a direct buy command when Mike infers a credit purchase without current spending authorization, instead of reporting a generic handler error.
+
+- Allow up to 27 kits per credit-paid delivery, independently of the free-order cap, and advertise the same limit to Mike.
+
+- Aim courier drops at the visible recipient’s current position, hold safe footing when they walk away, and use shorter supported handoff offsets when a three-block approach is unavailable. Support fractional collision surfaces without relaxing edge protection.
+- Celebrate only after a server-confirmed handoff with one-tick teabagging, spinning and randomized directions. Preserve saved Derp settings and disable the temporary mode at stash arrival, cancellation or disconnect.
+- Secure confirmed undelivered kits in the source ender chest after handoff failures as well as TPA timeouts, avoiding elevated-storage recovery without an elytra.
+
+## 0.16.1 — The Credit Union Update
+
+- Keep free claims hourly and enforce a separate ten-minute credit-purchase interval, including after undeliverable orders.
+- End unanswered player deliveries after a 60-second wall-clock deadline, return to the source and secure remaining kits in an accessible ender chest. Keep the requester cooldown and release the delivery queue.
+
+## 0.16.0 — The Credit Union Update
+
+- Add a durable SQLite kit-credit bank with lazy UUID accounts, transaction history, nonnegative balances and idempotent adjustments. Commit paid orders and their charges together; a credit buys one kit.
+- Keep the free hourly kit independent. Explicit `buy` commands or authorized Mike credit orders spend earned credits without consuming or resetting the free allowance. Confirmed undelivered kits are refunded once; uncertain drops remain available for operator review.
+- Credit purchases have a separate ten-minute cooldown; the free allowance remains hourly regardless of balance. Existing exemptions and shorter custom cooldowns remain intact.
+- Add balance-only API keys with independent read/write permissions, one-time secret display and revocation. These keys cannot access host control, jobs, stashes, player lookup or key administration.
+- Add a Credit bank page and Administrator user role. Mike receives a distinct Administrator prompt and credit gift/revoke tools only for fresh, UUID-verified administrators; host execution rechecks authorization.
+- Move the standalone host's kitbot configuration and request journal into the credit database so financial changes and order state remain atomic. Existing private JSON is imported once and retained as a legacy backup.
+
+## 0.15.56 — One free public kit (The Speedy Gonzalez Update)
+
+- Limit non-whitelisted users to one free kit per hour in both explicit commands and Mike orders. Preserve whitelisted project access and custom caps.
+- Document that future earned-credit balances remain independent of the free hourly allowance; no balance system is added in this patch.
+
+## 0.15.55 — Cooldown replies (The Speedy Gonzalez Update)
+
+- Reply deterministically to cooldown-blocked whispers with the remaining hours, minutes and seconds, calculated when the queued DM is sent. Coalesce repeated queued notices and retain the shared five-second DM limit.
+- Cooldown replies do not call Mike, create an order, or extend the cooldown. Menus remain accessible, and gift cooldowns continue to belong to the requester.
+
+## 0.15.54 — Bounded delivery recovery (The Speedy Gonzalez Update)
+
+- Resume a suspended player delivery once from its saved checkpoint. Cancel inspection-required jobs, exhausted navigation retries, repeated interruptions, and deliveries unavailable for two minutes.
+- Enforce five-minute idle and fifteen-minute total action deadlines, allowing configured home cooldown/warmup time and respecting operator pauses. Queued deliveries waiting for their turn are excluded.
+- Cancellation retains uncertain transfer receipts without restarting inactive executors. Live uncertain drops get their bounded confirmation window, then can yield safely without trapping the courier forever.
+
+## 0.15.53 — Gift notice delivery (The Speedy Gonzalez Update)
+
+- Use a distinct valid UUID for recipient gift notices, preserving the five-second DM spacing without disconnecting the courier before its TPA. Socket checks now enforce the real client's message-ID validation.
+
+## 0.15.52 — Personal acknowledgements and kit gifts (The Speedy Gonzalez Update)
+
+- Generate Mike's acknowledgement from the confirmed public order after admission, including for exact `kit` commands. Generation cannot submit or replay a job; provider failures retain a deterministic fallback.
+- Allow an explicitly requested gift recipient by username. Resolve the identity off the control thread, revalidate before dispatch, and charge only the verified requester's allowance. Legacy self-delivery cooldowns remain intact.
+- Queue the requester acknowledgement first and the recipient gift notice second, atomically and under the shared five-second DM limit. Notices identify the giver, count and actual kit name; failed deliveries are not announced as successful gifts.
+
+## 0.15.51 — Recover conversational kit choices (The Speedy Gonzalez Update)
+
+- Retry rejected multi-tool/category/reference responses with explicit sequencing feedback and no actions performed. Shared request budgets prevent loops or duplicate deliveries.
+- Refresh remembered exact kit choices before dispatch instead of failing when a player follows up on a previous recommendation. Changed contents are shown to Mike for reconsideration; unavailable variants never silently substitute another kit.
+- Record private-data-free rejection codes in host activity and Mike status so validation failures can be distinguished from provider failures.
+
+## 0.15.50 — Kit contents and exact selection (The Speedy Gonzalez Update)
+
+- Keep category menus and ordinary category ordering as the main kitbot flow. Advanced requests can inspect named variants, rank by matching contents, require minimum item quantities, and query per-kit category ranges through a bounded read-only tool.
+- Specific orders use public kit references in the existing delivery gate, with current stock, category membership, per-user limits and exact server-side source selection rechecked. An unavailable choice never silently falls back to a different variant.
+- Inspection shares exact contents of one learned complete kit and qualitative availability, never stored copy counts or private source details. Placeable-block totals use generated Minecraft registry data verified against the game version.
+
+## 0.15.49 — Courier food is optional (The Speedy Gonzalez Update)
+
+- Player kit deliveries no longer require enchanted golden apples or a personal food reserve, including returning undelivered kits to storage. Auto Eat still uses available food; elytra maintenance and the reserve for stash transfers and scans remain unchanged.
+- Mike can use a host-configured public provenance description when asked where kits came from, without access to private stash details.
+- Add optional fictional stash-coordinate replies, generated independently of real locations and validated against axis/diagonal exclusion distances.
+- Add a compact category menu with exact request words, in/out-of-stock groups and full-budget pagination. Mike selects host-formatted pages through a read-only tool; raw `kits` listings remain available.
+
+## 0.15.48 — Server identities and public Mike (The Speedy Gonzalez Update)
+
+- Default new kitbot setups to a 270-kit confirmed-stock cutoff. Distinct building kits receive individual request categories; the broad building category retains its storage purpose.
+- Define a primary Minecraft address and explicit aliases under Servers. Updated native workers synchronize the identity before work, preserving canonical job/stash/cooldown keys when using another address. Historical catalogs are preserved and policy changes require finished work.
+- In public mode, whitelisted project users have no hourly cooldown and a 109-kit confirmed-stock floor. Public users retain the normal cutoff and hourly limit; per-order caps and pending-delivery guards remain authoritative.
+- Add opt-in public whisper kitbot access while retaining whitelist-only mode and per-user overrides. Public deliveries require a worker-resolved server player UUID and allow one order of up to five kits per hour; durable cooldowns cannot be evicted early.
+- Mike receives the verified requesting username and explicit in-stock status. The system prompt labels unavailable kits in lists and identifies partial lists without exposing exact stock counts.
+
+## Unreleased — Mike kit handler
+
+- Mike keeps six recent exchanges per username and server for follow-up questions, with 24-hour expiry and a 128-conversation bound. Memory is session-only and contains only private request text and bounded queued replies; no tool calls, raw model reasoning, internal receipts or other players’ conversations. Output budgets and delivery checks remain unchanged.
+
+- Kitbot can draw from multiple source stashes, with a configurable stock cutoff in the WebUI. Category seeding covers newly stocked variants without rewriting operator categories or storage reservations. Low-stock variants remain unavailable through Mike and explicit requests.
+
+- Default Mike to Ollama Cloud's native API and add write-only bearer-key settings. API keys remain in owner-only host storage; API responses expose only a configured flag. Blank saves preserve the key, explicit clearing removes it, and endpoint changes require re-entering or clearing it. Local Ollama remains supported.
+
+- Add an optional standalone-host Ollama handler for natural-language kitbot whispers. Mike receives only public category descriptions, sample item types and qualitative stock labels; exact counts, kit UUIDs, stash locations, homes and history stay on the host.
+- One constrained tool proposes a category and quantity for the whisper sender. Existing whitelist, cooldown, cap, current-stock and durable-delivery checks remain authoritative. Inference runs off the coordinator thread with bounded requests/responses; stale or reconfigured proposals cannot create jobs. Explicit commands remain independent of Ollama.
+- Configure Mike in Kits → Categories & whisper kitbot. Disabled by default; requires an operator-installed tool-capable model. Synthetic HTTP/socket and browser checks cover the boundary; live model quality and Minecraft delivery remain untested.
+
+## 0.15.47 — Optional headless workers (The Speedy Gonzalez Update)
+
+- Add opt-in `-Dmonocle.headless=true` compatibility for launcher-provided HeadlessMC backends. Font metadata uses the JDK, custom font/icon pixel generation is bypassed, and HUD work is skipped without changing saved preferences. Projection buffers initialize only when rendering needs them; normal launches keep their existing graphics path.
+- Verified with HeadlessMC 3.0.0-RC8's Java agent on Debian/Java 25/Minecraft 26.2, with all display environment variables removed: created and joined a disposable single-player world, connected to an isolated standalone host, and completed host-assigned Wait and walking Travel jobs. The opt-in smoke fixture is built separately and excluded from the installable client. Live-server authentication, stash transfers and long-running operation remain untested; see [headless setup](docs/headless-workers.md).
+
+## 0.15.46 — Packet-only Teabag Derp (The Speedy Gonzalez Update)
+
+- Derp gains a Teabag mode with its own delay setting, defaulting to one tick between crouching and standing. It changes only the transmitted crouch bit and third-person model, preserving local movement, camera, collision pose and real crouch input. It uses vanilla input change detection instead of sending extra packets each frame.
+- Switching modes or disabling Derp restores normal transmitted input. Existing rotation modes and their independent settings remain available; Teabag leaves movement rotations untouched.
+
+## 0.15.45 — Lightweight passive stash reads (The Speedy Gonzalez Update)
+
+- Passive observers filter other crews and host-owned baselines using definition metadata before loading inventory rows. Unchanged local watch lists reuse compact, detached snapshots, invalidated by committed stash changes and database reopenings.
+- Local application of queued observations reads only the affected chest instead of the entire stash. Mirror creation, freshness conflicts, removal/discovery updates and journal-before-export ordering remain enforced. No stash schema change or rescan is required.
+
+## 0.15.44 — Incremental execution checkpoints (The Speedy Gonzalez Update)
+
+- Workers and the standalone host now checkpoint execution state in SQLite, updating changed run/task rows and storing shared workflow packages once. Unchanged history no longer gets serialized and rewritten for every inventory receipt or status update.
+- Existing execution JSON is validated and imported automatically, preserving recovery settings, pending actions and cargo receipts; the original files remain untouched as backups. Commits still complete before actions or acknowledgements proceed, using WAL and full synchronous durability. Missing, replaced or externally modified execution databases require inspection instead of silently replaying old JSON.
+
+## 0.15.43 — Skip covered sources and retain chest approaches (The Speedy Gonzalez Update)
+
+- Withdrawals check the same vanilla solid-lid rule as scans and deposits before travelling or opening. Covered chests advance to another connected chest or source immediately; unread contents stay unresolved, never inferred empty, and pending cargo moves cannot be skipped.
+- Stash flight clearance uses the active container target even after fall recovery resets route state, so a reachable, collision-checked chest approach is not lifted back into cruise clearance before opening.
+
+## 0.15.42 — Recover from stalled optional mending (The Speedy Gonzalez Update)
+
+- Auto Mend temporarily applies the downward client pitch during bottle use, including when another rotation precedes it; the normal view is restored afterward. Minecraft's item-use packet carries that pitch separately from movement rotation.
+- A stash worker seeing no elytra repair progress for 200 maintenance ticks logs the remaining durability, XP count and Auto Mend status, then continues cargo work and retries after one minute if at least 64 durability remains. The cooldown survives native action handoffs; the last-glider reserve, spare swap, food, cursor and pending-transfer guards remain enforced.
+
+## 0.15.41 — Find the complete ender-cargo view (The Speedy Gonzalez Update)
+
+- Prefer nearby paired ender chests so a single-chest view cannot hide half of the transport buffer. Before sending any cargo clicks, a mismatching view can try other loaded ender chests, bounded to eight views without revisiting inspected positions. Actual contents and exact receipts remain required; interrupted or already-started moves retain their strict reconciliation checks.
+
+## 0.15.40 — Deliver partial ender-buffer loads (The Speedy Gonzalez Update)
+
+- A verified partial ender store now delivers the carried remainder and then drains the known buffer, instead of failing the transfer. Adopt the actual 27/54-slot capacity reported by each buffer operation, and avoid immediately rebuffering a rejected remainder. Exact cargo receipts remain required; this host workflow change supports existing workers.
+
+## 0.15.39 — Refresh raced inventory slots before retrying (The Speedy Gonzalez Update)
+
+- Check live source, destination and cursor slots before arming a confirmed stash move or deposit retry. A hopper filling a reopened destination now requests fresh server contents and reselects a usable slot through the existing reconciliation flow, instead of failing the job with an unsent move marked pending. Ordinary withdrawals and legacy ender deposits share the same preflight guard; uncertain sent clicks retain their existing receipt requirements.
+
+## 0.15.38 — Accept larger native action reports (The Speedy Gonzalez Update)
+
+- Share the Lua/native action size bound with the host status validator so larger source manifests do not disconnect a worker when it reports its active pickup action. Workflow results retain their separate existing limit.
+
+## 0.15.37 — Keep source planning metadata host-side (The Speedy Gonzalez Update)
+
+- Strip observed-source selection and scan-gap metadata from native pickup actions. The host retains both in the job and result, while workers receive only the selected positions and normal transfer fields.
+
+## 0.15.36 — Larger bounded source manifests (The Speedy Gonzalez Update)
+
+- Support up to 2,048 compact source positions per kit, with a 60,000-character host plan limit and bounded 64 KiB Lua state/action data. JSON node budgets accommodate numeric position triples while keeping nesting, script, frame and inventory-operation limits intact. Update both host and worker for larger manifests.
+
+## 0.15.35 — Transfer verified stock around scan gaps (The Speedy Gonzalez Update)
+
+- Sequential stash transfers can explicitly select observed sources only after a full, non-lazy scan with unread containers. Unread records remain unknown, confirmed-withdrawal sources remain revisitable, and results retain the scan-gap count rather than claiming the entire source is empty. Strict whole-source planning remains the default. This host change supports existing workers and ender transport.
+
+## 0.15.34 — Catch worker falls (The Speedy Gonzalez Update)
+
+- Native stash scans, transfers, travel and stash hunting catch unexpected falls with an equipped usable elytra and Vanilla ElytraFly. Recovery requests flight immediately, retries at four-tick intervals if needed, brakes the descent and replans movement after a short hover. Normal jumps, fluids and short supported landings do not trigger recovery; cancellation and inventory confirmation remain intact.
+- After catching a fall, release only the worker's own Baritone goal immediately so an unfinished falling segment cannot block flight recovery. Normal navigation keeps its safe cancellation rules, and unrelated replacement goals are preserved.
+
+## 0.15.33 — Rotate by allocated storage columns (The Speedy Gonzalez Update)
+
+- Stash transfers can rotate through ordered kit types one destination column at a time, using preassigned neighboring columns for each kit. Inventory-only turns return overflow before switching types; verified exhaustion removes a type, while unavailable sources and exhausted allocations are reported separately without blocking the other types. This host workflow supports existing 0.15.32 clients.
+
+## 0.15.32 — Reuse saved chest occupancy (The Speedy Gonzalez Update)
+
+- Include verified slot occupancy in the compact stash catalog. New transfer jobs reuse SQLite observations from the past 24 hours to skip known empty withdrawal chests and full deposit chests, including within hopper chains. Later observations update availability; unknown, inferred and older contents retain physical checks, and zero-result source searches still perform their final verification pass.
+
+## 0.15.31 — Keep ender transport after skipped sources (The Speedy Gonzalez Update)
+
+- Keep using ender-chest transport after skipping an unresolved source while more source containers remain. Final deferred-source pickups still drain carried and buffered cargo before the workflow advances.
+
+## 0.15.30 — Search the full reachable aisle (The Speedy Gonzalez Update)
+
+- Search supported vertical shafts up to four blocks around destination chests, with an explicit interaction-reach bound. Dense hopper-fed rows can require a shaft beyond the previous two-block search; collision, footing and visibility checks still apply.
+
+## 0.15.29 — Use actual aisle footing (The Speedy Gonzalez Update)
+
+- Ground alignment drives the normal walking input with bounded movement and checks actual collision-shaped support using the player's real width, including fractional container tops. It no longer requires a padded full-block floor that can reject the worker's current safe footing.
+
+## 0.15.28 — Align and retry destination aisles (The Speedy Gonzalez Update)
+
+- Center precisely on the checked, supported aisle shaft after Baritone releases movement, before taking off. Bound the centering movement after speed modules so a nearby walking endpoint cannot launch a diagonal ascent through storage.
+- Exhausted aisle flight retries land, wait ten seconds and replan while retaining the same cargo and deposit state, instead of ending the job. Inventory reconciliation and normal flight safety guards remain active.
+
+## 0.15.27 — Recover inherited source menus (The Speedy Gonzalez Update)
+
+- Close an idle container inherited from a previous action and open the requested source with fresh contents instead of timing out the transfer. Awaited openings, held cursors and unconfirmed inventory moves retain their reconciliation guards; confirmed pickups remain unchanged.
+
+## 0.15.26 — Drain cargo before deferring a kit (The Speedy Gonzalez Update)
+
+- Deliver the final partial pickup and any buffered kits before advancing past an unresolved hopper source. Previously, that partial pickup could be buffered immediately before the workflow advanced, leaving kits for the next type's empty-buffer check. This host workflow fix supports 0.15.24 workers; prepare a new package to use it.
+
+## 0.15.25 — Return incidental overflow cargo (The Speedy Gonzalez Update)
+
+- Column-fill workflows also return any remaining recognized incidental kits before moving to the next type. This workflow correction supports 0.15.24 workers; prepare a new package to use it.
+
+## 0.15.24 — Fill allocated columns (The Speedy Gonzalez Update)
+
+- Sequential stash transfers can fill their allocated compatible columns, return excess carried and ender-buffer cargo to the source, then continue with the next kit type. Returned kits update source stock and are separate from destination deliveries.
+- Record destination-limited kit types without claiming the source is exhausted. Existing until-empty transfers retain capacity waiting, and explicit single-column delivery behavior stays unchanged.
+
+## 0.15.23 — Wait for destination capacity (The Speedy Gonzalez Update)
+
+- Ordinary stash deposits land and retry the host every ten seconds when compatible storage is unavailable. New space or changed reservations can restart the deposit without recreating the job; verified receipts, carried cargo and ender-buffer state remain intact.
+- Explicit single-column limits and uncertain inventory moves retain their safeguards. Update both host and worker for the capacity response; older workers retain the existing stop behavior.
+
+## 0.15.22 — Recover occupied deposit slots (The Speedy Gonzalez Update)
+
+- Recover when the planned destination fills while the exact kit remains on the cursor: close and reopen, prove the kit returned to inventory, then select fresh space without crediting the occupied slot as a deposit. Missing cargo and uncertain returns remain protected.
+- A replaced destination menu enters the existing fresh-menu reconciliation path instead of waiting on the obsolete menu until timeout.
+
+## 0.15.21 — Recover changed ender-chest menus (The Speedy Gonzalez Update)
+
+- Reopen changed ender-cargo menus instead of failing immediately. Preserve pending clicks and reconcile exact conserved cargo before sending more moves, including when the replacement snapshot arrives before the next tick.
+- Keep pending ender-buffer moves in the worker's unresolved-action guard, alongside pickups and deposits.
+
+## 0.15.20 — Aisle overflow takeoff recovery (The Speedy Gonzalez Update)
+
+- Skip visibly blocked deposit chests before moving toward them. Wait out collision recovery before aisle takeoff rather than consuming all three retries while the landing guard is active.
+
+## 0.15.19 — Capacity-sized transfers and destination overflow (The Speedy Gonzalez Update)
+
+- Send the full verified capacity-sized withdrawal or deposit batch without a four/five-move cap, including ender transport and hopper-refilled bottom chests. Sources with an active output hopper retain exact single-kit moves; small batches and uncertain transfers retain their fallback.
+- Skip blocked, unopened or unreadable destination chests before any click, try other chests, and request another compatible host column when necessary. Unreadable columns are excluded for this run without being falsely marked full. Locked single-column jobs retain their kits instead of overflowing elsewhere.
+
+## 0.15.18 — Ender transport chest selection (The Speedy Gonzalez Update)
+
+- Choose the nearest loaded ender chest around the stash's height, including reachable floor chests across the storage, instead of selecting buried chests with a similar X/Z position.
+
+## 0.15.17 — Ender-chest cargo transport (The Speedy Gonzalez Update)
+
+- Solo sequential stash transfers can fill a nearby ender chest, collect another inventory, then drain both at the destination using server-confirmed 27/54-slot capacity. Internal buffer moves do not count as stash deposits or withdrawals.
+- Resume interrupted buffer clicks by reopening and reconciling conserved cargo; preserve personal ender contents and stop on ambiguous cargo changes.
+- Full hopper-fed destination inputs advance down the connected column before requesting another column. Existing source withdrawals already inspect upper chests when the bottom cannot supply a load.
+
+## 0.15.16 — Solo stash transfer recovery audit (The Speedy Gonzalez Update)
+
+- Import kit types for manual destination reservations across dimensions on the same Minecraft server, retaining crew/server isolation in both the API and column picker.
+- Let interrupted couriers land before profile recovery in the current stash action's dimension, as well as the original job world.
+- Mark column fill uncertain when a chest disappears or verified cargo exceeds mapped capacity, rather than retaining a false exact-full claim.
+- Keep counts uncertain when a column footprint changes or mapped capacity shrinks, and support 1,024 source positions with numeric triples above 512 so large inventories retain every source inside the existing byte budget.
+
+## 0.15.15 — Cross-dimension stash transfers and alternating columns (The Speedy Gonzalez Update)
+
+- Stash deliveries can use an explicit destination dimension on the same Minecraft server. Each home leg, reservation, observation and verified stock receipt uses that stash's world.
+- Recognize mapped alternating chest stacks in multi-aisle storage, include all their rows in capacity and deposit validation, and allocate assumed-empty columns in physical aisle order.
+- The control panel offers cross-dimension destinations and projects alternating columns together. Detailed column fill ledgers stay off compact worker catalog frames.
+- Larger transfers retain up to 512 source positions in a compact manifest, subject to the existing workflow byte limit, rather than failing at the 55th matching chest.
+
+## 0.15.14 — Empty-storage aisle deposits (The Speedy Gonzalez Update)
+
+- Assume-empty destinations walk through supported aisles to a checked chest-side position before taking off vertically. Keep real collision, loaded-chunk and hazard checks without requiring the open-air three-block cruise buffer in narrow aisles.
+- Prefer the highest usable destination chest and descend the checked shaft before completing a deposit or changing columns. Existing stash scans, withdrawals and ordinary destination movement remain unchanged.
+- Persist confirmed net kit transfers per initially empty destination column, retain them across jobs/restarts, and expose mapped capacity and uncertainty in host summaries and column-map tooltips.
+
 ## 0.15.13 — Hopper-fed sorting pickups (The Speedy Gonzalez Update)
 
 - Detect enabled hopper feeds to either chest half independently of the withdrawal route. Sorting still leases exact containers, but now confirms identical source-slot refills with the existing exact destination, carried-count and empty-cursor checks.

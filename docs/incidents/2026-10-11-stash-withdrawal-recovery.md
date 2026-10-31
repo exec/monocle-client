@@ -1,9 +1,7 @@
-# Single-kit withdrawal recovery blocked by an inventory change
+# Single-kit recovery and unrelated inventory changes
 
-Job `5c6a873e-781f-4999-ba6c-15cd6600a3a4`, running 0.14.19, failed at Tango2 chest `[coordinates redacted]` after 536 verified deposits in its rotation. It retained 30 verified Grass-kit pickups. The pending source slot no longer matched, the destination remained air, the cursor was empty and the carried kit count stayed 30. One reopen occurred; the fresh menu reported `unchangedPlayerInventory: false`, so the old recovery check refused reselection and timed out.
+Whole-inventory equality can reject a recoverable single-kit withdrawal when food or another unrelated non-kit slot changes. The mismatch alone does not prove cargo conservation.
 
-Flight-collision damage and changing absorption were recorded during this window, making Auto Gap consumption a plausible unrelated inventory change. The old diagnostic did not identify changed slots: the exact live difference is **not established**, and this is not evidence that every withdrawal mismatch is safe. The failing path was single-kit hopper withdrawal, not the capacity-sized deposit batch added in 0.14.19.
+Reuse the shared cargo-slot comparison to permit benign changes while keeping every existing shulker exact. Fresh-menu, source, cursor, requested-count and ambiguity checks remain mandatory, including relocated cursor returns.
 
-For the requested restart, new job `06124afe-4e6a-4046-a284-8d80e05b8274` targets a deposit of the 30 retained Grass kits before restarting the captured rotation. Its initial dispatch was held by the failed run's uncertain record. Explicit host cancellation of that failed run preserved the record without replaying its click and allowed dispatch. Its recovery wrapper subsequently recorded `Verified 30 kit deposits`, with zero missing kits, and the rotation continued on 0.14.19.
-
-0.14.20 reuses `BotStashBulk.sameCargoSlot` for benign non-kit changes during negative recovery and relocated cursor-pickup reconciliation. Existing shulkers remain exact, and fresh-menu, cursor, count, source and ambiguity guards remain. Per-slot before/after item/count/damage diagnostics distinguish future food changes from actual cargo changes. Offline checks exercise those cases; the original live mismatch cannot be reconstructed from the old log. The corrected client is not automatically installed over the running restart.
+Per-slot item/count/damage diagnostics distinguish unrelated consumption from actual cargo changes. Recovery must preserve confirmed pickups and never replay an uncertain click merely because the rest of the job is intended to run unattended.

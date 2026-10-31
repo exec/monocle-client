@@ -65,19 +65,31 @@ public final class ControlApi implements AutoCloseable {
                     problem(exchange, 403, "forbidden", browser?"UI origin is not accepted":"Origin is not accepted", correlation); return;
                 }
                 String auth = exchange.getRequestHeaders().getFirst("Authorization");
-                if (auth == null || !MessageDigest.isEqual(expected, auth.getBytes(StandardCharsets.UTF_8))) { problem(exchange, 403, "forbidden", "Forbidden", correlation); return; }
                 URI resourceUri=browser?URI.create(exchange.getRequestURI().toString().substring("/ui/api".length())):exchange.getRequestURI();
+                boolean administrator=auth!=null&&MessageDigest.isEqual(expected,auth.getBytes(StandardCharsets.UTF_8));
+                String bankActor=administrator?"host-administrator":BalanceApi.route(resourceUri)&&!resourceUri.getPath().contains("balance-api-keys")
+                    ?host.creditBank().authorize(auth,exchange.getRequestMethod().equals("GET")?"balances:read":"balances:write"):null;
+                if(!administrator&&bankActor==null){problem(exchange,403,"forbidden","Forbidden",correlation);return;}
                 JsonObject body = new JsonObject();
                 if (ResourceApi.bodyRequired(exchange.getRequestMethod())) {
                     String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
                     if (contentType == null || !contentType.equalsIgnoreCase("application/json")) { problem(exchange, 415, "unsupported_media_type", "application/json required", correlation); return; }
-                    byte[] bytes = exchange.getRequestBody().readNBytes(TaskFiles.MAX_PACKAGE + 65_537);
-                    if (bytes.length > TaskFiles.MAX_PACKAGE + 65_536) { problem(exchange, 413, "request_too_large", "Request too large", correlation); return; }
+                    int maximum=BalanceApi.route(resourceUri)?16384:TaskFiles.MAX_PACKAGE+65536;
+                    byte[] bytes = exchange.getRequestBody().readNBytes(maximum+1);
+                    if (bytes.length > maximum) { problem(exchange, 413, "request_too_large", "Request too large", correlation); return; }
                     body = JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8)).getAsJsonObject();
                 } else if (exchange.getRequestHeaders().getFirst("Content-Length") != null && !exchange.getRequestHeaders().getFirst("Content-Length").equals("0")) {
                     problem(exchange, 400, "body_not_allowed", "Request body is not allowed", correlation); return;
                 }
                 String method = exchange.getRequestMethod();
+                if(BalanceApi.route(resourceUri)){
+                    String requestId=exchange.getRequestHeaders().getFirst("Idempotency-Key");
+                    if(!method.equals("GET")&&requestId==null){problem(exchange,428,"idempotency_key_required","Supply a UUID Idempotency-Key",correlation);return;}
+                    if(requestId!=null)requestId=UUID.fromString(requestId).toString();
+                    ResourceApi.Reply reply=BalanceApi.handle(host.creditBank(),method,resourceUri,body,requestId,administrator,bankActor);
+                    reply=standardize(reply,requestId==null?correlation:requestId,resourceUri.getPath());
+                    send(exchange,reply.code(),reply.body());return;
+                }
                 if (method.equals("GET")) {
                     ResourceApi.Reply reply = ResourceApi.route(host, method, resourceUri, body, null);
                     reply = standardize(reply, correlation, resourceUri.getPath());

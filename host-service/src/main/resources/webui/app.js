@@ -8,7 +8,9 @@ const headings = {
   workers: ['THE ROSTER', 'Your workers', 'Who is here, where they are, and what is holding them up.'],
   hostiles: ['THE RECKONING', 'Known hostile players', 'Server-scoped protection shared by this host. Crystal suspects are never added automatically.'],
   incidents: ['THE RECKONING', 'Incident timeline', 'Player sightings, damage, deaths and safety reconnects. Observations are evidence, not guaranteed attribution.'],
+  servers: ['CONNECTION IDENTITIES', 'Minecraft servers', 'Explicit alternate addresses for the same world.'],
   notifications: ['OWNER ALERTS', 'Discord notifications', 'Private owner DMs. Notification delivery never controls or delays a worker.'],
+  bank: ['KIT CREDITS', 'Credit bank', 'Earned credits and the free hourly kit have separate accounting.'],
   jobs: ['THE WORK AHEAD', 'Active jobs', 'Host decisions are authoritative—even when workers are offline.'],
   presets: ['REUSABLE WORK', 'Job presets', 'Built-in starting points and your own defaults. Running jobs keep their captured settings.'],
   stashes: ['RESOURCE INTELLIGENCE', 'Your stashes', 'Observed contents, not guaranteed stock. Unscanned is never empty.'],
@@ -25,6 +27,7 @@ const hostileDraft={server:'',name:'',uuid:''};
 const incidentView={before:'',kind:'',search:'',data:null,error:'',loading:false};
 let safetyDraft=null;
 let discordDraft=null;
+let serverDraft=null;
 let selectedColumns = new Set();
 const stashReads = new Map(), stashLayouts = new Map();
 const stashSortReads = new Map();
@@ -33,7 +36,7 @@ let generation = 0;
 const tokenKey = 'monocle-operator-token';
 try { token = sessionStorage.getItem(tokenKey) || ''; } catch (_) { /* Storage may be disabled. */ }
 function saveToken() { try { sessionStorage.setItem(tokenKey, token); } catch (_) { /* Keep this tab usable without storage. */ } }
-function clearToken() { token = ''; try { sessionStorage.removeItem(tokenKey); } catch (_) { /* Storage may be disabled. */ } }
+function clearToken() { bankData=null;bankError='';token = ''; try { sessionStorage.removeItem(tokenKey); } catch (_) { /* Storage may be disabled. */ } }
 const WAIT = 'return function(ctx)\n if ctx.state.waited then return bot.done() end\n ctx.state.waited=true\n return bot.wait(200)\nend';
 const STASH_SCAN = 'return function(ctx)\n if ctx.state.started then return bot.done(ctx.result) end\n ctx.state.started=true\n return bot.stash_scan(ctx.args)\nend';
 
@@ -50,6 +53,47 @@ function tone(status) {
     : /failed|stopped|offline|error/i.test(status) ? 'bad' : /wait|paused|inspection|restock|resupply|suspend/i.test(status) ? 'attention' : '';
 }
 function writable() { return !demo && !!token && !!snapshot && snapshot.status === 'Running' && Date.now() - refreshedAt < 5000 && !busy; }
+let bankData=null,bankLoading=false,bankError='';
+async function loadBank(){
+  if(bankLoading||demo)return;bankLoading=true;const epoch=generation;
+  try{const [accounts,keys,kitbot]=await Promise.all([resource('GET','balances'),resource('GET','balance-api-keys'),api('control',{op:'kitbot-get'})]);if(epoch!==generation)return;bankData={accounts:accounts.items,keys:keys.items,reviews:Object.values(kitbot.requests||{}).filter(r=>r.payment==='Credits'&&r.creditsCharged&&r.creditSettlement!=='Settled'&&terminal(r.status)).map(r=>({id:r.id,name:r.name,count:r.count,status:r.status}))};bankError='';}
+  catch(error){if(epoch===generation)bankError=error.message;}
+  finally{bankLoading=false;if(epoch===generation&&page==='bank')render();}
+}
+function bankDialog(title){const dialog=el('dialog'),body=el('div','management-section');body.append(el('h2','',title));dialog.append(body);document.body.append(dialog);dialog.addEventListener('close',()=>dialog.remove());dialog.showModal();return {dialog,body};}
+function renderBank(){
+  const root=$('content');root.append(el('p','hint','Accounts are created only after receiving credits. Reading an unknown account returns zero. Holding credits gives a ten-minute free cooldown; free claims never spend credits.'));
+  if(demo){root.append(el('p','hint','Connect to a live host with an administrative API key to manage the bank.'));return;}
+  const actions=el('div','actions');actions.append(button('Gift or revoke credits',()=>bankAdjustment(),!writable()),button('Generate balance API key',()=>bankKey(),!writable()),button('Reload bank',()=>{bankData=null;bankError='';loadBank();},bankLoading||demo));root.append(actions);
+  if(!bankData){root.append(el('p',bankError?'error':'hint',bankError||'Loading bank…'));if(!bankLoading&&!bankError&&!demo)loadBank();return;}
+  if(bankData.reviews.length){const reviews=el('div','management-section');reviews.append(el('h3','','Charges needing review'),el('p','hint','The worker could not prove the final delivery count. Inspect the outcome before confirming a refund.'));for(const order of bankData.reviews){const row=el('article','card');row.append(el('strong','',order.name+' · '+order.count+' charged credits'),el('p','hint',order.status+' · '+order.id),button('Resolve charged order',()=>bankReview(order),!writable()));reviews.append(row);}root.append(reviews);}
+  const accounts=el('div','management-section');accounts.append(el('h3','','Accounts (most recently updated)'));
+  if(!bankData.accounts.length)accounts.append(el('p','hint','No funded accounts yet. Everyone else has zero credits.'));
+  for(const account of bankData.accounts){const row=el('article','card');row.append(el('strong','',account.name),el('p','',number(account.balance)+' credits'),el('p','hint',account.playerId),button('Transactions',async()=>{const {dialog,body}=bankDialog(account.name+' · credit history');body.append(button('Close',()=>dialog.close()));try{const history=await resource('GET','balances/'+account.playerId+'/transactions');for(const transaction of history.items)body.append(el('p','hint',new Date(transaction.updatedAt).toLocaleString()+' · '+(transaction.delta>0?'+':'')+transaction.delta+' → '+transaction.balance+' · '+transaction.reason));if(!history.items.length)body.append(el('p','hint','No transactions.'));}catch(error){body.append(el('p','error',error.message));}},!writable()));accounts.append(row);}root.append(accounts);
+  const keys=el('div','management-section');keys.append(el('h3','','Balance API keys'),el('p','hint','Read/write permissions apply only to /v1/balances. These keys cannot access jobs, stashes, host control, player lookup, or key administration. Tokens are shown only once.'));
+  for(const key of bankData.keys){const row=el('article','card');row.append(el('strong','',key.name),el('p','hint',key.scopes.join(', ')+' · '+(key.revoked?'Revoked':'Active')));if(!key.revoked)row.append(button('Revoke key',async()=>{try{await resource('DELETE','balance-api-keys/'+key.id);await loadBank();}catch(error){notice(error.message);}},!writable()));keys.append(row);}root.append(keys);
+}
+function bankKey(){
+  const {dialog,body}=bankDialog('Generate balance API key'),form=el('form'),name=el('input'),permissions=el('select'),error=el('p','error');permissions.setAttribute('aria-label','Permissions');name.required=true;name.maxLength=64;
+  for(const [value,label] of [['read','Balances: read only'],['write','Balances: write only'],['both','Balances: read and write']]){const option=el('option','',label);option.value=value;permissions.append(option);}
+  for(const [title,input] of [['Key name',name],['Permissions',permissions]]){const label=el('label','',title);label.append(input);form.append(label);}
+  const submit=el('button','primary','Generate key');submit.type='submit';form.append(error,submit);body.append(form,button('Close',()=>dialog.close()));const id=crypto.randomUUID();let payload;
+  form.addEventListener('submit',async event=>{event.preventDefault();submit.disabled=true;error.textContent='';try{if(!name.value.trim())throw Error('Enter a key name.');payload??={name:name.value.trim(),scopes:permissions.value==='read'?['balances:read']:permissions.value==='write'?['balances:write']:['balances:read','balances:write']};name.disabled=permissions.disabled=true;const key=await resource('POST','balance-api-keys',payload,id);form.remove();if(key.token){const label=el('label','','Copy this token now. It cannot be retrieved later.'),secret=el('input');secret.readOnly=true;secret.value=key.token;label.append(secret);body.append(label,button('Copy token',()=>navigator.clipboard.writeText(secret.value),!navigator.clipboard));}else body.append(el('p','hint','This key was already created, but its secret cannot be retrieved. Revoke it and create another if you did not receive the token.'));await loadBank();}catch(failure){error.textContent=failure.message;submit.disabled=false;}});
+}
+function bankAdjustment(){
+  const {dialog,body}=bankDialog('Adjust kit credits'),form=el('form'),name=el('input'),direction=el('select'),amount=el('input'),reason=el('input'),error=el('p','error');direction.setAttribute('aria-label','Operation');name.required=true;name.pattern='[A-Za-z0-9_]{1,16}';name.maxLength=16;amount.type='number';amount.min=1;amount.max=1000000;amount.step=1;amount.required=true;reason.required=true;reason.maxLength=256;
+  for(const [value,label] of [['credit','Gift credits'],['debit','Revoke credits']]){const option=el('option','',label);option.value=value;direction.append(option);}
+  for(const [title,input] of [['Player username',name],['Operation',direction],['Credit amount',amount],['Reason',reason]]){const label=el('label','',title);label.append(input);form.append(label);}
+  const submit=el('button','primary','Apply credit adjustment');submit.type='submit';form.append(error,submit);body.append(form,button('Close',()=>dialog.close()));const id=crypto.randomUUID();let pending;
+  form.addEventListener('submit',async event=>{event.preventDefault();submit.disabled=true;error.textContent='';try{if(!pending){if(!reason.value.trim())throw Error('Enter a reason.');const identity=await resource('GET','players/'+encodeURIComponent(name.value.trim()));pending={player:identity.id,body:{name:identity.name,direction:direction.value,amount:Number(amount.value),reason:reason.value.trim()}};}for(const input of [name,direction,amount,reason])input.disabled=true;const receipt=await resource('POST','balances/'+pending.player+'/transactions',pending.body,id);dialog.close();await loadBank();notice(receipt.name+' now has '+number(receipt.balance)+' credits.',true);}catch(failure){error.textContent=failure.message;submit.disabled=false;}});
+}
+function bankReview(order){
+  const {dialog,body}=bankDialog('Resolve charged delivery'),form=el('form'),delivered=el('input'),reason=el('input'),error=el('p','error');delivered.type='number';delivered.min=0;delivered.max=order.count;delivered.step=1;delivered.required=true;reason.required=true;reason.maxLength=160;
+  body.append(el('p','hint','Confirm how many of the '+order.count+' kits actually reached the recipient. Only the remainder will be refunded. This final settlement is audited and cannot be silently changed.'));
+  for(const [title,input] of [['Confirmed kits delivered',delivered],['Review reason',reason]]){const label=el('label','',title);label.append(input);form.append(label);}
+  const submit=el('button','primary','Confirm settlement');submit.type='submit';form.append(error,submit);body.append(form,button('Close',()=>dialog.close()));let pending;
+  form.addEventListener('submit',async event=>{event.preventDefault();submit.disabled=true;try{if(!reason.value.trim())throw Error('Enter a review reason.');pending??={op:'kit-credit-settle',id:order.id,delivered:Number(delivered.value),reason:reason.value.trim()};delivered.disabled=reason.disabled=true;await api('control',pending);dialog.close();await loadBank();notice('Credit settlement recorded.',true);}catch(failure){error.textContent=failure.message;submit.disabled=false;}});
+}
 function notice(message, success = false) { $('notice').textContent = message; $('notice').className = 'banner' + (success ? ' success' : ''); $('notice').hidden = !message; }
 async function api(path, request, method = request ? 'POST' : 'GET', extraHeaders = {}) {
   const attempt = generation;
@@ -181,8 +225,8 @@ function workerState(worker) {
   const native = snapshot.highways[worker.crew]?.workers?.find(w => w.id === worker.id);
   const task = snapshot.tasks.find(t => Object.values(t.runs || {}).some(r => r.id === worker.current));
   const run = task?.runs?.[worker.id];
-  return { native, task, run, status: !worker.connected ? 'Offline' : native?.phase || run?.status || (worker.reconciled ? 'Ready' : 'Reconciling'),
-    detail: native?.status || run?.detail || (worker.current ? 'Execution ' + worker.current : 'Ready for assignment') };
+  return { native, task, run, status: !worker.connected ? 'Offline' : worker.serverAliasesReady===false ? 'Server aliases pending' : native?.phase || run?.status || (worker.reconciled ? 'Ready' : 'Reconciling'),
+    detail: worker.serverAliasesReady===false ? 'Waiting for the server identity policy; alias support requires Monocle 0.15.48+.' : native?.status || run?.detail || (worker.current ? 'Execution ' + worker.current : 'Ready for assignment') };
 }
 function render() {
   if (!snapshot) return;
@@ -211,7 +255,7 @@ function render() {
   $('connection').className = 'pill ' + (demo ? '' : fresh && token ? tone(snapshot.status) : 'bad');
   $('updated').textContent = demo ? 'Sample data · no live commands' : refreshedAt ? 'Updated ' + new Date(refreshedAt).toLocaleTimeString() : 'Last snapshot unavailable';
   $('new-job').disabled = !writable();
-  $('metrics').hidden = page === 'stashes' || page === 'kits';
+  $('metrics').hidden = page === 'stashes' || page === 'kits' || page === 'bank';
   const focused = $('content').contains(document.activeElement) ? document.activeElement.dataset.key : null;
   const scrolls = new Map([...$('content').querySelectorAll('[data-scroll]')].map(n=>[n.dataset.scroll,[n.scrollLeft,n.scrollTop]]));
   const expanded = new Set([...$('content').querySelectorAll('details[open][data-key]')].map(n=>n.dataset.key));
@@ -238,6 +282,8 @@ function render() {
   if(page==='hostiles')renderHostiles();
   if(page==='incidents')renderIncidents();
   if(page==='notifications')renderNotifications();
+  if(page==='bank')renderBank();
+  if(page==='servers')renderServers();
   if (page === 'jobs' || page === 'history') {
     const jobs = page === 'history' ? snapshot.history : snapshot.tasks;
     section(page === 'history' ? 'Finished jobs' : 'Job queue', jobs.length + ' records');
@@ -936,7 +982,7 @@ $('kit-delivery-form').addEventListener('submit',async event=>{
       const source=kitDelivery?.kit.sources[Number($('delivery-source').value)],count=Number($('delivery-count').value),name=$('delivery-recipient').value.trim();
       if(!source||!Number.isInteger(count)||count<1||count>36||!/^[A-Za-z0-9_]{1,16}$/.test(name))throw Error('Choose a source, 1–36 shulkers and an exact Minecraft username.');
       const selected=deliveryWorkers(source.stash,snapshot.workers).find(w=>w.id===$('delivery-worker').value);if(!selected)throw Error('Choose a connected worker in the source stash’s crew and world.');
-      const identity=await resource('GET','players/'+encodeURIComponent(name));
+      const identity=await resource('GET','players/'+encodeURIComponent(name)+'?workerId='+encodeURIComponent(selected.id));
       const worker=await resource('GET','workers/'+selected.id);
       if(!worker.connected||!worker.reconciled||worker.publicProtocol||worker.crew!==selected.crew||worker.scope!==source.stash.scope)throw Error('Worker state changed. Refresh and choose the delivery worker again.');
       if(identity.id===worker.id)throw Error('Choose a recipient other than the worker running this delivery.');
@@ -1083,14 +1129,14 @@ function storageColumns(db,layout='auto') {
   const records=Object.values(db.containers||{}).filter(r=>r.status!=='removed'&&(!r.block||/(?:^|:)(?:chest|trapped_chest)$/.test(r.block)));
   if(!records.length)return {columns:[],layout:'vertical',bottom:null};
   const bottom=Math.min(...records.map(r=>r.y)),anchors=new Set(records.filter(r=>r.y===bottom).map(r=>r.x+','+r.z));
-  const offsets={vertical:[0,0],'+Z':[0,1],'-Z':[0,-1],'+X':[1,0],'-X':[-1,0]};
+  const offsets={vertical:[0,0],'+Z':[0,1],'-Z':[0,-1],'+X':[1,0],'-X':[-1,0],'zigzag+Z':[0,1],'zigzag-Z':[0,-1],'zigzag+X':[1,0],'zigzag-X':[-1,0]};
   if(layout==='auto'){
     layout='vertical';let best=-1;
-    for(const [name,[dx,dz]] of Object.entries(offsets)){const score=records.filter(r=>anchors.has((r.x-dx*(r.y-bottom))+','+(r.z-dz*(r.y-bottom)))).length;if(score>best){best=score;layout=name;}}
+    for(const [name,[dx,dz]] of Object.entries(offsets)){const score=records.filter(r=>{const step=name.startsWith('zigzag')?(r.y-bottom)%2:r.y-bottom;return anchors.has((r.x-dx*step)+','+(r.z-dz*step));}).length;if(score>best){best=score;layout=name;}}
   }
   const [dx,dz]=offsets[layout]||offsets.vertical,columns=new Map(),types=db.kitTypes||{};
   for(const r of records){
-    const x=r.x-dx*(r.y-bottom),z=r.z-dz*(r.y-bottom),key=x+','+z;
+    const step=layout.startsWith('zigzag')?(r.y-bottom)%2:r.y-bottom,x=r.x-dx*step,z=r.z-dz*step,key=x+','+z;
     if(!columns.has(key))columns.set(key,{key,x,z,bottom,records:[],ids:new Set(),boxes:0,empty:true,unknown:false,inferred:false,mixed:false});
     const column=columns.get(key);column.records.push(r);
     const measured=r.status==='observed'&&!r.inferred;
@@ -1109,6 +1155,7 @@ function storageColumns(db,layout='auto') {
     c.state=c.reservation?.blocked?'conflict':c.mixed?'mixed':c.ids.size?'kit':c.unknown?'unknown':c.inferred?'inferred':c.empty?'empty':'mixed';
     c.label=c.ids.size?[...c.ids].map(id=>types[id]?.name||types[id]?.item||id).join(' + '):c.state==='empty'?'Observed empty':c.state==='unknown'?'Unknown contents':c.state==='inferred'?'Inferred contents':'Loose / mixed resources';
     c.description=[c.label,'Column X '+c.x+' · Z '+c.z,number(c.records.length)+' recorded chests · Y '+Math.min(...c.records.map(r=>r.y))+'–'+Math.max(...c.records.map(r=>r.y)),number(c.boxes)+' directly observed shulkers',c.unknown?'Has unscanned or changed chests':'',c.inferred?'Includes inferred observations':'',c.reservation?'Reserved: '+(db.categoryDefinitions?.[c.reservation.categoryId]?.name||types[c.reservation.kitTypeId]?.name||c.reservation.categoryId||c.reservation.kitTypeId)+(c.reservation.blocked?' · conflict':''):'',c.empty?'Only recorded chests are empty; unobserved upper stock is unknown':''].filter(Boolean).join('\n');
+    const fill=db.columnFill?.[c.key];if(fill)c.description+='\nTracked empty-storage fill: '+number(fill.kits)+' / '+number(fill.capacity)+' mapped chest slots'+(fill.uncertain?' · external observation; current occupancy needs verification':' · confirmed net kit transfers since empty baseline');
   }
   return {columns:[...columns.values()].sort((a,b)=>a.z-b.z||a.x-b.x),layout,bottom};
 }
@@ -1144,7 +1191,7 @@ function stashColumnMap(stash) {
   const selection=columns.filter(c=>selectedColumns.has(c.key));
   if(selection.length){
     const controls=el('div','column-reservation-controls'),label=el('label','','Reserve '+selection.length+' column'+(selection.length===1?'':'s')+' for kit type or category'),kits=el('select');kits.setAttribute('aria-label','Column reservation kit type');kits.dataset.key='column-reservation-kit';
-    const types=new Map();for(const source of snapshot.stashes)if(source.scope===stash.scope&&(source.crew===stash.crew||source.crew==='Local'))for(const [id,type] of Object.entries(source.kitTypes||{}))if(!types.has(id))types.set(id,type);
+    const types=new Map();for(const source of snapshot.stashes)if(source.scope.split('\n')[0].toLowerCase()===stash.scope.split('\n')[0].toLowerCase()&&(source.crew===stash.crew||source.crew==='Local'))for(const [id,type] of Object.entries(source.kitTypes||{}))if(!types.has(id))types.set(id,type);
     const prompt=el('option','','Choose a kit type');prompt.value='';kits.append(prompt);
     for(const c of Object.values(db.categoryDefinitions||{}).filter(c=>c.usage!=='Kitbot')){const option=el('option','','Category · '+c.name+' ('+c.slug+')');option.value='category:'+c.id;kits.append(option);}
     for(const [id,type] of [...types].sort((a,b)=>(a[1].name||a[1].item).localeCompare(b[1].name||b[1].item))){const option=el('option','',(type.name||type.item)+' · '+type.item.replace('minecraft:','')+' · '+id.slice(0,8));option.value=id;kits.append(option);}
@@ -1153,7 +1200,7 @@ function stashColumnMap(stash) {
       busy=true;render();
       try{
         if(!entry.pendingReservation){
-          const axis=model.layout.endsWith('Z')?'X':model.layout.endsWith('X')?'Z':'Vertical';
+          const axis=model.layout.startsWith('zigzag')?'Vertical':model.layout.endsWith('Z')?'X':model.layout.endsWith('X')?'Z':'Vertical';
           const category=!clear&&entry.reservationKit?.startsWith('category:');
           const body={[category?'categoryId':'kitTypeId']:clear?'':category?entry.reservationKit.slice(9):entry.reservationKit,columns:selection.map(c=>({x:c.x,y:c.bottom,z:c.z,axis}))};
           if(!clear&&!entry.reservationKit)throw Error('Choose a kit type or category.');
@@ -1174,7 +1221,7 @@ function stashColumnMap(stash) {
   panel.append(details);return panel;
 }
 function kitJobLabel(kit){
-  return kit.routes?'Round Robin · '+kit.routes.length+' routes · up to '+kit.count+'/turn · '+kit.routes.map(route=>route.name+' → '+route.targetStashName).join(' / '):(kit.transferAll?'All kits · up to '+kit.count+'/trip':kit.count+' kit boxes')+' · '+kit.name+' → '+kit.destination;
+  return kit.routes?'Round Robin · '+kit.routes.length+' routes · up to '+kit.count+'/turn · '+kit.routes.map(route=>route.name+' → '+route.targetStashName).join(' / '):(kit.enderTransport?'All kits · up to '+kit.count+'/inventory + ender buffer':kit.transferAll?'All kits · up to '+kit.count+'/trip':kit.count+' kit boxes')+' · '+kit.name+' → '+kit.destination;
 }
 function kitUsage(data) {
   const jobs=[...data.tasks,...data.history].filter(job=>job.kitJob),done=jobs.filter(job=>job.status==='Complete');
@@ -1190,41 +1237,88 @@ function overallResources(stashes) {
   card.append(table.childElementCount?table:el('p','hint','No observed resources yet. Export a stash definition, then assign a scan.'));return card;
 }
 
+function renderServers(){
+  const catalog=snapshot.minecraftServers||{servers:[],revision:''};
+  if(!serverDraft)serverDraft={revision:catalog.revision,servers:catalog.servers.map(s=>({...s,aliases:[...s.aliases]}))};
+  const form=el('form','card');form.append(el('p','hint','Use the existing stash/job address as the primary. Aliases assert these addresses share the same Minecraft world. Updated native workers receive this policy automatically. Finish jobs and cleanup before saving; historical catalogs are not merged.'));
+  const rows=el('div','management-section');
+  for(const server of serverDraft.servers){
+    const row=el('div','management-section');
+    for(const [key,title] of [['name','Server name'],['address','Primary Minecraft address'],['aliases','Alias addresses (one per line)']]){
+      const input=el(key==='aliases'?'textarea':'input');input.value=key==='aliases'?server.aliases.join('\n'):server[key];input.disabled=!writable();
+      input.addEventListener('input',()=>{server[key]=key==='aliases'?input.value.split(/\s+/).filter(Boolean):input.value;});const label=el('label','',title);label.append(input);row.append(label);
+    }
+    row.append(button('Remove server',()=>{serverDraft.servers.splice(serverDraft.servers.indexOf(server),1);render();},!writable()));rows.append(row);
+  }
+  form.append(rows,button('Add Minecraft server',()=>{serverDraft.servers.push({name:'',address:'',aliases:[]});render();},!writable()),button('Reload saved servers',()=>{serverDraft=null;render();},!writable()));
+  const save=el('button','primary','Save Minecraft servers');save.type='submit';save.disabled=!writable();form.append(save);
+  form.addEventListener('submit',async event=>{event.preventDefault();if(!writable())return;try{await api('control',{op:'server-aliases-save',expected:serverDraft.revision,servers:serverDraft.servers});serverDraft=null;await refresh();notice('Minecraft server aliases saved.',true);}catch(error){notice(error.message);}});
+  $('content').append(form);
+}
+
 async function kitBotSettings() {
   const dialog=el('dialog'),body=el('div','management-section');dialog.append(body);document.body.append(dialog);dialog.addEventListener('close',()=>dialog.remove());dialog.showModal();
   const field=(title,input)=>{const label=el('label','',title);label.append(input);body.append(label);return input;},message=el('p','hint');
   try {
-    body.append(el('h2','','Kit categories & whisper requests'),el('p','hint','Explicit incoming whispers only: kit <category> <1–36>. Each kit variant needs at least 250 complete recorded kits. Whitelist usernames and UUIDs are operator-supplied; server whisper text is not cryptographic authentication.'));
+    body.append(el('h2','','Kit categories & whisper requests'),el('p','hint','Explicit incoming whispers only: kit <category> <1–36>. Only complete recorded kits at or above the configured stock minimum can be requested. Whitelist usernames and UUIDs are operator-supplied; server whisper text is not cryptographic authentication.'));
     const settings=await api('control',{op:'kitbot-get'}),source=field('Source stash',el('select')),config=settings.config||{};
     for(const s of snapshot.stashes||[]){const option=el('option','',s.name+' · '+s.crew+' · '+s.scope.replace('\n',' / '));option.value=stashKey(s);source.append(option);}
     source.value=stashKey((snapshot.stashes||[]).find(s=>s.name===config.source&&s.scope===config.scope&&s.crew===config.crew)||(snapshot.stashes||[]).find(s=>s.name==='main')||(snapshot.stashes||[])[0]||{});
+    const additional=field('Additional source stashes (same crew and world)',el('select'));additional.multiple=true;additional.size=4;
+    const minimum=field('Minimum complete kits per variant',el('input'));minimum.type='number';minimum.min=250;minimum.max=1000000;minimum.step=1;minimum.value=config.minimumStock??270;
+    const stockMinimum=()=>{const n=Number(minimum.value);if(!Number.isInteger(n)||n<250||n>1000000)throw Error('Minimum stock must be 250–1000000 whole kits.');return n;};
+    const minimumOverrides=field('Category stock minimums (request-word = kits, one per line)',el('textarea'));minimumOverrides.rows=4;minimumOverrides.placeholder='specialty = 54';minimumOverrides.value=Object.entries(config.categoryMinimumStock||{}).sort(([a],[b])=>a.localeCompare(b)).map(([slug,n])=>slug+' = '+n).join('\n');
+    const stockMinimums=()=>{const result={};for(const line of minimumOverrides.value.split(/\n/).map(v=>v.trim()).filter(Boolean)){const match=line.match(/^([a-z][a-z0-9-]{0,47})\s*=\s*([0-9]{1,7})$/);if(!match||Number(match[2])>1000000||Object.hasOwn(result,match[1]))throw Error('Use distinct category = minimum lines, with 0–1000000 whole kits.');result[match[1]]=Number(match[2]);}if(Object.keys(result).length>128)throw Error('Select up to 128 category minimums.');return result;};
+    body.append(el('p','hint','Optional per-category stock floors replace the default. These use confirmed complete kits per variant; estimates do not count. Save kitbot settings to apply. Empty lines use the default. Project users keep their lower floor when applicable.'));
+
+    const limitedCategories=field('Limited categories (request-word = cooldown seconds, one per line)',el('textarea'));limitedCategories.rows=3;limitedCategories.placeholder='specialty = 86400';limitedCategories.value=Object.entries(config.categoryCooldownSeconds||{}).sort(([a],[b])=>a.localeCompare(b)).map(([slug,n])=>slug+' = '+n).join('\n');
+    const categoryCooldowns=()=>{const result={};for(const line of limitedCategories.value.split(/\n/).map(v=>v.trim()).filter(Boolean)){const match=line.match(/^([a-z][a-z0-9-]{0,47})\s*=\s*([1-9][0-9]{0,6})$/);if(!match||Number(match[2])>2592000||Object.hasOwn(result,match[1]))throw Error('Use distinct category = seconds lines, with 1–2592000 whole seconds.');result[match[1]]=Number(match[2]);}if(Object.keys(result).length>128)throw Error('Select up to 128 limited categories.');return result;};
+    body.append(el('p','hint','Limited categories share one kit per cooldown across everyone, including paid, gifted and whitelist orders. The timer starts at confirmed handoff and survives restarts. In-flight or uncertain deliveries reserve the slot. A stock floor of 0 still requires a complete kit to be present.'));
     const categories=el('div','management-section');body.append(categories);let catalog,stash;
     const operation=async fn=>{if(!writable())return;try{await fn();message.textContent='Saved.';}catch(e){message.textContent=e.message;}};
     const load=async()=>{
-      stash=(snapshot.stashes||[]).find(s=>stashKey(s)===source.value);categories.replaceChildren();if(!stash){categories.append(el('p','hint','Define a source stash first.'));return;}
+      const selected=new Set(additional.options.length?Array.from(additional.selectedOptions,o=>o.value):(config.sources||[]));
+      stash=(snapshot.stashes||[]).find(s=>stashKey(s)===source.value);additional.replaceChildren();
+      for(const s of snapshot.stashes||[])if(stash&&s.crew===stash.crew&&s.scope===stash.scope&&s.name!==stash.name){const o=el('option','',s.name);o.value=s.name;o.selected=selected.has(s.name);additional.append(o);}
+      categories.replaceChildren();if(!stash){categories.append(el('p','hint','Define a source stash first.'));return;}
       catalog=await api('control',{op:'kit-categories-get',crew:stash.crew,scope:stash.scope,source:stash.name});
       const select=el('select');for(const c of Object.values(catalog.categories)){const o=el('option','',c.slug+' · '+c.name+' · '+(c.usage||'Both'));o.value=c.id;select.append(o);}select.append(Object.assign(el('option','','New category'),{value:''}));
       const slug=el('input'),name=el('input'),mode=el('select'),members=el('textarea');members.rows=4;mode.append(Object.assign(el('option','','Allowed contents only'),{value:'Items'}),Object.assign(el('option','','Selected kit IDs'),{value:'Kits'}));
       const usage=el('select');for(const value of ['Storage','Kitbot','Both'])usage.append(Object.assign(el('option','',value),{value}));
       const fill=()=>{const c=catalog.categories[select.value]||{slug:'',name:'',mode:'Kits',members:[],usage:'Both'};slug.value=c.slug;name.value=c.name;mode.value=c.mode;members.value=c.members.join('\n');usage.value=c.usage||'Both';};select.addEventListener('change',fill);fill();
-      for(const [title,input] of [['Category',select],['Used for',usage],['Request word / storage slug (lowercase)',slug],['Display name',name],['Rule',mode],['Item IDs or kit UUIDs, one per line',members]]){const l=el('label','',title);l.append(input);categories.append(l);}
+      for(const [title,input] of [['Category',select],['Used for',usage],['Request word / storage slug (lowercase)',slug],['Display name',name],['Rule',mode],['Item IDs or kit UUIDs, one per line',members]]){const l=el('label','',title);input.setAttribute('aria-label',title);l.append(input);categories.append(l);}
       categories.append(el('p','hint','Storage groups organize columns; Kitbot categories are request words. A kit may match one of each. Both preserves shared behavior. Existing column reservations remain unchanged.'));
-      categories.append(button('Save category',()=>operation(async()=>{await api('control',{op:'kit-categories-save',crew:stash.crew,scope:stash.scope,expected:catalog.revision,category:{id:select.value||crypto.randomUUID(),slug:slug.value,name:name.value,mode:mode.value,usage:usage.value,members:members.value.split(/\s+/).filter(Boolean)}});await load();}),!writable()),button('Seed stocked categories (250+)',()=>operation(async()=>{await api('control',{op:'kit-categories-seed',crew:stash.crew,scope:stash.scope,source:stash.name});await load();}),!writable()));
-      const list=el('div');for(const [id,k] of Object.entries(catalog.stock||{}))list.append(el('p','hint',(k.name||k.item)+' · '+k.complete+' complete'+(k.complete<250?' · OUT OF STOCK':'')+' · '+id));categories.append(el('details'));categories.lastChild.append(el('summary','','Kit IDs & source stock'),list);
+      categories.append(button('Save category',()=>operation(async()=>{await api('control',{op:'kit-categories-save',crew:stash.crew,scope:stash.scope,expected:catalog.revision,category:{id:select.value||crypto.randomUUID(),slug:slug.value,name:name.value,mode:mode.value,usage:usage.value,members:members.value.split(/\s+/).filter(Boolean)}});await load();}),!writable()),button('Categorize stocked kits',()=>operation(async()=>{await api('control',{op:'kit-categories-seed',crew:stash.crew,scope:stash.scope,source:stash.name,minimumStock:stockMinimum()});await load();}),!writable()));
+      const list=el('div'),floors=stockMinimums();for(const [id,k] of Object.entries(catalog.stock||{})){const matches=Object.values(catalog.categories).filter(c=>(!c.usage||c.usage==='Both'||c.usage==='Kitbot')&&(c.mode==='Kits'?c.members.includes(id):Object.keys(k.items||{}).length&&Object.entries(k.items).every(([item,n])=>c.members.includes(item)&&n>0)));const required=matches.length?Math.min(...matches.map(c=>floors[c.slug]??stockMinimum())):stockMinimum();list.append(el('p','hint',(k.name||k.item)+' · '+k.complete+' complete · minimum '+required+(k.complete<=0||k.complete<required?' · OUT OF STOCK':'')+' · '+id));}categories.append(el('details'));categories.lastChild.append(el('summary','','Kit IDs & source stock'),list);
     };
     source.addEventListener('change',()=>operation(load));await load();
+    const publicAccess=field('Public access (any verified whisper sender)',el('input'));publicAccess.type='checkbox';publicAccess.checked=!!config.publicAccess;
+    body.append(el('p','hint','Public users get one free kit per hour. Credit purchases have a separate ten-minute cooldown; the free allowance stays hourly. Free claims never spend earned credits. Updated couriers verify sender UUIDs using the server player list. While public access is on, whitelisted project users have no hourly cooldown and normally need 109+ confirmed kits, with lower category floors honored; their configured request cap still applies. Leave public access off for whitelist-only service.'));
     const enabled=field('Enable whisper kitbot',el('input'));enabled.type='checkbox';enabled.checked=!!config.enabled;
     const worker=field('Courier / whisper receiver',el('select'));for(const w of snapshot.workers||[]){const o=el('option','',w.name||w.id);o.value=w.id;worker.append(o);}worker.value=config.worker||worker.value;
-    const whitelist=el('div','management-section'),people=[];body.append(el('h3','','Whitelisted users'),el('p','hint','Each person has their own cooldown and request cap (default five kits). New users default to one hour. Set 0 to disable their cooldown; the five-second duplicate guard and one outstanding delivery per person still apply.'),whitelist);
+    const backupWorker=field('Second courier / whisper receiver (optional)',el('select'));backupWorker.append(Object.assign(el('option','','Disabled'),{value:''}));for(const w of snapshot.workers||[]){const o=el('option','',(w.name||w.id)+(w.connected?' · online':' · offline'));o.value=w.id;backupWorker.append(o);}backupWorker.value=config.backupWorker||'';
+    body.append(el('p','hint','Both accounts share Mike, stock reservations, credits and user limits. Busy receivers route new deliveries to the other courier only when online, ready and idle in the same crew/server; otherwise orders queue. Each courier needs its own source homes and return bed/spawn.'));
+    body.append(el('h3','','Mike · optional Ollama kit handler'),el('p','hint','Natural-language kit requests. Mike starts with public category names, sample item types and qualitative stock labels. On request, read-only inspection can show exact contents per kit and public variant references. Stored copy counts, stash names, locations, homes and job history stay on the host. Existing cooldowns and quantity caps still apply. Explicit kit/kits commands work without Ollama.'));
+    const mikeConfig=config.mike||{},mikeEnabled=field('Enable Mike',el('input'));mikeEnabled.type='checkbox';mikeEnabled.checked=!!mikeConfig.enabled;
+    const mikeEndpoint=field('Ollama base URL',el('input'));mikeEndpoint.type='url';mikeEndpoint.value=mikeConfig.endpoint||'https://ollama.com';
+    const mikeModel=field('Ollama model (tool calling required)',el('input'));mikeModel.value=mikeConfig.model||'';mikeModel.placeholder='Cloud model ID or locally installed tag';
+    const mikeProvenance=field('Public kit provenance',el('input'));mikeProvenance.maxLength=256;mikeProvenance.value=mikeConfig.provenance||'';mikeProvenance.placeholder='Optional public explanation of where the kits came from';
+    const mikeCoordinateJokes=field('Fictional stash coordinate replies',el('input'));mikeCoordinateJokes.type='checkbox';mikeCoordinateJokes.checked=!!mikeConfig.coordinateJokes;
+    const mikeKey=field('Ollama API key (blank keeps saved key)',el('input'));mikeKey.type='password';mikeKey.autocomplete='new-password';mikeKey.placeholder=mikeConfig.apiKeyConfigured?'API key saved':'Required for Ollama Cloud';
+    const mikeClearKey=field('Clear saved Ollama API key',el('input'));mikeClearKey.type='checkbox';mikeClearKey.addEventListener('change',()=>{mikeKey.disabled=mikeClearKey.checked;if(mikeClearKey.checked)mikeKey.value='';});
+    body.append(el('p','hint','Ollama Cloud uses https://ollama.com with its native /api/chat API. The key stays on the host and is never returned here or included in model context.'));
+    const mikeFields=()=>{mikeEndpoint.disabled=!mikeEnabled.checked;mikeModel.disabled=!mikeEnabled.checked;};mikeEnabled.addEventListener('change',mikeFields);mikeFields();
+    if(settings.mikeStatus)body.append(el('p','hint','Mike requests pending: '+settings.mikeStatus.pending+(settings.mikeStatus.error?' · '+settings.mikeStatus.error:'')));
+    const whitelist=el('div','management-section'),people=[];body.append(el('h3','','Whitelisted users'),el('p','hint','In whitelist-only mode, each person has their own cooldown and free-order cap (default five kits). Credit orders allow up to 27 kits per delivery. In public mode, whitelist entries grant project access: no hourly cooldown, normally 109+ confirmed kits (lower category floors apply). New users default to one hour. Set 0 to disable their cooldown; the five-second duplicate guard still applies. Zero-cooldown users can order for different recipients concurrently; duplicate deliveries to the same recipient remain blocked.'),whitelist);
     const addPerson=person=>{
-      const row=el('div','management-section'),name=el('input'),uuid=el('input'),hours=el('input'),cap=el('input');name.value=person.name||'';uuid.value=person.uuid||'';hours.type='number';hours.min=0;hours.max=72;hours.step='any';hours.value=(person.cooldownSeconds??config.cooldownSeconds??3600)/3600;cap.type='number';cap.min=1;cap.max=36;cap.step=1;cap.value=person.maxKits??5;
-      for(const [title,input] of [['Minecraft username',name],['Player UUID',uuid],['User cooldown (hours; 0 disables)',hours],['Maximum kits per request',cap]]){const label=el('label','',title);label.append(input);row.append(label);}
-      const entry={row,name,uuid,hours,cap};people.push(entry);row.append(button('Remove user',()=>{people.splice(people.indexOf(entry),1);row.remove();},!writable()));whitelist.append(row);
+      const row=el('div','management-section'),name=el('input'),uuid=el('input'),hours=el('input'),cap=el('input'),role=el('select');name.value=person.name||'';uuid.value=person.uuid||'';hours.type='number';hours.min=0;hours.max=72;hours.step='any';hours.value=(person.cooldownSeconds??config.cooldownSeconds??3600)/3600;cap.type='number';cap.min=1;cap.max=36;cap.step=1;cap.value=person.maxKits??5;for(const value of ['User','Administrator']){const option=el('option','',value);option.value=value;role.append(option);}role.value=person.role||'User';role.setAttribute('aria-label','Role');
+      for(const [title,input] of [['Minecraft username',name],['Player UUID',uuid],['User cooldown (hours; 0 disables)',hours],['Maximum free kits per request',cap]]){const label=el('label','',title);label.append(input);row.append(label);}
+      const label=el('label','','Role');label.append(role);row.append(label);const entry={row,name,uuid,hours,cap,role};people.push(entry);row.append(button('Remove user',()=>{people.splice(people.indexOf(entry),1);row.remove();},!writable()));whitelist.append(row);
     };
     for(const person of config.whitelist||[])addPerson(person);
     body.append(button('Add whitelisted user',()=>addPerson({cooldownSeconds:3600}),!writable()));
-    body.append(button('Save kitbot settings',()=>operation(async()=>{if(!stash)throw Error('Choose a source stash.');const seconds=input=>{const n=Number(input.value)*3600;if(input.value===''||!Number.isInteger(n)||n<0||n>259200)throw Error('Cooldown must be 0–72 hours, precise to whole seconds.');return n;};const lines=people.map(p=>{const maxKits=Number(p.cap.value);if(!Number.isInteger(maxKits)||maxKits<1||maxKits>36)throw Error('Maximum kits must be 1–36 whole kits.');return {name:p.name.value.trim(),uuid:p.uuid.value.trim(),cooldownSeconds:seconds(p.hours),maxKits};});await api('control',{op:'kitbot-save',expected:settings.revision,config:{enabled:enabled.checked,crew:stash.crew,scope:stash.scope,source:stash.name,worker:worker.value,minimumStock:250,cooldownSeconds:3600,whitelist:lines}});dialog.close();}),!writable()),message);
-    const receipts=el('details');receipts.append(el('summary','','Request receipts'));for(const r of Object.values(settings.requests||{}).reverse().slice(0,30))receipts.append(el('p','hint',r.name+' · '+r.category+' × '+r.count+' · '+r.status+' · '+new Date(r.at).toLocaleString()+(r.detail?' · '+r.detail:'')));body.append(receipts);
+    body.append(button('Save kitbot settings',()=>operation(async()=>{if(!stash)throw Error('Choose a source stash.');if(backupWorker.value&&backupWorker.value===worker.value)throw Error('Choose two different couriers.');const seconds=input=>{const n=Number(input.value)*3600;if(input.value===''||!Number.isInteger(n)||n<0||n>259200)throw Error('Cooldown must be 0–72 hours, precise to whole seconds.');return n;};const lines=people.map(p=>{const maxKits=Number(p.cap.value);if(!Number.isInteger(maxKits)||maxKits<1||maxKits>36)throw Error('Maximum kits must be 1–36 whole kits.');return {name:p.name.value.trim(),uuid:p.uuid.value.trim(),cooldownSeconds:seconds(p.hours),maxKits,role:p.role.value};});await api('control',{op:'kitbot-save',expected:settings.revision,config:{enabled:enabled.checked,publicAccess:publicAccess.checked,crew:stash.crew,scope:stash.scope,source:stash.name,worker:worker.value,backupWorker:backupWorker.value,minimumStock:stockMinimum(),categoryMinimumStock:stockMinimums(),categoryCooldownSeconds:categoryCooldowns(),sources:Array.from(additional.selectedOptions,o=>o.value),cooldownSeconds:3600,whitelist:lines,mike:{enabled:mikeEnabled.checked,endpoint:mikeEndpoint.value.trim(),model:mikeModel.value.trim(),provenance:mikeProvenance.value.trim(),coordinateJokes:mikeCoordinateJokes.checked,apiKey:mikeKey.value.trim(),clearApiKey:mikeClearKey.checked}}});dialog.close();}),!writable()),message);
+    const receipts=el('details');receipts.append(el('summary','','Request receipts'));for(const r of Object.values(settings.requests||{}).reverse().slice(0,30))receipts.append(el('p','hint',r.name+(r.recipientName&&r.recipientName.toLowerCase()!==r.name.toLowerCase()?' → '+r.recipientName:'')+' · '+r.category+' × '+r.count+' · '+r.status+' · '+new Date(r.at).toLocaleString()+(r.detail?' · '+r.detail:'')));body.append(receipts);
   }catch(e){body.append(el('p','error',e.message));}
   body.append(button('Close',()=>dialog.close()));
 }
@@ -1324,6 +1418,13 @@ function kitSources(){
   for(const stash of snapshot.stashes||[])if(stash.scope===scope&&(stash.crew===crew||stash.crew==='Local')&&(!sources.has(stash.name)||stash.crew===crew))sources.set(stash.name,stash);
   return [...sources.values()];
 }
+function kitDestinations(){
+  const server=$('job-server').value.trim(),crew=$('job-crew').value,destinations=new Map(),team=$('kit-field').dataset.entry==='task-stash-transfer-team';
+  for(const stash of snapshot.stashes||[])if(stash.scope.split('\n')[0]===server&&(stash.crew===crew||stash.crew==='Local')&&(!team||stash.scope===server+'\n'+$('job-dimension').value.trim())){
+    const key=JSON.stringify([stash.scope,stash.name]);if(!destinations.has(key)||stash.crew===crew)destinations.set(key,stash);
+  }
+  return [...destinations].map(([key,stash])=>({key,stash}));
+}
 function updateKitSources(){
   if($('kit-field').hidden)return;
   const selected=$('kit-source').value||kitContext?.kitStash.name||'',sources=kitSources();$('kit-source').replaceChildren();
@@ -1376,11 +1477,11 @@ function updateKitTypes(){
   for(const [id,type] of Object.entries(source?.kitTypes||{})){const counts=source.kitCounts?.[id]||{},option=el('option','',(type.name||type.item)+' · '+number(counts.complete)+' complete / '+number(counts.incomplete)+' incomplete');option.value=id;$('kit-type').append(option);}
   for(const option of $('kit-type').options){const copy=option.cloneNode(true);copy.selected=previous.has(copy.value);$('kit-types').append(copy);}
   if([...$('kit-type').options].some(option=>option.value===selected))$('kit-type').value=selected;
-  const target=$('kit-target').value;$('kit-target').replaceChildren();for(const stash of kitSources().filter(stash=>stash.name!==source?.name)){const option=el('option','',stash.name);option.value=stash.name;$('kit-target').append(option);}if([...$('kit-target').options].some(option=>option.value===target))$('kit-target').value=target;
+  const target=$('kit-target').value;$('kit-target').replaceChildren();for(const {key,stash} of kitDestinations().filter(({stash})=>stash.name!==source?.name||stash.scope!==source?.scope)){const option=el('option','',stash.name+' · '+stash.scope.split('\n')[1]);option.value=key;$('kit-target').append(option);}if([...$('kit-target').options].some(option=>option.value===target))$('kit-target').value=target;
   $('kit-hint').textContent=source?($('kit-field').dataset.entry==='task-stash-transfer-team'?'Choose 2–3 workers. ':'Choose one worker. ')+'Counts are directly observed boxes; unscanned upper chests are not guaranteed.':'No stash with this crew and world is mapped. Define or export one first.';
 }
 function updateKitDestination(){const active=!$('kit-field').hidden,team=active&&$('kit-field').dataset.entry==='task-stash-transfer-team',transfer=active&&['task-stash-transfer','task-stash-transfer-team'].includes($('kit-field').dataset.entry),round=transfer&&!team&&$('kit-mode').value==='RoundRobin',mixed=transfer&&!team&&$('kit-mode').value==='Mixed',player=active&&!transfer&&$('kit-destination').value==='Player';if(transfer){$('kit-destination').value='Stash';$('kit-all').checked=true;}$('kit-mode-field').hidden=!transfer||team;$('kit-source-fields').hidden=round;$('kit-types-select').hidden=round;$('kit-routes-field').hidden=!round;if(round&&!$('kit-routes').children.length){addKitRoute();addKitRoute();}$('kit-destination').disabled=$('kit-all').disabled=transfer;$('kit-types-field').hidden=!transfer;$('kit-team-field').hidden=!team;$('kit-deposit-carried').disabled=team||mixed;if(team||mixed)$('kit-deposit-carried').checked=false;$('kit-type').parentElement.hidden=transfer;$('kit-recipient-field').hidden=!player;$('kit-target-field').hidden=round||!active||$('kit-destination').value!=='Stash';$('kit-recipient-name').required=$('kit-recipient-id').required=player;if($('kit-destination').value!=='Stash')$('kit-all').checked=false;$('kit-count-label').textContent=team?'Boxes per worker per trip':$('kit-all').checked?'Boxes per trip':'Boxes';}
-$('kit-mode').addEventListener('change',updateKitDestination);$('kit-route-add').addEventListener('click',addKitRoute);
+$('kit-mode').addEventListener('change',()=>{updateKitDestination();$('kit-ender-transport').disabled=$('kit-mode').value!=='Drain';if($('kit-ender-transport').disabled)$('kit-ender-transport').checked=false;});$('kit-route-add').addEventListener('click',addKitRoute);
 $('kit-all').addEventListener('change',()=>{if($('kit-all').checked){$('kit-destination').value='Stash';$('kit-count').value='36';}updateKitDestination();});
 $('kit-source').addEventListener('change',updateKitTypes);$('kit-destination').addEventListener('change',updateKitDestination);
 $('kit-recipient-worker').addEventListener('change',()=>{const worker=snapshot.workers.find(worker=>worker.id===$('kit-recipient-worker').value);if(worker){$('kit-recipient-name').value=worker.name;$('kit-recipient-id').value=worker.id;}});
@@ -1446,9 +1547,10 @@ $('job-form').addEventListener('submit', async event => {
           if(!source||source.scope!==scope||!transfer&&!source.kitTypes?.[kitTypeId])throw Error('Choose a mapped stash and one of its known kit types in this world.');
           args={...source.bounds,name:source.name,kitTypeId,count,destination,transferAll:$('kit-all').checked,includeIncomplete:$('kit-include-incomplete').checked};
           if(transfer){delete args.kitTypeId;const ids=[...$('kit-types').selectedOptions].map(option=>option.value);if(ids.length)args.kitTypeIds=ids;args.depositCarried=$('kit-deposit-carried').checked;if(!team&&$('kit-mode').value==='Mixed'){if(ids.length<2||ids.length>16)throw Error('Select 2–16 kit types for mixed loads.');args.mixedLoads=true;args.depositCarried=false;}}
+          if(transfer&&!team&&$('kit-mode').value==='Drain'&&$('kit-ender-transport').checked)args.enderTransport=true;
           if(team){args.leader=workers[0].id;args.tpaWarmupTicks=Math.round(Number($('kit-tpa-warmup').value)*20);if(!Number.isInteger(args.tpaWarmupTicks)||args.tpaWarmupTicks<0||args.tpaWarmupTicks>72000)throw Error('Choose a TPA warmup between 0 and 3600 seconds.');}
           if(destination==='Player'){args.recipient=$('kit-recipient-id').value.trim();args.recipientName=$('kit-recipient-name').value.trim();args.returnHome=$('kit-return-home').checked;if(!/^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(args.recipient)||!/^[A-Za-z0-9_]{1,16}$/.test(args.recipientName))throw Error('Specify the recipient’s exact UUID and Minecraft username.');}
-          if(destination==='Stash'){args.targetStashName=$('kit-target').value;if(!args.targetStashName||args.targetStashName===source.name)throw Error('Choose another mapped stash in this world.');}
+          if(destination==='Stash'){const target=kitDestinations().find(d=>d.key===$('kit-target').value)?.stash;if(!target||target.name===source.name&&target.scope===source.scope)throw Error('Choose another mapped stash.');args.targetStashName=target.name;if(target.scope!==source.scope)args.targetDimension=target.scope.split('\n')[1];}
           }
         }
         if(['task-follow','task-bodyguard','task-crystal-guard'].includes(preset.entry)){args={target:$('follow-leader').value,radius:Number($('follow-radius').value),ticks:0};if(workers.some(w=>w.id===args.target))throw Error('Uncheck the subject; select workers only.');if(preset.entry!=='task-follow'&&workers.length>3)throw Error('Bodyguard supports at most three workers.');if(preset.entry==='task-crystal-guard')args.combatTargets=$('crystal-targets').value.split(',').map(name=>name.trim()).filter(Boolean);}

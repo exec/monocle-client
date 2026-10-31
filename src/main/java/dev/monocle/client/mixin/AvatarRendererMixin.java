@@ -99,10 +99,13 @@ public abstract class AvatarRendererMixin
     private void extractRenderState$rotations(Avatar entity, AvatarRenderState state, float partialTicks, CallbackInfo ci) {
         Derp derp = Modules.get().get(Derp.class);
         if (derp.isActive() && entity == mc.player) {
-            state.yRot = 0;
-            state.bodyRot = derp.visualYaw();
-            state.xRot = derp.visualPitch();
-            return;
+            if (derp.teabagging()) state.isCrouching |= derp.visualCrouching();
+            if(derp.rotating()) {
+                state.yRot = 0;
+                state.bodyRot = derp.visualYaw();
+                state.xRot = derp.visualPitch();
+                return;
+            }
         }
         if (Rotations.rotating && entity == mc.player) {
             state.yRot = 0;

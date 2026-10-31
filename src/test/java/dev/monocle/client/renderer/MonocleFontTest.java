@@ -33,6 +33,7 @@ public final class MonocleFontTest {
         assert glacial != null && glacial.hasType(FontInfo.Type.Regular) && glacial.hasType(FontInfo.Type.Bold);
         assert Fonts.getFamily("Comfortaa") != null : "Previous selections remain available.";
         assert FontUtils.getBuiltinFontInfo(Fonts.DEFAULT_BUILTIN_FONT).equals(new FontInfo("Glacial Indifference", FontInfo.Type.Regular));
+        headlessFonts();
         checkFont("GlacialIndifference-Regular", FontInfo.Type.Regular, "de1eddf3f49fbc0782a1008a87053207f69174a3860f7068520ee4cd901ef926");
         checkFont("GlacialIndifference-Bold", FontInfo.Type.Bold, "b9007828ce438fea70e32d65fc93fe4d5fe1aead53fdb8d51f01e260db385e26");
 
@@ -63,6 +64,26 @@ public final class MonocleFontTest {
             Fonts.FONT_FAMILIES.clear();
         }
         System.out.println("Monocle font checks passed: default Regular, selectable Bold, native OpenType rasterization, legacy TTF fonts, system discovery, unmodified font bytes, and bundled license notices.");
+    }
+
+    private static void headlessFonts() throws Exception {
+        String old = System.getProperty("monocle.headless");
+        try {
+            for (String builtin : Fonts.BUILTIN_FONTS) {
+                System.clearProperty("monocle.headless");FontInfo expected = FontUtils.getBuiltinFontInfo(builtin);
+                System.setProperty("monocle.headless", "true");
+                assert expected.equals(FontUtils.getBuiltinFontInfo(builtin)) : "Headless metadata must preserve saved font family/style: " + builtin;
+            }
+            assert FontUtils.getFontInfo(new ByteArrayInputStream(new byte[12])) == null;
+            Fonts.load(new BuiltinFontFace(FontUtils.getBuiltinFontInfo(Fonts.DEFAULT_BUILTIN_FONT), Fonts.DEFAULT_BUILTIN_FONT));
+            assert Fonts.RENDERER == null : "Headless font selection cannot allocate native font textures";
+            assert dev.monocle.client.renderer.text.TextRenderer.get() == dev.monocle.client.renderer.text.VanillaTextRenderer.INSTANCE : "GUI measurements use Minecraft's font without rewriting preferences";
+            assert new dev.monocle.client.gui.renderer.packer.TexturePacker().add(null).get(16,16) != null : "Headless icons retain layout geometry without decoding image buffers";
+            net.minecraft.SharedConstants.tryDetectVersion();net.minecraft.server.Bootstrap.bootStrap();
+            new dev.monocle.client.systems.modules.player.Derp();
+        } finally {
+            if (old == null) System.clearProperty("monocle.headless"); else System.setProperty("monocle.headless", old);
+        }
     }
 
     private static void checkFont(String name, FontInfo.Type type, String sha256) throws Exception {

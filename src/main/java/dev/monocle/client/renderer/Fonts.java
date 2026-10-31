@@ -15,6 +15,7 @@ import dev.monocle.client.renderer.text.FontInfo;
 import dev.monocle.client.systems.config.Config;
 import dev.monocle.client.utils.PreInit;
 import dev.monocle.client.utils.render.FontUtils;
+import dev.monocle.client.utils.misc.HeadlessMode;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -60,6 +61,7 @@ public class Fonts {
     }
 
     public static void load(FontFace fontFace) {
+        if (HeadlessMode.enabled()) return;
         if (RENDERER != null) {
             if (RENDERER.fontFace.equals(fontFace)) return;
             else RENDERER.destroy();

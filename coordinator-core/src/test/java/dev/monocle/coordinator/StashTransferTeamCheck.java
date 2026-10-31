@@ -26,6 +26,8 @@ final class StashTransferTeamCheck {
         JsonObject destination=source.deepCopy();destination.addProperty("name","Destination");destination.addProperty("homeName","destination");destination.addProperty("minX",10000);destination.addProperty("maxX",10008);
         for(int x=10000;x<=10008;x++){JsonObject o=json("{y:116,z:0,status:'observed',block:'minecraft:chest',items:{},shulkers:[]}");o.addProperty("x",x);StashCatalog.save(root,"A",SCOPE,destination,o);}
         JsonObject request=json("{name:'Source',targetStashName:'Destination',count:36}");
+        JsonObject cross=request.deepCopy();cross.addProperty("targetDimension","minecraft:overworld");rejects(()->StashTransferTeam.prepare(root,"A",SCOPE,cross,IDS));
+        JsonObject largeCursor=json("{type:'KitTransferPlan',step:1,receipt:{ok:true,picked:0,nextPick:256,sourceExhausted:true}}");StashTransferTeam.checkedRequest(largeCursor);largeCursor.getAsJsonObject("receipt").addProperty("nextPick",1025);rejects(()->StashTransferTeam.checkedRequest(largeCursor));
         rejects(()->StashTransferTeam.prepare(root,"A",SCOPE,request,IDS.subList(0,1)));
         assert text(StashTransferTeam.prepare(root,"A",SCOPE,request,IDS.subList(0,2)),"leader").equals(IDS.getFirst());
         rejects(()->StashTransferTeam.prepare(root,"A",SCOPE,request,List.of(IDS.getFirst(),IDS.getFirst())));

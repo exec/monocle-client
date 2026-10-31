@@ -33,6 +33,29 @@ public final class KitCategoriesTest {
         try{KitCategories.save(root,"Default","server\nminecraft:the_end",rev,rule);throw new AssertionError("Stale revision accepted");}catch(IllegalStateException expected){}
         JsonObject seeded=KitCategories.seed(root,"Other","server\nminecraft:the_end",stockFixture(250),250);assert seeded.getAsJsonObject("categories").size()==1;
         assert KitCategories.seed(root,"Other","server\nminecraft:the_end",stockFixture(249),250).equals(seeded):"Rescan never deletes operator categories";
+        // Synthetic kits: a pre-existing group must not hide newly stocked variants on a later seed.
+        JsonObject pvpSource=stockFixture(500);for(var e:pvpSource.getAsJsonObject("containers").entrySet()){
+            JsonObject box=e.getValue().getAsJsonObject().getAsJsonArray("shulkers").get(0).getAsJsonObject();
+            box.addProperty("name","Synthetic combat");box.add("items",json("{'minecraft:end_crystal':64,'minecraft:netherite_sword':1}"));
+        }
+        pvpSource.getAsJsonObject("kitTypes").entrySet().clear();for(var e:pvpSource.getAsJsonObject("containers").entrySet())KitTypes.learn(pvpSource,e.getValue().getAsJsonObject());
+        JsonObject oldPvp=KitCategories.definition("pvp","Custom PvP","Kits",List.of(UUID.randomUUID().toString()));
+        KitCategories.save(root,"Coverage","server\nminecraft:the_end",TaskWire.text(KitCategories.get(root,"Coverage","server\nminecraft:the_end"),"revision"),oldPvp);
+        JsonObject covered=KitCategories.seed(root,"Coverage","server\nminecraft:the_end",pvpSource,500);
+        assert covered.getAsJsonObject("categories").getAsJsonObject(TaskWire.text(oldPvp,"id")).equals(oldPvp):"Operator categories stay unchanged";
+        for(var e:KitCategories.stock(pvpSource).entrySet())assert covered.getAsJsonObject("categories").entrySet().stream().anyMatch(c->KitCategories.usedFor(c.getValue().getAsJsonObject(),"Kitbot")&&KitCategories.matches(c.getValue().getAsJsonObject(),e.getKey(),e.getValue().getAsJsonObject().getAsJsonObject("items"))):"Every stocked kit gets a usable category";
+        assert KitCategories.seed(root,"Coverage","server\nminecraft:the_end",pvpSource,500).equals(covered):"Seeding is idempotent";
+        // Synthetic build palettes must not share a random building request selector.
+        JsonObject palettes=stockFixture(540);int paletteIndex=0;palettes.getAsJsonObject("kitTypes").entrySet().clear();
+        for(var entry:palettes.getAsJsonObject("containers").entrySet()){
+            JsonObject observation=entry.getValue().getAsJsonObject(),box=observation.getAsJsonArray("shulkers").get(0).getAsJsonObject();boolean stone=paletteIndex++<270;box.addProperty("name",stone?"Synthetic stone build":"Synthetic prismarine build");box.add("items",json(stone?"{'minecraft:stone':64,'minecraft:obsidian':64}":"{'minecraft:prismarine':64,'minecraft:obsidian':64}"));KitTypes.learn(palettes,observation);
+        }
+        JsonObject broad=KitCategories.definition("building","Building","Kits",KitCategories.stock(palettes).keySet());
+        KitCategories.save(root,"Builds","synthetic.invalid\nminecraft:overworld",TaskWire.text(KitCategories.get(root,"Builds","synthetic.invalid\nminecraft:overworld"),"revision"),broad);
+        JsonObject split=KitCategories.seed(root,"Builds","synthetic.invalid\nminecraft:overworld",palettes,270);
+        assert TaskWire.text(split.getAsJsonObject("categories").getAsJsonObject(TaskWire.text(broad,"id")),"usage").equals("Storage");
+        assert split.getAsJsonObject("categories").entrySet().stream().filter(e->KitCategories.usedFor(e.getValue().getAsJsonObject(),"Kitbot")).count()==2;
+        for(var entry:split.getAsJsonObject("categories").entrySet())if(KitCategories.usedFor(entry.getValue().getAsJsonObject(),"Kitbot"))assert entry.getValue().getAsJsonObject().getAsJsonArray("members").size()==1&&TaskWire.text(entry.getValue().getAsJsonObject(),"slug").contains("build");
         JsonObject manual=KitCategories.definition("test","Test","Kits",List.of(id));assert KitCategories.matches(manual,id,new JsonObject());assert !KitCategories.matches(manual,UUID.randomUUID().toString(),json("{'minecraft:obsidian':1728}"));
         assert StashCatalog.categoryContentsMatch(db.getAsJsonObject("containers").getAsJsonObject("2"),rule);
         JsonObject loose=db.getAsJsonObject("containers").getAsJsonObject("2").deepCopy();loose.getAsJsonObject("items").addProperty("minecraft:ender_pearl",1);assert !StashCatalog.categoryContentsMatch(loose,rule);

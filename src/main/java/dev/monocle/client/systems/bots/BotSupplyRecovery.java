@@ -66,7 +66,7 @@ public final class BotSupplyRecovery {
         return journal;
     }
     private static String owner() { return mc.player.getUUID().toString(); }
-    private static String scope() { return (mc.getCurrentServer()==null ? "local:"+Utils.getWorldName() : mc.getCurrentServer().ip) + "\n" + mc.level.dimension().identifier(); }
+    private static String scope() { return (mc.getCurrentServer()==null ? "local:"+Utils.getWorldName() : dev.monocle.client.utils.Utils.getServerIdentity()) + "\n" + mc.level.dimension().identifier(); }
     private static List<JsonObject> records() { return journal().pending(owner(),scope()); }
     private static BlockPos position(JsonObject r) { return new BlockPos(r.get("x").getAsInt(),r.get("y").getAsInt(),r.get("z").getAsInt()); }
     private static ItemStack decode(JsonElement s) { return ItemStack.CODEC.parse(mc.player.registryAccess().createSerializationContext(JsonOps.INSTANCE),s).getOrThrow(); }

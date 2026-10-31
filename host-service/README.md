@@ -1,6 +1,14 @@
 # Monocle standalone Workers host
 
+**Optional Mike kit handler:** Kits → Categories & whisper kitbot can connect to
+Ollama for natural-language requests. The model sees a public menu with qualitative
+stock labels, never exact counts or private stash locations. The host retains the
+existing whitelist, cooldown and delivery controls. See [Mike setup and information
+boundary](../docs/kitbot-mike.md); `kitbot-mike.md` is bundled in the distribution.
+
 **0.15.0 — The Speedy Gonzalez Update:** stash data now uses SQLite with WAL, indexed container rows and transactional observation/recovery commits. This is an intentional fresh start: old stash JSON/deltas and outboxes are not imported. Update workers and host, redefine stashes with their home names, then start new jobs. See [SQLite layout and backup instructions](../docs/stash-sqlite.md); the distribution also includes `stash-sqlite.md`.
+
+**0.15.44:** execution checkpoints also use SQLite, updating changed tasks and deduplicating workflow packages. Existing execution JSON is imported automatically and preserved as a backup; current jobs and cargo receipts carry over. The 0.15.0 stash reset does not apply to this execution journal migration. See [execution checkpoints](../docs/stash-sqlite.md#execution-checkpoints-01544) before backing up or downgrading.
 
 **0.14.11 worker job defaults:** built-in highway, stash and movement/guard presets now carry a shared 6b6t safety baseline for fresh workers. Homes, credentials, Lobby Skip and reconnect policies remain separate. Existing jobs and saved copies retain their captured settings. See [settings and boundaries](../docs/worker-job-defaults.md).
 
@@ -174,3 +182,11 @@ resume without duplicate stock or execution installation. It also replays uncert
 cancellation and missing worker checkpoints. `./gradlew unattendedReplayCheck`
 includes this plus the existing native receipt and shared crew checks. See the
 [coverage and remaining reliability work](../docs/worker-reliability.md).
+
+## Minecraft server aliases and public kitbot
+
+Use **Servers** in the WebUI to define explicit alternate addresses for one Minecraft world. Updated native workers synchronize the catalog before executing work; existing historical catalogs are preserved. See [server identities](../docs/minecraft-server-aliases.md). Kitbot settings now retain whitelist-only mode and offer opt-in public service with verified server-reported sender UUIDs, one free kit per hour. See [Mike and kitbot](../docs/kitbot-mike.md).
+
+## Kit-credit bank
+
+The **Credit bank** page manages earned kit credits, audit receipts, and revocable balance-only API keys. One credit purchases one kit; the free hourly allowance is independent. Verified Administrator players receive separate Mike credit tools and an operator prompt. See [the bank guide](../docs/kit-credit-bank.md), also bundled as `kit-credit-bank.md`.

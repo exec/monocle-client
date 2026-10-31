@@ -76,26 +76,92 @@ public final class BotWorkflows {
             end
             """,List.of(),List.of("Current")));
         String kitScript=depositReceipt+"""
+            local function enderAction(args,at,operation,buffered,count)
+             local a={operation=operation,buffered=buffered,count=count}
+             if operation=='Stow' then a.destination='Player' end
+             for _,k in ipairs({'name','homeName','homeWarmupTicks','homeCooldownTicks','dimension','minX','maxX','minY','maxY','minZ','maxZ'}) do a[k]=at[k] end
+             for _,k in ipairs({'kitTypeId','kitExemplar','kitIdentities','includeIncomplete','incomplete'}) do a[k]=args[k] end
+             return bot.stash_buffer(a)
+            end
+            local function enderReceipt(r,before,requested,take,inspect)
+             if not r or (r.capacity~=27 and r.capacity~=54) or type(r.moved)~='number' or r.moved<0 or r.moved>requested or r.moved~=math.floor(r.moved) or r.buffered~=before+(take and -r.moved or r.moved) or r.buffered<0 or r.buffered>r.capacity or (inspect and (r.moved~=0 or r.buffered~=0)) or (not inspect and r.moved==0) then error('Invalid ender cargo receipt') end
+             return r
+            end
+            local function returnVisit(at,death)
+             local back={};for k,v in pairs(at) do back[k]=v end
+             back.returnByDeath=death or false;return bot.stash_visit(back)
+            end
             return function(ctx)
              local s=ctx.state
+             if s.phase=='capacity-arrive' then s.atReturn=true;s.phase='capacity-return' end
+             if s.phase=='capacity-take' then
+              local r=enderReceipt(ctx.result,s.buffered,s.tripCount,true,false)
+              s.buffered=r.buffered;s.returnBatch=r.moved;s.phase='capacity-return'
+             end
+             if s.phase=='capacity-store' then
+              local n,missing=depositCount(ctx.result,s.returnBatch)
+              s.returned=(s.returned or 0)+n;s.missing=(s.missing or 0)+missing;s.returnBatch=0;s.atReturn=true;s.phase='capacity-return'
+             end
+             if s.phase=='capacity-extra' then
+              local n,missing=depositCount(ctx.result,s.incidental[s.extraIndex].count)
+              s.returned=(s.returned or 0)+n;s.missing=(s.missing or 0)+missing;s.extraIndex=s.extraIndex+1;s.phase='capacity-return'
+             end
+             if s.phase=='capacity-return' then
+              if not ctx.args.fillAllocatedColumns or not ctx.args.returnStash then return bot.fail('Missing column-overflow return route') end
+              if (s.returnBatch or 0)>0 then
+               local store={};for k,v in pairs(ctx.args.returnStash) do store[k]=v end
+               for _,k in ipairs({'kitTypeId','kitExemplar','kitIdentities','incomplete','includeIncomplete','catalogCrew'}) do store[k]=ctx.args[k] end
+               store.type='StashDeposit';store.count=s.returnBatch;s.phase='capacity-store';return bot.stash_store(store)
+              end
+              if (s.buffered or 0)>0 then
+               if not s.atReturn then s.phase='capacity-arrive';return returnVisit(ctx.args.returnStash,false) end
+               s.phase='capacity-take';return enderAction(ctx.args,ctx.args.returnStash,'Take',s.buffered,s.tripCount)
+              end
+              if s.incidental and s.extraIndex<=#s.incidental then
+               local store={};for k,v in pairs(ctx.args.returnStash) do store[k]=v end
+               for _,k in ipairs({'kitTypeId','kitExemplar','count','includeIncomplete','incomplete'}) do store[k]=s.incidental[s.extraIndex][k] end
+               store.type='StashDeposit';store.protectedBoxes=s.protectedBoxes;s.phase='capacity-extra';return bot.stash_store(store)
+              end
+              return bot.done({delivered=s.total,missing=s.missing or 0,destinationFull=true,retained=0,returned=s.returned or 0,sourceExhausted=false})
+             end
              if s.phase=='returning' then
               if ctx.result and ctx.result.ok==false then return bot.fail('Courier return failed; '..(ctx.result.detail or 'check the worker')) end
               if s.deliveryFailure then
                if (s.returnCount or 0)>0 then
-                local store={};for k,v in pairs(ctx.args.returnStash) do store[k]=v end
-                store.type='StashDeposit';store.count=s.returnCount
-                for _,k in ipairs({'kitTypeId','kitExemplar','kitIdentities','incomplete','includeIncomplete','catalogCrew'}) do store[k]=ctx.args[k] end
-                s.phase='return-depositing';return bot.stash_store(store)
+                s.phase='return-stowing';return enderAction(ctx.args,ctx.args.returnStash,'Stow',0,s.returnCount)
                end
                return bot.fail('Delivery incomplete; returned to source: '..s.deliveryFailure)
               end
               return bot.done({delivered=s.total,missing=s.missing or 0,returnedHome=true})
              end
+             if s.phase=='return-stowing' then
+              local r=ctx.result
+              if not r or type(r.moved)~='number' or r.moved~=s.returnCount or (r.capacity~=27 and r.capacity~=54) or type(r.buffered)~='number' or r.buffered<r.moved or r.buffered>r.capacity then return bot.fail('Undelivered kits could not all be secured in the ender chest; inspect retained cargo') end
+              s.returned=r.moved;return bot.fail('Delivery incomplete; secured '..r.moved..' kits in the ender chest. Requester cooldown retained.')
+             end
+             -- Legacy checkpoints may already be reconciling a source deposit.
              if s.phase=='return-depositing' then
               local n,missing=depositCount(ctx.result,s.returnCount)
               return bot.fail('Delivery incomplete; returned to source and redeposited '..n..' kits ('..missing..' missing): '..s.deliveryFailure)
              end
-             if not s.phase then s.phase='take'; s.left=ctx.args.count; s.cursor=ctx.args.oneBatch and (ctx.args.pickIndex or 0) or 0; s.all=ctx.args.transferAll or false; s.total=0 end
+             if not s.phase then
+              s.phase='take'; s.left=ctx.args.count; s.tripCount=ctx.args.count; s.cursor=ctx.args.oneBatch and (ctx.args.pickIndex or 0) or 0; s.all=ctx.args.transferAll or false; s.total=0
+              if ctx.args.enderTransport then
+               if not s.all or ctx.args.destination~='Stash' or ctx.args.oneBatch or ctx.args.targetStash.targetColumn then return bot.fail('Ender transport requires a sequential until-empty stash transfer') end
+               s.phase='buffer-inspect';return enderAction(ctx.args,ctx.args,'Inspect',0,ctx.args.count)
+              end
+             end
+             if s.phase=='buffer-inspect' then
+              local r=enderReceipt(ctx.result,0,0,false,true);s.bufferCapacity=r.capacity;s.buffered=0;s.phase='take'
+             elseif s.phase=='buffer-store' then
+              local r=enderReceipt(ctx.result,s.buffered,s.batch,false,false)
+              s.buffered=r.buffered;s.bufferCapacity=r.capacity
+              if r.moved==s.batch then s.batch=nil;s.phase='take'
+              else s.batch=s.batch-r.moved;s.bufferStoreLimited=true;s.phase='deliver' end
+             elseif s.phase=='buffer-take' then
+              local r=enderReceipt(ctx.result,s.buffered,s.tripCount,true,false)
+              s.buffered=r.buffered;s.bufferCapacity=r.capacity;s.batch=r.moved;s.phase='deliver'
+             elseif s.phase=='buffer-arrive' then s.atDestination=true;s.phase='take' end
              if s.phase=='taking' then
               local r=ctx.result
               if not r or not r.picked or not r.nextPick or r.picked<0 or r.picked>(s.all and ctx.args.count or s.left) or r.nextPick<s.cursor or r.nextPick>#ctx.args.picks or (r.sourceExhausted and (r.nextPick~=#ctx.args.picks or r.sourceDeferred)) or (r.sourceDeferred and (type(r.deferredSources)~='table' or #r.deferredSources==0 or #r.deferredSources>54)) or (r.picked==0 and not (r.inventoryFull and r.incidental and #r.incidental>0) and not (s.all and (r.sourceExhausted or (r.sourceDeferred and r.nextPick==#ctx.args.picks)))) then return bot.fail('Invalid kit pickup receipt') end
@@ -114,7 +180,7 @@ public final class BotWorkflows {
               end
               if not s.all then s.left=s.left-r.picked end
               s.batch=r.picked; s.cursor=r.nextPick; s.exhausted=r.sourceExhausted or false; s.issue=r.sourceIssue
-              if s.batch==0 and #s.incidental==0 then
+              if s.batch==0 and #s.incidental==0 and (s.buffered or 0)==0 then
                if ctx.args.oneBatch then return bot.done({delivered=0,missing=0,picked=0,nextPick=s.cursor,sourceExhausted=s.exhausted,sourceDeferred=s.deferred~=nil,deferredSources=s.deferred}) end
                if s.deferred then return bot.done({delivered=s.total,missing=s.missing or 0,sourceExhausted=false,sourceDeferred=true,deferredSources=s.deferred}) end
                s.emptyPasses=(s.emptyPasses or 0)+1
@@ -130,11 +196,15 @@ public final class BotWorkflows {
              if s.phase=='storing' then
               if ctx.result and ctx.result.columnFull==true then
                local r=ctx.result; local n=r.deposited; local missing=r.missing or 0; local retained=r.retained
-               if not ctx.args.targetStash or not ctx.args.targetStash.targetColumn or type(n)~='number' or type(missing)~='number' or type(retained)~='number' or n<0 or missing<0 or retained<0 or n~=math.floor(n) or missing~=math.floor(missing) or retained~=math.floor(retained) or n+missing+retained~=s.batch then return bot.fail('Invalid full-column deposit receipt') end
+               if not ctx.args.targetStash or not (ctx.args.targetStash.targetColumn or ctx.args.fillAllocatedColumns and ctx.args.returnStash) or type(n)~='number' or type(missing)~='number' or type(retained)~='number' or n<0 or missing<0 or retained<0 or n~=math.floor(n) or missing~=math.floor(missing) or retained~=math.floor(retained) or n+missing+retained~=s.batch then return bot.fail('Invalid full-column deposit receipt') end
+               if ctx.args.fillAllocatedColumns then
+                s.total=s.total+n;s.missing=(s.missing or 0)+missing;s.returnBatch=retained;s.phase='capacity-return';return bot.wait(0)
+               end
                return bot.done({delivered=s.total+n,missing=(s.missing or 0)+missing,retained=retained,columnFull=true,sourceExhausted=false})
               end
               local n,missing=depositCount(ctx.result,s.batch)
               s.total=s.total+n; s.missing=(s.missing or 0)+missing; s.phase='take'
+              if ctx.args.enderTransport then s.atDestination=true end
              end
              if s.phase=='dropping' then
               if ctx.result and ctx.result.ok==false and ctx.result.dropped==nil then return bot.fail('Courier failure lacks confirmed drop counts; inspect inventory') end
@@ -143,7 +213,7 @@ public final class BotWorkflows {
               s.total=s.total+n;s.phase='take'
               if ctx.result and ctx.result.ok==false then
                if not ctx.args.returnStash then return bot.fail(ctx.result.detail or 'Safe handoff failed') end
-               s.returnCount=s.batch-n;s.deliveryFailure=ctx.result.detail or 'Safe handoff failed';s.phase='returning';return bot.stash_visit(ctx.args.returnStash)
+               s.returnCount=s.batch-n;s.deliveryFailure=ctx.result.detail or 'Safe handoff failed';s.phase='returning';return returnVisit(ctx.args.returnStash,false)
               end
               if n~=s.batch then return bot.fail('Incomplete courier drop receipt') end
              end
@@ -153,7 +223,7 @@ public final class BotWorkflows {
              end
              if s.phase=='take' and s.batch~=nil and s.incidental and s.extraIndex<=#s.incidental then
               local extra=s.incidental[s.extraIndex]; local target={}
-              for k,v in pairs(ctx.args.targetStash) do if k~='targetColumn' and k~='columnKitTypeIds' then target[k]=v end end
+              for k,v in pairs(ctx.args.targetStash) do if k~='targetColumn' and k~='columnKitTypeIds' and k~='fillAllocatedColumns' and k~='allocatedColumns' then target[k]=v end end
               for _,k in ipairs({'kitTypeId','kitExemplar','count','includeIncomplete','incomplete'}) do target[k]=extra[k] end
               target.protectedBoxes=s.protectedBoxes
               s.phase='extra-storing'; return bot.stash_store(target)
@@ -161,29 +231,40 @@ public final class BotWorkflows {
              if s.phase=='teleporting' then
               if ctx.result and ctx.result.ok==false then
                if not ctx.args.returnStash then return bot.fail(ctx.result.detail or 'Recipient TPA failed') end
-               s.returnCount=s.batch;s.deliveryFailure=ctx.result.detail or 'Recipient TPA failed';s.phase='returning';return bot.stash_visit(ctx.args.returnStash)
+               s.tpaTimedOut=ctx.result.tpaTimedOut==true;s.returnCount=s.batch;s.deliveryFailure=ctx.result.detail or 'Recipient TPA failed';s.phase='returning';return returnVisit(ctx.args.returnStash,false)
               end
               s.phase='dropping'
               return bot.drop({item=ctx.args.kitItem,kitTypeId=ctx.args.kitTypeId,kitExemplar=ctx.args.kitExemplar,kitIdentities=ctx.args.kitIdentities,incomplete=ctx.args.incomplete,count=s.batch,recipient=ctx.args.recipient,handoff=true,deliveryAnchor=ctx.result and ctx.result.deliveryAnchor,allowFailure=ctx.args.returnStash~=nil})
              end
              if s.phase=='deliver' then
+              if ctx.args.enderTransport and not s.atDestination and not s.bufferStoreLimited and s.batch>0 and s.buffered<s.bufferCapacity and not s.exhausted and (not s.deferred or s.cursor<#ctx.args.picks) and not s.issue and #s.incidental==0 then
+               s.phase='buffer-store';return enderAction(ctx.args,ctx.args,'Store',s.buffered,s.batch)
+              end
               if ctx.args.destination=='Player' then
                s.phase='teleporting'
                return bot.tpa({target=ctx.args.recipient,targetName=ctx.args.recipientName,external=true,radius=4,timeoutTicks=1200,allowFailure=ctx.args.returnStash~=nil})
               end
-              if s.batch==0 then s.phase='take'; return bot.wait(0) end
+              if s.batch==0 then
+               if (s.buffered or 0)>0 and not s.atDestination then s.phase='buffer-arrive';return bot.stash_visit(ctx.args.targetStash) end
+               s.phase='take'; return bot.wait(0)
+              end
               s.phase='storing'; ctx.args.targetStash.count=s.batch
               return bot.stash_store(ctx.args.targetStash)
              end
+             if s.phase=='take' and s.atDestination and (s.buffered or 0)>0 then
+              s.phase='buffer-take';return enderAction(ctx.args,ctx.args.targetStash,'Take',s.buffered,s.tripCount)
+             end
+             if s.phase=='take' then s.atDestination=false;s.bufferStoreLimited=nil end
              if s.issue then return bot.fail('Delivered '..s.total..' kits before source needs attention: '..s.issue) end
              if ctx.args.oneBatch and s.batch~=nil and s.phase=='take' then return bot.done({delivered=s.total,missing=s.missing or 0,picked=s.batch,nextPick=s.cursor,sourceExhausted=s.exhausted,sourceDeferred=s.deferred~=nil,deferredSources=s.deferred,inventoryFull=s.inventoryFull,incidentalDelivered=s.extraDelivered or 0,incidentalMissing=s.extraMissing or 0}) end
              if s.all and s.deferred and s.cursor==#ctx.args.picks then return bot.done({delivered=s.total,missing=s.missing or 0,sourceExhausted=false,sourceDeferred=true,deferredSources=s.deferred}) end
              if s.left==0 then
-              if ctx.args.returnStash then s.phase='returning';return bot.stash_visit(ctx.args.returnStash) end
+              if ctx.args.returnStash then s.phase='returning';return returnVisit(ctx.args.returnStash,ctx.args.returnByDeath) end
               return bot.done({delivered=s.total,missing=s.missing or 0,sourceExhausted=s.exhausted})
              end
              if s.all and s.exhausted then s.cursor=0; s.exhausted=false end
-             s.phase='taking'; ctx.args.count=s.all and ctx.args.count or s.left; ctx.args.pickIndex=s.cursor
+             s.phase='taking'; ctx.args.count=s.all and (s.tripCount or ctx.args.count) or s.left; ctx.args.pickIndex=s.cursor
+             if ctx.args.enderTransport and s.buffered<s.bufferCapacity then ctx.args.count=math.min(ctx.args.count,s.bufferCapacity-s.buffered) end
              return bot.stash_resupply(ctx.args)
             end
             """;
@@ -202,7 +283,7 @@ public final class BotWorkflows {
              local progress=s.routes[s.index]
              if s.phase=='planned' then
               local plan=ctx.result and ctx.result.args; local carried=ctx.result and ctx.result.carried or 0
-              if not plan or plan.kitTypeId~=routes[s.index].kitTypeId or plan.oneBatch~=true or not whole(carried,36) or not plan.picks or #plan.picks<1 or #plan.picks>54 then return bot.fail('Invalid Round Robin plan') end
+              if not plan or plan.kitTypeId~=routes[s.index].kitTypeId or plan.oneBatch~=true or not whole(carried,36) or not plan.picks or #plan.picks<1 or #plan.picks>(plan.compactPicks and 1024 or 54) then return bot.fail('Invalid Round Robin plan') end
               if s.preparing then
                if carried>0 then
                 s.phase='recovering'; s.recoverCount=carried; plan.targetStash.count=carried
@@ -248,6 +329,53 @@ public final class BotWorkflows {
               return bot.done({delivered=s.total,missing=s.missing,recovered=s.recovered,byRoute=results,byKit=byKit,sourceExhausted=true})
              end
              s.phase='planned'; return bot.kit_transfer_plan({index=s.index})
+            end
+            """;
+        String columnRotation="""
+            local function columnStep(ctx)
+             local s=ctx.state; local ids=ctx.args.kitTypeIds
+             if not s.index then
+              s.index=1; s.total=0; s.missing=0; s.returned=0; s.types={}
+              for i,_ in ipairs(ids) do s.types[i]={column=1,delivered=0} end
+             end
+             local p=s.types[s.index]
+             if s.phase=='planned' then
+              local result=ctx.result
+              if result and result.sourceUnavailable==true then p.deferred=true; s.index=s.index%#ids+1; s.phase=nil
+              else
+               local plan=result and result.args
+               if not plan or plan.kitTypeId~=ids[s.index] or not plan.targetStash or not plan.returnStash or plan.enderTransport then return bot.fail('Invalid column rotation plan') end
+               plan.fillAllocatedColumns=true; plan.targetStash.fillAllocatedColumns=true
+               plan.targetStash.allocatedColumns={ctx.args.columnAllocations[ids[s.index]][p.column]}
+               s.phase='delivering';return bot.call('task-kit-delivery',plan)
+              end
+             elseif s.phase=='delivering' then
+              local r=ctx.result and ctx.result.value
+              if not r or not whole(r.delivered,10000000) or not whole(r.missing or 0,10000000) or not whole(r.returned or 0,10000000) or not (r.sourceExhausted==true or r.sourceDeferred==true or r.destinationFull==true) then return bot.fail('Invalid column rotation receipt') end
+              s.total=s.total+r.delivered; s.missing=s.missing+(r.missing or 0); s.returned=s.returned+(r.returned or 0); p.delivered=p.delivered+r.delivered
+              if r.destinationFull then
+               if r.retained~=0 then return bot.fail('Column rotation must return excess cargo before switching kits') end
+               p.column=p.column+1; p.limited=p.column>#ctx.args.columnAllocations[ids[s.index]]
+              elseif r.sourceExhausted then p.done=true
+              else p.deferred=true end
+              s.index=s.index%#ids+1; s.phase=nil
+             end
+             local checked=0
+             while checked<#ids do
+              p=s.types[s.index]
+              if not p.done and not p.deferred and not p.limited then break end
+              s.index=s.index%#ids+1;checked=checked+1
+             end
+             if checked==#ids then
+              local byKit={};local deferred={};local limited={};local exhausted=true
+              for i,id in ipairs(ids) do
+               p=s.types[i];byKit[id]=p.delivered
+               if p.deferred then deferred[id]=true;exhausted=false end
+               if p.limited then limited[id]=true;exhausted=false end
+              end
+              return bot.done({delivered=s.total,missing=s.missing,returned=s.returned,byKit=byKit,deferred=deferred,destinationLimited=limited,sourceExhausted=exhausted})
+             end
+             s.phase='planned';return bot.kit_transfer_plan({index=s.index})
             end
             """;
         String mixedLoads="""
@@ -331,8 +459,9 @@ public final class BotWorkflows {
              return bot.done({delivered=s.total,missing=s.missing,byKit=s.byKit,sourceExhausted=true})
             end
             """;
-        values.put("task-stash-transfer",new Workflow("task-stash-transfer","Transfer Stash Kits","Stash Management",true,List.of(),depositReceipt+roundRobin+mixedLoads+"""
+        values.put("task-stash-transfer",new Workflow("task-stash-transfer","Transfer Stash Kits","Stash Management",true,List.of(),depositReceipt+roundRobin+columnRotation+mixedLoads+"""
             return function(ctx)
+             if ctx.args.columnAllocations then return columnStep(ctx) end
              if ctx.args.mixedLoads then return mixedStep(ctx) end
              if ctx.args.routes then return routeStep(ctx) end
              local s=ctx.state
@@ -359,11 +488,12 @@ public final class BotWorkflows {
              end
              if s.phase=='delivering' then
               local r=ctx.result and ctx.result.value
-              if not r or (r.sourceExhausted~=true and r.sourceDeferred~=true) or (r.sourceDeferred and (r.sourceExhausted or type(r.deferredSources)~='table' or #r.deferredSources==0 or #r.deferredSources>54)) or not r.delivered or r.delivered<0 or r.delivered>10000000 or r.delivered~=math.floor(r.delivered) then return bot.fail('Invalid completed kit transfer receipt') end
+              if not r or (r.sourceExhausted~=true and r.sourceDeferred~=true and r.destinationFull~=true) or (r.sourceDeferred and (r.sourceExhausted or type(r.deferredSources)~='table' or #r.deferredSources==0 or #r.deferredSources>54)) or (r.destinationFull and (not ctx.args.fillAllocatedColumns or r.sourceExhausted or r.sourceDeferred or r.retained~=0 or type(r.returned)~='number' or r.returned<0 or r.returned>10000000 or r.returned~=math.floor(r.returned))) or not r.delivered or r.delivered<0 or r.delivered>10000000 or r.delivered~=math.floor(r.delivered) then return bot.fail('Invalid completed kit transfer receipt') end
               local missing=0; if r.missing~=nil then missing=r.missing end
               if type(missing)~='number' or missing<0 or missing>10000000 or missing~=math.floor(missing) then return bot.fail('Invalid missing-kit receipt') end
               s.missing=(s.missing or 0)+missing
               local kit=ctx.args.kitTypeIds[s.index]
+              if r.destinationFull then s.capacityLimited=s.capacityLimited or {};s.capacityLimited[kit]=true;s.returned=(s.returned or 0)+r.returned end
               if r.sourceDeferred then s.deferred[kit]=true; s.lastDeferred=r.deferredSources[1] else s.deferred[kit]=nil end
               s.delivered[ctx.args.kitTypeIds[s.index]]=(s.delivered[ctx.args.kitTypeIds[s.index]] or 0)+r.delivered
               s.total=s.total+r.delivered; s.index=s.index+1
@@ -374,13 +504,13 @@ public final class BotWorkflows {
               elseif next(s.deferred) then
                if s.retrying then return bot.fail('Transferred '..s.total..' kits; hopper columns remain unresolved (see deferred kit details)') end
                s.retrying=true; s.index=1
-              else return bot.done({delivered=s.total,missing=s.missing or 0,byKit=s.delivered,recovered=s.recovered or 0,typesCompleted=#ctx.args.kitTypeIds,sourceExhausted=true}) end
+              else return bot.done({delivered=s.total,missing=s.missing or 0,byKit=s.delivered,recovered=s.recovered or 0,returned=s.returned or 0,destinationLimited=s.capacityLimited or {},typesCompleted=#ctx.args.kitTypeIds,sourceScanGaps=ctx.args.sourceScanGaps or 0,sourceExhausted=next(s.capacityLimited or {})==nil and (ctx.args.sourceScanGaps or 0)==0}) end
              end
              if s.retrying then
               while s.index<=#ctx.args.kitTypeIds and not s.deferred[ctx.args.kitTypeIds[s.index]] do s.index=s.index+1 end
               if s.index>#ctx.args.kitTypeIds then
                if next(s.deferred) then return bot.fail('Transferred '..s.total..' kits; hopper columns remain unresolved (see deferred kit details)') end
-               return bot.done({delivered=s.total,missing=s.missing or 0,byKit=s.delivered,recovered=s.recovered or 0,typesCompleted=#ctx.args.kitTypeIds,sourceExhausted=true})
+               return bot.done({delivered=s.total,missing=s.missing or 0,byKit=s.delivered,recovered=s.recovered or 0,returned=s.returned or 0,destinationLimited=s.capacityLimited or {},typesCompleted=#ctx.args.kitTypeIds,sourceScanGaps=ctx.args.sourceScanGaps or 0,sourceExhausted=next(s.capacityLimited or {})==nil and (ctx.args.sourceScanGaps or 0)==0})
               end
              end
              s.phase='planned'

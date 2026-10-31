@@ -231,7 +231,7 @@ public final class SwarmCrew extends dev.monocle.coordinator.HighwayCoordinator<
         builder().pauseJob(reason);builder().disable();clearLocal();phase="failed";swarm.error(reason);
     }
     public boolean live() { return swarm.isActive() && (swarm.isWorker() || swarm.isHost() && connections().stream().anyMatch(SwarmConnection::connected)); }
-    protected String scope() { return !Utils.canUpdate() ? "" : (mc.getCurrentServer() == null ? "local" : mc.getCurrentServer().ip) + "\n" + mc.level.dimension().identifier(); }
+    protected String scope() { return !Utils.canUpdate() ? "" : (mc.getCurrentServer() == null ? "local" : dev.monocle.client.utils.Utils.getServerIdentity()) + "\n" + mc.level.dimension().identifier(); }
     private Path namedJournal() { return MonocleClient.FOLDER.toPath().resolve(crewName.isEmpty() ? "swarm-crew-recovery.json" : "bot-crew-" + UUID.nameUUIDFromBytes(crewName.getBytes(java.nio.charset.StandardCharsets.UTF_8)) + ".json"); }
     protected Path journal() { return legacyRecovery ? MonocleClient.FOLDER.toPath().resolve("swarm-crew-recovery.json") : namedJournal(); }
     protected Path endings() { return namedJournal().resolveSibling(namedJournal().getFileName().toString().replace(".json", "-endings.json")); }

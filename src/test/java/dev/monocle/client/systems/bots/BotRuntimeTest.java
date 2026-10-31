@@ -64,13 +64,13 @@ public final class BotRuntimeTest {
 
         // An actual disk round-trip preserves the nested frames, args and action identity.
         var directory = Files.createTempDirectory("monocle-runtime-check-");
-        var checkpoint = directory.resolve("worker.json");
         JsonObject restored;
-        try {
-            write(checkpoint, run);
-            restored = read(checkpoint);
+        try (var journal=new dev.monocle.coordinator.TaskJournal(directory.resolve("worker.sqlite"),directory.resolve("worker.json"),"runs")) {
+            JsonObject root=new JsonObject(),records=new JsonObject();root.addProperty("version",1);records.add(id(run).toString(),run);root.add("runs",records);
+            journal.write(root);
+            restored = journal.read().getAsJsonObject("runs").getAsJsonObject(id(run).toString());
             assert restored.equals(run);
-        } finally { Files.deleteIfExists(checkpoint); Files.deleteIfExists(directory); }
+        } finally { try(var files=Files.list(directory)){for(var file:files.toList())Files.delete(file);}Files.delete(directory); }
         BotRuntime.validateCheckpoint(id(restored), restored);
         assert token.equals(text(BotRuntime.top(restored), "token"));
         // Native execution has its own tests; deliver its recorded result to the real Lua frame.
@@ -149,8 +149,16 @@ public final class BotRuntimeTest {
         stashFrame.getAsJsonObject("native").add("stashDeposit", object("{pending:true}"));
         assert !BotRuntime.needsActionRestore(stashFrame, "", "Cancelled") && BotRuntime.hasUncertainAction(retainedRun);
         stashFrame.getAsJsonObject("native").remove("stashDeposit");
+        stashFrame.getAsJsonObject("native").add("stashBuffer", object("{pending:true}"));
+        assert BotRuntime.hasUncertainAction(retainedRun)&&!BotRuntime.needsActionRestore(stashFrame,"","Cancelled")
+            : "Interrupted ender cargo remains guarded and is not replayed during cancellation";
+        stashFrame.getAsJsonObject("native").remove("stashBuffer");
         stashFrame.getAsJsonObject("native").add("pendingDrop", new JsonObject());
-        assert BotRuntime.needsActionRestore(stashFrame, "", "Cancelled") : "Drop/teleport reconciliation is unchanged";
+        assert !BotRuntime.needsActionRestore(stashFrame, "", "Cancelled")&&BotRuntime.hasUncertainAction(retainedRun) : "Cancelled drops retain evidence without restarting their executor";
+        assert BotActions.dropNeedsSettlement("Running",true) : "An issued live drop gets its bounded confirmation window";
+        assert !BotActions.dropNeedsSettlement("Failed",true)&&BotActions.dropNeedsSettlement("Failed",false) : "Cancellation can yield after an uncertain drop times out; pause retains reconciliation";
+        JsonObject tpaFrame=object("{token:'saved-token',action:{type:'Tpa'},commandSent:true,native:{state:'Running',tpaSent:true}}");
+        assert !BotRuntime.needsActionRestore(tpaFrame,"","Cancelled")&&BotRuntime.needsActionRestore(tpaFrame,"","") : "Cancel never resends or waits forever for an old TPA; ordinary resume observes it";
         for (String outcome : java.util.List.of("Suspended", "Failed", "Complete", "Cancelled")) {
             assert BotRuntime.finishOutcome("Cancelled", outcome).equals("Cancelled") : "Retries, failures and disconnects cannot undo host cancellation";
             assert BotRuntime.finishOutcome(outcome, "Cancelled").equals("Cancelled");

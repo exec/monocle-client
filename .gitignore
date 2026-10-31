@@ -28,6 +28,7 @@ bot-worker-tasks.json
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.sqlite.initialized
 *.db
 *.db-wal
 *.db-shm

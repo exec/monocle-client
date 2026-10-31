@@ -76,6 +76,16 @@ public final class StashStore {
         if(!Files.exists(path(file)))return new JsonObject();
         return readOnly(file,c->load(c,null));
     }
+    static JsonObject watchHeader(Path file){
+        if(!Files.exists(path(file)))return new JsonObject();
+        return readOnly(file,c->{
+            JsonObject result=new JsonObject();
+            try(var s=c.createStatement();var r=s.executeQuery("SELECT key,value FROM metadata WHERE key IN ('name','scope','crew','bounds')")){
+                while(r.next())result.add(r.getString(1),JsonParser.parseString(r.getString(2)));
+            }
+            return result;
+        });
+    }
     /** Own commits plus SQLite's external-commit counter; reopening always changes the token. */
     static synchronized String revision(Path file){
         Path checked=path(file);if(!Files.exists(checked))return "missing";

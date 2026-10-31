@@ -207,6 +207,20 @@ public final class BotStashObserver {
     }
     public void reconcile(BlockPos p){if(enabled()&&mc.level!=null&&!predicted(p)&&mc.level.getChunkSource().hasChunk(p.getX()>>4,p.getZ()>>4))block(p,mc.level.getBlockState(p));}
     public boolean knownSource(BlockPos p){String cell=p.getX()+","+p.getY()+","+p.getZ();return watches.values().stream().filter(w->w.scope.equals(world)).map(w->w.records.get(cell)).anyMatch(r->r!=null&&!text(r,"status").equals("removed"));}
+    boolean knownOccupancy(JsonObject action,BlockPos p,boolean full){
+        if(action.has("sortBatch")||dev.monocle.coordinator.TaskWire.flag(action,"requireLocal"))return false;
+        Watch w=watches.get(key(world,text(action,"name")));if(w==null||!w.owner.isEmpty()&&!w.owner.equals(owner))return false;
+        String cell=p.getX()+","+p.getY()+","+p.getZ();JsonObject record=latest(w,cell);
+        if(record!=null&&!text(record,"status").equals("removed"))return observedOccupancy(record,full);
+        for(BlockPos anchor:relatedAnchors(w.records,p))if(observedOccupancy(latest(w,anchor.getX()+","+anchor.getY()+","+anchor.getZ()),full))return true;
+        return false;
+    }
+    static boolean observedOccupancy(JsonObject record,boolean full){
+        if(record==null||!text(record,"status").equals("observed")||dev.monocle.coordinator.TaskWire.flag(record,"inferred")||!record.has("slotCount")||!record.has("occupiedSlots")||!record.has("observedAt"))return false;
+        long at=record.get("observedAt").getAsLong(),now=System.currentTimeMillis();if(at<=0||at>now||now-at>86_400_000L)return false;
+        int slots=record.get("slotCount").getAsInt(),occupied=record.get("occupiedSlots").getAsInt();
+        return slots>0&&occupied==(full?slots:0);
+    }
     public boolean catalogReady(){return restored;}
     private void physical(BlockPos p,BlockState confirmedState){
         if(mc.level==null||predicted(p)||!geometryReady(mc.level,p,v->mc.level.getChunkSource().hasChunk(v.getX()>>4,v.getZ()>>4))||!mc.level.getBlockState(p).equals(confirmedState))return;
@@ -276,7 +290,7 @@ public final class BotStashObserver {
         for(JsonElement entry:journal.getAsJsonArray("pending"))apply.accept(entry.getAsJsonObject());
     }
     public void tick(){
-        tick++;String scope=mc.level==null?"":(mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();
+        tick++;String scope=mc.level==null?"":(mc.getCurrentServer()==null?"local":dev.monocle.client.utils.Utils.getServerIdentity())+"\n"+mc.level.dimension().identifier();
         if(!scope.equals(world)){flushMenu();parkFlight();clearMenu();openings.clear();confirmed.clear();catchup.clear();world=scope;loadAt=0;}
         if(!bots.isWorker()&&!owner.isEmpty()){owner="";parkFlight();}
         if(!enabled()){clearMenu();confirmed.clear();catchup.clear();}
@@ -287,8 +301,9 @@ public final class BotStashObserver {
             }
         }}
         if(menuDirty&&(tick-menuTick>=2||mc.player==null||mc.player.containerMenu.containerId!=menu)){flushMenu();if(mc.player==null||mc.player.containerMenu.containerId!=menu)clearMenu();}
-        if(loading==null&&System.currentTimeMillis()-loadAt>10_000){loadAt=System.currentTimeMillis();boolean host=bots.isHost(),restore=!restored;loading=CompletableFuture.supplyAsync(()->{
-            JsonArray data=StashCatalog.localWatches(root(),host);
+        if(loading==null&&System.currentTimeMillis()-loadAt>10_000){loadAt=System.currentTimeMillis();boolean host=bots.isHost(),restore=!restored;
+            Set<String> hostOwned=new HashSet<>();watches.forEach((key,watch)->{if(!watch.owner.isEmpty())hostOwned.add(key);});loading=CompletableFuture.supplyAsync(()->{
+            JsonArray data=StashCatalog.localWatches(root(),host,hostOwned);
             if(restore){JsonObject journal=TaskFiles.read(outbox());TaskFiles.jsonBytes(journal,4*1024*1024);if(journal.has("pending"))data.add(journal);}return data;
         },writer);}
         if(loading!=null&&loading.isDone()){
@@ -307,8 +322,7 @@ public final class BotStashObserver {
         if(saving!=null){if(!saving.isDone())return;try{saving.join();}catch(RuntimeException e){warn("Live stash save failed; queued updates retained: "+e.getMessage());dirty=true;}saving=null;}
         if(dirty){JsonArray queue=new JsonArray();flights.values().forEach(m->queue.add(m.deepCopy()));pending.values().forEach(m->queue.add(m.deepCopy()));JsonObject journal=new JsonObject();journal.addProperty("version",1);journal.add("pending",queue);TaskFiles.jsonBytes(journal,4*1024*1024);
             saving=CompletableFuture.runAsync(()->journalFirst(outbox(),journal,m->{if(!savedEvents.contains(text(m,"eventId"))){
-                String crew=text(m,"crew"),scopeName=text(m,"scope");JsonObject db=StashCatalog.get(root(),crew,scopeName,text(m,"name"));if(db.isEmpty()&&!text(m,"owner").isEmpty()){StashCatalog.define(root(),crew,scopeName,m.getAsJsonObject("plan"));db=StashCatalog.get(root(),crew,scopeName,text(m,"name"));}
-                String cell=StashCatalog.containerKey(m.getAsJsonObject("observation"));JsonObject local=m.deepCopy();if(!db.isEmpty()&&!text(m,"owner").isEmpty())local.addProperty("basis",StashCatalog.observationBasis(db.getAsJsonObject("containers").has(cell)?db.getAsJsonObject("containers").getAsJsonObject(cell):null));JsonObject ack=StashCatalog.acceptLive(root(),crew,scopeName,text(m,"worker"),local);ack.add("watchKey",m.get("watchKey"));localAcks.add(ack);
+                JsonObject ack=StashCatalog.acceptLocalLive(root(),m);ack.add("watchKey",m.get("watchKey"));localAcks.add(ack);
                 savedEvents.add(text(m,"eventId"));while(savedEvents.size()>512)savedEvents.remove(savedEvents.iterator().next());}}),writer);dirty=false;return;}
         if(!flights.isEmpty()){JsonObject first=flights.values().iterator().next();if(export()&&bots.isWorker()&&world.equals(text(first,"scope"))&&owner.equals(text(first,"owner"))&&System.currentTimeMillis()-sentAt>5000)send();return;}
         for(var iterator=pending.entrySet().iterator();iterator.hasNext();){var entry=iterator.next();JsonObject m=entry.getValue();if(!text(m,"scope").equals(world))continue;

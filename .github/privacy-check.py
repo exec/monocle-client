@@ -26,7 +26,7 @@ PRIVATE_FILES = {"host-config.json", "host-tasks.json", "bot-worker-tasks.json"}
 
 def findings(path, content):
     name = pathlib.PurePosixPath(path).name
-    if name in PRIVATE_FILES or re.search(r"\.(?:sqlite|db)(?:-wal|-shm)?$", name) or name == '.env' or name.startswith('.env.') and name != '.env.example':
+    if name in PRIVATE_FILES or re.search(r"\.(?:sqlite|db)(?:-wal|-shm|\.initialized)?$", name) or name == '.env' or name.startswith('.env.') and name != '.env.example':
         return [(0, "private runtime/configuration file")]
     if '/' not in path and name.startswith('BUILDING_'):
         return [(0, "personal inventory report")]
@@ -58,6 +58,7 @@ def self_test():
     assert not findings('src/test/Example.java', ('// Synthetic coordinates for precision\nnew BlockPos(' + point + ')').encode())
     assert not findings('docs/example.md', b'128,64,-96')
     assert findings('data/stash.sqlite-wal', b'')
+    assert findings('data/tasks.sqlite.initialized', b'{}')
     assert findings('host-config.json', b'{}')
     assert findings('BUILDING_RESOURCES.txt', b'')
     assert findings('example.txt', ('ghp_' + 'A' * 36).encode())

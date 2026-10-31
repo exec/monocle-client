@@ -60,9 +60,10 @@ import static dev.monocle.client.MonocleClient.mc;
 
 /** One client-thread native action. The host owns scheduling, profiles and teleport commands. */
 public final class BotActions {
-    private static final Set<String> TYPES = Set.of("Travel", "StashHunt", "StashScan", "StashVisit", "StashResupply", "StashDeposit", "KitTransferPlan", "StashSortPlan", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies");
+    private static final Set<String> TYPES = Set.of("Travel", "StashHunt", "StashScan", "StashVisit", "StashResupply", "StashDeposit", "StashBuffer", "KitTransferPlan", "StashSortPlan", "DropItems", "Wait", "Modules", "Tpa", "SetProfile", "Highway", "RecoverSupplies");
     private static final Set<String> EXTERNAL = Set.of("Highway", "SetProfile", "KitTransferPlan", "StashSortPlan");
-    private static final Set<String> STASH_ACTIONS = Set.of("StashScan", "StashVisit", "StashResupply", "StashDeposit");
+    private static final Set<String> STASH_ACTIONS = Set.of("StashScan", "StashVisit", "StashResupply", "StashDeposit", "StashBuffer");
+    private static final int DROP_MOVES_PER_TICK = 4;
     private static final int STASH_FLIGHT_MIN_DURABILITY = 64, STASH_FLIGHT_LANDING_RESERVE = 32;
     private static final Set<String> RESERVED_MODULES = Set.of("highway-builder", "printer-helper");
     private static final List<String> CRYSTAL_GUARD_MODULES = List.of("auto-totem", "auto-gap", "auto-eat", "auto-armor", "crystal-aura");
@@ -72,6 +73,8 @@ public final class BotActions {
     private boolean stashMending;
     private boolean stashMendDeferred;
     private int stashMendDamage=-1,stashMendIdle;
+    private Object stashMendRetryPlayer;
+    private int stashMendRetryAt;
     private dev.monocle.coordinator.ActionProgress progress = new dev.monocle.coordinator.ActionProgress();
 
     static dev.monocle.coordinator.ActionProgress.Observation progress(String phase, String expected, String milestone, BlockPos target, boolean waiting, boolean navigation) {
@@ -95,6 +98,7 @@ public final class BotActions {
         if ((STASH_ACTIONS.contains(type())||type().equals("DropItems")&&action.has("handoff")&&action.get("handoff").getAsBoolean()) && !dev.monocle.client.utils.network.WorldReadiness.INSTANCE.inventoryReady()) {
             healthyWait = true; waitingFor = "Server inventory synchronization";
         }
+        if(!healthyWait&&respawnReturn!=null){healthyWait=true;waitingFor="Kill cooldown / verified stash respawn";}
         if (!healthyWait && STASH_ACTIONS.contains(type()) && !stashHomeArrived) {
             long now = System.currentTimeMillis();
             healthyWait = stashHomeWaiting(stashHomeAttempts,now,homeReadyAt,bots.stashHomeReadyAt(homeCooldownKey(),action.get("homeCooldownTicks").getAsLong()*50L));
@@ -106,6 +110,7 @@ public final class BotActions {
         else if (stashScan != null) observation = stashScan.progress();
         else if (stashResupply != null) observation = stashResupply.progress();
         else if (stashDeposit != null) observation = stashDeposit.progress();
+        else if (stashBuffer != null) observation = stashBuffer.progress();
         else if (survey != null) observation = survey.progress();
         else if (type().equals("Travel") && !(action.has("follow") && action.get("follow").getAsBoolean())) {
             Vec3 goal = new Vec3(action.get("x").getAsDouble(), action.get("y").getAsDouble(), action.get("z").getAsDouble());
@@ -138,8 +143,11 @@ public final class BotActions {
     }
     private JsonObject action, pending, originals = new JsonObject(), result, deliveryAnchor;
     private Vec3 deliveryGoal;
+    private volatile BotRespawnReturn respawnReturn;
+    private long respawnRequestAt;
     private String state = "Complete", detail = "Idle", dimension = "", pendingStashFailure;
     private int elapsed, remaining, dropWait, lastTick = -1, launchTick = -1, launchAttempts, bodyguardMissingTicks, bodyguardTpaAt;
+    private long tpaSentAtMs;
     private boolean suspended, suspendRequested, checkpoint, armed, acknowledged, listening, modulesApplied, modulesArmed, restoredModuleLease, tpaSent, runOnly, enabledFly, stashHandoff;
     private long homeReadyAt;
     private int stashHomeAttempts;
@@ -150,6 +158,8 @@ public final class BotActions {
     }
     private ClientInput previousInput;
     private LocalPlayer inputPlayer;
+    private LocalPlayer fallCatchPlayer;
+    private int fallCatchTick=-1,fallCatchRequestTick=-1;
     private final CustomPlayerInput input = new CustomPlayerInput();
     private final PrinterFlight.LocalRoute localFlight = new PrinterFlight.LocalRoute();
     private final WalkingRoute walkingRoute=new WalkingRoute();
@@ -157,6 +167,7 @@ public final class BotActions {
     private BotStashScan stashScan;
     private BotStashResupply stashResupply;
     private BotStashDeposit stashDeposit;
+    private BotStashBuffer stashBuffer;
     private BlockPos scanFlightTarget;
     private Vec3 scanCoverageFlightGoal;
     private List<Vec3> scanFlightRoute = List.of();
@@ -177,6 +188,10 @@ public final class BotActions {
     private int stashCollisionWalkUntil;
     private BlockPos stashFlightAttemptTarget;
     private int stashFlightFailures, stashFlightRetryAt;
+    private AisleApproach stashAisle;
+    private BlockPos stashAisleTarget;
+    private boolean stashAisleCentering;
+    private int stashAisleRetryAt;
     private Vec3 stashWalkProgress;
     private int stashWalkProgressTick;
     private final Map<String,Long> emptyStashSources=new LinkedHashMap<>();
@@ -200,7 +215,7 @@ public final class BotActions {
     public void acknowledgeStashDeposit(JsonObject ack){if(stashDeposit!=null)stashDeposit.acknowledge(ack);}
     public JsonObject stashWithdrawal(){return stashResupply==null||!stashResupply.hasWithdrawal()?null:stashResupply.result();}
     public JsonObject stashDeposit(){return stashDeposit==null||!stashDeposit.hasTouched()?null:stashDeposit.result();}
-    public boolean stashFlightActive(){return action!=null&&Set.of("StashScan","StashResupply","StashDeposit").contains(type())&&Utils.canUpdate()&&mc.player.isFallFlying();}
+    public boolean stashFlightActive(){return action!=null&&STASH_ACTIONS.contains(type())&&Utils.canUpdate()&&mc.player.isFallFlying();}
     boolean stashHandoff(){return stashHandoff&&!suspendRequested&&!suspended;}
     static boolean compatibleStashFlight(JsonObject previous,JsonObject next,String world,Position position){
         return previous!=null&&next!=null&&STASH_ACTIONS.contains(previous.get("type").getAsString())&&STASH_ACTIONS.contains(next.get("type").getAsString())
@@ -225,7 +240,7 @@ public final class BotActions {
 
     /** Validate at the Lua/network boundary before acquiring any control or changing a module. */
     public static JsonObject validate(JsonObject source) {
-        if (source == null || source.size() > 32+(source.has("kitIdentities")?1:0)+(source.has("mixedLoad")?1:0)) throw new IllegalArgumentException("Invalid native action");
+        if (source == null || source.size() > 32+(source.has("kitIdentities")?1:0)+(source.has("mixedLoad")?1:0)+(source.has("dimension")?1:0)+(source.has("compactPicks")?1:0)+(source.has("enderTransport")?1:0)+(source.has("fillAllocatedColumns")?1:0)+(source.has("returnStash")?1:0)+(source.has("returnByDeath")?1:0)) throw new IllegalArgumentException("Invalid native action");
         JsonObject a = source.deepCopy();
         String type = string(a, "type", 32);
         if (!TYPES.contains(type)) throw new IllegalArgumentException("Unsupported native action: " + type);
@@ -233,10 +248,14 @@ public final class BotActions {
             case "StashSortPlan" -> a=dev.monocle.coordinator.StashSortExecution.checkedRequest(a);
             case "KitTransferPlan" -> {if(a.has("step"))a=dev.monocle.coordinator.StashTransferTeam.checkedRequest(a);else{if(a.size()!=2)throw new IllegalArgumentException("Kit planning accepts only type and index");integer(a,"index",1,128);}}
             case "StashScan", "StashVisit" -> a = dev.monocle.coordinator.StashCatalog.plan(a);
+            case "StashBuffer" -> a = dev.monocle.coordinator.StashCatalog.bufferAction(a);
             case "StashResupply" -> {
                 if(a.has("mixedLoad")&&(!a.get("mixedLoad").isJsonPrimitive()||!a.getAsJsonPrimitive("mixedLoad").isBoolean()||!a.has("targetStash")||!a.has("knownKitTypeIds")||!a.has("kitTypeId")||!string(a,"depositMode",16).equals("Carry")))throw new IllegalArgumentException("Mixed collection requires a carried stash kit batch");
-                a=dev.monocle.coordinator.StashCatalog.plan(a);JsonArray picks=a.getAsJsonArray("picks");if(picks==null||picks.isEmpty()||picks.size()>(a.has("sortBatch")?64:54))throw new IllegalArgumentException("Invalid selected stash containers");
-                for(JsonElement value:picks){JsonObject p=value.getAsJsonObject();integer(p,"x",-29_900_000,29_900_000);integer(p,"y",-2048,2048);integer(p,"z",-29_900_000,29_900_000);integer(p,"slot",0,215);identifier(string(p,"resource",128));}
+                a=dev.monocle.coordinator.StashCatalog.plan(a);boolean compact=dev.monocle.coordinator.TaskWire.flag(a,"compactPicks");
+                if(compact&&(!dev.monocle.coordinator.TaskWire.flag(a,"transferAll")||!a.has("kitTypeId")))throw new IllegalArgumentException("Compact sources require a full kit transfer");
+                JsonArray picks=a.getAsJsonArray("picks");if(picks==null||picks.isEmpty()||picks.size()>(compact?2048:a.has("sortBatch")?64:54))throw new IllegalArgumentException("Invalid selected stash containers");
+                if(compact)identifier(string(a,"kitItem",128));
+                for(JsonElement value:picks){JsonObject p=dev.monocle.coordinator.StashCatalog.sourcePosition(value);if(compact){if(!p.keySet().equals(Set.of("x","y","z")))throw new IllegalArgumentException("Compact sources contain positions only");}else{if(!value.isJsonObject())throw new IllegalArgumentException("Ordinary sources require slot and resource");integer(p,"slot",0,215);identifier(string(p,"resource",128));}}
                 if(a.has("kitTypeId")){UUID.fromString(string(a,"kitTypeId",36));integer(a,"count",1,36);if(!a.has("kitExemplar"))throw new IllegalArgumentException("Kit withdrawal needs its learned exemplar");optionalInteger(a,"pickIndex",0,0,picks.size());}
                 if(a.has("transferAll")&&a.get("transferAll").getAsBoolean()&&(!a.has("kitTypeId")||!a.has("depositMode")||!a.get("depositMode").getAsString().equals("Carry")))throw new IllegalArgumentException("Transfer all needs a carried kit batch for stash delivery");
                 if(a.has("depositMode")&&!Set.of("Carry","Ender Chest").contains(string(a,"depositMode",16)))throw new IllegalArgumentException("Invalid stash deposit mode");
@@ -365,31 +384,36 @@ public final class BotActions {
         resetStashFlightProgress();
         stashHandoff=false;
         stashFlightAttemptTarget=null;stashFlightFailures=stashFlightRetryAt=0;
+        stashAisle=null;stashAisleTarget=null;stashAisleCentering=false;stashAisleRetryAt=0;
         action = validated; pending = null; pendingStashFailure = null; originals = new JsonObject(); result = null;
         progress = new dev.monocle.coordinator.ActionProgress();
         survey = type().equals("StashHunt") ? new BotStashHunt(action) : null;
         stashScan = type().equals("StashScan") ? new BotStashScan(action) : null;
         stashDeposit=type().equals("StashDeposit")?new BotStashDeposit(action):null;
+        stashBuffer=type().equals("StashBuffer")?new BotStashBuffer(action):null;
         if (stashScan != null) {
             var selector=Modules.get().get(dev.monocle.client.systems.modules.world.SchematicSelector.class);
             if(selector.isActive())selector.disable();
         }
         recoveryReady = false;
         recovery = Set.of("RecoverSupplies", "Highway").contains(type()) ? new BotSupplyRecovery(bots, action.has("recovery") ? validateRecovery(action.getAsJsonObject("recovery")) : type().equals("RecoverSupplies") ? action : new JsonObject()) : null;
-        elapsed = dropWait = launchAttempts = bodyguardMissingTicks = bodyguardTpaAt = 0; launchTick = lastTick = -1;
+        tpaSentAtMs=0;elapsed = dropWait = launchAttempts = bodyguardMissingTicks = bodyguardTpaAt = 0; launchTick = lastTick = -1;
         deliveryAnchor=action.has("deliveryAnchor")?action.getAsJsonObject("deliveryAnchor").deepCopy():null;deliveryGoal=null;
         remaining = type().equals("DropItems") ? action.get("count").getAsInt() : action.has("ticks") ? action.get("ticks").getAsInt() : 0;
-        resetStashHome();stashHomeAttempts=0;
+        resetStashHome();stashHomeAttempts=0;respawnReturn=returnByDeath(action)?new BotRespawnReturn():null;respawnRequestAt=0;
         suspended = suspendRequested = checkpoint = armed = acknowledged = modulesApplied = modulesArmed = restoredModuleLease = tpaSent = runOnly = false;
         dimension = action.has("dimension") ? action.get("dimension").getAsString() : Utils.canUpdate() ? mc.level.dimension().identifier().toString() : "";
         stashResupply=type().equals("StashResupply")?new BotStashResupply(action,emptyStashSources,homeCooldownKey()+"\n"+dimension):null;
         state = "Running"; detail = "Starting " + type();
-        listen(type().equals("DropItems") || survey != null || stashScan != null || stashResupply!=null || stashDeposit!=null);
+        listen(respawnReturn!=null || type().equals("DropItems") || survey != null || stashScan != null || stashResupply!=null || stashDeposit!=null || stashBuffer!=null);
     }
 
     public JsonObject tick() {return tick(false);}
     JsonObject tick(boolean workflowHandoff) {
         clientThread();
+        if((state.equals("Running")&&!suspended||stashHandoff())&&Utils.canUpdate()
+            &&dev.monocle.client.utils.network.WorldReadiness.INSTANCE.ready()&&!nativeBusy()
+            &&(STASH_ACTIONS.contains(type())||type().equals("Travel")||survey!=null)&&catchWorkerFall())return status();
         if(stashNavigation!=null&&stashNavigation.closing()&&!stopStashNavigation()){
             detail="Waiting for safe Baritone movement release";return status();
         }
@@ -403,9 +427,10 @@ public final class BotActions {
         }
         if (lastTick == mc.player.tickCount) return status();
         lastTick = mc.player.tickCount;
+        stashAisleCentering=false;
         try {
             if (observeOnly) { listen(true); settleDrop(); return status(); }
-            if (!mc.player.isAlive()&&!suspendRequested) { stopStashNavigation(); releaseMovement(); detail = "Waiting for respawn before continuing worker action"; progress.resetClock(); return status(); }
+            if (!mc.player.isAlive()&&(!suspendRequested||respawnReturn!=null&&respawnReturn.issued())) { if(respawnReturn!=null){respawnReturn.died(System.currentTimeMillis());requestRespawn();checkpoint=true;} stopStashNavigation(); releaseMovement(); detail = "Waiting for respawn before continuing worker action"; progress.resetClock(); return status(); }
             if (pendingStashFailure != null) {
                 if (!landBeforeHandoff()) { detail = "Landing after stash failure: " + pendingStashFailure + " · " + detail; return status(); }
                 String failure=pendingStashFailure;pendingStashFailure=null;fail(failure);return status();
@@ -447,6 +472,7 @@ public final class BotActions {
                 case "StashVisit" -> {holdStashPosition();completeStash("Stash arrival verified",workflowHandoff);}
                 case "StashResupply" -> resupplyStash(workflowHandoff);
                 case "StashDeposit" -> depositStash(workflowHandoff);
+                case "StashBuffer" -> bufferStash(workflowHandoff);
                 case "DropItems" -> drop();
                 case "Modules" -> runModules();
                 case "Tpa" -> teleport();
@@ -456,7 +482,39 @@ public final class BotActions {
         return status();
     }
 
+    boolean loadingStashHome(long now){return state.equals("Running")&&(respawnReturn!=null&&respawnReturn.issued()&&now<=respawnReturn.readyAt(0)+90_000||STASH_ACTIONS.contains(type())&&stashHomeLoading(stashHomeSent,stashHomeArrived,now,homeReadyAt));}
+    static boolean stashHomeLoading(boolean sent,boolean arrived,long now,long readyAt){return sent&&!arrived&&readyAt>0&&now<=readyAt+60_000;}
+    private void courierAtStash(){
+        var derp=Modules.get().get(dev.monocle.client.systems.modules.player.Derp.class);
+        if(dev.monocle.coordinator.TaskWire.text(action,"destination").equals("Player"))derp.courierAtStash();else derp.courierCelebration(false);
+    }
+    static boolean returnByDeath(JsonObject action){return action!=null&&dev.monocle.coordinator.TaskWire.text(action,"type").equals("StashVisit")&&dev.monocle.coordinator.TaskWire.flag(action,"returnByDeath");}
+    private void requestRespawn(){
+        long now=System.currentTimeMillis();if(now<respawnRequestAt)return;
+        mc.player.respawn();respawnRequestAt=now+1000;
+    }
+    private boolean prepareRespawnReturn(){
+        holdStashPosition();long now=System.currentTimeMillis();
+        boolean near=dimension.equals(mc.level.dimension().identifier().toString())&&StashCatalog.nearby(action,new Position(mc.player.getX(),mc.player.getY(),mc.player.getZ()),32);
+        switch(respawnReturn.next(now,bots.killReadyAt(homeCooldownKey()),mc.player.isAlive(),near)){
+            case Checkpoint -> {checkpoint=true;detail="Checkpointing one-shot /kill return";}
+            case Kill -> {mc.getConnection().sendCommand("kill");detail="Waiting for death and stash respawn";}
+            case Respawn -> {requestRespawn();detail="Respawning at the stash";}
+            case Arrived -> {courierAtStash();stashHomeArrived=true;return true;}
+            case WrongSpawn -> fail("Respawn point is outside the source stash; fix the bed or spawn point. No repeated kill was sent");
+            case Exhausted -> fail("/kill did not produce a verified stash respawn after three attempts; no kits will be dropped again");
+            case Wait -> detail="Waiting "+Math.max(1,(respawnReturn.readyAt(bots.killReadyAt(homeCooldownKey()))-now+999)/1000)+"s for /kill cooldown / respawn";
+        }
+        return false;
+    }
+    @EventHandler private void respawnPacket(dev.monocle.client.events.packets.PacketEvent.Receive event){
+        if(event.packet instanceof net.minecraft.network.protocol.game.ClientboundRespawnPacket){
+            BotRespawnReturn pending=respawnReturn;
+            mc.execute(()->{if(state.equals("Running")&&pending!=null&&pending==respawnReturn){pending.respawned(System.currentTimeMillis());checkpoint=true;}});
+        }
+    }
     private boolean prepareStashHome(){
+        if(respawnReturn!=null)return prepareRespawnReturn();
         String home=action.get("homeName").getAsString();
         long now=System.currentTimeMillis(),cooldown=action.get("homeCooldownTicks").getAsLong()*50L;
         String server=homeCooldownKey();
@@ -468,7 +526,7 @@ public final class BotActions {
         if(homeReadyAt==0){
             if(stashHomeReached(dimension,mc.level.dimension().identifier().toString(),action,new Position(mc.player.getX(),mc.player.getY(),mc.player.getZ()))){
                 if(stashHomeArrivalUsesCooldown(stashHomeSent,stashHomeAttempts))bots.recordStashHomeUse(server,now);
-                homeReadyAt=now;stashHomeArrived=true;stashHomeAttempts=0;return true;
+                homeReadyAt=now;stashHomeArrived=true;stashHomeAttempts=0;courierAtStash();return true;
             }
             if(action.has("requireLocal")&&action.get("requireLocal").getAsBoolean())throw new IllegalStateException("Crew inventory work requires arrival at the assigned stash; kits retained");
             long ready=bots.stashHomeReadyAt(server,cooldown);
@@ -490,6 +548,7 @@ public final class BotActions {
                 detail="Waiting to arrive at stash after /home "+home+"; navigation and transfers are held";return false;
             }
             if(stashHomeArrivalUsesCooldown(stashHomeSent,stashHomeAttempts))bots.recordStashHomeUse(server,now);
+            courierAtStash();
             stashHomeAttempts=0; // A later server restart gets a fresh budget after verified arrival.
         }
         return true;
@@ -505,13 +564,13 @@ public final class BotActions {
         if(action.has("picks")&&!action.getAsJsonArray("picks").isEmpty()){
             var picks=action.getAsJsonArray("picks");int index=action.has("pickIndex")?action.get("pickIndex").getAsInt():0;
             if(index<picks.size()){
-                var target=picks.get(index).getAsJsonObject();double dx=target.get("x").getAsDouble()+.5-position.x(),dy=target.get("y").getAsDouble()+.5-position.y(),dz=target.get("z").getAsDouble()+.5-position.z();
+                var target=dev.monocle.coordinator.StashCatalog.sourcePosition(picks.get(index));double dx=target.get("x").getAsDouble()+.5-position.x(),dy=target.get("y").getAsDouble()+.5-position.y(),dz=target.get("z").getAsDouble()+.5-position.z();
                 return dx*dx+dy*dy+dz*dz<=256*256;
             }
         }
         return StashCatalog.nearby(action,position,256);
     }
-    public static String homeCooldownKey(){return mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip.toLowerCase(Locale.ROOT);}
+    public static String homeCooldownKey(){return mc.getCurrentServer()==null?"local":dev.monocle.client.utils.Utils.getServerIdentity().toLowerCase(Locale.ROOT);}
 
     static boolean shouldRecover(String type, boolean recoveryReady) {
         return !recoveryReady && !type.equals("Highway");
@@ -521,16 +580,19 @@ public final class BotActions {
     public boolean checkpointRequired() { return checkpoint; }
     public void checkpointSaved() {
         clientThread();
-        if (checkpoint) { checkpoint = false; if (pending != null) armed = true; else if (type().equals("Modules") || crystalGuard()) modulesArmed = true; }
+        if (checkpoint) { checkpoint = false; if(respawnReturn!=null)respawnReturn.checkpointSaved(); if (pending != null) armed = true; else if (type().equals("Modules") || crystalGuard()) modulesArmed = true; }
     }
 
-    public boolean requestSuspend() {
+    public boolean requestSuspend() { return requestSuspend(false); }
+    static boolean dropNeedsSettlement(String state,boolean cancelling){return !cancelling||state.equals("Running");}
+    boolean requestSuspend(boolean cancelling) {
         clientThread(); suspendRequested = true;
         quietCrystalGuard();
         if (recovery != null && !recovery.suspend()) return false;
         // Prepared but unsent is known safe in this live process. A restored prepared record is not.
         if (pending != null && !pending.get("issued").getAsBoolean()) { pending = null; checkpoint = armed = false; }
-        if (pending != null) { releaseMovement(); listen(true); detail = "Waiting for authoritative drop confirmation before suspending"; return false; }
+        if (pending != null && dropNeedsSettlement(state,cancelling)) { releaseMovement(); listen(true); detail = "Waiting for authoritative drop confirmation before suspending"; return false; }
+        if(pending!=null&&cancelling&&Utils.canUpdate()&&!mc.player.onGround()&&!landBeforeHandoff())return false;
         if (state.equals("Running") && type().equals("Tpa") && tpaSent) { detail = "Waiting for the outstanding teleport to resolve before yielding"; return false; }
         if (Utils.canUpdate() && !mc.player.onGround()) {
             if(!landing)detail = "Landing before handing off movement and profile settings";
@@ -541,7 +603,7 @@ public final class BotActions {
         if (survey != null) Modules.get().get(dev.monocle.client.systems.modules.world.StashFinder.class).surveyFlush();
         suspended = true; release(); return true;
     }
-    public void resume() { clientThread(); progress.resetClock(); suspendRequested = suspended = false; lastTick = -1; listen((type().equals("DropItems") || survey != null || stashScan != null || stashResupply != null || stashDeposit != null) && state.equals("Running")); }
+    public void resume() { clientThread(); progress.resetClock(); suspendRequested = suspended = false; lastTick = -1; listen((type().equals("DropItems") || survey != null || stashScan != null || stashResupply != null || stashDeposit != null || stashBuffer!=null) && state.equals("Running")); }
     public void disconnected() {
         progress.resetClock();
         clientThread();
@@ -555,6 +617,7 @@ public final class BotActions {
         if (stashScan != null) stashScan.close();
         if(stashResupply!=null)stashResupply.close();
         if(stashDeposit!=null)stashDeposit.close();
+        if(stashBuffer!=null)stashBuffer.close();
         releaseMovement();
     }
     public void stop() {
@@ -563,7 +626,7 @@ public final class BotActions {
         if (pending != null && pending.get("issued").getAsBoolean()) fail("Stopped with an uncertain item drop. Review the recorded transfer; it will not be sent again.");
         else { pending = null; checkpoint = armed = false; fail("Cancelled"); }
     }
-    public void markTpaSent() { clientThread(); if (!type().equals("Tpa")) throw new IllegalStateException("Not a teleport action"); if (!tpaSent) { tpaSent = true; elapsed = 0; } }
+    public void markTpaSent() { clientThread(); if (!type().equals("Tpa")) throw new IllegalStateException("Not a teleport action"); if (!tpaSent) { tpaSent = true; elapsed = 0; tpaSentAtMs=System.currentTimeMillis(); } }
     boolean rejectTeleport(String message){
         clientThread();if(!teleportRejected(state,type(),tpaSent,elapsed,message))return false;
         tpaSent=false;fail("Teleport rejected by server: "+message);return true;
@@ -597,10 +660,10 @@ public final class BotActions {
         if (action != null) s.add("action", action.deepCopy());
         s.addProperty("elapsed", elapsed); s.addProperty("remaining", remaining); s.addProperty("dimension", dimension);
         if(homeReadyAt>0)s.addProperty("homeReadyAt",homeReadyAt);
-        s.addProperty("stashHomeSent",stashHomeSent);
+        s.addProperty("stashHomeSent",stashHomeSent);if(respawnReturn!=null)s.add("respawnReturn",respawnReturn.snapshot());
         s.addProperty("stashHomeAttempts",stashHomeAttempts);
         if(pendingStashFailure!=null)s.addProperty("pendingStashFailure",pendingStashFailure);
-        s.addProperty("suspended", suspended); s.addProperty("suspendRequested", suspendRequested); s.addProperty("tpaSent", tpaSent);
+        s.addProperty("suspended", suspended); s.addProperty("suspendRequested", suspendRequested); s.addProperty("tpaSent", tpaSent);s.addProperty("tpaSentAtMs",tpaSentAtMs);
         s.addProperty("stashHandoff",stashHandoff);
         s.add("originalModules", originals.deepCopy());
         if (pending != null) s.add("pendingDrop", pending.deepCopy());
@@ -614,6 +677,7 @@ public final class BotActions {
             diagnostic.addProperty("walkingOnly",runOnly);s.add("stashApproach",diagnostic);
         }
         if(stashDeposit!=null)s.add("stashDeposit",stashDeposit.snapshot());
+        if(stashBuffer!=null)s.add("stashBuffer",stashBuffer.snapshot());
         if(personalSupplies!=null)s.add("personalSupplies",personalSupplies.diagnostic());
         s.addProperty("stashMending",stashMending);
         s.addProperty("stashMendDeferred",stashMendDeferred);
@@ -646,12 +710,15 @@ public final class BotActions {
             deliveryAnchor=BotDelivery.checked(snapshot.getAsJsonObject("deliveryAnchor"));
         }
         if(snapshot.has("homeReadyAt")){homeReadyAt=snapshot.get("homeReadyAt").getAsLong();if(homeReadyAt<0||homeReadyAt>System.currentTimeMillis()+3_600_000)throw new IllegalArgumentException("Invalid saved home warmup");}
+        if(snapshot.has("respawnReturn")){if(respawnReturn==null)throw new IllegalArgumentException("Unexpected respawn-return checkpoint");respawnReturn.restore(snapshot.getAsJsonObject("respawnReturn"));}
         stashHomeSent=snapshot.has("stashHomeSent")&&snapshot.get("stashHomeSent").getAsBoolean();
         stashHomeAttempts=snapshot.has("stashHomeAttempts")?integer(snapshot,"stashHomeAttempts",0,3):stashHomeSent?1:0;
         // The saved world/teleport timer is stale after reconnect; inventory checkpoints are not.
         resetStashHome();
         if(snapshot.has("pendingStashFailure"))pendingStashFailure=string(snapshot,"pendingStashFailure",900);
         suspended = snapshot.get("suspended").getAsBoolean(); suspendRequested = snapshot.get("suspendRequested").getAsBoolean(); tpaSent = snapshot.get("tpaSent").getAsBoolean();
+        tpaSentAtMs=snapshot.has("tpaSentAtMs")?snapshot.get("tpaSentAtMs").getAsLong():tpaSent?System.currentTimeMillis()-elapsed*50L:0;
+        if(tpaSentAtMs<0)throw new IllegalArgumentException("Invalid teleport checkpoint time");
         stashHandoff=snapshot.has("stashHandoff")&&snapshot.get("stashHandoff").getAsBoolean()&&state.equals("Complete")&&STASH_ACTIONS.contains(type());
         if (snapshot.has("actionProgress")) progress.restore(snapshot.getAsJsonObject("actionProgress"));
         if (snapshot.has("originalModules")) {
@@ -673,6 +740,7 @@ public final class BotActions {
         }
         if(snapshot.has("stashResupply")){if(stashResupply==null)throw new IllegalArgumentException("Unexpected stash resupply checkpoint");stashResupply.restore(snapshot.getAsJsonObject("stashResupply"));}
         if(snapshot.has("stashDeposit")){if(stashDeposit==null)throw new IllegalArgumentException("Unexpected stash deposit checkpoint");stashDeposit.restore(snapshot.getAsJsonObject("stashDeposit"));}
+        if(snapshot.has("stashBuffer")){if(stashBuffer==null)throw new IllegalArgumentException("Unexpected ender cargo checkpoint");stashBuffer.restore(snapshot.getAsJsonObject("stashBuffer"));}
         if (snapshot.has("pendingDrop")) {
             if (!type().equals("DropItems")) throw new IllegalArgumentException("Unexpected pending drop");
             pending = snapshot.getAsJsonObject("pendingDrop").deepCopy();
@@ -690,7 +758,7 @@ public final class BotActions {
             // The durable prepared record may already have produced a packet before the process died.
             pending.addProperty("issued", true); armed = checkpoint = false; acknowledged = false;
         }
-        listen(issuedDrop() || (type().equals("DropItems") || survey != null || stashScan != null || stashResupply!=null || stashDeposit!=null) && state.equals("Running") && !suspended);
+        listen(issuedDrop() || (respawnReturn!=null || type().equals("DropItems") || survey != null || stashScan != null || stashResupply!=null || stashDeposit!=null || stashBuffer!=null) && state.equals("Running") && !suspended);
         } catch (RuntimeException error) { fail("Invalid saved action: " + error.getMessage()); throw error; }
     }
 
@@ -732,7 +800,7 @@ public final class BotActions {
             } else if (pending.get("issued").getAsBoolean()) settleDrop();
             return;
         }
-        if (remaining == 0) { result = new JsonObject(); result.addProperty("dropped", action.get("count").getAsInt()); complete("Items dropped and confirmed by the server"); return; }
+        if (remaining == 0) { if(action.has("handoff")&&action.get("handoff").getAsBoolean())Modules.get().get(dev.monocle.client.systems.modules.player.Derp.class).courierCelebration(true); result = new JsonObject(); result.addProperty("dropped", action.get("count").getAsInt()); complete("Items dropped and confirmed by the server"); return; }
         if (!inventoryReady() || !aimRecipient()) return;
         String id = action.get("item").getAsString();
         int total = countInventory(id), slot = -1;
@@ -756,7 +824,7 @@ public final class BotActions {
     record Drop(int slot,int amount,ItemStack stack){}
     static List<Drop> planDropBurst(List<ItemStack> inventory,int remaining,java.util.function.Predicate<ItemStack> matches){
         List<Drop> drops=new ArrayList<>();
-        for(int slot=0;slot<Math.min(36,inventory.size())&&remaining>0&&drops.size()<BotStashBulk.MOVES_PER_TICK;slot++){
+        for(int slot=0;slot<Math.min(36,inventory.size())&&remaining>0&&drops.size()<DROP_MOVES_PER_TICK;slot++){
             ItemStack stack=inventory.get(slot);if(stack.isEmpty()||!matches.test(stack))continue;
             int amount=nextDropCount(remaining,stack.getCount());drops.add(new Drop(slot,amount,stack.copy()));remaining-=amount;
             if(amount<stack.getCount())break;
@@ -765,7 +833,7 @@ public final class BotActions {
     }
     private boolean dropBurst(){return pending!=null&&pending.has("stage")&&pending.get("stage").getAsString().equals("burst");}
     static void validateDropBurstRecord(JsonObject pending){
-        if(!pending.has("drops")||!pending.get("drops").isJsonArray()||pending.getAsJsonArray("drops").isEmpty()||pending.getAsJsonArray("drops").size()>BotStashBulk.MOVES_PER_TICK)throw new IllegalArgumentException("Invalid saved inventory drop burst");
+        if(!pending.has("drops")||!pending.get("drops").isJsonArray()||pending.getAsJsonArray("drops").isEmpty()||pending.getAsJsonArray("drops").size()>DROP_MOVES_PER_TICK)throw new IllegalArgumentException("Invalid saved inventory drop burst");
         Set<Integer> slots=new HashSet<>();int total=0;
         for(JsonElement value:pending.getAsJsonArray("drops")){
             JsonObject record=value.getAsJsonObject();int slot=integer(record,"slot",0,35),amount=integer(record,"amount",1,99);
@@ -790,7 +858,7 @@ public final class BotActions {
         }
     }
     static boolean confirmedDropBurst(List<Drop> drops,List<ItemStack> inventory,ItemStack cursor,int beforeTotal,int afterTotal){
-        if(drops.isEmpty()||drops.size()>BotStashBulk.MOVES_PER_TICK||!cursor.isEmpty()||beforeTotal-afterTotal!=drops.stream().mapToInt(Drop::amount).sum())return false;
+        if(drops.isEmpty()||drops.size()>DROP_MOVES_PER_TICK||!cursor.isEmpty()||beforeTotal-afterTotal!=drops.stream().mapToInt(Drop::amount).sum())return false;
         for(Drop drop:drops){
             if(drop.slot()>=inventory.size())return false;
             ItemStack expected=drop.stack().copy();expected.shrink(drop.amount());
@@ -848,6 +916,7 @@ public final class BotActions {
         if(state.equals("Running")&&!suspended&&!suspendRequested)try{
             if(stashDeposit!=null)stashDeposit.inventory(event);
             if(stashResupply!=null)stashResupply.inventory(event);
+            if(stashBuffer!=null)stashBuffer.inventory(event);
         }catch(RuntimeException e){fail("Stash transfer needs inspection: "+(e.getMessage()==null?e.getClass().getSimpleName():e.getMessage()));}
         if (!mc.isSameThread() || pending == null || !pending.get("issued").getAsBoolean() || !Utils.canUpdate()
             || event.packet.containerId() != mc.player.inventoryMenu.containerId) return;
@@ -889,48 +958,56 @@ public final class BotActions {
         if (bots.crew.localAssigned()) { detail = "Waiting for the native crew to finish reserved-container recovery"; return false; }
         return true;
     }
+    private Player deliveryRecipient(){
+        Player player=mc.level.getPlayerByUUID(UUID.fromString(action.get("recipient").getAsString()));
+        return player!=null&&player.isAlive()?player:null;
+    }
+    private boolean handoffFooting(Vec3 feet){
+        return stashAisleFooting(feet,mc.player.getBbWidth()+.02,this::safeLandingShape,this::clearBody);
+    }
     private boolean aimRecipient() {
         if (!action.has("recipient")) return true;
+        Player recipient=deliveryRecipient();
         if(action.has("handoff")&&action.get("handoff").getAsBoolean()){
-            if(deliveryAnchor==null||!deliveryAnchor.get("dimension").getAsString().equals(mc.level.dimension().identifier().toString())||!standable(mc.player.position()))return false;
-            Vec3 target=BotDelivery.position(deliveryAnchor);
-            if(mc.player.position().distanceToSqr(target)>16)return false;
+            if(deliveryAnchor==null||!deliveryAnchor.get("dimension").getAsString().equals(mc.level.dimension().identifier().toString())||recipient==null||!handoffFooting(mc.player.position()))return false;
+            Vec3 target=recipient.position();
             mc.player.setYRot((float)Rotations.getYaw(target));
-            mc.player.setXRot(BotDelivery.pitch(mc.player.getEyeY(),target.y,mc.player.position().multiply(1,0,1).distanceTo(target.multiply(1,0,1))));return true;
+            mc.player.setXRot(BotDelivery.pitch(mc.player.getEyeY(),target.y,Math.max(1.5,mc.player.position().multiply(1,0,1).distanceTo(target.multiply(1,0,1)))));return true;
         }
-        Player recipient = mc.level.getPlayerByUUID(UUID.fromString(action.get("recipient").getAsString()));
-        if (recipient == null || !recipient.isAlive() || recipient.distanceToSqr(mc.player) > 16 || !mc.player.hasLineOfSight(recipient)) { detail = "Waiting for the transfer recipient within four blocks and in sight"; return false; }
+        if (recipient == null || recipient.distanceToSqr(mc.player) > 16 || !mc.player.hasLineOfSight(recipient)) { detail = "Waiting for the transfer recipient within four blocks and in sight"; return false; }
         mc.player.setYRot((float) Rotations.getYaw(recipient.position())); mc.player.setXRot(-10); return true;
     }
     private boolean prepareDelivery(){
         if(TickRate.INSTANCE.getTimeSinceLastTick()>=1.5f){releaseMovement();detail="Delivery approach waiting for server response";return false;}
         if(++elapsed>600){fail("Safe delivery handoff timed out; no uncertain drop will be repeated");return false;}
         if(mc.player.isPassenger()){releaseMovement();detail="Delivery requires dismounting before the supported walking handoff";return false;}
+        Player player=deliveryRecipient();
+        if(player==null){releaseMovement();detail="Waiting to see the delivery recipient; no stale direction used";return false;}
         if(deliveryAnchor==null){
-            Player player=mc.level.getPlayerByUUID(UUID.fromString(action.get("recipient").getAsString()));
-            if(player==null||!player.isAlive()||player.distanceToSqr(mc.player)>16||!mc.player.hasLineOfSight(player)){
-                releaseMovement();detail="Waiting to snapshot the nearby delivery recipient";return false;
-            }
             deliveryAnchor=BotDelivery.anchor(player.position(),player.getYRot(),mc.level.dimension().identifier().toString());checkpoint=true;
-            detail="Checkpointing the recipient's fixed handoff position";return false;
+            detail="Checkpointing the initial handoff position";return false;
         }
         if(!deliveryAnchor.get("dimension").getAsString().equals(mc.level.dimension().identifier().toString())){fail("Delivery location changed world; no kits dropped");return false;}
         if(!mc.player.onGround()||mc.player.isFallFlying()){
             if(!landBeforeHandoff())return false;
         }
-        Vec3 from=mc.player.position(),target=BotDelivery.position(deliveryAnchor);
-        if(deliveryGoal==null||!BotDelivery.corridor(from,deliveryGoal,this::standable))deliveryGoal=BotDelivery.goal(from,deliveryAnchor,this::standable);
-        if(deliveryGoal==null){releaseMovement();detail="No supported local delivery approach; kits retained";return false;}
-        if(from.distanceToSqr(deliveryGoal)>.09){
-            if(!acquireMovement())return false;
-            input.stop();brakeFlight();mc.player.setSprinting(false);
-            Vec3 step=localGoal(from,deliveryGoal,.2);
-            if(!BotDelivery.corridor(from,step,this::standable)){releaseMovement();detail="Delivery footing changed; stopping at the edge";return false;}
-            mc.player.setYRot((float)Rotations.getYaw(step));input.sneak(true);input.forward(true);
-            detail="Walking to fixed handoff spot · "+deliveryGoal;return false;
+        Vec3 from=mc.player.position(),target=player.position();
+        if(!handoffFooting(from)){releaseMovement();detail="Waiting for safe delivery footing; kits retained";return false;}
+        if(BotDelivery.holdPosition(from,BotDelivery.position(deliveryAnchor),target,deliveryGoal!=null)){
+            deliveryGoal=null;releaseMovement();
+        }else{
+            if(deliveryGoal==null||!BotDelivery.corridor(from,deliveryGoal,this::handoffFooting))deliveryGoal=BotDelivery.goal(from,BotDelivery.anchor(target,player.getYRot(),mc.level.dimension().identifier().toString()),this::handoffFooting);
+            if(deliveryGoal==null){releaseMovement();detail="No supported local delivery approach; kits retained";return false;}
+            if(from.distanceToSqr(deliveryGoal)>.09){
+                if(!acquireMovement())return false;
+                input.stop();brakeFlight();mc.player.setSprinting(false);
+                Vec3 step=localGoal(from,deliveryGoal,.2);
+                if(!BotDelivery.corridor(from,step,this::handoffFooting)){releaseMovement();detail="Delivery footing changed; stopping at the edge";return false;}
+                mc.player.setYRot((float)Rotations.getYaw(step));input.sneak(true);input.forward(true);
+                detail="Walking to safe local handoff spot";return false;
+            }
+            releaseMovement();
         }
-        releaseMovement();
-        if(!BotDelivery.corridor(from,target,this::standable)){detail="Delivery landing area is unsupported; kits retained";return false;}
         if(!aimRecipient())return false;
         if(mc.player.getDeltaMovement().horizontalDistanceSqr()>.0004){detail="Settling at handoff spot before aimed drop";return false;}
         return true;
@@ -942,7 +1019,14 @@ public final class BotActions {
             ||!action.has("handoff")||!action.get("handoff").getAsBoolean()||inputPlayer!=mc.player||mc.player.input!=input)return;
         Vec3 movement=new Vec3(event.movement.x,0,event.movement.z);double length=movement.length();
         if(length>.12)movement=movement.scale(.12/length);
-        if(!mc.player.onGround()||!BotDelivery.corridor(mc.player.position(),mc.player.position().add(movement),this::standable))movement=Vec3.ZERO;
+        if(!mc.player.onGround()||!BotDelivery.corridor(mc.player.position(),mc.player.position().add(movement),this::handoffFooting))movement=Vec3.ZERO;
+        ((dev.monocle.client.mixininterface.IVec3)event.movement).monocle$set(movement.x,event.movement.y,movement.z);
+    }
+    @EventHandler(priority=meteordevelopment.orbit.EventPriority.LOWEST)
+    private void aisleCenterMove(dev.monocle.client.events.entity.player.PlayerMoveEvent event){
+        if(!mc.isSameThread()||!Utils.canUpdate()||!state.equals("Running")||suspended||suspendRequested||!stashAisleCentering
+            ||!aisleDeposit()||stashAisle==null||inputPlayer!=mc.player||mc.player.input!=input)return;
+        Vec3 movement=mc.player.onGround()?stashAisleCenterStep(mc.player.position(),stashAisle.ground(),p->stashAisleFooting(p,mc.player.getBbWidth(),this::safeLandingShape,this::clearBody)):Vec3.ZERO;
         ((dev.monocle.client.mixininterface.IVec3)event.movement).monocle$set(movement.x,event.movement.y,movement.z);
     }
     private void runModules() {
@@ -1009,17 +1093,20 @@ public final class BotActions {
         String target = action.get("target").getAsString();
         Player player = mc.level.players().stream().filter(p -> p != mc.player && (p.getUUID().toString().equalsIgnoreCase(target) || p.getName().getString().equalsIgnoreCase(target))).findFirst().orElse(null);
         boolean nearby=player!=null&&player.isAlive()&&player.distanceToSqr(mc.player)<=Math.pow(action.get("radius").getAsDouble(),2)&&teleportStashReached(action,new Position(mc.player.getX(),mc.player.getY(),mc.player.getZ()));
+        if(externalTeleport(action)&&tpaSent&&teleportExpired(action,tpaSentAtMs,System.currentTimeMillis())){tpaTimeout("Recipient did not arrive before the teleport request deadline");return;}
         if(teleportMayArrive(action,dimension,mc.level.dimension().identifier().toString(),tpaSent,elapsed,nearby)){
             result=new JsonObject();result.add("deliveryAnchor",BotDelivery.anchor(player.position(),player.getYRot(),mc.level.dimension().identifier().toString()));
             complete("Recipient physically confirmed nearby");return;
         }
         if (!tpaSent) { detail = "Waiting for host teleport handshake"; return; }
-        if (++elapsed >= action.get("timeoutTicks").getAsInt()) { fail("Teleport did not reach the observed target before timeout"); return; }
+        if (++elapsed >= action.get("timeoutTicks").getAsInt()) { tpaTimeout("Teleport did not reach the observed target before timeout"); return; }
         if (elapsed < action.get("warmupTicks").getAsInt()) { detail = "Waiting for teleport warmup"; return; }
         if (!externalTeleport(action)&&(dimension.isEmpty() || !dimension.equals(mc.level.dimension().identifier().toString()))) { detail = "Waiting for the expected target dimension"; return; }
         if(!teleportStashReached(action,new Position(mc.player.getX(),mc.player.getY(),mc.player.getZ()))){detail="Waiting for teleport arrival at the assigned stash, not the leader's old position";return;}
         detail = "Waiting to observe the teleport target nearby";
     }
+    private void tpaTimeout(String detail){result=new JsonObject();if(externalTeleport(action))result.addProperty("tpaTimedOut",true);fail(detail);}
+    static boolean teleportExpired(JsonObject action,long sentAt,long now){return sentAt>0&&now>=sentAt&&now-sentAt>=action.get("timeoutTicks").getAsLong()*50L;}
     static boolean externalTeleport(JsonObject action){return action.has("external")&&action.get("external").getAsBoolean();}
     static boolean teleportMayArrive(JsonObject action,String expected,String actual,boolean sent,int elapsed,boolean nearby){
         return nearby&&(externalTeleport(action)||!expected.isEmpty()&&expected.equals(actual))
@@ -1416,6 +1503,7 @@ public final class BotActions {
     }
     private void brakeFlight() { stashCruiseSpeed=0; ElytraFly fly = Modules.get().get(ElytraFly.class); if (fly.isActive() && fly.flightMode.get() == ElytraFlightModes.Vanilla) fly.requestAutopilot(Vec3.ZERO); }
     private void releaseMovement() {
+        stashAisleCentering=false;
         input.stop();
         if (inputPlayer != null) {
             if (inputPlayer.input == input && previousInput != null) inputPlayer.input = previousInput;
@@ -1428,12 +1516,14 @@ public final class BotActions {
     }
     private void release() {release(false);}
     private void release(boolean keepFlight) {
+        fallCatchPlayer=null;fallCatchTick=fallCatchRequestTick=-1;
         stopStashNavigation();
         Modules.get().get(AutoMend.class).releaseWorkerMaintenance(this);stashMending=stashMendDeferred=false;stashMendDamage=-1;stashMendIdle=0;
         if(personalSupplies!=null){personalSupplies.close();personalSupplies=null;}
         if (stashScan != null) stashScan.close();
         if (stashResupply != null) stashResupply.close();
         if (stashDeposit != null) stashDeposit.close();
+        if (stashBuffer != null) stashBuffer.close();
         if (recovery != null) recovery.close();
         if(keepFlight){input.stop();brakeFlight();}else{releaseMovement();stashHandoff=false;}
         if (crystalGuard()) {
@@ -1523,6 +1613,7 @@ public final class BotActions {
         boolean safe=(mc.player.containerMenu==mc.player.inventoryMenu||personalSupplies!=null&&personalSupplies.busy())&&mc.player.containerMenu.getCarried().isEmpty()
             &&(stashResupply==null||stashResupply.canYieldInventory())
             &&(stashDeposit==null||stashDeposit.canYieldInventory())
+            &&(stashBuffer==null||stashBuffer.canYieldInventory())
             &&(stashScan==null||stashScan.canYieldInventory());
         AutoMend mend=Modules.get().get(AutoMend.class);
         if(!safe){mend.workerYielding(this,false);return false;}
@@ -1544,7 +1635,8 @@ public final class BotActions {
                 detail="Equipping spare elytra before stash flight reserve is exhausted";return true;
             }
         }
-        boolean repair=mend.requestWorkerMaintenance(this);
+        if(stashMendRetryPlayer!=mc.player){stashMendRetryPlayer=mc.player;stashMendRetryAt=0;}
+        boolean repair=mend.requestWorkerMaintenance(this)&&!stashMendCoolingDown(mc.player.tickCount,stashMendRetryAt,gliderDurability());
         var xp=net.minecraft.world.item.Items.EXPERIENCE_BOTTLE;
         if(repair&&BotPersonalSupplies.count(xp)==0&&(personalSupplies==null||!personalSupplies.busy())){
             if(personalSupplies==null)personalSupplies=new BotPersonalSupplies();
@@ -1552,7 +1644,7 @@ public final class BotActions {
                 deferStashMending(mend);repair=false;
             }else stashMendDeferred=false;
         }else if(!repair||BotPersonalSupplies.count(xp)>0)stashMendDeferred=false;
-        boolean food=Modules.get().get(AutoEat.class).isActive()&&personalFoodCount()<=8;
+        boolean food=Modules.get().get(AutoEat.class).isActive()&&stashFoodRestockRequired(action,personalFoodCount());
         if(food&&Modules.get().get(AutoEat.class).blacklist.get().contains(net.minecraft.world.item.Items.ENCHANTED_GOLDEN_APPLE))
             throw new IllegalStateException("Personal food restock needs enchanted golden apples allowed in Auto Eat; change the job profile");
         net.minecraft.world.item.Item requested=food?net.minecraft.world.item.Items.ENCHANTED_GOLDEN_APPLE
@@ -1575,6 +1667,7 @@ public final class BotActions {
         if(!supplies){
             if(stashResupply!=null)stashResupply.close();
             if(stashDeposit!=null)stashDeposit.close();
+            if(stashBuffer!=null)stashBuffer.close();
             if(stashScan!=null)stashScan.close();
         }
         if(!landBeforeHandoff())return true;
@@ -1607,14 +1700,25 @@ public final class BotActions {
             int damage=mc.player.getItemBySlot(EquipmentSlot.CHEST).getDamageValue();
             if(stashMendDamage<0||damage<stashMendDamage)stashMendIdle=0;
             stashMendDamage=damage;
-            if(++stashMendIdle>200)throw new IllegalStateException("Elytra mending made no progress for 200 ticks; check Mending and XP supply");
+            if(++stashMendIdle>200){
+                String reason="Elytra mending made no progress for 200 ticks; remaining="+gliderDurability()+", bottles="+BotPersonalSupplies.count(xp)+", Auto Mend="+mend.getInfoString();
+                if(!stashMendMayDefer(xp,false,gliderDurability()))throw new IllegalStateException(reason);
+                stashMendRetryAt=mc.player.tickCount+1200;
+                deferStashMending(mend,reason);resetFlightRoutes();progress.resetClock();return false;
+            }
             stashMending=true;mend.workerYielding(this,true);detail="Mending stash elytra · "+mend.getInfoString();return true;
         }
         return false;
     }
     private void deferStashMending(AutoMend mend){
-        if(!stashMendDeferred)MonocleClient.LOG.warn("[Workers] XP unavailable; deferring stash mending with {} elytra durability remaining",gliderDurability());
+        deferStashMending(mend,"XP unavailable");
+    }
+    private void deferStashMending(AutoMend mend,String reason){
+        if(!stashMendDeferred)MonocleClient.LOG.warn("[Workers] {}; deferring stash mending with {} elytra durability remaining",reason,gliderDurability());
         stashMendDeferred=true;stashMending=false;stashMendDamage=-1;stashMendIdle=0;mend.workerYielding(this,false);
+    }
+    static boolean stashMendCoolingDown(int tick,int retryAt,int durability){
+        int left=retryAt-tick;return left>0&&left<=1200&&stashFlightDurabilitySafe(durability,false);
     }
     static boolean stashMendMayDefer(net.minecraft.world.item.Item requested,boolean pending,int durability){
         return requested==net.minecraft.world.item.Items.EXPERIENCE_BOTTLE&&!pending&&stashFlightDurabilitySafe(durability,false);
@@ -1632,6 +1736,9 @@ public final class BotActions {
     private int personalFoodCount(){
         AutoEat eat=Modules.get().get(AutoEat.class);
         return AutoEat.foodCount(mc.player.getInventory(),mc.player.getOffhandItem(),eat.blacklist.get(),eat.protectNamed.get());
+    }
+    static boolean stashFoodRestockRequired(JsonObject action,int foodCount){
+        return !dev.monocle.coordinator.TaskWire.text(action,"destination").equals("Player")&&foodCount<=8;
     }
     private boolean personalSupplyIsCargo(ItemStack stack){
         if(action.has("kitTypeId")&&BotStashScan.matchesKit(stack,action))return true;
@@ -1746,6 +1853,42 @@ public final class BotActions {
         // Leave a landing reserve; don't reject an ongoing flight at its higher takeoff threshold.
         return gliding?remaining>STASH_FLIGHT_LANDING_RESERVE:remaining>=STASH_FLIGHT_MIN_DURABILITY;
     }
+    static boolean workerFallDanger(double fallen,double verticalSpeed,boolean grounded,boolean gliding,boolean ineligible,boolean nearbySupport){
+        return !grounded&&!gliding&&!ineligible&&!nearbySupport&&Double.isFinite(fallen)&&Double.isFinite(verticalSpeed)
+            &&fallen>=1.25&&verticalSpeed<-.35;
+    }
+    private boolean catchWorkerFall(){
+        if(fallCatchPlayer!=mc.player){fallCatchPlayer=mc.player;fallCatchTick=fallCatchRequestTick=-1;}
+        ElytraFly fly=Modules.get().get(ElytraFly.class);
+        boolean ineligible=!mc.player.isAlive()||mc.player.isPassenger()||mc.player.isInWater()||mc.player.isInLava()
+            ||mc.player.getAbilities().flying||mc.player.hasEffect(net.minecraft.world.effect.MobEffects.LEVITATION)
+            ||!stashFlightDurabilitySafe(gliderDurability(),true)||fly.flightMode.get()!=ElytraFlightModes.Vanilla;
+        if(mc.player.onGround()||ineligible){fallCatchTick=fallCatchRequestTick=-1;return false;}
+        int tick=mc.player.tickCount;
+        if(fallCatchTick<0){
+            if(!workerFallDanger(mc.player.fallDistance,mc.player.getDeltaMovement().y,false,mc.player.isFallFlying(),false,
+                safeLandingBelow(mc.player.position(),2)!=null))return false;
+            fallCatchTick=tick;
+            resetFlightRoutes(true);resetStashFlightProgress();
+            stashFlightFailures=stashFlightRetryAt=0;runOnly=false;launchTick=-1;
+            MonocleClient.LOG.warn("[Workers] Catching unexpected fall during {}: distance={}, verticalSpeed={}, elytraRemaining={}",
+                type(),mc.player.fallDistance,mc.player.getDeltaMovement().y,gliderDurability());
+        }
+        if(!fly.isActive()){fly.enable();enabledFly=true;}
+        input.stop();
+        if(!mc.player.isFallFlying()){
+            fallCatchTick=tick;
+            if(fallCatchRequestTick<0||tick-fallCatchRequestTick>=4){
+                fallCatchRequestTick=tick;
+                if(mc.player.tryToStartFallFlying())mc.getConnection().send(new ServerboundPlayerCommandPacket(mc.player,ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+            }
+        }
+        // A falling Baritone segment may never become safe to cancel after we catch it in midair.
+        if(mc.player.isFallFlying()&&stashNavigation!=null&&stashNavigation.releaseForFall())stashNavigation=null;
+        brakeFlight();
+        if(mc.player.isFallFlying()&&tick-fallCatchTick>=4){fallCatchTick=fallCatchRequestTick=-1;return false;}
+        progress.resetClock();detail="Catching unexpected fall with ElytraFly";return true;
+    }
     private int gliderDurability(){
         ItemStack glider=mc.player.getItemBySlot(EquipmentSlot.CHEST);
         return !glider.has(DataComponents.GLIDER)?0:glider.isDamageableItem()?glider.getMaxDamage()-glider.getDamageValue():Integer.MAX_VALUE;
@@ -1767,12 +1910,16 @@ public final class BotActions {
     private boolean maintainStashClearance(){
         if(landing||runOnly||stashCollisionWalking(stashCollisionWalkUntil,mc.player.tickCount))return !landBeforeHandoff();
         if(!mc.player.isFallFlying())return false;
+        // Aisle approaches use the real collision envelope, not the open-air cruise buffer.
+        if(aisleDeposit()&&clearBody(PrinterFlight.body(mc.player.position(),stashFlightWidth(mc.player.getBbWidth()),mc.player.getBbHeight()))){stashClearanceTarget=null;return false;}
         ElytraFly fly=Modules.get().get(ElytraFly.class);
         if(fly.flightMode.get()!=ElytraFlightModes.Vanilla||fly.horizontalSpeed.get()<=0)return false;
         if(!fly.isActive()){fly.enable();enabledFly=true;}
         Vec3 from=mc.player.position();double width=stashFlightWidth(mc.player.getBbWidth()),height=mc.player.getBbHeight();
         // Final container approaches may enter the cruise buffer, never actual blocks or hazards.
-        if(stashFinalApproach(from,scanFlightWatchTarget)&&clearBody(PrinterFlight.body(from,width,height))){stashClearanceTarget=null;return false;}
+        BlockPos interaction=stashResupply!=null?stashResupply.target():stashDeposit!=null?stashDeposit.target():stashBuffer!=null?stashBuffer.target():stashScan!=null?stashScan.target():null;
+        // Recovery resets route targets, but a reachable active container still owns its final approach.
+        if(stashFinalApproach(from,interaction!=null?interaction:scanFlightWatchTarget)&&clearBody(PrinterFlight.body(from,width,height))){stashClearanceTarget=null;return false;}
         if(clearStashCruise(PrinterFlight.body(from,width,height))){stashClearanceTarget=null;return false;}
         if(!acquireMovement())return true;
         stopStashNavigation();input.stop();
@@ -1839,7 +1986,7 @@ public final class BotActions {
         }
         launchTick=-1;
         double width=stashFlightWidth(mc.player.getBbWidth()),height=mc.player.getBbHeight();
-        boolean approach=stashFinalApproach(from,target);
+        boolean approach=aisleDeposit()&&stashAisle!=null||stashFinalApproach(from,target);
         // World state cannot change inside this client-thread search; discard cached corridors next tick.
         Map<AABB,Boolean> checkedCorridors=new HashMap<>();
         java.util.function.Predicate<AABB> clearance=approach?this::clearBody:this::clearStashCruise;
@@ -1890,11 +2037,14 @@ public final class BotActions {
         }
         if(!target.equals(scanFlightTarget)||scanFlightRoute.isEmpty()&&mc.player.tickCount>=scanFlightRetry){
             scanFlightTarget=target;scanFlightStep=1;scanFlightRetry=mc.player.tickCount+20;
-            if(coverageGoal!=null){
+            if(aisleDeposit()&&stashAisle!=null){
+                // Ascend the shaft we checked from the ground; never cut diagonally through a storage bank.
+                scanFlightRoute=PrinterFlight.segmentClear(from,stashAisle.hover(),width,height,flightClear)?List.of(from,stashAisle.hover()):List.of();
+            }else if(coverageGoal!=null){
                 scanFlightRoute=PrinterFlight.route(from,coverageGoal,width,height,flightClear);
                 if(scanFlightRoute.isEmpty()){stashScan.rejectCoverage();scanCoverageFlightGoal=null;coverageGoal=null;}
             }
-            if(coverageGoal==null)scanFlightRoute=PrinterFlight.routeToInteraction(from,target,width,height,mc.player.getEyeHeight(),4.4,flightClear,
+            if(coverageGoal==null&&!(aisleDeposit()&&stashAisle!=null))scanFlightRoute=PrinterFlight.routeToInteraction(from,target,width,height,mc.player.getEyeHeight(),4.4,flightClear,
                 p->stashFlightGoal(p,target,hopper,hopper||BotStashScan.visibleFrom(p.add(0,mc.player.getEyeHeight(),0),target)));
         }
         if(scanFlightRoute.isEmpty()){
@@ -1931,10 +2081,99 @@ public final class BotActions {
         if(!dev.monocle.client.pathing.BaritoneUtils.IS_AVAILABLE){fail("Stash deposit requires Baritone for Minecraft 26.2");return;}
         if(stashInteractionPaused())return;
         stashDeposit.tick();detail=stashDeposit.detail();
+        if(stashDeposit.waitingForCapacity()){if(aisleDeposit())landInStashAisle();else landBeforeHandoff();detail="Waiting for destination capacity · "+stashDeposit.detail();return;}
         if(stashDeposit.done()){result=stashDeposit.workflowResult();completeStash(stashDeposit.completionDetail(),workflowHandoff);return;}
-        if(stashDeposit.approaching())moveToStashContainer(stashDeposit.target(),stashDeposit.target(),-1,false);else holdStashPosition();
+        if(stashDeposit.approaching()){
+            if(aisleDeposit())moveToAisleDeposit(stashDeposit.target());
+            else moveToStashContainer(stashDeposit.target(),stashDeposit.target(),-1,false);
+        }else holdStashPosition();
+    }
+    private void bufferStash(boolean workflowHandoff){
+        if(stashInteractionPaused())return;
+        stashBuffer.tick();detail=stashBuffer.detail();
+        if(stashBuffer.done()){result=stashBuffer.result();completeStash("Ender cargo verified",workflowHandoff);return;}
+        if(stashBuffer.approaching())moveToStashContainer(stashBuffer.target(),stashBuffer.target(),-1,false);
+        else holdStashPosition();
+    }
+    private boolean aisleDeposit(){return action!=null&&type().equals("StashDeposit")&&dev.monocle.coordinator.TaskWire.flag(action,"assumeEmpty");}
+    record AisleApproach(Vec3 ground,Vec3 hover) { }
+    static Vec3 stashAisleCenterStep(Vec3 from,Vec3 ground,java.util.function.Predicate<Vec3> supported){
+        Vec3 next=localGoal(from,new Vec3(ground.x,from.y,ground.z),.1);
+        return BotDelivery.corridor(from,next,supported)?next.subtract(from):Vec3.ZERO;
+    }
+    static boolean stashAisleFooting(Vec3 feet,double width,java.util.function.Function<BlockPos,VoxelShape> shapes,java.util.function.Predicate<AABB> clear){
+        Vec3 support=PrinterFlight.landingBelow(feet.add(0,.01,0),width,1.8,1.8,1,shapes,clear);
+        return support!=null&&Math.abs(support.y-feet.y)<.02;
+    }
+    static AisleApproach stashAisleApproach(Vec3 from,BlockPos chest,int floor,double width,
+        java.util.function.Function<BlockPos,net.minecraft.world.phys.shapes.VoxelShape> shapes,
+        java.util.function.Predicate<AABB> clear,java.util.function.Predicate<Vec3> visible){
+        AisleApproach best=null;double distance=Double.POSITIVE_INFINITY;
+        for(int dx=-4;dx<=4;dx++)for(int dz=-4;dz<=4;dz++){
+            if(dx==0&&dz==0)continue;
+            Vec3 ground=PrinterFlight.landingBelow(new Vec3(chest.getX()+dx+.5,floor+.5,chest.getZ()+dz+.5),width,1.8,1.8,2,shapes,clear);
+            if(ground==null||ground.y>floor+.01||ground.y<floor-1.01)continue;
+            Vec3 hover=new Vec3(ground.x,Math.max(ground.y,chest.getY()+.25),ground.z);
+            if(hover.distanceToSqr(Vec3.atCenterOf(chest))>4.4*4.4)continue;
+            if(!PrinterFlight.segmentClear(ground,hover,width,.6,clear)||!visible.test(hover))continue;
+            double score=Math.hypot(from.x-ground.x,from.z-ground.z);
+            if(score<distance){distance=score;best=new AisleApproach(ground,hover);}
+        }
+        return best;
+    }
+    private void moveToAisleDeposit(BlockPos target){
+        stashAisleCentering=false;
+        if(stashAisleRetryAt>0){
+            if(!landInStashAisle())return;
+            if(mc.player.tickCount<stashAisleRetryAt){holdStashPosition();detail="Landed; waiting before replanning the destination aisle";return;}
+            stashAisleTarget=null;stashAisle=null;stashAisleRetryAt=0;
+        }
+        if(!target.equals(stashAisleTarget)){
+            if(!mc.player.onGround()){
+                if(!landInStashAisle())return;
+            }
+            stashAisle=stashAisleApproach(mc.player.position(),target,stashDeposit.floorY(),stashFlightWidth(mc.player.getBbWidth()),
+                this::safeLandingShape,this::clearBody,p->BotStashScan.visibleFrom(p.add(0,mc.player.getEyeHeight(net.minecraft.world.entity.Pose.FALL_FLYING),0),target));
+            if(stashAisle==null){fail("No supported aisle with a clear vertical approach to the destination chest; kits retained");return;}
+            stashAisleTarget=target;stashFlightAttemptTarget=target;stashFlightFailures=stashFlightRetryAt=0;launchTick=-1;runOnly=false;resetStashFlightProgress();
+        }
+        if(stashCollisionWalking(stashCollisionWalkUntil,mc.player.tickCount)){launchTick=-1;holdStashPosition();detail="Waiting for collision recovery before aisle takeoff";return;}
+        if(mc.player.tickCount<stashFlightRetryAt){holdStashPosition();detail="Waiting before aisle takeoff retry";return;}
+        if(!stashFlightRetryAllowed(stashFlightFailures)){
+            stashAisleRetryAt=mc.player.tickCount+200;
+            MonocleClient.LOG.warn("[Workers] Aisle flight retries exhausted toward {}; landing and replanning without changing cargo",target);
+            landInStashAisle();detail="Landing to replan the destination aisle; cargo retained";return;
+        }
+        if(mc.player.isFallFlying()||launchTick>=0){
+            if(!stopStashNavigation()){detail="Releasing aisle walking before flight";return;}
+            flyToStashChest(target,false);return;
+        }
+        Vec3 ground=stashAisle.ground();
+        if(!mc.player.onGround()||Math.hypot(mc.player.getX()-ground.x,mc.player.getZ()-ground.z)>.75||Math.abs(mc.player.getY()-ground.y)>.6){
+            walkToStashContainer(scanCoverageCell(ground),0);detail="Walking through stash aisle to chest X/Z · "+detail;return;
+        }
+        if(!stopStashNavigation()){detail="Releasing aisle walking before takeoff";return;}
+        if(Math.hypot(mc.player.getX()-ground.x,mc.player.getZ()-ground.z)>.1){
+            if(!acquireMovement())return;
+            input.stop();brakeFlight();mc.player.setSprinting(false);stashAisleCentering=true;
+            mc.player.setYRot((float)Rotations.getYaw(ground));input.sneak(true);input.forward(true);
+            detail="Aligning with the checked vertical aisle before takeoff";return;
+        }
+        mc.player.setDeltaMovement(0,mc.player.getDeltaMovement().y,0);
+        flyToStashChest(target,false);
+    }
+    private boolean landInStashAisle(){
+        if(mc.player.onGround())return landBeforeHandoff();
+        if(stashAisle==null)return landBeforeHandoff();
+        if(!stopStashNavigation()||!acquireMovement())return false;
+        input.stop();Vec3 from=mc.player.position(),goal=stashAisle.ground().add(0,.15,0);
+        if(Math.hypot(from.x-goal.x,from.z-goal.z)<.7&&from.y-goal.y<.7)return landBeforeHandoff();
+        if(!mc.player.isFallFlying())return landBeforeHandoff();
+        Vec3 velocity=PrinterFlight.safeVelocity(from,goal,.3,stashFlightWidth(mc.player.getBbWidth()),mc.player.getBbHeight(),this::clearBody);
+        Modules.get().get(ElytraFly.class).requestAutopilot(velocity);detail="Descending the checked stash aisle before walking";return false;
     }
     private void completeStash(String message,boolean workflowHandoff){
+        if(aisleDeposit()){if(landInStashAisle())complete(message);return;}
         if(!workflowHandoff||!mc.player.isFallFlying()){if(landBeforeHandoff())complete(message);return;}
         recordStashFlight(stashFlightTrail,mc.player.position());holdStashPosition();
         state="Complete";detail=message;stashHandoff=true;

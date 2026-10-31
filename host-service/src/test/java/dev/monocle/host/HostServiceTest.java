@@ -42,6 +42,15 @@ public final class HostServiceTest {
     }
     public static void main(String[] args) throws Exception {
         if (args.length == 1 && args[0].equals("--webui")) { webUiPreview(); return; }
+        if (args.length == 1 && args[0].equals("--server-aliases")) { serverAliasesCheck(); KitBotCheck.run(); return; }
+        if (args.length == 1 && args[0].equals("--mike")) { MikeKitHandlerCheck.run(); mikeChatCheck(); mikeContentsCheck(); return; }
+        if (args.length == 1 && args[0].equals("--gifts")) { DeliveryWatchdogCheck.run(); MikeKitHandlerCheck.run(); KitBotCheck.run(); mikeGiftsCheck(); return; }
+        if (args.length == 1 && args[0].equals("--cooldowns")) { KitBotCheck.run(); kitBotChatCheck(); return; }
+        if (args.length == 1 && args[0].equals("--bank")) { CreditBankCheck.run(); creditBankHttpCheck(); creditBankMikeCheck(); return; }
+        if (args.length == 1 && args[0].equals("--pending-chat")) { KitBotCheck.run(); CreditBankCheck.run(); pendingGiftChatCheck(); return; }
+        if (args.length == 1 && args[0].equals("--couriers")) { MikeKitHandlerCheck.run(); twoCouriersCheck(); KitBotAvailabilityCheck.run(); return; }
+        if (args.length == 1 && args[0].equals("--availability")) { KitBotAvailabilityCheck.run(); return; }
+        if (args.length == 1 && args[0].equals("--players")) { serverPlayerLookupsCheck(); creditBankMikeCheck(); mikeGiftsCheck(); return; }
         if (args.length == 1 && args[0].equals("--catalog-lock")) { catalogLockCheck(); System.out.println("Catalog and sorting preview reads do not block worker control."); return; }
         if (args.length == 1 && args[0].equals("--rwp-only")) { monocleRwpWorkerCheck(); return; }
         boolean assertions = false; assert assertions = true; if (!assertions) throw new AssertionError("Enable assertions");
@@ -51,11 +60,20 @@ public final class HostServiceTest {
         }
         assert HostService.ACTIONS.contains("Tpa") : "Standalone workers must be able to use the trusted TPA action";
         assert HostService.ACTIONS.contains("StashDeposit") : "An operator can safely store kits already carried after an interrupted pickup";
+        serverAliasesCheck();
         KitStockCheck.run();
         catalogLockCheck();
         KitBotCheck.run();
+        CreditBankCheck.run();creditBankHttpCheck();creditBankMikeCheck();serverPlayerLookupsCheck();
+        DeliveryWatchdogCheck.run();
+        MikeKitHandlerCheck.run();
         stashSortControlCheck();
         kitBotChatCheck();
+        twoCouriersCheck();
+        pendingGiftChatCheck();
+        mikeChatCheck();
+        mikeContentsCheck();
+        mikeGiftsCheck();
         publicWorkerGatewayCheck();
         monocleRwpWorkerCheck();
         monocleRwpFollowReconnectCheck();
@@ -209,11 +227,11 @@ public final class HostServiceTest {
             }
         }
         // Missing executed worker checkpoint never replays side effects.
-        JsonObject root = TaskFiles.read(directory.resolve("host-tasks.json"));
+        JsonObject root = readTaskJournal(directory);
         JsonObject task = root.getAsJsonObject("tasks").getAsJsonObject(unfinished.toString());
         task.remove("cancelled"); task.addProperty("status", "Running");
         task.getAsJsonObject("runs").asMap().values().forEach(value -> value.getAsJsonObject().addProperty("status", "Running"));
-        TaskFiles.write(directory.resolve("host-tasks.json"), root);
+        try(var journal=new TaskJournal(directory.resolve("host-tasks.sqlite"),directory.resolve("host-tasks.json"),"tasks")){journal.write(root);}
         try (HostService host = new HostService(directory, "127.0.0.1", 0, CREWS, 30);
              Worker lost = new Worker(host.port(), KEY, workerId, new LinkedHashMap<>())) {
             await(() -> connected(host) == 1, lost);
@@ -294,32 +312,441 @@ public final class HostServiceTest {
         System.out.println("Action stall socket checks passed: per-worker hold, explicit Resume, stale reports, restart/reconnect and cancellation.");
     }
 
+    private static void serverAliasesCheck() throws Exception {
+        Path directory=Files.createTempDirectory("synthetic-server-alias-host-");
+        JsonArray definitions=JsonParser.parseString("[{name:'Synthetic world',address:'test.invalid',aliases:['relay.test.invalid']}]").getAsJsonArray();
+        ServerAliases.save(directory,ServerAliases.load(directory).revision(),definitions);
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker worker=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())){
+            await(()->connected(host)==1,worker);worker.aliasSupport=true;worker.deferAliases=true;worker.serverAddress="relay.test.invalid";worker.scope="relay.test.invalid\nminecraft:the_nether";worker.announce();
+            await(()->!flag(host.control(op("status")).getAsJsonArray("workers").get(0).getAsJsonObject(),"serverAliasesReady"),worker);
+            JsonObject job=submit(worker.id,0);host.control(job);
+            for(int i=0;i<30;i++){worker.pump();Thread.sleep(10);}assert worker.current.isEmpty():"Alias negotiation must precede execution";
+            JsonObject edit=op("server-aliases-save");edit.addProperty("expected",text(host.control(op("server-aliases-get")),"revision"));edit.add("servers",new JsonArray());rejects(()->host.control(edit));
+            worker.deferAliases=false;worker.announce();await(()->worker.aliasFrames>0&&worker.scope.equals("test.invalid\nminecraft:the_nether"),worker);
+            await(()->!worker.current.isEmpty(),worker);
+            assert flag(host.control(op("status")).getAsJsonArray("workers").get(0).getAsJsonObject(),"serverAliasesReady");
+            assert text(worker.installedEnvelope.getAsJsonObject("dispatch"),"server").equals("test.invalid"):"Dispatch keeps the canonical server identity";
+            host.control(opWithId("cancel",UUID.fromString(text(job,"id"))));await(()->worker.current.isEmpty(),worker);
+        }
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30)){
+            assert host.control(op("server-aliases-get")).getAsJsonArray("servers").equals(definitions):"Aliases survive host restart";
+        }
+        System.out.println("Server alias host checks passed: negotiation gate, canonical dispatch, active-edit rejection and restart persistence.");
+    }
+
+    private static JsonObject kitOrder(HostService host,String name){
+        return host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().stream().map(e->e.getValue().getAsJsonObject()).filter(r->text(r,"name").equals(name)).findFirst().orElse(null);
+    }
+    private static void kitWhisper(Worker worker,String name,String id,String command){
+        JsonObject message=new JsonObject(),sender=new JsonObject();message.addProperty("type","worker-chat");sender.addProperty("name",name);sender.addProperty("uuid",id);message.add("sender",sender);message.addProperty("direction","received");message.addProperty("text",name+" whispers: "+command);worker.c.send(message.toString());
+    }
+    private static void pendingGiftChatCheck()throws Exception{
+        Path directory=Files.createTempDirectory("synthetic-pending-gift-chat-");String owner="00000000-0000-0000-0000-000000000141",recipient="00000000-0000-0000-0000-000000000142";
+        var server=com.sun.net.httpserver.HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);
+        server.createContext("/api/chat",exchange->{
+            try{
+                JsonObject body=JsonParser.parseString(new String(exchange.getRequestBody().readAllBytes(),StandardCharsets.UTF_8)).getAsJsonObject();JsonArray messages=body.getAsJsonArray("messages");String incoming=text(messages.get(messages.size()-1).getAsJsonObject(),"content");
+                JsonObject response=body.getAsJsonArray("tools").isEmpty()?JsonParser.parseString("{role:'assistant',content:'Queued for you.'}").getAsJsonObject():MikeKitHandlerCheck.reply(incoming.contains("GiftFriend")?"{category:'obsidian',quantity:1,payment:'Credits',recipient:'GiftFriend'}":"{category:'obsidian',quantity:3}");
+                byte[] bytes=("{\"done\":true,\"message\":"+response+"}").getBytes(StandardCharsets.UTF_8);exchange.sendResponseHeaders(200,bytes.length);exchange.getResponseBody().write(bytes);
+            }finally{exchange.close();}
+        });server.start();
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker primary=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());Worker backup=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())){
+            primary.name="PrimaryCourier";backup.name="BackupCourier";primary.announce();backup.announce();await(()->connected(host)==2,primary,backup);
+            // Independently invented synthetic geometry and contents.
+            JsonObject bounds=JsonParser.parseString("{name:'SyntheticDepot',homeName:'synthetic-home',minX:3200,maxX:3206,minY:88,maxY:88,minZ:768,maxZ:768}").getAsJsonObject();StashCatalog.define(directory,"Default",primary.scope,bounds);
+            for(int x=3200;x<=3206;x++){
+                JsonObject row=JsonParser.parseString("{y:88,z:768,status:'observed',block:'minecraft:chest',items:{'minecraft:blue_shulker_box':50},shulkers:[]}").getAsJsonObject();row.addProperty("x",x);
+                for(int slot=0;slot<50;slot++){JsonObject box=JsonParser.parseString("{item:'minecraft:blue_shulker_box',name:'Synthetic stone',quantity:1,contentsKnown:true,items:{'minecraft:obsidian':1728}}").getAsJsonObject();box.addProperty("slot",slot);row.getAsJsonArray("shulkers").add(box);}StashCatalog.save(directory,"Default",primary.scope,bounds,row);
+            }
+            KitCategories.seed(directory,"Default",primary.scope,StashCatalog.get(directory,"Default",primary.scope,"SyntheticDepot"),270);
+            JsonObject config=JsonParser.parseString("{enabled:true,publicAccess:true,crew:'Default',source:'SyntheticDepot',minimumStock:270,cooldownSeconds:3600,whitelist:[{name:'Operator',uuid:'00000000-0000-0000-0000-000000000141',role:'Administrator',cooldownSeconds:0,maxKits:5}]}").getAsJsonObject();config.addProperty("worker",primary.id.toString());config.addProperty("backupWorker",backup.id.toString());config.addProperty("scope",primary.scope);
+            JsonObject mike=MikeKitHandler.defaults();mike.addProperty("enabled",true);mike.addProperty("model","synthetic");mike.addProperty("endpoint","http://127.0.0.1:"+server.getAddress().getPort());config.add("mike",mike);
+            JsonObject save=op("kitbot-save");save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));save.add("config",config);host.control(save);
+            primary.serverPlayers.put("GiftFriend",UUID.fromString(recipient));host.creditBank().adjust(UUID.randomUUID().toString(),owner,"Operator",10,"Synthetic reward","test");
+            kitWhisper(primary,"Operator",owner,"buy 1 obsidian kit for GiftFriend");await(()->kitOrder(host,"Operator")!=null&&!primary.current.isEmpty(),primary,backup);JsonObject gift=kitOrder(host,"Operator");UUID giftId=UUID.fromString(text(gift,"id"));
+            JsonObject routed=primary.installedEnvelope.getAsJsonObject("dispatch").getAsJsonObject("args");String script=text(primary.installedEnvelope.getAsJsonObject("programs").getAsJsonObject("task-kit-delivery"),"script");var pick=BotLua.next(script,new JsonObject(),routed,null,null);var tpa=BotLua.next(script,pick.state(),routed,JsonParser.parseString("{ok:true,picked:1,nextPick:1}").getAsJsonObject(),null);assert text(tpa.action(),"type").equals("Tpa");replayAction(host,primary,giftId,tpa.action());
+            await(()->primary.tpaSends.size()==1&&primary.chatMessages.stream().anyMatch(m->m.startsWith("/msg GiftFriend ")),primary,backup);
+            kitWhisper(primary,"Operator",owner,"need 3 obsidian kits");
+            await(()->host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2&&!backup.current.isEmpty(),primary,backup);
+            JsonObject own=host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().stream().map(e->e.getValue().getAsJsonObject()).filter(r->!text(r,"id").equals(giftId.toString())).findFirst().orElseThrow();
+            assert text(own,"recipient").equals(owner)&&own.get("count").getAsInt()==3&&text(own,"worker").equals(backup.id.toString())&&text(own,"payment").equals("Free") : "An outstanding gift does not swallow the operator's own request";
+            assert !primary.current.isEmpty()&&host.creditBank().account(owner).get("balance").getAsInt()==9 : "The original TPA and its charge remain untouched";
+            await(()->primary.chatMessages.stream().anyMatch(m->m.startsWith("/msg Operator ")&&m.contains("BackupCourier")),primary,backup);
+            kitWhisper(primary,"Operator",owner,"need 3 obsidian kits");await(()->primary.chatMessages.stream().anyMatch(m->m.startsWith("/msg Operator ")&&m.contains("already have a delivery")),primary,backup);
+            assert host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2&&host.creditBank().account(owner).get("balance").getAsInt()==9 : "Same-recipient retries get a reply, not another charge or delivery";
+        }finally{server.stop(0);}
+        System.out.println("Pending gift chat checks passed: active external TPA, same requester orders for a different recipient, second courier dispatch and explicit same-recipient rejection without extra charges.");
+    }
+    private static void twoCouriersCheck()throws Exception{
+        Path directory=Files.createTempDirectory("synthetic-two-couriers-");UUID primaryId=UUID.randomUUID(),backupId=UUID.randomUUID();String first="00000000-0000-0000-0000-000000000101",second="00000000-0000-0000-0000-000000000102",recipient="00000000-0000-0000-0000-000000000103";
+        var server=com.sun.net.httpserver.HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);
+        server.createContext("/api/chat",exchange->{
+            try{
+                JsonObject body=JsonParser.parseString(new String(exchange.getRequestBody().readAllBytes(),StandardCharsets.UTF_8)).getAsJsonObject();
+                JsonObject response=body.getAsJsonArray("tools").isEmpty()?JsonParser.parseString("{role:'assistant',content:'Gotchu, queued.'}").getAsJsonObject():MikeKitHandlerCheck.reply("{category:'obsidian',quantity:1,payment:'Credits',recipient:'GiftFriend'}");
+                byte[] bytes=("{\"done\":true,\"message\":"+response+"}").getBytes(StandardCharsets.UTF_8);exchange.sendResponseHeaders(200,bytes.length);exchange.getResponseBody().write(bytes);
+            }finally{exchange.close();}
+        });server.start();
+        try{
+            try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker primary=new Worker(host.port(),KEY,primaryId,new LinkedHashMap<>());Worker backup=new Worker(host.port(),KEY,backupId,new LinkedHashMap<>())){
+                primary.name="PrimaryCourier";backup.name="BackupCourier";primary.announce();backup.announce();await(()->connected(host)==2,primary,backup);
+                // Independently invented synthetic geometry and contents.
+                JsonObject bounds=JsonParser.parseString("{name:'SyntheticDepot',homeName:'synthetic-home',minX:2400,maxX:2406,minY:96,maxY:96,minZ:512,maxZ:512}").getAsJsonObject();StashCatalog.define(directory,"Default",primary.scope,bounds);
+                for(int x=2400;x<=2406;x++){
+                    JsonObject row=JsonParser.parseString("{y:96,z:512,status:'observed',block:'minecraft:chest',items:{'minecraft:blue_shulker_box':50},shulkers:[]}").getAsJsonObject();row.addProperty("x",x);
+                    for(int slot=0;slot<50;slot++){JsonObject box=JsonParser.parseString("{item:'minecraft:blue_shulker_box',name:'Synthetic stone',quantity:1,contentsKnown:true,items:{'minecraft:obsidian':1728}}").getAsJsonObject();box.addProperty("slot",slot);row.getAsJsonArray("shulkers").add(box);}StashCatalog.save(directory,"Default",primary.scope,bounds,row);
+                }
+                KitCategories.seed(directory,"Default",primary.scope,StashCatalog.get(directory,"Default",primary.scope,"SyntheticDepot"),270);
+                JsonObject config=JsonParser.parseString("{enabled:true,publicAccess:true,crew:'Default',source:'SyntheticDepot',minimumStock:270,cooldownSeconds:3600,whitelist:[]}").getAsJsonObject();config.addProperty("worker",primaryId.toString());config.addProperty("backupWorker",backupId.toString());config.addProperty("scope",primary.scope);
+                JsonObject mike=MikeKitHandler.defaults();mike.addProperty("enabled",true);mike.addProperty("model","synthetic");mike.addProperty("endpoint","http://127.0.0.1:"+server.getAddress().getPort());config.add("mike",mike);
+                JsonObject save=op("kitbot-save");save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));save.add("config",config);host.control(save);
+                JsonObject duplicate=save.deepCopy();duplicate.getAsJsonObject("config").addProperty("backupWorker",primaryId.toString());duplicate.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));rejects(()->host.control(duplicate));
+                kitWhisper(primary,"FirstUser",first,"kit obsidian 1");await(()->kitOrder(host,"FirstUser")!=null&&!primary.current.isEmpty(),primary,backup);
+                JsonObject firstOrder=kitOrder(host,"FirstUser");assert text(firstOrder,"worker").equals(primaryId.toString());
+                backup.inLobby=true;backup.announce();await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().anyMatch(v->text(v.getAsJsonObject(),"id").equals(backupId.toString())&&text(v.getAsJsonObject().getAsJsonObject("worldReadiness"),"state").equals("Lobby")),primary,backup);
+                kitWhisper(primary,"LobbyUser","00000000-0000-0000-0000-000000000104","kit obsidian 1");await(()->kitOrder(host,"LobbyUser")!=null,primary,backup);
+                JsonObject lobbyOrder=kitOrder(host,"LobbyUser");assert text(lobbyOrder,"worker").equals(primaryId.toString())&&flag(lobbyOrder,"courierQueued") : "An online lobby account cannot take deliveries";
+                host.control(opWithId("cancel",UUID.fromString(text(lobbyOrder,"id"))));await(()->text(taskView(host,UUID.fromString(text(lobbyOrder,"id"))),"status").equals("Cancelled"),primary,backup);
+                await(()->primary.chatMessages.stream().anyMatch(m->m.startsWith("/msg LobbyUser ")),primary,backup);
+                backup.inLobby=false;backup.announce();await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().anyMatch(v->text(v.getAsJsonObject(),"id").equals(backupId.toString())&&text(v.getAsJsonObject().getAsJsonObject("worldReadiness"),"state").equals("Ready")),primary,backup);
+                primary.serverPlayers.put("GiftFriend",UUID.fromString(recipient));host.creditBank().adjust(UUID.randomUUID().toString(),second,"SecondUser",5,"Synthetic reward","test");
+                kitWhisper(primary,"SecondUser",second,"buy one obsidian kit for GiftFriend");await(()->kitOrder(host,"SecondUser")!=null,primary,backup);
+                JsonObject secondOrder=kitOrder(host,"SecondUser");assert text(secondOrder,"worker").equals(backupId.toString())&&text(secondOrder,"recipient").equals(recipient)&&host.creditBank().account(second).get("balance").getAsInt()==4;
+                assert taskView(host,UUID.fromString(text(secondOrder,"id"))).getAsJsonObject("runs").has(backupId.toString());
+                await(()->primary.chatMessages.stream().anyMatch(m->m.startsWith("/msg SecondUser ")&&m.contains("BackupCourier")&&m.contains("GiftFriend")),primary,backup);
+                assert backup.current.isEmpty() : "The second courier waits for source pickup, not the first recipient's handoff";
+                JsonObject routed=primary.installedEnvelope.getAsJsonObject("dispatch").getAsJsonObject("args");String script=text(primary.installedEnvelope.getAsJsonObject("programs").getAsJsonObject("task-kit-delivery"),"script");
+                var pick=BotLua.next(script,new JsonObject(),routed,null,null);var tpa=BotLua.next(script,pick.state(),routed,JsonParser.parseString("{ok:true,picked:1,nextPick:1}").getAsJsonObject(),null);
+                assert text(tpa.action(),"type").equals("Tpa");replayAction(host,primary,UUID.fromString(text(firstOrder,"id")),tpa.action());
+                await(()->!backup.current.isEmpty(),primary,backup);assert !primary.current.isEmpty()&&!backup.current.isEmpty() : "Both couriers deliver concurrently once source pickup finishes";
+                await(()->primary.chatMessages.stream().anyMatch(m->m.startsWith("/msg GiftFriend ")&&m.contains("BackupCourier's TPA")),primary,backup);
+                int orders=host.control(op("kitbot-get")).getAsJsonObject("requests").size();kitWhisper(backup,"FirstUser",first,"kit obsidian 1");
+                await(()->backup.chatMessages.stream().anyMatch(m->m.startsWith("/msg FirstUser ")&&m.contains("cooldown")),primary,backup);assert host.control(op("kitbot-get")).getAsJsonObject("requests").size()==orders : "The same user cannot bypass their allowance using the other receiver";
+                kitWhisper(backup,"ThirdUser","00000000-0000-0000-0000-000000000105","kit obsidian 1");await(()->kitOrder(host,"ThirdUser")!=null,primary,backup);assert text(kitOrder(host,"ThirdUser"),"worker").equals(backupId.toString())&&flag(kitOrder(host,"ThirdUser"),"courierQueued");
+                backup.close();await(()->connected(host)==1,primary);
+                kitWhisper(primary,"OfflineUser","00000000-0000-0000-0000-000000000106","kit obsidian 1");await(()->kitOrder(host,"OfflineUser")!=null,primary);assert text(kitOrder(host,"OfflineUser"),"worker").equals(primaryId.toString());
+                await(()->primary.chatMessages.stream().anyMatch(m->m.startsWith("/msg OfflineUser ")&&m.contains("queued behind")&&!m.contains("BackupCourier")),primary);
+                assert text(kitOrder(host,"SecondUser"),"worker").equals(backupId.toString()) : "Disconnect does not reissue accepted cargo to another account";
+                JsonObject oldClient=config.deepCopy();oldClient.remove("backupWorker");save.add("config",oldClient);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);assert text(host.control(op("kitbot-get")).getAsJsonObject("config"),"backupWorker").equals(backupId.toString());
+            }
+            try(HostService restarted=new HostService(directory,"127.0.0.1",0,CREWS,30)){
+                assert text(kitOrder(restarted,"SecondUser"),"worker").equals(backupId.toString())&&text(restarted.control(op("kitbot-get")).getAsJsonObject("config"),"backupWorker").equals(backupId.toString()) : "Host restart preserves configuration and immutable courier assignment";
+            }
+        }finally{server.stop(0);}
+        JsonObject older=JsonParser.parseString("{id:'00000000-0000-0000-0000-000000000201',status:'Running',crew:'Synthetic',server:'synthetic.invalid',dimension:'minecraft:overworld',package:{entry:'task-kit-delivery'},args:{name:'SyntheticDepot',destination:'Player'},runs:{'00000000-0000-0000-0000-000000000202':{status:'Sending'}}}").getAsJsonObject();
+        JsonObject newer=older.deepCopy();newer.addProperty("id","00000000-0000-0000-0000-000000000203");newer.add("runs",JsonParser.parseString("{'00000000-0000-0000-0000-000000000204':{status:'Sending'}}"));
+        assert !HostService.kitPickupBlocked(older,UUID.fromString("00000000-0000-0000-0000-000000000202"),List.of(older,newer))&&HostService.kitPickupBlocked(newer,UUID.fromString("00000000-0000-0000-0000-000000000204"),List.of(older,newer)) : "Two interrupted installs use deterministic priority instead of waiting on each other";
+        System.out.println("Two courier socket checks passed: shared Mike, paid gifts, pickup serialization, parallel handoffs, lobby/offline gating, shared allowances and durable assignment.");
+    }
     private static void kitBotChatCheck() throws Exception {
         Path directory=Files.createTempDirectory("monocle-kitbot-chat-");
         try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker worker=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())){
             await(()->connected(host)==1,worker);
             JsonObject bounds=JsonParser.parseString("{name:'main',homeName:'main',minX:0,maxX:2,minY:100,maxY:100,minZ:0,maxZ:0}").getAsJsonObject();StashCatalog.define(directory,"Default",worker.scope,StashCatalog.plan(bounds));
-            JsonObject config=JsonParser.parseString("{enabled:true,crew:'Default',source:'main',minimumStock:250,cooldownSeconds:86400,whitelist:[{name:'iotacism',uuid:'ebe1d0a2-a08f-4223-8a92-8d50b6431dc4'}]}").getAsJsonObject();config.addProperty("worker",worker.id.toString());config.addProperty("scope",worker.scope);
+            JsonObject config=JsonParser.parseString("{enabled:true,crew:'Default',source:'main',minimumStock:250,cooldownSeconds:86400,whitelist:[{name:'ExampleUser',uuid:'00000000-0000-0000-0000-000000000077'}]}").getAsJsonObject();config.addProperty("worker",worker.id.toString());config.addProperty("scope",worker.scope);
             JsonObject save=op("kitbot-save");save.add("config",config);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);
             worker.inLobby=true;worker.announce();await(()->text(host.control(op("status")).getAsJsonArray("workers").get(0).getAsJsonObject().getAsJsonObject("worldReadiness"),"state").equals("Lobby"),worker);
-            JsonObject message=op("unused");message.remove("op");message.addProperty("type","worker-chat");message.addProperty("direction","received");message.addProperty("text","[unknown player head] iotacism whispers: kit pvp 2");worker.c.send(message.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()==1,worker);
+            JsonObject message=op("unused");message.remove("op");message.addProperty("type","worker-chat");message.addProperty("direction","received");message.addProperty("text","[unknown player head] ExampleUser whispers: kit pvp 2");worker.c.send(message.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()==1,worker);
             assert host.control(op("kitbot-get")).getAsJsonObject("requests").isEmpty();
             worker.inLobby=false;worker.announce();await(()->text(host.control(op("status")).getAsJsonArray("workers").get(0).getAsJsonObject().getAsJsonObject("worldReadiness"),"state").equals("Ready"),worker);
-            message.addProperty("text","iotacism » kit pvp 2");worker.c.send(message.toString());message.addProperty("text","other whispers: kit pvp 2");worker.c.send(message.toString());message.addProperty("direction","sent");message.addProperty("text","iotacism whispers: kit pvp 2");worker.c.send(message.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()>=4,worker);assert host.control(op("kitbot-get")).getAsJsonObject("requests").isEmpty();
+            message.addProperty("text","ExampleUser » kit pvp 2");worker.c.send(message.toString());message.addProperty("text","other whispers: kit pvp 2");worker.c.send(message.toString());message.addProperty("direction","sent");message.addProperty("text","ExampleUser whispers: kit pvp 2");worker.c.send(message.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()>=4,worker);assert host.control(op("kitbot-get")).getAsJsonObject("requests").isEmpty();
             message.addProperty("direction","received");worker.c.send(message.toString());await(()->host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1,worker);await(()->worker.chatMessages.size()==1,worker);
-            assert worker.chatMessages.getFirst().startsWith("/msg iotacism ");assert host.control(op("status")).getAsJsonArray("tasks").isEmpty();
-            worker.c.send(message.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()>=7,worker);assert host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1;
+            assert worker.chatMessages.getFirst().startsWith("/msg ExampleUser ");assert host.control(op("status")).getAsJsonArray("tasks").isEmpty();
+            message.addProperty("text","ExampleUser whispers: hello?");worker.c.send(message.toString());worker.c.send(message.toString());
+            await(()->worker.chatMessages.size()==2,worker);assert worker.chatMessages.getLast().matches("/msg ExampleUser You're on cooldown\\. You can request kits again in \\d+h \\d+m \\d+s\\.");
+            assert host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1 : "Cooldown notices create no order or new cooldown entry";
             JsonObject other=JsonParser.parseString("{name:'other',uuid:'00000000-0000-0000-0000-000000000002',cooldownSeconds:0,maxKits:1}").getAsJsonObject();config.getAsJsonArray("whitelist").add(other);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);
-            message.addProperty("text","other whispers: kit pvp 2");worker.c.send(message.toString());await(()->worker.chatMessages.size()==2,worker);
+            message.addProperty("text","other whispers: kit pvp 2");worker.c.send(message.toString());await(()->worker.chatMessages.size()==3,worker);
             assert worker.chatTimes.getLast()-worker.chatTimes.getFirst()>=4_900_000_000L:"DM queue enforces five seconds per courier";
             assert worker.chatMessages.getLast().contains("Maximum kits per request: 1")&&host.control(op("status")).getAsJsonArray("tasks").isEmpty();
             assert host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().stream().anyMatch(e->text(e.getValue().getAsJsonObject(),"status").equals("LimitExceeded"));
-            int receipts=host.control(op("kitbot-get")).getAsJsonObject("requests").size();message.addProperty("text","iotacism whispers: kits");worker.c.send(message.toString());await(()->worker.chatMessages.size()==3,worker);
-            assert worker.chatMessages.getLast().equals("/msg iotacism Kits 1: No kits in stock.")&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==receipts;
+            int receipts=host.control(op("kitbot-get")).getAsJsonObject("requests").size();message.addProperty("text","ExampleUser whispers: kits");worker.c.send(message.toString());await(()->worker.chatMessages.size()==4,worker);
+            assert worker.chatMessages.getLast().equals("/msg ExampleUser Kits 1: No kits in stock.")&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==receipts;
         }
         System.out.println("Kitbot socket checks passed: authenticated courier, ready-world gate, lobby/public/sent exclusion and durable request deduplication.");
     }
 
+    private static void mikeChatCheck() throws Exception {
+        // Synthetic source and player only; this test cannot reach a game or real Ollama.
+        Path directory=Files.createTempDirectory("monocle-mike-chat-");
+        var server=com.sun.net.httpserver.HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);
+        var calls=new java.util.concurrent.atomic.AtomicInteger();var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        server.createContext("/api/chat",exchange->{
+            try{
+                String prompt=new String(exchange.getRequestBody().readAllBytes(),StandardCharsets.UTF_8);
+                if(JsonParser.parseString(prompt).getAsJsonObject().getAsJsonArray("tools").isEmpty()){byte[] ack="{\"done\":true,\"message\":{\"role\":\"assistant\",\"content\":\"Gotchu, queued.\"}}".getBytes(StandardCharsets.UTF_8);exchange.sendResponseHeaders(200,ack.length);exchange.getResponseBody().write(ack);return;}
+                assert !prompt.contains("SyntheticDepot")&&!prompt.contains("PRIVATE_HOME_CANARY")&&!prompt.contains("1728")&&!prompt.contains("250");
+                int call=calls.incrementAndGet();entered.countDown();release.await(5,java.util.concurrent.TimeUnit.SECONDS);
+                JsonObject response=MikeKitHandlerCheck.reply("{category:'obsidian',quantity:2}");
+                if(call==2)response=JsonParser.parseString("{role:'assistant',content:'What kind of kit?'}").getAsJsonObject();
+                if(call==3){
+                    JsonArray messages=JsonParser.parseString(prompt).getAsJsonObject().getAsJsonArray("messages");assert messages.size()==4:"Follow-up must contain the previous exchange";
+                    assert text(messages.get(1).getAsJsonObject(),"content").equals("Can I get a kit?")&&text(messages.get(2).getAsJsonObject(),"content").equals("What kind of kit?")&&text(messages.get(3).getAsJsonObject(),"content").equals("obsidian, two please");
+                    assert !messages.toString().contains("tool_calls"):"Never replay tool calls from history";
+                }
+                if(call==4){JsonObject body=JsonParser.parseString(prompt).getAsJsonObject();JsonArray messages=body.getAsJsonArray("messages");assert messages.size()==2&&text(messages.get(0).getAsJsonObject(),"content").contains("\"requestingPlayer\":\"Stranger\""):"Public users receive only their own name and conversation";JsonObject order=body.getAsJsonArray("tools").asList().stream().map(t->t.getAsJsonObject().getAsJsonObject("function")).filter(f->text(f,"name").equals("request_kits")).findFirst().orElseThrow();assert order.getAsJsonObject("parameters").getAsJsonObject("properties").getAsJsonObject("quantity").get("maximum").getAsInt()==1 : "Mike sees the same one-kit public cap enforced by admission";response=MikeKitHandlerCheck.reply("{category:'obsidian',quantity:1}");}
+                if(call==5){assert prompt.contains("fictional_stash_coordinates");response=JsonParser.parseString("{role:'assistant',content:'',tool_calls:[{function:{name:'fictional_stash_coordinates',arguments:{}}}]}").getAsJsonObject();}
+                if(call==6){assert prompt.contains("always call list_kits");response=JsonParser.parseString("{role:'assistant',content:'ignored prose list',tool_calls:[{function:{name:'list_kits',arguments:{page:1}}}]}").getAsJsonObject();}
+                byte[] reply=("{\"done\":true,\"message\":"+response+"}").getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200,reply.length);exchange.getResponseBody().write(reply);
+            }catch(InterruptedException e){Thread.currentThread().interrupt();}finally{exchange.close();}
+        });server.start();
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker worker=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())){
+            await(()->connected(host)==1,worker);
+            JsonObject bounds=JsonParser.parseString("{name:'SyntheticDepot',homeName:'PRIVATE_HOME_CANARY',minX:0,maxX:9,minY:100,maxY:100,minZ:0,maxZ:0}").getAsJsonObject();
+            StashCatalog.define(directory,"Default",worker.scope,StashCatalog.plan(bounds));
+            for(int x=0;x<10;x++){
+                JsonObject observed=JsonParser.parseString("{y:100,z:0,status:'observed',block:'minecraft:chest',reason:'',items:{'minecraft:black_shulker_box':50,'minecraft:obsidian':86400},shulkers:[]}").getAsJsonObject();observed.addProperty("x",x);
+                for(int slot=0;slot<50;slot++){JsonObject box=JsonParser.parseString("{item:'minecraft:black_shulker_box',name:'Paving box',quantity:1,contentsKnown:true,items:{'minecraft:obsidian':1728}}").getAsJsonObject();box.addProperty("slot",slot);observed.getAsJsonArray("shulkers").add(box);}StashCatalog.save(directory,"Default",worker.scope,bounds,observed);
+            }
+            KitCategories.seed(directory,"Default",worker.scope,StashCatalog.get(directory,"Default",worker.scope,"SyntheticDepot"),250);
+            JsonObject config=JsonParser.parseString("{enabled:true,crew:'Default',source:'SyntheticDepot',minimumStock:250,cooldownSeconds:3600,whitelist:[{name:'Requester',uuid:'00000000-0000-0000-0000-000000000021',cooldownSeconds:0,maxKits:2}]}").getAsJsonObject();config.addProperty("worker",worker.id.toString());config.addProperty("scope",worker.scope);
+            JsonObject mike=MikeKitHandler.defaults();mike.addProperty("enabled",true);mike.addProperty("model","synthetic-tool-model");mike.addProperty("endpoint","http://127.0.0.1:"+server.getAddress().getPort());config.add("mike",mike);
+            JsonObject save=op("kitbot-save");save.add("config",config);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);
+            JsonObject whisper=new JsonObject();whisper.addProperty("type","worker-chat");whisper.addProperty("direction","received");whisper.addProperty("text","Stranger whispers: can I get two obsidian kits?");worker.c.send(whisper.toString());
+            whisper.addProperty("text","Requester » can I get two obsidian kits?");worker.c.send(whisper.toString());
+            whisper.addProperty("direction","sent");whisper.addProperty("text","Requester whispers: can I get two obsidian kits?");worker.c.send(whisper.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()>=3,worker);assert calls.get()==0;
+            whisper.addProperty("direction","received");worker.c.send(whisper.toString());worker.c.send(whisper.toString());
+            await(()->entered.getCount()==0,worker);assert calls.get()==1;
+            long started=System.nanoTime();host.control(op("status"));assert System.nanoTime()-started<1_000_000_000L:"Ollama must not hold the coordinator monitor";
+            mike.addProperty("enabled",false);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);release.countDown();
+            await(()->host.control(op("kitbot-get")).getAsJsonObject("mikeStatus").get("pending").getAsInt()==0,worker);assert host.control(op("kitbot-get")).getAsJsonObject("requests").isEmpty():"Disabling Mike invalidates an in-flight delivery proposal";
+            mike.addProperty("enabled",true);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);
+            long next=System.nanoTime()+5_100_000_000L;await(()->System.nanoTime()>=next,worker);whisper.addProperty("text","Requester whispers: Can I get a kit?");worker.c.send(whisper.toString());
+            await(()->worker.chatMessages.size()==1,worker);assert worker.chatMessages.getFirst().equals("/msg Requester What kind of kit?")&&host.control(op("kitbot-get")).getAsJsonObject("requests").isEmpty();
+            long followup=System.nanoTime()+5_100_000_000L;await(()->System.nanoTime()>=followup,worker);whisper.addProperty("text","requester whispers: obsidian, two please");worker.c.send(whisper.toString());
+            await(()->host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1,worker);
+            JsonObject accepted=host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().iterator().next().getValue().getAsJsonObject();
+            assert text(accepted,"recipient").equals("00000000-0000-0000-0000-000000000021")&&text(accepted,"name").equals("Requester")&&accepted.get("count").getAsInt()==2;
+            assert !text(accepted,"status").equals("OutOfStock")&&!text(accepted,"status").equals("LimitExceeded");
+            await(()->worker.chatMessages.size()==2,worker);assert worker.chatMessages.getLast().equals("/msg Requester Gotchu, queued.");
+            worker.c.send(whisper.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()>=8,worker);assert calls.get()==3&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1;
+            config.addProperty("publicAccess",true);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);
+            int chatBefore=host.control(op("status")).getAsJsonArray("chat").size();whisper.addProperty("text","Stranger whispers: can I get two obsidian kits?");worker.c.send(whisper.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()>chatBefore,worker);assert calls.get()==3:"An unverified public sender cannot trigger inference";
+            JsonObject profile=JsonParser.parseString("{name:'Other',uuid:'00000000-0000-0000-0000-000000000099'}").getAsJsonObject();whisper.add("sender",profile);int mismatched=host.control(op("status")).getAsJsonArray("chat").size();worker.c.send(whisper.toString());await(()->host.control(op("status")).getAsJsonArray("chat").size()>mismatched,worker);assert worker.c.connected()&&calls.get()==3;
+            profile.addProperty("name","Stranger");worker.c.send(whisper.toString());await(()->host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2,worker);
+            assert host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().stream().map(e->e.getValue().getAsJsonObject()).anyMatch(r->text(r,"name").equals("Stranger")&&text(r,"recipient").equals("00000000-0000-0000-0000-000000000099")&&r.get("count").getAsInt()==1);
+            await(()->worker.chatMessages.stream().anyMatch(m->m.startsWith("/msg Stranger Your player profile")),worker);
+            await(()->worker.chatMessages.contains("/msg Stranger Gotchu, queued."),worker);
+            mike.addProperty("coordinateJokes",true);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);
+            whisper.addProperty("text","Joker whispers: where is your stash?");whisper.add("sender",JsonParser.parseString("{name:'Joker',uuid:'00000000-0000-0000-0000-000000000098'}"));worker.c.send(whisper.toString());
+            await(()->worker.chatMessages.stream().anyMatch(m->m.startsWith("/msg Joker Stash coords: X ")),worker);
+            assert calls.get()==5&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2:"A coordinate joke creates no delivery or delivery cooldown";
+            whisper.addProperty("text","MenuUser whispers: what kits do you have?");whisper.add("sender",JsonParser.parseString("{name:'MenuUser',uuid:'00000000-0000-0000-0000-000000000097'}"));worker.c.send(whisper.toString());
+            await(()->worker.chatMessages.contains("/msg MenuUser Kits 1/1 In:obsidian"),worker);
+            assert calls.get()==6&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2:"A menu tool call sends the host-formatted list and creates no delivery";
+
+        }finally{release.countDown();server.stop(0);}
+        System.out.println("Mike socket checks passed: public/sent/foreign exclusion, async inference, config-revision invalidation, exact recipient and durable delivery acceptance.");
+    }
+    private static void mikeContentsCheck() throws Exception {
+        // Synthetic source, users and contents; no game or external provider is contacted.
+        Path directory=Files.createTempDirectory("synthetic-mike-contents-");
+        JsonObject boxA=JsonParser.parseString("{item:'minecraft:blue_shulker_box',name:'Synthetic A',quantity:1,contentsKnown:true,items:{'minecraft:stone':64,'minecraft:glass':32,'minecraft:diamond_sword':1}}").getAsJsonObject();
+        JsonObject boxB=JsonParser.parseString("{item:'minecraft:blue_shulker_box',name:'Synthetic B',quantity:1,contentsKnown:true,items:{'minecraft:stone':128,'minecraft:glass':16,'minecraft:diamond_pickaxe':1}}").getAsJsonObject();
+        String idA=StashCatalog.kitTypeId(boxA),idB=StashCatalog.kitTypeId(boxB),ref=KitBotContents.reference(idA);
+        var server=com.sun.net.httpserver.HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);var calls=new java.util.concurrent.atomic.AtomicInteger();var perPerson=new java.util.concurrent.ConcurrentHashMap<String,java.util.concurrent.atomic.AtomicInteger>();
+        server.createContext("/api/chat",exchange->{
+            try{
+                JsonObject body=JsonParser.parseString(new String(exchange.getRequestBody().readAllBytes(),StandardCharsets.UTF_8)).getAsJsonObject();String wire=body.toString();
+                assert !wire.contains("PRIVATE_HOME_CANARY")&&!wire.contains(idA)&&!wire.contains(idB)&&!wire.contains("SyntheticDepot")&&!wire.contains("\"complete\":");
+                if(body.getAsJsonArray("tools").isEmpty()){byte[] ack="{\"done\":true,\"message\":{\"role\":\"assistant\",\"content\":\"Gotchu, queued.\"}}".getBytes(StandardCharsets.UTF_8);exchange.sendResponseHeaders(200,ack.length);exchange.getResponseBody().write(ack);return;}
+                calls.incrementAndGet();String system=text(body.getAsJsonArray("messages").get(0).getAsJsonObject(),"content");String person=text(JsonParser.parseString(system.substring(system.lastIndexOf("Public menu: ")+13)).getAsJsonObject(),"requestingPlayer");
+                int turn=perPerson.computeIfAbsent(person,_ -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();JsonObject answer;
+                JsonObject read=JsonParser.parseString("{role:'assistant',content:'',tool_calls:[{function:{name:'inspect_kits',arguments:{category:'build',minimums:{'minecraft:glass':20}}}}]}").getAsJsonObject();
+                if(person.equals("SpecificUser")){
+                    if(turn==1){answer=read;answer.getAsJsonArray("tool_calls").add(MikeKitHandlerCheck.reply("{category:'build',quantity:1,kit:'"+ref+"'}").getAsJsonArray("tool_calls").get(0));}
+                    else if(turn==2){assert text(body.getAsJsonArray("messages").asList().getLast().getAsJsonObject(),"role").equals("system");assert wire.contains("NO action was executed");answer=read;}
+                    else {JsonObject result=JsonParser.parseString(text(body.getAsJsonArray("messages").asList().getLast().getAsJsonObject(),"content")).getAsJsonObject();assert result.getAsJsonArray("kits").size()==1&&result.getAsJsonObject("blocksPerKitRange").get("min").getAsInt()==96;answer=MikeKitHandlerCheck.reply("{category:'build',quantity:1,kit:'"+ref+"'}");}
+                }else if(person.equals("InfoUser")){
+                    if(turn==1)answer=JsonParser.parseString("{role:'assistant',content:'',tool_calls:[{function:{name:'inspect_kits',arguments:{category:'build',items:['blocks']}}}]}").getAsJsonObject();
+                    else {JsonObject result=JsonParser.parseString(text(body.getAsJsonArray("messages").asList().getLast().getAsJsonObject(),"content")).getAsJsonObject();assert result.getAsJsonObject("blocksPerKitRange").get("min").getAsInt()==96&&result.getAsJsonObject("blocksPerKitRange").get("max").getAsInt()==144;answer=JsonParser.parseString("{role:'assistant',content:'Build kits contain 96-144 placeable block items per kit.'}").getAsJsonObject();}
+                }else if(person.equals("RememberedUser")){
+                    if(turn==2)assert text(body.getAsJsonArray("messages").asList().getLast().getAsJsonObject(),"role").equals("tool"):"A remembered reference gets a host-initiated fresh inspection";
+                    answer=MikeKitHandlerCheck.reply("{category:'build',quantity:1,kit:'"+ref+"'}");
+                }else if(person.equals("ManyOrdersUser")){
+                    answer=MikeKitHandlerCheck.reply("{category:'build',quantity:1}");answer.getAsJsonArray("tool_calls").add(MikeKitHandlerCheck.reply("{category:'build',quantity:2}").getAsJsonArray("tool_calls").get(0));
+                }else if(person.equals("LoopUser"))answer=read;
+                else throw new AssertionError("Unexpected synthetic requester");
+                byte[] bytes=("{\"done\":true,\"message\":"+answer+"}").getBytes(StandardCharsets.UTF_8);exchange.sendResponseHeaders(200,bytes.length);exchange.getResponseBody().write(bytes);
+            }finally{exchange.close();}
+        });server.start();
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker worker=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())){
+            await(()->connected(host)==1,worker);
+            JsonObject bounds=StashCatalog.plan(JsonParser.parseString("{name:'SyntheticDepot',homeName:'PRIVATE_HOME_CANARY',minX:0,maxX:11,minY:100,maxY:100,minZ:0,maxZ:0}").getAsJsonObject());StashCatalog.define(directory,"Default",worker.scope,bounds);
+            for(int x=0;x<12;x++){
+                JsonObject observed=JsonParser.parseString("{y:100,z:0,status:'observed',block:'minecraft:chest',reason:'',items:{'minecraft:blue_shulker_box':50},shulkers:[]}").getAsJsonObject();observed.addProperty("x",x);
+                for(int slot=0;slot<50;slot++){JsonObject box=(x<6?boxA:boxB).deepCopy();box.addProperty("slot",slot);observed.getAsJsonArray("shulkers").add(box);}StashCatalog.save(directory,"Default",worker.scope,bounds,observed);
+            }
+            JsonObject category=KitCategories.definition("build","Synthetic build","Kits",List.of(idA,idB));KitCategories.save(directory,"Default",worker.scope,text(KitCategories.get(directory,"Default",worker.scope),"revision"),category);
+            JsonObject config=JsonParser.parseString("{enabled:true,crew:'Default',source:'SyntheticDepot',minimumStock:270,cooldownSeconds:3600,whitelist:[]}").getAsJsonObject();config.addProperty("worker",worker.id.toString());config.addProperty("scope",worker.scope);
+            for(int i=1;i<=5;i++){JsonObject person=new JsonObject();person.addProperty("name",List.of("SpecificUser","InfoUser","LoopUser","RememberedUser","ManyOrdersUser").get(i-1));person.addProperty("uuid","00000000-0000-0000-0000-%012d".formatted(i));person.addProperty("cooldownSeconds",0);config.getAsJsonArray("whitelist").add(person);}
+            JsonObject settings=MikeKitHandler.defaults();settings.addProperty("enabled",true);settings.addProperty("model","synthetic-tool-model");settings.addProperty("endpoint","http://127.0.0.1:"+server.getAddress().getPort());config.add("mike",settings);
+            JsonObject save=op("kitbot-save");save.add("config",config);save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));host.control(save);
+            JsonObject whisper=JsonParser.parseString("{type:'worker-chat',direction:'received',text:'SpecificUser whispers: bring one kit with at least 20 glass'}").getAsJsonObject();worker.c.send(whisper.toString());
+            await(()->host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1,worker);JsonObject accepted=host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().iterator().next().getValue().getAsJsonObject();assert text(accepted,"kitTypeId").equals(idA)&&text(accepted,"kit").equals(ref)&&!text(accepted,"status").equals("OutOfStock");await(()->worker.chatMessages.contains("/msg SpecificUser Gotchu, queued."),worker);
+            whisper.addProperty("text","InfoUser whispers: how many blocks are in a build kit?");worker.c.send(whisper.toString());await(()->worker.chatMessages.contains("/msg InfoUser Build kits contain 96-144 placeable block items per kit."),worker);assert host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1;
+            whisper.addProperty("text","LoopUser whispers: compare build kits");worker.c.send(whisper.toString());await(()->worker.chatMessages.stream().anyMatch(m->m.startsWith("/msg LoopUser Mike couldn't handle that.")),worker);assert perPerson.get("LoopUser").get()==5&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1:"Read loops are bounded and never create extra orders";
+            whisper.addProperty("text","RememberedUser whispers: bring that specific build kit");worker.c.send(whisper.toString());await(()->worker.chatMessages.contains("/msg RememberedUser Gotchu, queued."),worker);assert perPerson.get("RememberedUser").get()==2&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2:"Remembered selections refresh before one exact delivery";
+            whisper.addProperty("text","ManyOrdersUser whispers: bring one build kit");worker.c.send(whisper.toString());await(()->worker.chatMessages.stream().anyMatch(m->m.startsWith("/msg ManyOrdersUser Mike couldn't handle that.")),worker);assert perPerson.get("ManyOrdersUser").get()==5&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2:"Repeated multi-order responses are bounded and never partially executed";
+            assert perPerson.get("SpecificUser").get()==3&&worker.chatMessages.stream().filter(m->m.equals("/msg SpecificUser Gotchu, queued.")).count()==1;
+            assert text(host.control(op("kitbot-get")).getAsJsonObject("mikeStatus"),"error").contains("tool_budget_exhausted"):"Validation failures have an operator-visible safe reason code";
+        }finally{server.stop(0);}
+        System.out.println("Mike content socket checks passed: bounded read-tool exchanges, per-kit ranges, exact-variant delivery and no order for information-only requests.");
+    }
+    private static void failedPlayerLookup(java.util.concurrent.CompletableFuture<JsonObject> result,String message){
+        assert result.isCompletedExceptionally();try{result.join();throw new AssertionError("Invalid lookup accepted");}catch(java.util.concurrent.CompletionException expected){assert expected.getCause().getMessage().contains(message):expected.getCause();}
+    }
+    private static void serverPlayerLookupsCheck()throws Exception{
+        // Entirely synthetic server names and UUIDs, including a non-Mojang server profile.
+        Path directory=Files.createTempDirectory("synthetic-server-players-");UUID guest=UUID.fromString("00000000-0000-3000-8000-000000000091");
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker courier=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());Worker other=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())){
+            await(()->connected(host)==2,courier,other);courier.serverPlayers.put("Synthetic_Guest",guest);
+            var found=host.playerIdentity("synthetic_guest",courier.id.toString());await(found::isDone,courier,other);
+            assert text(found.join(),"id").equals(guest.toString())&&text(found.join(),"name").equals("Synthetic_Guest") : "Only server-provided UUIDs and canonical case are used";
+            other.name="RosterOnly";other.announce();await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().anyMatch(v->text(v.getAsJsonObject(),"name").equals("RosterOnly")),courier,other);
+            var missing=host.playerIdentity(other.name,courier.id.toString());await(missing::isDone,courier,other);failedPlayerLookup(missing,"not in the courier");
+            courier.serverPlayers.put("SYNTHETIC_GUEST",UUID.randomUUID());var ambiguous=host.playerIdentity("Synthetic_Guest",courier.id.toString());await(ambiguous::isDone,courier,other);failedPlayerLookup(ambiguous,"multiple");courier.serverPlayers.remove("SYNTHETIC_GUEST");
+            courier.playerLookupSupported=false;courier.announce();await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().anyMatch(v->text(v.getAsJsonObject(),"id").equals(courier.id.toString())&&!flag(v.getAsJsonObject(),"playerLookupSupported")),courier,other);
+            failedPlayerLookup(host.playerIdentity("Synthetic_Guest",courier.id.toString()),"0.16.7");
+            courier.playerLookupSupported=true;courier.announce();await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().anyMatch(v->text(v.getAsJsonObject(),"id").equals(courier.id.toString())&&flag(v.getAsJsonObject(),"playerLookupSupported")),courier,other);
+            courier.holdPlayerLookup=true;var timed=host.playerIdentity("Synthetic_Guest",courier.id.toString());long begin=System.nanoTime();host.control(op("status"));assert System.nanoTime()-begin<1_000_000_000L : "Lookup waiting cannot lock coordinator control";await(timed::isDone,courier,other);failedPlayerLookup(timed,"timed out");
+            var changed=host.playerIdentity("Synthetic_Guest",courier.id.toString());String scope=courier.scope;courier.scope="other.synthetic.invalid\nminecraft:the_nether";courier.announce();await(changed::isDone,courier,other);failedPlayerLookup(changed,"unavailable");courier.scope=scope;courier.announce();await(()->host.control(op("status")).getAsJsonArray("workers").asList().stream().anyMatch(v->text(v.getAsJsonObject(),"id").equals(courier.id.toString())&&text(v.getAsJsonObject(),"scope").equals(scope)),courier,other);
+            int before=courier.playerLookups.size();var bound=host.playerIdentity("Synthetic_Guest",courier.id.toString());await(()->courier.playerLookups.size()>before,courier,other);JsonObject response=courier.playerLookups.getLast().deepCopy();response.addProperty("type","worker-player-lookup");response.addProperty("status","Missing");other.c.send(response.toString());await(()->!other.c.connected(),courier,other);assert !bound.isDone() : "Another worker cannot satisfy the request";courier.c.send(response.toString());await(bound::isDone,courier);failedPlayerLookup(bound,"not in the courier");
+            courier.holdPlayerLookup=false;var read=java.util.concurrent.CompletableFuture.supplyAsync(()->ResourceApi.route(host,"GET",URI.create("/v1/players/Synthetic_Guest?workerId="+courier.id),null,null));await(read::isDone,courier);assert read.join().code()==200&&text(read.join().body(),"id").equals(guest.toString());
+            rejects(()->ResourceApi.route(host,"GET",URI.create("/v1/players/Synthetic_Guest?unexpected=1"),null,null));rejects(()->host.playerIdentity("invalid.name",courier.id.toString()));
+            courier.holdPlayerLookup=true;var closing=host.playerIdentity("Synthetic_Guest",courier.id.toString());host.close();failedPlayerLookup(closing,"Host closed");
+        }
+        try(var stream=ResourceApi.class.getResourceAsStream("ResourceApi.class")){String bytes=new String(stream.readAllBytes(),StandardCharsets.ISO_8859_1);assert !bytes.contains("api.mojang.com")&&!bytes.contains("java/net/http/HttpClient") : "Name lookup must never query an external profile service";}
+        System.out.println("Server player lookup checks passed: authoritative UUIDs, missing/ambiguous names, worker binding, timeout, world changes, HTTP scope and no external fallback.");
+    }
+    private static void creditBankHttpCheck()throws Exception{
+        Path directory=Files.createTempDirectory("synthetic-credit-api-");String player="00000000-0000-0000-0000-000000000074";
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);ControlApi api=new ControlApi(host,0,TOKEN);HttpClient http=HttpClient.newHttpClient()){
+            Map<String,String> tokens=new HashMap<>(),ids=new HashMap<>();
+            for(String permission:List.of("read","write","both")){
+                JsonObject create=JsonParser.parseString("{name:'Synthetic integration',scopes:[]}").getAsJsonObject();if(!permission.equals("write"))create.getAsJsonArray("scopes").add("balances:read");if(!permission.equals("read"))create.getAsJsonArray("scopes").add("balances:write");String command=UUID.randomUUID().toString();
+                var response=resourceRequest(http,api,"POST","/v1/balance-api-keys",create,TOKEN,command,null);assert response.statusCode()==200:response.body();JsonObject key=JsonParser.parseString(response.body()).getAsJsonObject();tokens.put(permission,text(key,"token"));ids.put(permission,text(key,"id"));assert host.operatorOperation(command)==null : "One-time secrets never enter operator receipt journals";
+                assert !JsonParser.parseString(resourceRequest(http,api,"POST","/v1/balance-api-keys",create,TOKEN,command,null).body()).getAsJsonObject().has("token");
+            }
+            String account="/v1/balances/"+player,transactions=account+"/transactions";
+            assert resourceRequest(http,api,"GET",account,null,tokens.get("read")).statusCode()==200;
+            assert host.creditBank().accounts().getAsJsonArray("items").isEmpty();
+            JsonObject credit=JsonParser.parseString("{name:'SyntheticUser',direction:'credit',amount:10,reason:'Synthetic reward'}").getAsJsonObject();String operation=UUID.randomUUID().toString();
+            assert resourceRequest(http,api,"POST",transactions,credit,tokens.get("read")).statusCode()==403;
+            assert resourceRequest(http,api,"GET",account,null,tokens.get("write")).statusCode()==403;
+            for(String path:List.of("/v1/status","/v1/jobs","/v1/stashes","/v1/players/SyntheticUser","/v1/balance-api-keys","/v1/operations/"+operation,"/ui/api/status","/ui/api/v1/jobs"))assert resourceRequest(http,api,"GET",path,null,tokens.get("both")).statusCode()==403:path;
+            assert request(http,api,op("status"),tokens.get("both"),false).statusCode()==403;
+            assert resourceRequest(http,api,"POST","/v1/balance-api-keys",credit,tokens.get("both")).statusCode()==403;
+            var charged=resourceRequest(http,api,"POST",transactions,credit,tokens.get("write"),operation,null);assert charged.statusCode()==200:charged.body();
+            assert resourceRequest(http,api,"POST",transactions,credit,tokens.get("write"),operation,null).body().equals(charged.body());assert host.creditBank().account(player).get("balance").getAsLong()==10;
+            credit.addProperty("amount",11);assert resourceRequest(http,api,"POST",transactions,credit,tokens.get("write"),operation,null).statusCode()==409;
+            credit.addProperty("direction","debit");credit.addProperty("amount",11);assert resourceRequest(http,api,"POST",transactions,credit,tokens.get("write")).statusCode()==409;
+            credit.addProperty("amount",2);assert resourceRequest(http,api,"POST",transactions,credit,tokens.get("both")).statusCode()==200;assert host.creditBank().account(player).get("balance").getAsLong()==8;
+            assert JsonParser.parseString(resourceRequest(http,api,"GET",transactions,null,tokens.get("read")).body()).getAsJsonObject().getAsJsonArray("items").size()==2;
+            assert resourceRequest(http,api,"DELETE","/v1/balance-api-keys/"+ids.get("read"),null,TOKEN).statusCode()==200;
+            assert resourceRequest(http,api,"GET",account,null,tokens.get("read")).statusCode()==403;
+        }
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30)){assert host.creditBank().account(player).get("balance").getAsLong()==8;}
+        System.out.println("Credit API checks passed: read/write-only isolation, revocation, one-time secrets, exact idempotency and restart persistence.");
+    }
+    private static void creditBankMikeCheck()throws Exception{
+        Path directory=Files.createTempDirectory("synthetic-admin-mike-");String adminId="00000000-0000-0000-0000-000000000081",userId="00000000-0000-0000-0000-000000000082";
+        var server=com.sun.net.httpserver.HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);
+        server.createContext("/api/chat",exchange->{try{
+            JsonObject body=JsonParser.parseString(new String(exchange.getRequestBody().readAllBytes(),StandardCharsets.UTF_8)).getAsJsonObject();String system=text(body.getAsJsonArray("messages").get(0).getAsJsonObject(),"content");Set<String> tools=new HashSet<>();for(JsonElement tool:body.getAsJsonArray("tools"))tools.add(text(tool.getAsJsonObject().getAsJsonObject("function"),"name"));boolean admin=system.contains("VERIFIED ADMINISTRATOR");
+            assert tools.contains("gift_credits")==admin&&tools.contains("revoke_credits")==admin;
+            JsonArray messages=body.getAsJsonArray("messages");boolean revoke=text(messages.get(messages.size()-1).getAsJsonObject(),"content").contains("revoke");JsonObject response=JsonParser.parseString("{role:'assistant',tool_calls:[{function:{arguments:{player:'CreditFriend',amount:"+(revoke?4:9)+"}}}]}").getAsJsonObject();response.getAsJsonArray("tool_calls").get(0).getAsJsonObject().getAsJsonObject("function").addProperty("name",revoke?"revoke_credits":"gift_credits");
+            if(text(messages.get(messages.size()-1).getAsJsonObject(),"content").equals("Several paving kits, please"))response=MikeKitHandlerCheck.reply("{category:'paving',quantity:3,payment:'Credits'}");
+            if(text(messages.get(messages.size()-1).getAsJsonObject(),"content").equals("Another two paving kits for CreditFriend please"))response=MikeKitHandlerCheck.reply("{category:'paving',quantity:2,payment:'Credits',recipient:'CreditFriend'}");
+            assert !text(messages.get(messages.size()-1).getAsJsonObject(),"content").equals("yes") : "Credit confirmation is host-validated, never inferred by Mike";
+            byte[] bytes=("{\"done\":true,\"message\":"+response+"}").getBytes(StandardCharsets.UTF_8);exchange.sendResponseHeaders(200,bytes.length);exchange.getResponseBody().write(bytes);
+        }finally{exchange.close();}});server.start();
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker courier=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());Worker friend=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())){
+            friend.name="CreditFriend";courier.serverPlayers.put(friend.name,friend.id);friend.announce();await(()->connected(host)==2,courier,friend);
+            // Synthetic source; bank tools require no inventory or job dispatch.
+            JsonObject bounds=StashCatalog.plan(JsonParser.parseString("{name:'SyntheticDepot',homeName:'synthetic-home',minX:0,maxX:5,minY:90,maxY:90,minZ:0,maxZ:0}").getAsJsonObject());StashCatalog.define(directory,"Default",courier.scope,bounds);
+            KitCategories.save(directory,"Default",courier.scope,text(KitCategories.get(directory,"Default",courier.scope),"revision"),KitCategories.definition("paving","Synthetic paving","Items",List.of("minecraft:obsidian")));
+            JsonObject config=JsonParser.parseString("{enabled:true,publicAccess:true,crew:'Default',source:'SyntheticDepot',minimumStock:270,cooldownSeconds:3600,whitelist:[]}").getAsJsonObject();config.addProperty("worker",courier.id.toString());config.addProperty("scope",courier.scope);
+            for(String name:List.of("SyntheticAdmin","SyntheticUser")){JsonObject person=new JsonObject();person.addProperty("name",name);person.addProperty("uuid",name.endsWith("Admin")?adminId:userId);person.addProperty("role",name.endsWith("Admin")?"Administrator":"User");config.getAsJsonArray("whitelist").add(person);}
+            JsonObject settings=MikeKitHandler.defaults();settings.addProperty("enabled",true);settings.addProperty("model","synthetic");settings.addProperty("endpoint","http://127.0.0.1:"+server.getAddress().getPort());config.add("mike",settings);JsonObject save=op("kitbot-save");save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));save.add("config",config);host.control(save);
+            JsonObject message=JsonParser.parseString("{type:'worker-chat',direction:'received',sender:{name:'SyntheticAdmin'}}").getAsJsonObject();message.getAsJsonObject("sender").addProperty("uuid",adminId);message.addProperty("text","SyntheticAdmin whispers: gift CreditFriend 9 credits");courier.c.send(message.toString());
+            await(()->courier.chatMessages.stream().anyMatch(m->m.contains("Gifted 9 kit credits to CreditFriend")),courier,friend);assert host.creditBank().account(friend.id.toString()).get("balance").getAsLong()==9;
+            message.getAsJsonObject("sender").addProperty("name","SyntheticUser");message.getAsJsonObject("sender").addProperty("uuid",userId);message.addProperty("text","SyntheticUser whispers: gift CreditFriend 9 credits");courier.c.send(message.toString());
+            await(()->courier.chatMessages.stream().anyMatch(m->m.startsWith("/msg SyntheticUser Mike couldn't handle that.")),courier,friend);assert host.creditBank().account(friend.id.toString()).get("balance").getAsLong()==9 : "A model-forged admin tool cannot change balances for an ordinary user";
+            message.getAsJsonObject("sender").addProperty("name","SyntheticAdmin");message.getAsJsonObject("sender").addProperty("uuid",adminId);message.addProperty("text","SyntheticAdmin whispers: revoke CreditFriend 4 credits");courier.c.send(message.toString());
+            await(()->courier.chatMessages.stream().anyMatch(m->m.contains("Revoked 4 kit credits from CreditFriend")),courier,friend);assert host.creditBank().account(friend.id.toString()).get("balance").getAsLong()==5;
+            assert host.control(op("status")).getAsJsonArray("tasks").isEmpty()&&host.creditBank().accounts().getAsJsonArray("items").size()==1 : "Bank operations never start jobs or initialize unfunded users";
+            message.getAsJsonObject("sender").addProperty("name","SyntheticUser");message.getAsJsonObject("sender").addProperty("uuid",userId);message.addProperty("text","SyntheticUser whispers: Several paving kits, please");courier.c.send(message.toString());
+            await(()->courier.chatMessages.stream().anyMatch(m->m.startsWith("/msg SyntheticUser That order costs 3 credits.")&&m.contains("buy paving 3")),courier,friend);
+            assert host.control(op("status")).getAsJsonArray("tasks").isEmpty()&&!host.creditBank().account(userId).get("exists").getAsBoolean() : "An inferred credit purchase receives an actionable confirmation without charging, creating a bank account or dispatching a delivery";
+            // Independently invented synthetic containers; confirmation must traverse the real chat pipeline.
+            for(int x=0;x<=5;x++){
+                JsonObject row=JsonParser.parseString("{y:90,z:0,status:'observed',block:'minecraft:chest',items:{'minecraft:blue_shulker_box':50},shulkers:[]}").getAsJsonObject();row.addProperty("x",x);
+                for(int slot=0;slot<50;slot++){JsonObject box=JsonParser.parseString("{item:'minecraft:blue_shulker_box',name:'Synthetic paving',quantity:1,contentsKnown:true,items:{'minecraft:obsidian':1728}}").getAsJsonObject();box.addProperty("slot",slot);row.getAsJsonArray("shulkers").add(box);}StashCatalog.save(directory,"Default",courier.scope,bounds,row);
+            }
+            String buyer="00000000-0000-0000-0000-000000000083";message.getAsJsonObject("sender").addProperty("name","CreditBuyer");message.getAsJsonObject("sender").addProperty("uuid",buyer);message.addProperty("text","CreditBuyer whispers: kit paving 1");courier.c.send(message.toString());
+            await(()->!courier.current.isEmpty(),courier,friend);JsonObject freeRun=courier.checkpoints.get(UUID.fromString(courier.current));freeRun.addProperty("status","Complete");freeRun.remove("action");freeRun.remove("token");freeRun.add("deliveryReceipt",JsonParser.parseString("{expected:1,delivered:1,uncertain:false}"));courier.current="";courier.sendStatus(freeRun);courier.heartbeat();
+            await(()->host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().stream().anyMatch(e->text(e.getValue().getAsJsonObject(),"name").equals("CreditBuyer")&&text(e.getValue().getAsJsonObject(),"status").equals("Complete")),courier,friend);
+            host.creditBank().adjust(UUID.randomUUID().toString(),buyer,"CreditBuyer",5,"Synthetic confirmation reward","test");long later=System.nanoTime()+5_100_000_000L;await(()->System.nanoTime()>=later,courier,friend);
+            message.addProperty("text","CreditBuyer whispers: Another two paving kits for CreditFriend please");courier.c.send(message.toString());
+            await(()->courier.chatMessages.stream().anyMatch(m->m.startsWith("/msg CreditBuyer ")&&m.contains("Spend 2 credits")&&m.contains("for CreditFriend")&&m.contains("Reply yes")),courier,friend);
+            assert host.creditBank().account(buyer).get("balance").getAsLong()==5&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==1 : "A cooldown offer reserves no delivery or credits";
+            message.addProperty("text","CreditBuyer whispers: yes");courier.c.send(message.toString());
+            await(()->host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2,courier,friend);
+            JsonObject purchase=host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().stream().map(e->e.getValue().getAsJsonObject()).filter(r->text(r,"payment").equals("Credits")).findFirst().orElseThrow();
+            assert purchase.get("count").getAsInt()==2&&text(purchase,"recipient").equals(friend.id.toString())&&text(purchase,"requester").equals(buyer)&&host.creditBank().account(buyer).get("balance").getAsLong()==3 : "Yes pays once for the offered gift, on the requester's allowance";
+
+
+        }finally{server.stop(0);}
+        System.out.println("Administrator Mike checks passed: distinct verified prompt, hidden ordinary tools, rejected forged tools, canonical recipient and audited credit mutations.");
+    }
+    private static void mikeGiftsCheck() throws Exception {
+        // Synthetic players and source. Connected worker identity resolution avoids external profile services.
+        Path directory=Files.createTempDirectory("synthetic-mike-gifts-");var server=com.sun.net.httpserver.HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);var acknowledgements=new java.util.concurrent.atomic.AtomicInteger();
+        server.createContext("/api/chat",exchange->{
+            try{
+                JsonObject body=JsonParser.parseString(new String(exchange.getRequestBody().readAllBytes(),StandardCharsets.UTF_8)).getAsJsonObject();String wire=body.toString();assert !wire.contains("PRIVATE_HOME_CANARY")&&!wire.contains("SyntheticDepot")&&!wire.contains("\"complete\":");JsonObject reply;
+                if(body.getAsJsonArray("tools").isEmpty()){
+                    acknowledgements.incrementAndGet();String system=text(body.getAsJsonArray("messages").get(0).getAsJsonObject(),"content");
+                    if(system.contains("\"requester\":\"GiftSender\""))reply=JsonParser.parseString("{role:'assistant',content:'Absolutely! I will grab a kit for GiftFriend.'}").getAsJsonObject();
+                    else reply=MikeKitHandlerCheck.reply("{category:'obsidian',quantity:5}"); // An acknowledgement cannot create another order.
+                }else reply=MikeKitHandlerCheck.reply("{category:'obsidian',quantity:1,recipient:'GiftFriend'}");
+                byte[] bytes=("{\"done\":true,\"message\":"+reply+"}").getBytes(StandardCharsets.UTF_8);exchange.sendResponseHeaders(200,bytes.length);exchange.getResponseBody().write(bytes);
+            }finally{exchange.close();}
+        });server.start();
+        try(HostService host=new HostService(directory,"127.0.0.1",0,CREWS,30);Worker courier=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>());Worker recipient=new Worker(host.port(),KEY,UUID.randomUUID(),new LinkedHashMap<>())){
+            recipient.name="GiftFriend";courier.serverPlayers.put(recipient.name,recipient.id);recipient.announce();await(()->connected(host)==2&&host.control(op("status")).getAsJsonArray("workers").asList().stream().anyMatch(w->text(w.getAsJsonObject(),"name").equals("GiftFriend")),courier,recipient);
+            JsonObject bounds=StashCatalog.plan(JsonParser.parseString("{name:'SyntheticDepot',homeName:'PRIVATE_HOME_CANARY',minX:0,maxX:5,minY:100,maxY:100,minZ:0,maxZ:0}").getAsJsonObject());StashCatalog.define(directory,"Default",courier.scope,bounds);
+            for(int x=0;x<6;x++){
+                JsonObject row=JsonParser.parseString("{y:100,z:0,status:'observed',block:'minecraft:chest',reason:'',items:{'minecraft:blue_shulker_box':50},shulkers:[]}").getAsJsonObject();row.addProperty("x",x);
+                for(int slot=0;slot<50;slot++){JsonObject box=JsonParser.parseString("{item:'minecraft:blue_shulker_box',name:'Synthetic paving',quantity:1,contentsKnown:true,items:{'minecraft:obsidian':1728}}").getAsJsonObject();box.addProperty("slot",slot);row.getAsJsonArray("shulkers").add(box);}StashCatalog.save(directory,"Default",courier.scope,bounds,row);
+            }
+            KitCategories.seed(directory,"Default",courier.scope,StashCatalog.get(directory,"Default",courier.scope,"SyntheticDepot"),270);
+            JsonObject config=JsonParser.parseString("{enabled:true,publicAccess:true,crew:'Default',source:'SyntheticDepot',minimumStock:270,cooldownSeconds:3600,whitelist:[]}").getAsJsonObject();config.addProperty("scope",courier.scope);config.addProperty("worker",courier.id.toString());JsonObject settings=MikeKitHandler.defaults();settings.addProperty("enabled",true);settings.addProperty("model","synthetic-tool-model");settings.addProperty("endpoint","http://127.0.0.1:"+server.getAddress().getPort());config.add("mike",settings);
+            JsonObject save=op("kitbot-save");save.addProperty("expected",text(host.control(op("kitbot-get")),"revision"));save.add("config",config);host.control(save);
+            JsonObject whisper=JsonParser.parseString("{type:'worker-chat',direction:'received',text:'GiftSender whispers: give one obsidian kit to GiftFriend',sender:{name:'GiftSender',uuid:'00000000-0000-0000-0000-000000000061'}}").getAsJsonObject();courier.c.send(whisper.toString());
+            await(()->courier.chatMessages.contains("/msg GiftSender Absolutely! I will grab a kit for GiftFriend."),courier,recipient);long first=System.nanoTime();assert courier.chatMessages.stream().noneMatch(m->m.startsWith("/msg GiftFriend "));
+            JsonObject receipt=host.control(op("kitbot-get")).getAsJsonObject("requests").entrySet().iterator().next().getValue().getAsJsonObject();assert KitBot.cooldownOwner(receipt).equals("00000000-0000-0000-0000-000000000061")&&text(receipt,"recipient").equals(recipient.id.toString())&&text(receipt,"recipientName").equals("GiftFriend");
+            await(()->courier.chatMessages.stream().anyMatch(m->m.startsWith("/msg GiftFriend GiftSender has gifted you 1 kit: Synthetic paving.")),courier,recipient);assert System.nanoTime()-first>=4_000_000_000L:"Recipient notice respects the shared five-second DM cooldown";
+            whisper.addProperty("text","GiftSender whispers: kit obsidian 1");courier.c.send(whisper.toString());
+            await(()->courier.chatMessages.stream().anyMatch(m->m.startsWith("/msg GiftSender You're on cooldown.")),courier,recipient);
+            JsonObject profile=new JsonObject();profile.addProperty("name","GiftFriend");profile.addProperty("uuid",recipient.id.toString());whisper.add("sender",profile);whisper.addProperty("text","GiftFriend whispers: kit obsidian 1");courier.c.send(whisper.toString());await(()->host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2,courier,recipient);
+            await(()->courier.chatMessages.stream().anyMatch(m->m.startsWith("/msg GiftFriend Gotchu—your kits are queued.")),courier,recipient);assert acknowledgements.get()==2&&host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2:"Raw commands get a generated acknowledgement too; invalid acknowledgement tool calls never replay delivery";
+            assert !flag(host.control(op("status")),"autoTpy")&&recipient.tpaAccepts.isEmpty():"Gifting grants no automatic TPA acceptance";
+            await(()->!courier.current.isEmpty(),courier,recipient);
+            JsonObject interrupted=courier.checkpoints.get(UUID.fromString(courier.current));int resumes=courier.resumes;
+            interrupted.addProperty("status","Suspended");courier.current="";courier.sendStatus(interrupted);courier.heartbeat();
+            await(()->courier.resumes>resumes,courier,recipient);
+            assert text(interrupted,"status").equals("Running") : "A brief interruption resumes the same checkpoint, not another pickup";
+            interrupted.addProperty("status","Inspection required");courier.current="";courier.sendStatus(interrupted);courier.heartbeat();
+            UUID interruptedTask=UUID.fromString(text(receipt,"id"));
+            await(()->state(host,interruptedTask).equals("Cancelled")&&text(interrupted,"status").equals("Cancelled"),courier,recipient);
+            await(()->text(host.control(op("kitbot-get")).getAsJsonObject("requests").getAsJsonObject(interruptedTask.toString()),"status").equals("Cancelled"),courier,recipient);
+            assert host.control(op("kitbot-get")).getAsJsonObject("requests").size()==2 : "Cancellation never creates a replacement delivery";
+        }finally{server.stop(0);}
+        System.out.println("Gift socket checks passed: requester-owned allowance, canonical target resolution, generated acknowledgement, ordered rate-limited notices and acknowledgement-only failure isolation.");
+    }
     private static void webUiPreview() throws Exception {
         Path directory=Files.createTempDirectory("monocle-ui-preview-");
         try (HostService host = new HostService(directory, "127.0.0.1", 0, CREWS, 30);
@@ -860,11 +1287,12 @@ public final class HostServiceTest {
             assert resourceRequest(http,api,"GET","/v1/kits/invalid/stock",null,TOKEN).statusCode()==400;
             assert resourceRequest(http,api,"GET","/v1/kits/"+unknownKit+"/stock?unexpected=1",null,TOKEN).statusCode()==400;
             assert resourceRequest(http,api,"GET","/v1/kits/"+unknownKit+"/stock",null,"wrong").statusCode()==403;
-            JsonObject identity=JsonParser.parseString(resourceRequest(http,api,"GET","/v1/players/"+worker.name,null,TOKEN).body()).getAsJsonObject();
+            var playerRead=java.util.concurrent.CompletableFuture.supplyAsync(()->{try{return resourceRequest(http,api,"GET","/v1/players/"+worker.name+"?workerId="+worker.id,null,TOKEN);}catch(Exception e){throw new RuntimeException(e);}});
+            await(playerRead::isDone,worker);assert playerRead.join().statusCode()==200;JsonObject identity=JsonParser.parseString(playerRead.join().body()).getAsJsonObject();
             assert text(identity,"id").equals(workerId.toString()) && text(identity,"name").equals(worker.name) : "Connected Minecraft names resolve without an external lookup";
             assert resourceRequest(http,api,"GET","/v1/players/invalid.name",null,TOKEN).statusCode()==400;
             assert resourceRequest(http,api,"GET","/v1/players/"+worker.name,null,"wrong").statusCode()==403;
-            JsonObject profile=new JsonObject();profile.addProperty("id",workerId.toString().replace("-",""));profile.addProperty("name",worker.name);
+            JsonObject profile=new JsonObject();profile.addProperty("id",workerId.toString());profile.addProperty("name",worker.name);
             assert text(ResourceApi.checkedPlayerIdentity(profile,worker.name.toLowerCase(java.util.Locale.ROOT)),"id").equals(workerId.toString());
             rejects(()->ResourceApi.checkedPlayerIdentity(profile,"DifferentName"));
             profile.addProperty("id","invalid");rejects(()->ResourceApi.checkedPlayerIdentity(profile,worker.name));
@@ -1238,6 +1666,9 @@ public final class HostServiceTest {
         System.out.println("Host-wide socket checks passed: negative lookups, lobby incident/learning exclusion, guard-off cross-crew warnings, old-client gating, dedup, active reconnect and forgiveness.");
     }
     static JsonObject op(String op) { JsonObject request = new JsonObject(); request.addProperty("op", op); return request; }
+    private static JsonObject readTaskJournal(Path directory){
+        try(var journal=new TaskJournal(directory.resolve("host-tasks.sqlite"),directory.resolve("host-tasks.json"),"tasks")){return journal.read();}
+    }
     private static void stashMultiTransferCheck() throws Exception {
         Path dir=Files.createTempDirectory("monocle-host-multi-kits-");UUID workerId=UUID.randomUUID();String scope="test.invalid\nminecraft:the_nether";
         JsonObject source=StashCatalog.plan(JsonParser.parseString("{name:'Source',homeName:'source',minX:0,maxX:0,minY:116,maxY:116,minZ:0,maxZ:0,scanMode:'Full',lazyMode:false}").getAsJsonObject());
@@ -1348,7 +1779,7 @@ public final class HostServiceTest {
             assert observedEvents==1 : "Duplicate findings re-acknowledge without counting another container read";
             for(int sequence=2;sequence<=9;sequence++){JsonObject next=message.deepCopy();next.addProperty("delivery",sequence);worker.c.send(next.toString());}
             await(()->worker.stashAcks==10,worker);
-            JsonObject persisted=TaskFiles.read(dir.resolve("host-tasks.json")).getAsJsonObject("tasks").getAsJsonObject(task.toString()).getAsJsonObject("runs").getAsJsonObject(workerId.toString());
+            JsonObject persisted=readTaskJournal(dir).getAsJsonObject("tasks").getAsJsonObject(task.toString()).getAsJsonObject("runs").getAsJsonObject(workerId.toString());
             assert persisted.get("stashDelivery").getAsInt()==9 : "A streamed scan window is committed before any acknowledgement releases the worker's durable outbox";
             JsonObject stash=host.control(op("status")).getAsJsonArray("stashes").get(0).getAsJsonObject();assert stash.getAsJsonObject("items").get("minecraft:stone").getAsInt()==1728 : "Duplicate delivery is acknowledged, not double-counted";
             JsonObject inspect=op("stash-get");inspect.addProperty("crew","Default");inspect.addProperty("scope","test.invalid\nminecraft:the_nether");inspect.addProperty("name","Depot");assert host.control(inspect).getAsJsonObject("containers").size()==2;
@@ -1510,7 +1941,7 @@ public final class HostServiceTest {
             observation.addProperty("workerId",worker.toString());socket.sendText(observation.toString(),true).join();
             JsonObject reconcile=hello.deepCopy();reconcile.addProperty("type","state.reconcile");reconcile.addProperty("sequence",2);
             reconcile.addProperty("messageId",UUID.randomUUID().toString());reconcile.addProperty("workerId",worker.toString());
-            reconcile.add("payload",JsonParser.parseString("{lastHostSequence:0,lastWorkerSequence:1,activeExecutions:[{jobId:'34bc05e5-6973-4629-bd69-644d6fbf3a3b',executionId:'c9547876-e3d8-4713-97d3-35a751718ccd',generation:1}]}").getAsJsonObject());
+            reconcile.add("payload",JsonParser.parseString("{lastHostSequence:0,lastWorkerSequence:1,activeExecutions:[{jobId:'00000000-0000-0000-0000-000000000301',executionId:'00000000-0000-0000-0000-000000000302',generation:1}]}").getAsJsonObject());
             socket.sendText(reconcile.toString(),true).join();
             JsonObject reconciled=JsonParser.parseString(listener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
             assert text(reconciled,"type").equals("state.reconciled") && text(reconciled.getAsJsonObject("payload").getAsJsonArray("decisions").get(0).getAsJsonObject(),"decision").equals("inspect") : "Unknown public executions cannot resume";
@@ -1632,7 +2063,7 @@ public final class HostServiceTest {
             try (RwpWorkerConnection returned = new RwpWorkerConnection(address, worker, token, journal)) {
                 returned.connect();
                 try{await(() -> { returned.poll(() -> observation); return returned.connected() && returned.work().equals("idle") && !flag(taskView(host, cancelled), "cleanupPending"); });}
-                catch(AssertionError e){throw new AssertionError("Reconnected cancellation: "+returned.work()+" connected="+returned.connected()+" task="+taskView(host,cancelled),e);}
+                catch(AssertionError e){throw new AssertionError("Reconnected cancellation: "+returned.work()+" connected="+returned.connected()+" failure="+returned.failure()+" task="+taskView(host,cancelled),e);}
             }
         }
         rejects(() -> new RwpWorkerConnection("ws://example.org:6972" + RwpWorkerConnection.PATH, worker, token, directory.resolve("invalid.json")));
@@ -1800,7 +2231,7 @@ public final class HostServiceTest {
             reconnect.sendText(retry.toString(),true).join();
             JsonObject duplicate=JsonParser.parseString(resumedListener.frames.poll(3,java.util.concurrent.TimeUnit.SECONDS)).getAsJsonObject();
             assert text(duplicate,"type").equals("message.ack") && text(duplicate.getAsJsonObject("payload"),"result").equals("duplicate");
-            assert TaskFiles.read(directory.resolve("host-tasks.json")).getAsJsonObject("publicReportReceipts")
+            assert readTaskJournal(directory).getAsJsonObject("publicReportReceipts")
                 .getAsJsonObject(worker.toString()).has(text(waitCompletion,"messageId"));
             JsonObject conflict=retry.deepCopy();conflict.addProperty("sequence",6);conflict.getAsJsonObject("payload").addProperty("generation",999);
             reconnect.sendText(conflict.toString(),true).join();
@@ -2234,6 +2665,9 @@ public final class HostServiceTest {
         JsonObject lastKitPlan;
         JsonObject installedEnvelope;
         boolean holdCancellation;
+        boolean playerLookupSupported=true,holdPlayerLookup;
+        final Map<String,UUID> serverPlayers=new LinkedHashMap<>();
+        final List<JsonObject> playerLookups=new ArrayList<>();
         JsonArray stashCatalog=new JsonArray();
         int stashCatalogReports;
         long announceAt;
@@ -2255,6 +2689,7 @@ public final class HostServiceTest {
         boolean connectionStopped;
         int supplyProtocol = 2;
         String scope="test.invalid\nminecraft:the_nether";
+        boolean aliasSupport,deferAliases;String serverAddress="test.invalid",aliasRevision="";int aliasFrames;
         boolean liveStashes;
         boolean sortSupported;
         int stashContainerLimit;
@@ -2287,10 +2722,10 @@ public final class HostServiceTest {
         }
         private void announce() {
             JsonObject hello = new JsonObject(); hello.addProperty("type", "hello"); hello.addProperty("id", id.toString()); hello.addProperty("name", name);
-            hello.addProperty("taskProtocol", 1); hello.addProperty("scope", scope); hello.addProperty("job", "");
+            hello.addProperty("taskProtocol", 1);if(aliasSupport){hello.addProperty("serverAliasesProtocol",1);hello.addProperty("serverAliasesRevision",aliasRevision);hello.addProperty("serverAddress",serverAddress);} hello.addProperty("scope", scope); hello.addProperty("job", "");
             JsonObject readiness=new JsonObject();readiness.addProperty("state",inLobby?"Lobby":"Ready");readiness.addProperty("reason","Simulated world readiness");hello.add("worldReadiness",readiness);
             hello.addProperty("available",nativeJob==null&&current.isEmpty());
-            hello.addProperty("chatProtocol",1);
+            hello.addProperty("chatProtocol",1);if(playerLookupSupported)hello.addProperty("playerLookupProtocol",1);
             hello.addProperty("reconnectReady",reconnectReady); hello.addProperty("supplyProtocol",supplyProtocol);
             hello.addProperty("initialStockProtocol",1); hello.addProperty("initialStockReady",true);
             hello.addProperty("connectionStopped",connectionStopped);
@@ -2343,6 +2778,15 @@ public final class HostServiceTest {
             while ((wire = c.poll()) != null) {
                 JsonObject message = JsonParser.parseString(wire).getAsJsonObject();
                 switch (text(message, "type")) {
+                    case "task-server-aliases" -> {if(!deferAliases){ServerAliases aliases=ServerAliases.checked(message.getAsJsonObject("catalog"));aliasRevision=aliases.revision();scope=aliases.scope(serverAddress+scope.substring(scope.indexOf('\n')));aliasFrames++;announce();}}
+                    case "manage-player-lookup" -> {
+                        playerLookups.add(message.deepCopy());if(holdPlayerLookup)break;
+                        JsonObject reply=message.deepCopy();reply.addProperty("type","worker-player-lookup");
+                        Map<String,UUID> players=new LinkedHashMap<>(serverPlayers);players.put(name,id);
+                        var matches=players.entrySet().stream().filter(e->e.getKey().equalsIgnoreCase(text(message,"name"))).toList();
+                        reply.addProperty("status",matches.isEmpty()?"Missing":matches.size()>1?"Ambiguous":"Found");
+                        if(matches.size()==1){JsonObject profile=new JsonObject();profile.addProperty("id",matches.getFirst().getValue().toString());profile.addProperty("name",matches.getFirst().getKey());reply.add("player",profile);}c.send(reply.toString());
+                    }
                     case "task-known-hostiles" -> { hostileCatalog=message.getAsJsonObject("catalog").deepCopy();KnownHostiles.validate(hostileCatalog);hostileFrames++; }
                     case "task-hostile-warning" -> {HostileWarnings.validate(message);assert hostileCatalog!=null&&hostileCatalog.get("revision").equals(message.get("revision")):"Catalog precedes warning";hostileWarnings.add(message.deepCopy());}
                     case "task-player-check-result" -> {HostileWarnings.validateReceipt(message);playerCheckReceipts++;}
@@ -2352,7 +2796,7 @@ public final class HostServiceTest {
                         JsonObject report=new JsonObject();report.addProperty("note","Test-only worker readback");report.add("rows",new JsonArray());
                         for(JsonObject reply:ConfigurationReadback.replies(message,report))c.send(reply.toString());
                     }
-                    case "manage-chat" -> { assert text(message,"scope").equals(scope);chatMessages.add(BotChat.command(text(message,"text")));chatTimes.add(System.nanoTime());JsonObject report=new JsonObject();report.addProperty("type","worker-chat");report.addProperty("direction","sent");report.addProperty("text",text(message,"text"));c.send(report.toString()); }
+                    case "manage-chat" -> { UUID.fromString(text(message,"id"));assert text(message,"scope").equals(scope);chatMessages.add(BotChat.command(text(message,"text")));chatTimes.add(System.nanoTime());JsonObject report=new JsonObject();report.addProperty("type","worker-chat");report.addProperty("direction","sent");report.addProperty("text",text(message,"text"));c.send(report.toString()); }
                     case "heartbeat" -> autoTpy=flag(message,"autoTpy");
                     case "task-tpa-accept" -> tpaAccepts.add(message.deepCopy());
                     case "task-tpa-send" -> tpaSends.add(message.deepCopy());

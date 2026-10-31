@@ -94,12 +94,12 @@ public final class CoordinatorCoreTest {
         var path = java.nio.file.Files.createTempDirectory("monocle-supply-recovery-check-").resolve("records.json");
         var journal = new SupplyRecovery(path);
         JsonObject r = new JsonObject(); r.addProperty("id",UUID.randomUUID().toString()); r.addProperty("owner",WORKER.toString());
-        r.addProperty("scope","server\nnether"); r.addProperty("x",0); r.addProperty("y",116); r.addProperty("z",-100);
+        r.addProperty("scope","server\nminecraft:the_nether"); r.addProperty("x",0); r.addProperty("y",116); r.addProperty("z",-100);
         r.addProperty("stage","placing"); r.addProperty("baseline",2); r.addProperty("expected",1); r.add("stack",new JsonObject());
         journal.put(r);
         var restarted = new SupplyRecovery(path);
-        assert restarted.pending(WORKER.toString(),"server\nnether").size()==1;
-        assert restarted.pending(OTHER.toString(),"server\nnether").isEmpty();
+        assert restarted.pending(WORKER.toString(),"server\nminecraft:the_nether").size()==1;
+        assert restarted.pending(OTHER.toString(),"server\nminecraft:the_nether").isEmpty();
         assert restarted.pending(WORKER.toString(),"other\nnether").isEmpty();
         assert SupplyRecovery.confirmed(true,true,true,false,2,2,1,true);
         for (boolean fresh : new boolean[]{true,false}) for(boolean loaded:new boolean[]{true,false})
@@ -108,9 +108,9 @@ public final class CoordinatorCoreTest {
         assert !SupplyRecovery.confirmed(true,true,false,false,3,2,1,false);
         assert !SupplyRecovery.confirmed(true,true,true,false,2,2,1,false);
         JsonObject bad=r.deepCopy(); bad.addProperty("x",30_000_000); rejects(() -> restarted.put(bad));
-        assert restarted.pending(WORKER.toString(),"server\nnether").size()==1;
+        assert restarted.pending(WORKER.toString(),"server\nminecraft:the_nether").size()==1;
         restarted.resolved(r.get("id").getAsString());
-        assert new SupplyRecovery(path).pending(WORKER.toString(),"server\nnether").isEmpty();
+        assert new SupplyRecovery(path).pending(WORKER.toString(),"server\nminecraft:the_nether").isEmpty();
         JsonObject invalid = new JsonObject(); invalid.addProperty("version",1); TaskFiles.write(path,invalid);
         rejects(() -> new SupplyRecovery(path));
         assert TaskFiles.read(path).equals(invalid) : "Malformed recovery data must never be overwritten as an empty ledger";
@@ -216,6 +216,7 @@ public final class CoordinatorCoreTest {
     }
 
     public static void main(String[] args) throws Exception {
+        ServerAliasesTest.run();
         KitCategoriesTest.run();
         WorkerSupplyStationsTest.run();
         StashSortPlannerTest.run();
@@ -243,6 +244,8 @@ public final class CoordinatorCoreTest {
         stashManualColumns();
         stashMultiTransfer();
         StashTransferTeamCheck.run();
+        EnderTransportCheck.run();
+        TaskJournalCheck.run();
         supplyRecovery();
         teleportRecovery();
         highwayStartup();
@@ -331,7 +334,7 @@ public final class CoordinatorCoreTest {
     }
     private static JsonObject liveMessage(JsonObject o,String basis){JsonObject m=TaskWire.message("stash-live");m.addProperty("name","Live");m.addProperty("eventId",UUID.randomUUID().toString());m.addProperty("basis",basis);StashCatalog.attachObservation(m,o);return m;}
     private static void stashLive() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-stash-live-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-stash-live-");String scope="server\nminecraft:the_nether";
         JsonObject p=JsonParser.parseString("{name:'Live',homeName:'live',minX:0,maxX:3,minY:64,maxY:64,minZ:0,maxZ:0,lazyMode:false,scanMode:'Full'}").getAsJsonObject();StashCatalog.define(root,"A",scope,p);
         JsonObject stock=JsonParser.parseString("{x:0,y:64,z:0,status:'observed',block:'minecraft:chest',capacity:27,parts:[{x:0,y:64,z:0}],slotCount:27,occupiedSlots:1,items:{'minecraft:obsidian':64},shulkers:[]}").getAsJsonObject();
         JsonObject created=liveMessage(stock,"");assert TaskWire.text(StashCatalog.acceptLive(root,"A",scope,WORKER.toString(),created),"outcome").equals("applied");
@@ -375,7 +378,7 @@ public final class CoordinatorCoreTest {
         assert StashCatalog.get(root,"A",scope,"Live").getAsJsonArray("containerEvents").size()>2 : "Storage lifecycle remains inspectable after recreation";
     }
     private static void stashLiveBatch() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-live-batch-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-live-batch-");String scope="server\nminecraft:the_nether";
         JsonObject plan=JsonParser.parseString("{name:'Live',homeName:'live',minX:0,maxX:63,minY:64,maxY:64,minZ:0,maxZ:0}").getAsJsonObject();StashCatalog.define(root,"A",scope,plan);
         JsonObject batch=TaskWire.message("stash-live-batch");JsonArray entries=new JsonArray();batch.add("entries",entries);
         JsonObject stock=JsonParser.parseString("{x:0,y:64,z:0,status:'unscanned',block:'minecraft:chest',capacity:54,items:{},shulkers:[]}").getAsJsonObject();
@@ -398,7 +401,7 @@ public final class CoordinatorCoreTest {
         System.out.println("32 passive observations: "+bytes+" bytes, durable independent receipts and retry checks passed.");
     }
     private static void stashLegacyWatches() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-legacy-watch-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-legacy-watch-");String scope="server\nminecraft:the_nether";
         JsonObject plan=JsonParser.parseString("{name:'Legacy',homeName:'legacy',minX:0,maxX:1,minY:64,maxY:64,minZ:0,maxZ:0}").getAsJsonObject();
         JsonObject stock=JsonParser.parseString("{x:0,y:64,z:0,status:'observed',block:'minecraft:chest',capacity:27,items:{'minecraft:obsidian':64},shulkers:[]}").getAsJsonObject();
         StashCatalog.record(root,"Local",scope,plan,stock);
@@ -444,7 +447,7 @@ public final class CoordinatorCoreTest {
         assert TaskWire.text(StashCatalog.get(root,"A",scope,"Live").getAsJsonObject("containers").getAsJsonObject("3,64,0"),"status").equals("unscanned") : "Out-of-range legacy kit slots are evidence of an incompatible shape";
     }
     private static void stashExpansion() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-stash-expansion-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-stash-expansion-");String scope="server\nminecraft:the_nether";
         JsonObject p=JsonParser.parseString("{name:'Large',homeName:'large',minX:0,maxX:16384,minY:64,maxY:64,minZ:0,maxZ:0}").getAsJsonObject();StashCatalog.define(root,"A",scope,p);
         var file=root.resolve("stashes").resolve(TaskFiles.hash("A\n"+scope+"\nLarge")+".sqlite");JsonObject db=StashStore.read(file),records=db.getAsJsonObject("containers");
         JsonObject o=JsonParser.parseString("{x:0,y:64,z:0,status:'unscanned',block:'minecraft:chest',capacity:27,items:{},shulkers:[]}").getAsJsonObject();
@@ -474,7 +477,7 @@ public final class CoordinatorCoreTest {
         String revision=TaskWire.text(StashCatalog.summary(grow),"revision");JsonObject shrink=JsonParser.parseString("{minX:-1}").getAsJsonObject();rejects(()->StashCatalog.revise(root,"A",scope,"Grow",revision,shrink));
     }
     private static void stashExports() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-stash-exports-");String scope="server\nnether",worker=WORKER.toString(),owner="host:6969#credential-selector";
+        var root=java.nio.file.Files.createTempDirectory("monocle-stash-exports-");String scope="server\nminecraft:the_nether",worker=WORKER.toString(),owner="host:6969#credential-selector";
         JsonObject p=StashCatalog.plan(JsonParser.parseString("{name:'Exports',homeName:'main',minX:0,maxX:300,minY:64,maxY:64,minZ:0,maxZ:0}").getAsJsonObject());
         StashCatalog.importDefinition(root,"A",scope,p,worker,"");String revision=StashCatalog.definitionRevision(StashCatalog.get(root,"A",scope,"Exports"));
         JsonObject o=JsonParser.parseString("{x:0,y:64,z:0,status:'observed',block:'minecraft:chest',items:{'minecraft:obsidian':64},shulkers:[]}").getAsJsonObject();StashCatalog.record(root,"A",scope,p,o);
@@ -515,29 +518,29 @@ public final class CoordinatorCoreTest {
         JsonObject box=JsonParser.parseString("{slot:0,item:'minecraft:blue_shulker_box',quantity:1,name:'Kit',contentsKnown:true,items:{'minecraft:obsidian':64}}").getAsJsonObject();
         JsonObject observation=JsonParser.parseString("{x:0,y:100,z:0,status:'observed',block:'minecraft:chest',reason:'',items:{'minecraft:obsidian':64},shulkers:[]}").getAsJsonObject();
         observation.getAsJsonArray("shulkers").add(box);String kit=StashCatalog.kitTypeId(box);
-        StashCatalog.save(root,"A","server\nnether",p,observation);
+        StashCatalog.save(root,"A","server\nminecraft:the_nether",p,observation);
         JsonObject expanded=p.deepCopy();expanded.addProperty("name","Main");expanded.addProperty("maxX",3);
         JsonObject newer=observation.deepCopy();newer.getAsJsonObject("items").addProperty("minecraft:obsidian",128);
         newer.getAsJsonArray("shulkers").get(0).getAsJsonObject().addProperty("quantity",2);
-        StashCatalog.save(root,"B","server\nnether",expanded,newer);
+        StashCatalog.save(root,"B","server\nminecraft:the_nether",expanded,newer);
         // Fixed timestamps avoid relying on the two writes landing in different milliseconds.
-        var oldFile=root.resolve("stashes").resolve(TaskFiles.hash("A\nserver\nnether\nOld")+".sqlite");
+        var oldFile=root.resolve("stashes").resolve(TaskFiles.hash("A\nserver\nminecraft:the_nether\nOld")+".sqlite");
         JsonObject old=StashStore.read(oldFile);old.getAsJsonObject("containers").getAsJsonObject("0,100,0").addProperty("observedAt",0);StashStore.write(oldFile,old);
         JsonArray views=StashCatalog.list(root);
         assert overlapItems(views)==128 && overlapKits(views,kit)==2 : "Overlapping stashes/crews count a physical container only once";
-        assert StashCatalog.get(root,"A","server\nnether","Old").getAsJsonObject("containers").size()==1 : "Aggregation must not erase old observations";
-        StashCatalog.save(root,"A","other-server\nnether",p,observation);
+        assert StashCatalog.get(root,"A","server\nminecraft:the_nether","Old").getAsJsonObject("containers").size()==1 : "Aggregation must not erase old observations";
+        StashCatalog.save(root,"A","other-server\nminecraft:the_nether",p,observation);
         StashCatalog.save(root,"A","server\nend",p,observation);
         assert overlapItems(StashCatalog.list(root))==256 && overlapKits(StashCatalog.list(root),kit)==4 : "Server and dimension distinguish physically separate storage";
         JsonObject estimate=observation.deepCopy();estimate.addProperty("inferred",true);estimate.getAsJsonObject("items").addProperty("minecraft:obsidian",999);
-        JsonObject estimated=p.deepCopy();estimated.addProperty("name","Estimate");StashCatalog.save(root,"A","server\nnether",estimated,estimate);
+        JsonObject estimated=p.deepCopy();estimated.addProperty("name","Estimate");StashCatalog.save(root,"A","server\nminecraft:the_nether",estimated,estimate);
         assert overlapItems(StashCatalog.list(root))==256 : "A newer estimate cannot replace a measured observation";
         JsonObject empty=observation.deepCopy();empty.add("items",new JsonObject());empty.add("shulkers",new JsonArray());
-        StashCatalog.save(root,"B","server\nnether",expanded,empty);
+        StashCatalog.save(root,"B","server\nminecraft:the_nether",expanded,empty);
         assert overlapItems(StashCatalog.list(root))==128 && overlapKits(StashCatalog.list(root),kit)==2 : "A newly observed empty chest must suppress older stock";
-        StashCatalog.save(root,"B","server\nnether",expanded,newer);
+        StashCatalog.save(root,"B","server\nminecraft:the_nether",expanded,newer);
         JsonObject picks=new JsonObject();picks.addProperty("x",0);picks.addProperty("y",100);picks.addProperty("z",0);picks.addProperty("kitTypeId",kit);
-        JsonArray withdrawn=new JsonArray();withdrawn.add(picks);StashCatalog.invalidateWithdrawn(root,"B","server\nnether","Main",withdrawn);
+        JsonArray withdrawn=new JsonArray();withdrawn.add(picks);StashCatalog.invalidateWithdrawn(root,"B","server\nminecraft:the_nether","Main",withdrawn);
         assert overlapItems(StashCatalog.list(root))==128 && overlapKits(StashCatalog.list(root),kit)==2 : "A confirmed withdrawal invalidation must not resurrect an older stash scan";
         assert !StashCatalog.wireSummary(StashCatalog.list(root).get(0).getAsJsonObject()).has("deduplicatedItems") : "Detailed aggregates stay out of the bounded worker catalog frame";
     }
@@ -554,19 +557,19 @@ public final class CoordinatorCoreTest {
             int owners=0;for(int index=0;index<workers;index++){JsonObject a=p.deepCopy();a.addProperty("workerCount",workers);a.addProperty("workerIndex",index);if(StashCatalog.owns(a,x,y,z))owners++;}assert owners==1;
         }
         var root=java.nio.file.Files.createTempDirectory("monocle-stash-check-");
-        StashCatalog.define(root,"A","server\nnether",p);
-        StashCatalog.define(root,"A","server\nnether",home,"00000000-0000-0000-0000-000000000001");
-        JsonObject routed=StashCatalog.route(root,"A","server\nnether",p,"00000000-0000-0000-0000-000000000001");assert routed.get("homeName").getAsString().equals("main-stash_1")&&StashCatalog.list(root).get(0).getAsJsonObject().getAsJsonObject("homes").size()==1;
+        StashCatalog.define(root,"A","server\nminecraft:the_nether",p);
+        StashCatalog.define(root,"A","server\nminecraft:the_nether",home,"00000000-0000-0000-0000-000000000001");
+        JsonObject routed=StashCatalog.route(root,"A","server\nminecraft:the_nether",p,"00000000-0000-0000-0000-000000000001");assert routed.get("homeName").getAsString().equals("main-stash_1")&&StashCatalog.list(root).get(0).getAsJsonObject().getAsJsonObject("homes").size()==1;
         long now=System.nanoTime();
-        var near=new PlayerObservation(WORKER,"Near","server\nnether",new PlayerObservation.Position(0,116,0),now);
-        var far=new PlayerObservation(OTHER,"Far","server\nnether",new PlayerObservation.Position(100,116,0),now);
+        var near=new PlayerObservation(WORKER,"Near","server\nminecraft:the_nether",new PlayerObservation.Position(0,116,0),now);
+        var far=new PlayerObservation(OTHER,"Far","server\nminecraft:the_nether",new PlayerObservation.Position(100,116,0),now);
         assert StashCatalog.nearby(p,near.position())&&!StashCatalog.nearby(p,far.position());
         assert StashCatalog.nearby(p,far.position(),128)&&!StashCatalog.nearby(p,new PlayerObservation.Position(200,116,0),128);
         assert StashCatalog.nearby(p,new PlayerObservation.Position(200,116,0),256)&&!StashCatalog.nearby(p,new PlayerObservation.Position(300,116,0),256);
-        JsonObject joined=StashCatalog.scanRoute(root,"A","server\nnether",p,OTHER.toString(),List.of(near,far),now);
+        JsonObject joined=StashCatalog.scanRoute(root,"A","server\nminecraft:the_nether",p,OTHER.toString(),List.of(near,far),now);
         assert joined.get("scanAnchor").getAsString().equals(WORKER.toString()) : "Remote scanners rendezvous with a nearby worker";
-        assert !StashCatalog.scanRoute(root,"A","server\nnether",p,WORKER.toString(),List.of(near,far),now).has("scanAnchor");
-        assert !StashCatalog.scanRoute(root,"A","server\nnether",p,OTHER.toString(),List.of(new PlayerObservation(WORKER,"Near","server\nnether",near.position(),now-PlayerObservation.MAX_AGE),far),now).has("scanAnchor") : "Stale anchors fall back to /home";
+        assert !StashCatalog.scanRoute(root,"A","server\nminecraft:the_nether",p,WORKER.toString(),List.of(near,far),now).has("scanAnchor");
+        assert !StashCatalog.scanRoute(root,"A","server\nminecraft:the_nether",p,OTHER.toString(),List.of(new PlayerObservation(WORKER,"Near","server\nminecraft:the_nether",near.position(),now-PlayerObservation.MAX_AGE),far),now).has("scanAnchor") : "Stale anchors fall back to /home";
         String scanScript=new dev.monocle.client.systems.bots.BotWorkflows(null).get("task-stash-scan").script();
         var rendezvous=BotLua.next(scanScript,new JsonObject(),joined,null,null);
         assert rendezvous.action().get("type").getAsString().equals("Tpa")&&rendezvous.action().get("allowFailure").getAsBoolean();
@@ -574,8 +577,8 @@ public final class CoordinatorCoreTest {
         StashCatalog.cacheRemote(root,StashCatalog.list(root));assert StashCatalog.remote(root).size()==1;
         assert StashCatalog.list(root).size()==1&&StashCatalog.list(root).get(0).getAsJsonObject().get("observed").getAsInt()==0 : "Exported definitions are visible before scanning";
         JsonObject observation=JsonParser.parseString("{\"x\":0,\"y\":116,\"z\":0,\"status\":\"observed\",\"block\":\"minecraft:chest\",\"reason\":\"\",\"items\":{\"minecraft:stone\":1728},\"shulkers\":[]}").getAsJsonObject();
-        StashCatalog.save(root,"A","server\nnether",p,observation);StashCatalog.save(root,"A","server\nnether",p,observation);
-        StashCatalog.record(root,"A","server\nnether",p,observation);
+        StashCatalog.save(root,"A","server\nminecraft:the_nether",p,observation);StashCatalog.save(root,"A","server\nminecraft:the_nether",p,observation);
+        StashCatalog.record(root,"A","server\nminecraft:the_nether",p,observation);
         assert StashCatalog.list(root).size()==1 && StashCatalog.list(root).get(0).getAsJsonObject().getAsJsonObject("items").get("minecraft:stone").getAsInt()==1728 : "Retries never add stock twice";
         JsonObject mapped=StashCatalog.list(root).get(0).getAsJsonObject();
         assert mapped.getAsJsonObject("columns").getAsJsonObject("0,0").getAsJsonObject("items").get("minecraft:stone").getAsInt()==1728;
@@ -588,27 +591,27 @@ public final class CoordinatorCoreTest {
         StashCatalog.observation(p,dense);
         JsonObject wire=TaskWire.message("stash-findings");StashCatalog.attachObservation(wire,dense);
         assert wire.has("observationGzip") && TaskFiles.jsonBytes(wire,16_000).length<16_000 && StashCatalog.readObservation(wire).equals(dense);
-        JsonObject kits=observation.deepCopy();kits.getAsJsonArray("shulkers").add(box);StashCatalog.save(root,"A","server\nnether",p,kits);
+        JsonObject kits=observation.deepCopy();kits.getAsJsonArray("shulkers").add(box);StashCatalog.save(root,"A","server\nminecraft:the_nether",p,kits);
         String kitId=StashCatalog.kitTypeId(box);assert !kitId.isBlank();
         JsonObject partial=box.deepCopy();partial.getAsJsonObject("items").addProperty("minecraft:obsidian",32);
-        JsonObject partialObservation=kits.deepCopy();partialObservation.addProperty("x",1);partialObservation.getAsJsonArray("shulkers").set(0,partial);StashCatalog.save(root,"A","server\nnether",p,partialObservation);
+        JsonObject partialObservation=kits.deepCopy();partialObservation.addProperty("x",1);partialObservation.getAsJsonArray("shulkers").set(0,partial);StashCatalog.save(root,"A","server\nminecraft:the_nether",p,partialObservation);
         JsonObject kitSummary=StashCatalog.list(root).get(0).getAsJsonObject();
         assert kitSummary.getAsJsonObject("kitCounts").getAsJsonObject(kitId).get("complete").getAsInt()==1&&kitSummary.getAsJsonObject("kitCounts").getAsJsonObject(kitId).get("incomplete").getAsInt()==1;
         assert kitSummary.getAsJsonObject("kitTypes").getAsJsonObject(kitId).getAsJsonObject("items").get("minecraft:obsidian").getAsInt()==64;
-        assert StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nnether","Depot"),kitId,1,false).size()>=1;
-        assert StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nnether","Depot"),kitId,1,true).get(0).getAsJsonObject().get("x").getAsInt()==1;
-        JsonArray mappedKits=StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nnether","Depot"),kitId,2,false);
+        assert StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nminecraft:the_nether","Depot"),kitId,1,false).size()>=1;
+        assert StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nminecraft:the_nether","Depot"),kitId,1,true).get(0).getAsJsonObject().get("x").getAsInt()==1;
+        JsonArray mappedKits=StashCatalog.kitPicks(StashCatalog.get(root,"A","server\nminecraft:the_nether","Depot"),kitId,2,false);
         assert mappedKits.size()>=2&&mappedKits.get(0).getAsJsonObject().get("dynamic").getAsBoolean()&&mappedKits.get(1).getAsJsonObject().get("y").getAsInt()==117 : "Observed and unscanned chests are searched live, not bound to stale slots";
-        JsonObject crowded=StashCatalog.get(root,"A","server\nnether","Depot");JsonArray crowdedBoxes=crowded.getAsJsonObject("containers").getAsJsonObject("0,116,0").getAsJsonArray("shulkers");
+        JsonObject crowded=StashCatalog.get(root,"A","server\nminecraft:the_nether","Depot");JsonArray crowdedBoxes=crowded.getAsJsonObject("containers").getAsJsonObject("0,116,0").getAsJsonArray("shulkers");
         for(int i=1;i<27;i++){JsonObject packed=box.deepCopy();packed.addProperty("slot",i);crowdedBoxes.add(packed);}
         JsonArray crowdedPicks=StashCatalog.kitPicks(crowded,kitId,27,false);
         assert crowdedPicks.get(0).getAsJsonObject().get("dynamic").getAsBoolean()
             &&java.util.stream.StreamSupport.stream(crowdedPicks.spliterator(),false).filter(e->e.getAsJsonObject().get("x").getAsInt()==0&&e.getAsJsonObject().get("y").getAsInt()==116).count()==1 : "A full chest is one live search target, not 27 stale slot promises";
-        JsonArray upperReceipt=new JsonArray();upperReceipt.add(mappedKits.get(1).deepCopy());StashCatalog.invalidateWithdrawn(root,"A","server\nnether","Depot",upperReceipt);
-        assert StashCatalog.get(root,"A","server\nnether","Depot").getAsJsonObject("containers").getAsJsonObject("0,117,0").get("status").getAsString().equals("unscanned") : "A discovered upper chest is recorded without rejecting the worker receipt";
-        JsonObject overflow=p.deepCopy();overflow.addProperty("name","Overflow");overflow.addProperty("minX",100);overflow.addProperty("maxX",100);StashCatalog.define(root,"A","server\nnether",overflow);
+        JsonArray upperReceipt=new JsonArray();upperReceipt.add(mappedKits.get(1).deepCopy());StashCatalog.invalidateWithdrawn(root,"A","server\nminecraft:the_nether","Depot",upperReceipt);
+        assert StashCatalog.get(root,"A","server\nminecraft:the_nether","Depot").getAsJsonObject("containers").getAsJsonObject("0,117,0").get("status").getAsString().equals("unscanned") : "A discovered upper chest is recorded without rejecting the worker receipt";
+        JsonObject overflow=p.deepCopy();overflow.addProperty("name","Overflow");overflow.addProperty("minX",100);overflow.addProperty("maxX",100);StashCatalog.define(root,"A","server\nminecraft:the_nether",overflow);
         JsonObject kitRequest=p.deepCopy();kitRequest.addProperty("kitTypeId",kitId);kitRequest.addProperty("count",1);kitRequest.addProperty("destination","Stash");kitRequest.addProperty("targetStashName","Overflow");
-        JsonObject kitAction=StashCatalog.kitAction(root,"A","server\nnether",kitRequest,WORKER.toString());
+        JsonObject kitAction=StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",kitRequest,WORKER.toString());
         assert kitAction.getAsJsonObject("targetStash").get("name").getAsString().equals("Overflow")&&kitAction.getAsJsonArray("picks").size()>=1;
         assert kitAction.getAsJsonObject("targetStash").getAsJsonObject("kitExemplar").get("minecraft:obsidian").getAsInt()==64&&!kitAction.getAsJsonObject("targetStash").get("incomplete").getAsBoolean();
         String kitScript=new dev.monocle.client.systems.bots.BotWorkflows(null).get("task-kit-delivery").script();
@@ -616,19 +619,20 @@ public final class CoordinatorCoreTest {
         assert pickup.action().get("type").getAsString().equals("StashResupply");
         JsonObject firstReceipt=JsonParser.parseString("{picked:1,nextPick:1,ok:true}").getAsJsonObject();
         assert BotLua.next(kitScript,pickup.state(),kitAction,firstReceipt,null).action().get("type").getAsString().equals("StashDeposit");
-        JsonObject multiRequest=kitRequest.deepCopy();multiRequest.addProperty("count",3);JsonObject multiKit=StashCatalog.kitAction(root,"A","server\nnether",multiRequest,WORKER.toString());
+        JsonObject multiRequest=kitRequest.deepCopy();multiRequest.addProperty("count",3);JsonObject multiKit=StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",multiRequest,WORKER.toString());
         BotLua.Decision first=BotLua.next(kitScript,new JsonObject(),multiKit,null,null),store=BotLua.next(kitScript,first.state(),multiKit,firstReceipt,null),again=BotLua.next(kitScript,store.state(),multiKit,new JsonObject(),null);
         assert store.action().get("count").getAsInt()==1&&again.action().get("type").getAsString().equals("StashResupply")&&again.action().get("count").getAsInt()==2&&again.action().get("pickIndex").getAsInt()==1 : "The next batch resumes after the confirmed source pick";
         BotLua.Decision finalStore=BotLua.next(kitScript,again.state(),multiKit,JsonParser.parseString("{picked:2,nextPick:1,ok:true}").getAsJsonObject(),null);
         assert finalStore.action().get("count").getAsInt()==2&&BotLua.next(kitScript,finalStore.state(),multiKit,new JsonObject(),null).action().get("type").getAsString().equals("Done");
         JsonObject playerRequest=kitRequest.deepCopy();playerRequest.addProperty("destination","Player");playerRequest.addProperty("recipient",OTHER.toString());playerRequest.addProperty("recipientName","KitRecipient");playerRequest.addProperty("incomplete",true);
-        JsonObject playerKit=StashCatalog.kitAction(root,"A","server\nnether",playerRequest,WORKER.toString());
+        JsonObject playerKit=StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",playerRequest,WORKER.toString());
         BotLua.Decision playerPickup=BotLua.next(kitScript,new JsonObject(),playerKit,null,null),teleport=BotLua.next(kitScript,playerPickup.state(),playerKit,firstReceipt,null),drop=BotLua.next(kitScript,teleport.state(),playerKit,new JsonObject(),null);
         assert drop.action().get("type").getAsString().equals("DropItems")&&drop.action().get("incomplete").getAsBoolean()&&drop.action().getAsJsonObject("kitExemplar").get("minecraft:obsidian").getAsInt()==64;
         assert drop.action().get("handoff").getAsBoolean();
         playerRequest.addProperty("returnHome",true);
-        JsonObject courier=StashCatalog.kitAction(root,"A","server\nnether",playerRequest,WORKER.toString());
-        assert courier.getAsJsonObject("returnStash").get("dimension").getAsString().equals("nether")
+        JsonObject courier=StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",playerRequest,WORKER.toString());
+        assert TaskWire.text(courier.getAsJsonObject("returnStash"),"destination").equals("Player")
+            &&courier.getAsJsonObject("returnStash").get("dimension").getAsString().equals("minecraft:the_nether")
             &&courier.getAsJsonObject("returnStash").get("homeName").equals(courier.get("homeName")) : "Return uses the source's worker-specific home and dimension";
         var courierTake=BotLua.next(kitScript,new JsonObject(),courier,null,null);
         var courierTpa=BotLua.next(kitScript,courierTake.state(),courier,firstReceipt,null);
@@ -636,56 +640,59 @@ public final class CoordinatorCoreTest {
         var arrival=JsonParser.parseString("{ok:true,deliveryAnchor:{x:5,y:64,z:8,yaw:90,dimension:'minecraft:the_end'}}").getAsJsonObject();
         var courierDrop=BotLua.next(kitScript,courierTpa.state(),courier,arrival,null);
         assert courierDrop.action().get("allowFailure").getAsBoolean()&&courierDrop.action().getAsJsonObject("deliveryAnchor").equals(arrival.getAsJsonObject("deliveryAnchor"));
+        courier.addProperty("returnByDeath",true);
         var courierHome=BotLua.next(kitScript,courierDrop.state(),courier,JsonParser.parseString("{ok:true,dropped:1}").getAsJsonObject(),null);
+        assert TaskWire.flag(courierHome.action(),"returnByDeath") : "Only a successful fully-confirmed delivery gets a respawn return";
         assert courierHome.action().get("type").getAsString().equals("StashVisit") : "Final player delivery returns before declaring completion";
         var courierDone=BotLua.next(kitScript,courierHome.state(),courier,JsonParser.parseString("{ok:true}").getAsJsonObject(),null);
         assert courierDone.action().getAsJsonObject("result").get("returnedHome").getAsBoolean()&&courierDone.action().getAsJsonObject("result").get("delivered").getAsInt()==1;
         var tpaFailed=BotLua.next(kitScript,courierTpa.state(),courier,JsonParser.parseString("{ok:false,detail:'TPA not accepted'}").getAsJsonObject(),null);
         assert tpaFailed.action().get("type").getAsString().equals("StashVisit");
         var failedReturn=BotLua.next(kitScript,tpaFailed.state(),courier,JsonParser.parseString("{ok:true}").getAsJsonObject(),null);
-        assert failedReturn.action().get("type").getAsString().equals("StashDeposit")&&failedReturn.action().get("count").getAsInt()==1&&failedReturn.action().get("name").equals(courier.get("name")) : "An unsuccessful request redeposits only its undelivered cargo at the source";
-        assert BotLua.next(kitScript,failedReturn.state(),courier,JsonParser.parseString("{deposited:1,missing:0}").getAsJsonObject(),null).action().get("type").getAsString().equals("Fail");
+        assert failedReturn.action().get("type").getAsString().equals("StashBuffer")&&failedReturn.action().get("count").getAsInt()==1&&failedReturn.action().get("name").equals(courier.get("name")) : "An unanswered request stows only its undelivered cargo in the source ender chest";
+        assert TaskWire.text(failedReturn.action(),"destination").equals("Player") : "Returned delivery cargo retains its optional-food policy";
+        assert BotLua.next(kitScript,failedReturn.state(),courier,JsonParser.parseString("{capacity:54,moved:1,buffered:1}").getAsJsonObject(),null).action().get("type").getAsString().equals("Fail");
         var partialHandoff=BotLua.next(kitScript,JsonParser.parseString("{phase:'dropping',batch:3,total:0}").getAsJsonObject(),courier,JsonParser.parseString("{ok:false,dropped:1,detail:'Recipient left during handoff'}").getAsJsonObject(),null);
         var partialReturn=BotLua.next(kitScript,partialHandoff.state(),courier,JsonParser.parseString("{ok:true}").getAsJsonObject(),null);
-        assert partialReturn.action().get("type").getAsString().equals("StashDeposit")&&partialReturn.action().get("count").getAsInt()==2 : "Already delivered kits must never be returned or counted twice";
+        assert partialReturn.action().get("type").getAsString().equals("StashBuffer")&&partialReturn.action().get("count").getAsInt()==2 : "Already delivered kits must never be returned or counted twice";
         var blocked=BotLua.next(kitScript,courierDrop.state(),courier,JsonParser.parseString("{ok:false,dropped:0,detail:'No supported approach'}").getAsJsonObject(),null);
         assert blocked.action().get("type").getAsString().equals("StashVisit")&&blocked.state().get("total").getAsInt()==0;
         assert TaskWire.text(BotLua.next(kitScript,courierDrop.state(),courier,JsonParser.parseString("{ok:false,detail:'Unknown receipt'}").getAsJsonObject(),null).action(),"type").equals("Fail") : "A failed drop without confirmation counts cannot claim the batch was delivered";
         var invalidReturn=playerRequest.deepCopy();invalidReturn.addProperty("returnHome","yes");
-        try{StashCatalog.kitAction(root,"A","server\nnether",invalidReturn,WORKER.toString());throw new AssertionError("Invalid return flag accepted");}catch(IllegalArgumentException expected){}
-        JsonArray deposited=new JsonArray();deposited.add(JsonParser.parseString("{x:100,y:116,z:0}"));StashCatalog.invalidateDeposited(root,"A","server\nnether","Overflow",deposited);
-        assert StashCatalog.get(root,"A","server\nnether","Overflow").getAsJsonObject("containers").getAsJsonObject("100,116,0").get("status").getAsString().equals("unscanned");
-        assert StashCatalog.get(root,"A","server\nnether","Overflow").getAsJsonObject("containers").getAsJsonObject("100,116,0").get("reason").getAsString().contains("attempted") : "An attempted transfer cannot be reported as a verified deposit";
+        try{StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",invalidReturn,WORKER.toString());throw new AssertionError("Invalid return flag accepted");}catch(IllegalArgumentException expected){}
+        JsonArray deposited=new JsonArray();deposited.add(JsonParser.parseString("{x:100,y:116,z:0}"));StashCatalog.invalidateDeposited(root,"A","server\nminecraft:the_nether","Overflow",deposited);
+        assert StashCatalog.get(root,"A","server\nminecraft:the_nether","Overflow").getAsJsonObject("containers").getAsJsonObject("100,116,0").get("status").getAsString().equals("unscanned");
+        assert StashCatalog.get(root,"A","server\nminecraft:the_nether","Overflow").getAsJsonObject("containers").getAsJsonObject("100,116,0").get("reason").getAsString().contains("attempted") : "An attempted transfer cannot be reported as a verified deposit";
         JsonObject missed=observation.deepCopy();missed.addProperty("status","unscanned");missed.add("items",new JsonObject());missed.addProperty("reason","Opening timed out");
-        StashCatalog.save(root,"A","server\nnether",p,missed);
-        JsonObject missedSummary=StashCatalog.summary(StashCatalog.get(root,"A","server\nnether","Depot"));
+        StashCatalog.save(root,"A","server\nminecraft:the_nether",p,missed);
+        JsonObject missedSummary=StashCatalog.summary(StashCatalog.get(root,"A","server\nminecraft:the_nether","Depot"));
         assert missedSummary.get("unscanned").getAsInt()==2 : "Inspect Depot, not the filesystem's first entry (which may be Overflow)";
-        JsonObject inferred=observation.deepCopy();inferred.addProperty("inferred",true);StashCatalog.save(root,"A","server\nnether",p,inferred);
-        JsonObject inferredSummary=StashCatalog.summary(StashCatalog.get(root,"A","server\nnether","Depot"));
+        JsonObject inferred=observation.deepCopy();inferred.addProperty("inferred",true);StashCatalog.save(root,"A","server\nminecraft:the_nether",p,inferred);
+        JsonObject inferredSummary=StashCatalog.summary(StashCatalog.get(root,"A","server\nminecraft:the_nether","Depot"));
         assert inferredSummary.get("inferred").getAsInt()==1&&inferredSummary.get("observed").getAsInt()==1 : "Estimates never masquerade as observed containers";
-        assert StashCatalog.get(root,"B","server\nnether","Depot").isEmpty();
+        assert StashCatalog.get(root,"B","server\nminecraft:the_nether","Depot").isEmpty();
         JsonObject invalid=observation.deepCopy();invalid.addProperty("x",3);JsonObject assignment=p;
-        rejects(()->StashCatalog.save(root,"A","server\nnether",assignment,invalid));
+        rejects(()->StashCatalog.save(root,"A","server\nminecraft:the_nether",assignment,invalid));
         invalid.addProperty("x",0);invalid.getAsJsonObject("items").addProperty("minecraft:stone",-1);rejects(()->StashCatalog.observation(assignment,invalid));
         JsonObject refillDb=JsonParser.parseString("{containers:{'1,116,2':{status:'observed',shulkers:[{slot:0,dominant:'minecraft:obsidian',mixed:false,items:{'minecraft:obsidian':1728}},{slot:1,dominant:'minecraft:golden_apple',mixed:false,items:{'minecraft:golden_apple':1728}}]},'2,116,2':{status:'observed',inferred:true,shulkers:[{slot:0,dominant:'minecraft:obsidian',mixed:false,items:{'minecraft:obsidian':1728}}]}}}").getAsJsonObject();
         JsonObject inventory=JsonParser.parseString("{target:[3456,2,64,64,64],loose:[0,0,0,0,0],echest:[0,0,0,0,0],shulkers:[0,0,0,0,0]}").getAsJsonObject();JsonObject planned=StashCatalog.refillNeeds(refillDb,inventory,0,"minecraft:obsidian");assert planned!=null&&planned.get("_primary").getAsString().equals("minecraft:obsidian");
         JsonObject needs=JsonParser.parseString("{'minecraft:obsidian':3456,'minecraft:golden_apple':1728,'minecraft:netherrack':100}").getAsJsonObject();JsonArray refill=StashCatalog.refill(refillDb,needs,"minecraft:obsidian",27);
         assert refill.size()==2&&refill.get(0).getAsJsonObject().get("resource").getAsString().equals("minecraft:obsidian") : "Primary shortage is first; inferred stock and sub-box shortages are skipped";
-        JsonObject withdrawalPlan=p.deepCopy();withdrawalPlan.addProperty("name","Withdrawals");StashCatalog.define(root,"A","server\nnether",withdrawalPlan);JsonObject withdrawalObservation=observation.deepCopy();JsonArray receipt=refill.deepCopy();receipt.forEach(v->{v.getAsJsonObject().addProperty("x",0);v.getAsJsonObject().addProperty("z",0);});StashCatalog.save(root,"A","server\nnether",withdrawalPlan,withdrawalObservation);StashCatalog.invalidateWithdrawn(root,"A","server\nnether","Withdrawals",receipt);
-        assert StashCatalog.get(root,"A","server\nnether","Withdrawals").getAsJsonObject("containers").getAsJsonObject("0,116,0").get("status").getAsString().equals("unscanned") : "Withdrawn containers cannot remain authoritative";
+        JsonObject withdrawalPlan=p.deepCopy();withdrawalPlan.addProperty("name","Withdrawals");StashCatalog.define(root,"A","server\nminecraft:the_nether",withdrawalPlan);JsonObject withdrawalObservation=observation.deepCopy();JsonArray receipt=refill.deepCopy();receipt.forEach(v->{v.getAsJsonObject().addProperty("x",0);v.getAsJsonObject().addProperty("z",0);});StashCatalog.save(root,"A","server\nminecraft:the_nether",withdrawalPlan,withdrawalObservation);StashCatalog.invalidateWithdrawn(root,"A","server\nminecraft:the_nether","Withdrawals",receipt);
+        assert StashCatalog.get(root,"A","server\nminecraft:the_nether","Withdrawals").getAsJsonObject("containers").getAsJsonObject("0,116,0").get("status").getAsString().equals("unscanned") : "Withdrawn containers cannot remain authoritative";
         var decision=BotLua.next("return function(ctx) return bot.stash_scan(ctx.args) end",new JsonObject(),p,null,null);
         assert decision.action().get("type").getAsString().equals("StashScan");
         JsonObject telemetry=JsonParser.parseString("{\"name\":\"Depot\",\"phase\":\"Reading\",\"reason\":\"Awaiting contents\",\"target\":\"0,116,0\",\"movementTarget\":\"\",\"lastAction\":\"Requested opening\",\"discovery\":1,\"volume\":30,\"discovered\":1,\"observed\":0,\"unscanned\":0,\"missingChunks\":0,\"attempts\":1}").getAsJsonObject();
         JsonObject run=new JsonObject();for(int i=0;i<100;i++){telemetry.addProperty("reason","Retry "+i);StashCatalog.telemetry(run,telemetry);}assert run.getAsJsonArray("stashEvents").size()==64;
         StashCatalog.telemetry(run,telemetry);assert run.getAsJsonArray("stashEvents").size()==64;
         JsonObject wide=p.deepCopy();wide.addProperty("name","WideDepot");wide.addProperty("minX",0);wide.addProperty("maxX",60);wide.addProperty("scanMode","Full");wide.addProperty("lazyMode",false);
-        StashCatalog.define(root,"A","server\nnether",wide);
-        for(int x=0;x<54;x++){JsonObject chest=kits.deepCopy();chest.addProperty("x",x);StashCatalog.save(root,"A","server\nnether",wide,chest);}
+        StashCatalog.define(root,"A","server\nminecraft:the_nether",wide);
+        for(int x=0;x<54;x++){JsonObject chest=kits.deepCopy();chest.addProperty("x",x);StashCatalog.save(root,"A","server\nminecraft:the_nether",wide,chest);}
         JsonObject wideRequest=wide.deepCopy();wideRequest.addProperty("kitTypeId",kitId);wideRequest.addProperty("count",2);wideRequest.addProperty("destination","Stash");wideRequest.addProperty("targetStashName","Overflow");
-        JsonObject boundedAction=StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());
+        JsonObject boundedAction=StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",wideRequest,WORKER.toString());
         assert boundedAction.toString().length()<=7_500&&boundedAction.getAsJsonArray("picks").size()<54 : "Crowded kit catalogs must fit the native-action wire limit";
         wideRequest.addProperty("transferAll",true);wideRequest.addProperty("includeIncomplete",true);wideRequest.addProperty("count",36);
-        JsonObject all=StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());
+        JsonObject all=StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",wideRequest,WORKER.toString());
         assert all.getAsJsonArray("picks").size()==54&&all.toString().length()<=24_000&&all.getAsJsonObject("targetStash").get("includeIncomplete").getAsBoolean() : "Transfer all never truncates its selected source chests";
         JsonObject allRun=JsonParser.parseString("{id:'"+WORKER+"',status:'Running'}").getAsJsonObject(),allTask=new JsonObject();
         JsonObject allReport=JsonParser.parseString("{run:'"+WORKER+"',status:'Running',token:'"+OTHER+"'}").getAsJsonObject();allReport.add("action",all);
@@ -736,20 +743,21 @@ public final class CoordinatorCoreTest {
         assert TaskWire.text(BotLua.next(kitScript,storeAll.state(),all,JsonParser.parseString("{deposited:10,missing:0,retained:26,columnFull:true}").getAsJsonObject(),null).action(),"type").equals("Fail") : "Ordinary jobs cannot accept a full-column stop";
         deferred.addProperty("sourceExhausted",true);
         assert TaskWire.text(BotLua.next(kitScript,takeAll.state(),all,deferred,null).action(),"type").equals("Fail") : "A source cannot be both deferred and exhausted";
-        JsonObject withdrawnSearch=StashCatalog.get(root,"A","server\nnether","WideDepot"),known=withdrawnSearch.getAsJsonObject("containers").getAsJsonObject("0,116,0");
+        JsonObject withdrawnSearch=StashCatalog.get(root,"A","server\nminecraft:the_nether","WideDepot"),known=withdrawnSearch.getAsJsonObject("containers").getAsJsonObject("0,116,0");
         known.addProperty("status","unscanned");known.addProperty("reason","Contents changed by a confirmed stash withdrawal; rescan required");known.add("shulkers",new JsonArray());known.add("items",new JsonObject());
         // Exercise the shared selection through a temporary persisted catalog, not an alternate planner.
-        StashCatalog.save(root,"A","server\nnether",wide,known);
-        assert StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString()).getAsJsonArray("picks").size()==54 : "Our own withdrawals invalidate quantities but retain live search targets";
-        known.addProperty("reason","Opening timed out");StashCatalog.save(root,"A","server\nnether",wide,known);
-        try{StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());throw new AssertionError("Unknown scan gaps are not known withdrawn sources");}catch(IllegalStateException expected){}
-        known.addProperty("status","observed");known.add("shulkers",kits.getAsJsonArray("shulkers").deepCopy());known.add("items",kits.getAsJsonObject("items").deepCopy());StashCatalog.save(root,"A","server\nnether",wide,known);
-        JsonObject extra=kits.deepCopy();extra.addProperty("x",54);StashCatalog.save(root,"A","server\nnether",wide,extra);
-        try{StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());throw new AssertionError("Transfer all cannot silently omit source 55");}catch(IllegalStateException expected){}
+        StashCatalog.save(root,"A","server\nminecraft:the_nether",wide,known);
+        assert StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",wideRequest,WORKER.toString()).getAsJsonArray("picks").size()==54 : "Our own withdrawals invalidate quantities but retain live search targets";
+        known.addProperty("reason","Opening timed out");StashCatalog.save(root,"A","server\nminecraft:the_nether",wide,known);
+        try{StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",wideRequest,WORKER.toString());throw new AssertionError("Unknown scan gaps are not known withdrawn sources");}catch(IllegalStateException expected){}
+        known.addProperty("status","observed");known.add("shulkers",kits.getAsJsonArray("shulkers").deepCopy());known.add("items",kits.getAsJsonObject("items").deepCopy());StashCatalog.save(root,"A","server\nminecraft:the_nether",wide,known);
+        JsonObject extra=kits.deepCopy();extra.addProperty("x",54);StashCatalog.save(root,"A","server\nminecraft:the_nether",wide,extra);
+        JsonObject compact=StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",wideRequest,WORKER.toString());
+        assert compact.getAsJsonArray("picks").size()==55&&compact.get("compactPicks").getAsBoolean()&&compact.getAsJsonArray("picks").get(54).getAsJsonObject().keySet().equals(java.util.Set.of("x","y","z")) : "Larger transfers retain every source using bounded compact positions";
         wideRequest.addProperty("destination","Carry");
-        try{StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());throw new AssertionError("Repeat pickup needs somewhere to unload");}catch(IllegalArgumentException expected){}
-        wideRequest.addProperty("destination","Stash");extra.addProperty("status","unscanned");extra.add("shulkers",new JsonArray());extra.add("items",new JsonObject());StashCatalog.save(root,"A","server\nnether",wide,extra);
-        try{StashCatalog.kitAction(root,"A","server\nnether",wideRequest,WORKER.toString());throw new AssertionError("Unscanned sources cannot establish exhaustion");}catch(IllegalStateException expected){}
+        try{StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",wideRequest,WORKER.toString());throw new AssertionError("Repeat pickup needs somewhere to unload");}catch(IllegalArgumentException expected){}
+        wideRequest.addProperty("destination","Stash");extra.addProperty("status","unscanned");extra.add("shulkers",new JsonArray());extra.add("items",new JsonObject());StashCatalog.save(root,"A","server\nminecraft:the_nether",wide,extra);
+        try{StashCatalog.kitAction(root,"A","server\nminecraft:the_nether",wideRequest,WORKER.toString());throw new AssertionError("Unscanned sources cannot establish exhaustion");}catch(IllegalStateException expected){}
     }
 
     private static void stashMultiTransfer() throws Exception {
@@ -938,7 +946,7 @@ public final class CoordinatorCoreTest {
         if(deferred){JsonArray notes=new JsonArray();notes.add("Blocked outlet");value.add("deferredSources",notes);}return result;
     }
     private static void stashManualColumns() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-manual-columns-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-manual-columns-");String scope="server\nminecraft:the_nether";
         JsonObject p=StashCatalog.plan(JsonParser.parseString("{name:'Manual',homeName:'vault',minX:0,maxX:8,minY:115,maxY:119,minZ:0,maxZ:3}").getAsJsonObject());
         JsonObject box=JsonParser.parseString("{slot:0,item:'minecraft:blue_shulker_box',quantity:1,name:'Alpha',contentsKnown:true,items:{'minecraft:obsidian':64}}").getAsJsonObject();String kit=StashCatalog.kitTypeId(box);
         for(int x=0;x<=8;x+=2){JsonObject o=JsonParser.parseString("{x:0,y:116,z:0,status:'observed',block:'minecraft:chest',items:{},shulkers:[]}").getAsJsonObject();o.addProperty("x",x);
@@ -968,7 +976,7 @@ public final class CoordinatorCoreTest {
         assert StashCatalog.get(root,"A",scope,"Empty target").getAsJsonObject("kitTypes").has(kit) : "Known crew kits can reserve empty destination stashes";
     }
     private static void stashColumns() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-column-check-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-column-check-");String scope="server\nminecraft:the_nether";
         JsonObject p=StashCatalog.plan(JsonParser.parseString("{name:'Columns',homeName:'vault',minX:0,maxX:10,minY:116,maxY:119,minZ:0,maxZ:3}").getAsJsonObject());
         JsonObject box=JsonParser.parseString("{slot:0,item:'minecraft:blue_shulker_box',quantity:1,name:'Alpha',contentsKnown:true,items:{'minecraft:obsidian':64}}").getAsJsonObject();
         JsonObject other=box.deepCopy();other.addProperty("name","Beta");String kit=StashCatalog.kitTypeId(box),foreign=StashCatalog.kitTypeId(other);
@@ -988,7 +996,7 @@ public final class CoordinatorCoreTest {
         JsonObject badColumn=column.deepCopy();badColumn.addProperty("y",115);rejects(()->StashCatalog.checkedColumn(p,badColumn));
         JsonObject run=new JsonObject();run.addProperty("id",WORKER.toString());run.addProperty("token",OTHER.toString());
         JsonObject action=p.deepCopy();action.addProperty("type","StashDeposit");action.addProperty("kitTypeId",kit);action.addProperty("count",1);run.add("action",action);
-        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'nether',id:'columns-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
+        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'minecraft:the_nether',id:'columns-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
         JsonObject message=TaskWire.message("stash-findings");message.addProperty("task","columns-task");message.addProperty("run",WORKER.toString());message.addProperty("token",OTHER.toString());message.add("action",action.deepCopy());message.addProperty("delivery",1);
         JsonObject ack=StashCatalog.accept(root,task,run,WORKER.toString(),"A",message);
         assert !ack.get("permit").getAsBoolean()&&ack.getAsJsonObject("column").equals(column);
@@ -1028,7 +1036,7 @@ public final class CoordinatorCoreTest {
     }
 
     private static void fullColumnMemory() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-full-columns-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-full-columns-");String scope="server\nminecraft:the_nether";
         JsonObject p=StashCatalog.plan(JsonParser.parseString("{name:'Full memory',homeName:'vault',minX:0,maxX:4,minY:116,maxY:119,minZ:0,maxZ:3}").getAsJsonObject());
         JsonObject box=JsonParser.parseString("{slot:0,item:'minecraft:blue_shulker_box',quantity:1,name:'Alpha',contentsKnown:true,items:{'minecraft:obsidian':64}}").getAsJsonObject(),beta=box.deepCopy();beta.addProperty("name","Beta");
         String a=StashCatalog.kitTypeId(box),b=StashCatalog.kitTypeId(beta);
@@ -1043,7 +1051,7 @@ public final class CoordinatorCoreTest {
         StashCatalog.setColumnReservations(root,"A",scope,"Full memory",TaskWire.text(StashCatalog.summary(StashCatalog.get(root,"A",scope,"Full memory")),"revision"),a,manual);
         JsonObject run=new JsonObject();run.addProperty("id",WORKER.toString());run.addProperty("token",OTHER.toString());
         JsonObject action=p.deepCopy();action.addProperty("type","StashDeposit");action.addProperty("kitTypeId",a);action.addProperty("count",1);run.add("action",action);
-        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'nether',id:'full-memory-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
+        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'minecraft:the_nether',id:'full-memory-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
         JsonObject message=TaskWire.message("stash-findings");message.addProperty("task","full-memory-task");message.addProperty("run",WORKER.toString());message.addProperty("token",OTHER.toString());message.add("action",action);message.addProperty("delivery",1);
         assert StashCatalog.accept(root,task,run,WORKER.toString(),"A",message).getAsJsonObject("column").get("x").getAsInt()==0;
         assert !StashCatalog.get(root,"A",scope,"Full memory").has("fullColumns") : "A full bottom snapshot alone is not proof that the column cannot accept stock";
@@ -1080,7 +1088,7 @@ public final class CoordinatorCoreTest {
     }
 
     private static void singleColumnTransfer() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-single-column-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-single-column-");String scope="server\nminecraft:the_nether";
         JsonObject p=StashCatalog.plan(JsonParser.parseString("{name:'Limit',homeName:'vault',minX:0,maxX:4,minY:116,maxY:119,minZ:0,maxZ:3}").getAsJsonObject());
         JsonObject box=JsonParser.parseString("{slot:0,item:'minecraft:blue_shulker_box',quantity:1,name:'Alpha',contentsKnown:true,items:{'minecraft:obsidian':64}}").getAsJsonObject();
         String kit=StashCatalog.kitTypeId(box);
@@ -1095,7 +1103,7 @@ public final class CoordinatorCoreTest {
         JsonObject wrongDestination=request.deepCopy();wrongDestination.addProperty("destination","Carry");rejects(()->StashCatalog.kitAction(root,"A",scope,wrongDestination,WORKER.toString()));
         rejects(()->StashCatalog.kitTransfer(root,"A",scope,request,WORKER.toString()));
         JsonObject run=JsonParser.parseString("{id:'"+WORKER+"',token:'"+OTHER+"'}").getAsJsonObject();run.add("action",action);
-        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'nether',id:'limit-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
+        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'minecraft:the_nether',id:'limit-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
         JsonObject message=TaskWire.message("stash-findings");message.addProperty("task","limit-task");message.addProperty("run",WORKER.toString());message.addProperty("token",OTHER.toString());message.add("action",action);message.addProperty("delivery",1);
         JsonObject ack=StashCatalog.accept(root,task,run,WORKER.toString(),"A",message);
         assert ack.getAsJsonObject("column").equals(action.get("targetColumn")) : "The selected empty column overrides matching-stock allocation elsewhere";
@@ -1112,7 +1120,7 @@ public final class CoordinatorCoreTest {
     }
 
     private static void sharedColumnTransfer() throws Exception {
-        var root=java.nio.file.Files.createTempDirectory("monocle-shared-column-");String scope="server\nnether";
+        var root=java.nio.file.Files.createTempDirectory("monocle-shared-column-");String scope="server\nminecraft:the_nether";
         JsonObject p=StashCatalog.plan(JsonParser.parseString("{name:'Shared',homeName:'vault',minX:0,maxX:4,minY:116,maxY:119,minZ:0,maxZ:3}").getAsJsonObject());
         JsonObject alpha=JsonParser.parseString("{slot:0,item:'minecraft:blue_shulker_box',quantity:1,name:'Alpha',contentsKnown:true,items:{'minecraft:obsidian':64}}").getAsJsonObject(),beta=alpha.deepCopy();beta.addProperty("name","Beta");beta.addProperty("slot",1);
         String a=StashCatalog.kitTypeId(alpha),b=StashCatalog.kitTypeId(beta);
@@ -1127,7 +1135,7 @@ public final class CoordinatorCoreTest {
         JsonObject request=source.deepCopy();for(String key:List.of("kitTypeId","count","targetColumn","columnKitTypeIds"))request.add(key,action.get(key).deepCopy());request.addProperty("destination","Stash");request.addProperty("targetStashName","Shared");
         JsonObject routed=StashCatalog.kitAction(root,"A",scope,request,WORKER.toString());assert !routed.has("columnKitTypeIds")&&routed.getAsJsonObject("targetStash").get("columnKitTypeIds").equals(allowed) : "Shared destination rules never reach source selection";
         JsonObject run=JsonParser.parseString("{id:'"+WORKER+"',token:'"+OTHER+"'}").getAsJsonObject();run.add("action",action);
-        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'nether',id:'shared-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
+        JsonObject task=JsonParser.parseString("{crew:'A',server:'server',dimension:'minecraft:the_nether',id:'shared-task',runs:{}}").getAsJsonObject();task.getAsJsonObject("runs").add(WORKER.toString(),run);
         JsonObject message=TaskWire.message("stash-findings");message.addProperty("task","shared-task");message.addProperty("run",WORKER.toString());message.addProperty("token",OTHER.toString());message.add("action",action);message.addProperty("delivery",1);
         JsonObject ack=StashCatalog.accept(root,task,run,WORKER.toString(),"A",message);assert !ack.has("error")&&ack.get("column").equals(action.get("targetColumn")) : "Explicit sharing upgrades an existing compatible single-kit reservation";
         JsonObject reservation=StashCatalog.get(root,"A",scope,"Shared").getAsJsonObject("columnReservations").getAsJsonObject("2,0");assert reservation.get("columnKitTypeIds").equals(allowed)&&reservation.get("kitTypeId").getAsString().equals(a) : "Sharing persists while preserving the original primary kit";
@@ -1161,7 +1169,7 @@ public final class CoordinatorCoreTest {
         JsonArray predictionWorkers=new JsonArray();JsonObject predictionWorker=new JsonObject();predictionWorker.add("roadPrediction",prediction);predictionWorkers.add(predictionWorker);
         assert RoadForecast.crew(predictionWorkers).get("nextBlocks").getAsInt()==100;
         prediction.addProperty("nextBlocks",1025);rejects(()->RoadForecast.checked(prediction));
-        BotChat chat=new BotChat();UUID commandId=UUID.randomUUID();assert chat.first(commandId)&&!chat.first(commandId);
+        BotChat chat=new BotChat();UUID commandId=UUID.randomUUID();assert !chat.executed(commandId);assert chat.first(commandId)&&chat.executed(commandId)&&!chat.first(commandId);
         assert BotChat.command("/home stash1").equals("/home stash1");rejects(()->BotChat.command("hello\n/stop"));rejects(()->BotChat.command("x".repeat(257)));
         for(int i=0;i<300;i++)chat.append(WORKER,"Default","Worker","world","received","message "+i);
         assert chat.json().size()==256 && chat.json().get(0).getAsJsonObject().get("text").getAsString().equals("message 44");

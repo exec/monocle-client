@@ -1,13 +1,7 @@
-# Crew pickup confirmation failure
+# Crew pickup confirmation
 
-Task `6f1b5f9c-39e9-4020-b1f8-9e5c8476a8b5`, `zungle1` to `newstorage`, Unbans leader, UnbansBot and iotacism followers.
+An intermediate contents packet may show the source changed before the carried gain is confirmed. That packet alone must neither confirm pickup nor immediately discard a pending transfer. Local prediction also requires reconciliation before issuing a move.
 
-After correcting catalog starvation, all three reached the source. The first two kit types were already exhausted by previous transfers. On `TSR Build Kit V.3` (`2dd5502e-731b-3e8b-91cc-442eac05dd43`), Unbans confirmed 35 pickups. Both followers recorded three pickups, then failed with `Source kit vanished without a server-confirmed inventory pickup`. Unbans subsequently failed at the crew barrier because a follower needed attention. No delivery was confirmed.
+Pickup uses a reconciled baseline and the existing forced two-click operation. Confirmation requires the exact source/destination/cursor evidence; intermediate negatives wait within the bounded deadline. Pending clicks are never blindly replayed, and confirmed receipts cannot be undone by late packets.
 
-The saved follower native frames retained `withdrawPending: true`; receipts are lower bounds, not proof of current inventory counts. Their assigned source coordinates were distinct. The previous verifier threw immediately when a full contents packet lacked a matching source stack but did not yet show the carried gain. It also started predicted shift-clicks without the local/server baseline reconciliation already required by deposits. These are reproducible verification weaknesses. The old telemetry did not retain the triggering packet's source/destination/count/cursor values, so its exact ordering is not proven.
-
-0.13.39 uses the existing forced, non-predicted two-click move in both directions. Pickup requires a reconciled baseline and a receipt showing a changed source slot, exact destination stack, one matching-kit gain and empty cursor. Intermediate or late negative snapshots wait within the existing 60-tick verification deadline; no uncertain click is replayed. Pending checkpoints include verification diagnostics. Confirmed receipts remain confirmed until consumed even if a late packet arrives.
-
-Next live run must deposit carried loads first. Use per-worker `task-stash-transfer` recovery with `depositCarried: true, depositOnly: true`, targeting `newstorage` and selecting the V.3 kit above. Determine quantities from current worker inventory; do not assume the followers carry exactly their three confirmed receipts. Recover separately before starting another crew transfer. Keep the pure obsidian kit excluded from that transfer. Unbans maps the destination to `/home newstorage`; followers can TPA there to avoid relying on their separate home names/cooldowns.
-
-Assertion checks cover intermediate cursor snapshots, stale negative receipts, exact component/count mismatch, duplicate confirmations, shared move dispatch and recovery completion without new pickup. Live validation remains pending installation.
+Recovery must inspect actual carried cargo and deposit confirmed loads before replacement collection. Receipt totals are not proof of current inventory. Tests cover packet ordering, component/count mismatches, duplicate confirmation and recovery without new pickup.

@@ -2,6 +2,13 @@
 
 ## Whitelist kitbot and category columns (0.14.33)
 
+The same dialog includes **Mike**, an optional Ollama kit handler. Enable him and
+choose an Ollama base URL and installed tool-capable model for natural-language
+whispers. Only public category descriptions, sample item types and coarse stock
+labels reach the model; the host retains delivery authorization. Mike is off by
+default, and explicit commands work independently. See [setup and data
+boundary](kitbot-mike.md).
+
 Under **Kits**, open **Categories & whisper kitbot** to choose a source stash, seed/edit categories, select the courier, and configure exact username/UUID whitelist entries and a persistent requester cooldown. Requests use `/msg <courier> kit <category-slug> [count]`; quantity defaults to one and is capped at 36. Each eligible variant must have 250 complete directly observed kits after outstanding requests. Low-stock kits remain visible for management but are unavailable to kitbot. Incoming ready-world whispers are the only trigger; the standalone host queues the existing delivery-and-return workflow. Receipts show accepted/out-of-stock requests and job outcomes. Disable stops new requests; cancel already accepted deliveries in Jobs.
 
 In 0.14.34 the whitelist editor has a cooldown field for each person. New users default to **one hour**; **0 disables their cooldown**, while the duplicate and in-flight delivery guards remain. Existing entries without overrides retain the shared fallback until edited. Saving settings does not clear request history or restart jobs.

@@ -195,11 +195,23 @@ public class InvUtils {
         moveSlotsConfirmed(source,destination);
     }
 
+    public static boolean canMoveConfirmed(int inventoryIndex,int destination){
+        return canMoveSlotsConfirmed(SlotUtils.indexToId(inventoryIndex),destination);
+    }
+
+    public static boolean canMoveSlotsConfirmed(int source,int destination){
+        return mc.player!=null&&canMoveSlotsConfirmed(mc.player.containerMenu,source,destination);
+    }
+
+    static boolean canMoveSlotsConfirmed(net.minecraft.world.inventory.AbstractContainerMenu menu,int source,int destination){
+        return source>=0&&source<menu.slots.size()&&destination>=0&&destination<menu.slots.size()&&source!=destination
+            &&menu.getCarried().isEmpty()&&!menu.getSlot(source).getItem().isEmpty()&&!menu.getSlot(destination).hasItem();
+    }
+
     /** Same confirmed move in either direction; indices belong to the current open menu. */
     public static void moveSlotsConfirmed(int source, int destination) {
         var menu=mc.player.containerMenu;
-        if(source<0||source>=menu.slots.size()||destination<0||destination>=menu.slots.size()||source==destination||!menu.getCarried().isEmpty()
-            ||menu.getSlot(source).getItem().isEmpty()||menu.getSlot(destination).hasItem())
+        if(!canMoveSlotsConfirmed(menu,source,destination))
             throw new IllegalStateException("Confirmed inventory move requires a carried item, empty destination and empty cursor");
         // No local prediction: each mismatched state ID makes vanilla send the post-click full contents
         // within that handler, before a subsequent hopper tick can drain the destination.

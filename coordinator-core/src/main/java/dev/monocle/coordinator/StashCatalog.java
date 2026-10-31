@@ -27,6 +27,8 @@ public final class StashCatalog {
     private StashCatalog() {}
     private record CachedStash(String revision,JsonObject database,JsonObject summary) {}
     private static final Map<Path,CachedStash> summaries=new LinkedHashMap<>();
+    private record CachedLocalWatch(String revision,JsonObject header,JsonObject view) {}
+    private static final Map<Path,CachedLocalWatch> localWatches=new LinkedHashMap<>();
     private static CachedStash cached(Path file){
         file=file.toAbsolutePath().normalize();String revision=StashStore.revision(file);
         synchronized(summaries){
@@ -82,7 +84,9 @@ public final class StashCatalog {
         if (!p.has("workerIndex")) p.addProperty("workerIndex", 0);
         if (!p.has("lazyMode")) p.addProperty("lazyMode", true);
         if (!p.get("lazyMode").isJsonPrimitive() || !p.getAsJsonPrimitive("lazyMode").isBoolean()) throw new IllegalArgumentException("Invalid stash lazyMode");
+        if(p.has("returnByDeath")&&(!p.get("returnByDeath").isJsonPrimitive()||!p.getAsJsonPrimitive("returnByDeath").isBoolean()))throw new IllegalArgumentException("Expected boolean returnByDeath");
         if(p.has("assumeEmpty")&&(!p.get("assumeEmpty").isJsonPrimitive()||!p.getAsJsonPrimitive("assumeEmpty").isBoolean()))throw new IllegalArgumentException("Invalid stash assumeEmpty");
+        if(p.has("fillAllocatedColumns")&&(!p.get("fillAllocatedColumns").isJsonPrimitive()||!p.getAsJsonPrimitive("fillAllocatedColumns").isBoolean()))throw new IllegalArgumentException("Expected boolean fillAllocatedColumns");
         String home=TaskWire.text(p,"homeName").strip();
         if (!home.matches("[A-Za-z0-9_-]{1,48}")) throw new IllegalArgumentException("Give the stash its required /home name using letters, numbers, underscores or dashes");
         p.addProperty("homeName",home);
@@ -100,6 +104,16 @@ public final class StashCatalog {
         return p;
     }
     static JsonObject sortRows(Path root,String crew,String scope,String name,Set<String> keys){return StashStore.readRows(file(root,crew,scope,name),keys);}
+    public static JsonObject bufferAction(JsonObject source){
+        JsonObject a=plan(source);UUID.fromString(TaskWire.text(a,"kitTypeId"));
+        String op=TaskWire.text(a,"operation");if(!Set.of("Inspect","Store","Take","Stow").contains(op))throw new IllegalArgumentException("Invalid ender buffer operation");
+        int buffered=integer(a,"buffered",0,54);integer(a,"count",1,36);
+        if(!a.has("incomplete"))a.addProperty("incomplete",false);
+        for(String key:List.of("incomplete","includeIncomplete"))if(a.has(key)&&(!a.get(key).isJsonPrimitive()||!a.getAsJsonPrimitive(key).isBoolean()))throw new IllegalArgumentException("Expected boolean "+key);
+        if(!a.has("kitExemplar")||!a.get("kitExemplar").isJsonObject())throw new IllegalArgumentException("Ender transport needs its kit identity");
+        if(op.equals("Inspect")&&buffered!=0||op.equals("Take")&&buffered==0)throw new IllegalArgumentException("Invalid expected ender cargo");
+        return a;
+    }
     public static Set<String> columnKitTypes(JsonObject plan){
         String kit=TaskWire.text(plan,"kitTypeId");UUID.fromString(kit);
         if(!plan.has("columnKitTypeIds"))return Set.of(kit);
@@ -221,6 +235,18 @@ public final class StashCatalog {
         JsonObject ack=TaskWire.message("stash-live-ack");ack.addProperty("eventId",event);ack.addProperty("outcome",outcome);ack.addProperty("basis",observationBasis(previous));
         if(previous!=null)ack.add("record",watchRecord(previous));return ack;
     }
+    /** Host-owned mirrors use their own current row basis; standalone local watches retain CAS conflicts. */
+    public static synchronized JsonObject acceptLocalLive(Path root,JsonObject message){
+        String crew=TaskWire.text(message,"crew"),scope=TaskWire.text(message,"scope"),name=TaskWire.text(message,"name");
+        JsonObject local=message;
+        if(!TaskWire.text(message,"owner").isEmpty()){
+            String cell=containerKey(message.getAsJsonObject("observation"));Path path=file(root,crew,scope,name);
+            JsonObject db=StashStore.readRows(path,Set.of(cell));
+            if(db.isEmpty()){define(root,crew,scope,message.getAsJsonObject("plan"));db=StashStore.readRows(path,Set.of(cell));}
+            local=message.deepCopy();local.addProperty("basis",observationBasis(db.getAsJsonObject("containers").getAsJsonObject(cell)));
+        }
+        return acceptLive(root,crew,scope,TaskWire.text(message,"worker"),local);
+    }
     /** Validate the whole envelope before applying any entry; each durable result remains independently retryable. */
     public static JsonArray liveBatch(JsonObject message){
         TaskFiles.jsonBytes(message,LIVE_BATCH_BYTES);
@@ -242,7 +268,7 @@ public final class StashCatalog {
         }
         JsonObject ack=TaskWire.message("stash-live-batch-ack");ack.add("entries",results);TaskFiles.jsonBytes(ack,LIVE_BATCH_BYTES);return ack;
     }
-    public static JsonObject watchRecord(JsonObject o){JsonObject r=new JsonObject();for(String key:List.of("x","y","z","status","block","capacity","parts","previousParts"))if(o.has(key))r.add(key,o.get(key).deepCopy());r.addProperty("basis",observationBasis(o));return r;}
+    public static JsonObject watchRecord(JsonObject o){JsonObject r=new JsonObject();for(String key:List.of("x","y","z","status","block","capacity","parts","previousParts","slotCount","occupiedSlots","inferred","observedAt"))if(o.has(key))r.add(key,o.get(key).deepCopy());r.addProperty("basis",observationBasis(o));return r;}
     private static JsonObject watchPlan(JsonObject db){
         try{return plan(db.getAsJsonObject("bounds"));}
         catch(IllegalArgumentException e){return null;} // Legacy definitions without a home remain stored, but cannot authorize observations.
@@ -254,13 +280,30 @@ public final class StashCatalog {
     }
     /** Observer baselines need geometry and CAS hashes, not operator aggregates or kit contents. Call off the game thread. */
     public static JsonArray localWatches(Path root,boolean host){
+        return localWatches(root,host,Set.of());
+    }
+    private static boolean localWatchIncluded(JsonObject header,boolean host,Set<String> hostOwned){
+        return !header.isEmpty()&&header.has("bounds")&&(host||TaskWire.text(header,"crew").equals("Local"))
+            &&!hostOwned.contains(TaskWire.text(header,"scope")+"\n"+TaskWire.text(header,"name"));
+    }
+    public static JsonArray localWatches(Path root,boolean host,Set<String> hostOwned){
         JsonArray result=new JsonArray();Path dir=root.resolve("stashes");if(!Files.exists(dir))return result;
         try(var paths=Files.list(dir)){for(Path path:paths.filter(p->p.getFileName().toString().endsWith(".sqlite")).sorted().limit(256).toList()){
-            JsonObject db=StashStore.read(path);if(db.isEmpty()||!db.has("bounds")||!host&&!TaskWire.text(db,"crew").equals("Local"))continue;
-            JsonObject plan=watchPlan(db);if(plan==null)continue;ensureKitTypes(db);
-            JsonObject view=new JsonObject();for(String key:List.of("name","scope","crew","bounds"))view.add(key,db.get(key).deepCopy());
-            JsonObject records=new JsonObject();watchedContainers(db,plan).forEach(o->records.add(containerKey(o),watchRecord(o)));
-            view.add("containers",records);result.add(view);
+            path=path.toAbsolutePath().normalize();String revision=StashStore.revision(path);CachedLocalWatch cached;
+            synchronized(localWatches){cached=localWatches.get(path);}
+            if(cached==null||!cached.revision.equals(revision))cached=new CachedLocalWatch(revision,StashStore.watchHeader(path),null);
+            if(localWatchIncluded(cached.header,host,hostOwned)&&cached.view==null&&watchPlan(cached.header)!=null){
+                JsonObject db=StashStore.read(path),header=new JsonObject();
+                for(String key:List.of("name","scope","crew","bounds"))if(db.has(key))header.add(key,db.get(key).deepCopy());
+                JsonObject view=null,plan=header.has("bounds")?watchPlan(header):null;
+                if(localWatchIncluded(header,host,hostOwned)&&plan!=null){
+                    view=header.deepCopy();JsonObject records=new JsonObject();
+                    watchedContainers(db,plan).forEach(o->records.add(containerKey(o),watchRecord(o)));view.add("containers",records);
+                }
+                cached=new CachedLocalWatch(revision,header,view);
+            }
+            if(localWatchIncluded(cached.header,host,hostOwned)&&cached.view!=null)result.add(cached.view.deepCopy());
+            synchronized(localWatches){localWatches.put(path,cached);while(localWatches.size()>32)localWatches.remove(localWatches.keySet().iterator().next());}
         }}catch(IOException e){throw new IllegalStateException("Could not read local stash watches",e);}return result;
     }
     /** Small independently bounded frames, not a growing manifest in every worker heartbeat. */
@@ -436,7 +479,7 @@ public final class StashCatalog {
     public static JsonObject summary(JsonObject db) {
         ensureKitTypes(db);
         JsonObject s=new JsonObject(),totals=new JsonObject(),estimatedTotals=new JsonObject(),columns=new JsonObject(),kitCounts=new JsonObject();int observed=0,unscanned=0,inferred=0;
-        for(String key:List.of("version","name","crew","scope","bounds","homes","updatedAt","kitReserves"))if(db.has(key))s.add(key,db.get(key).deepCopy());
+        for(String key:List.of("version","name","crew","scope","bounds","homes","updatedAt","kitReserves","columnFill"))if(db.has(key))s.add(key,db.get(key).deepCopy());
         int removed=0,assumedEmpty=0;long assumedSlots=0;
         JsonObject kitTypes=db.has("kitTypes")?db.getAsJsonObject("kitTypes"):new JsonObject();
         int bottom=columnBottom(db);
@@ -539,7 +582,7 @@ public final class StashCatalog {
     private static long observedAt(JsonObject observation){return observation.has("observedAt")?observation.get("observedAt").getAsLong():0;}
     /** Keep the authenticated 16 KiB crew frame for catalog sync small; detailed catalog stays on the host. */
     public static JsonObject wireSummary(JsonObject summary){
-        JsonObject compact=summary.deepCopy();compact.remove("kitReserves");compact.remove("columns");compact.remove("deduplicatedItems");compact.remove("deduplicatedKitCounts");compact.remove("kitAliases");compact.remove("estimatedItems");compact.remove("transferKitCounts");compact.remove("transferItems");compact.remove("transferStockUncertain");
+        JsonObject compact=summary.deepCopy();compact.remove("kitReserves");compact.remove("columns");compact.remove("columnFill");compact.remove("deduplicatedItems");compact.remove("deduplicatedKitCounts");compact.remove("kitAliases");compact.remove("estimatedItems");compact.remove("transferKitCounts");compact.remove("transferItems");compact.remove("transferStockUncertain");
         if(compact.has("items")){
             JsonObject source=compact.getAsJsonObject("items"),items=new JsonObject();compact.addProperty("itemTypes",source.size());
             source.entrySet().stream().sorted((a,b)->Long.compare(b.getValue().getAsLong(),a.getValue().getAsLong())).limit(24).forEach(e->items.add(e.getKey(),e.getValue().deepCopy()));compact.add("items",items);
@@ -562,6 +605,7 @@ public final class StashCatalog {
         if(db.has("homes")&&db.getAsJsonObject("homes").has(worker)){
             JsonObject home=db.getAsJsonObject("homes").getAsJsonObject(worker);result.addProperty("homeName",TaskWire.text(home,"name"));result.add("homeWarmupTicks",home.get("warmupTicks").deepCopy());result.add("homeCooldownTicks",home.get("cooldownTicks").deepCopy());
         }
+        result.addProperty("dimension",scope.substring(scope.indexOf('\n')+1));
         return plan(result);
     }
     public static JsonObject refillAction(Path root,String crew,String scope,JsonObject request,String worker){
@@ -591,6 +635,9 @@ public final class StashCatalog {
         return kitPicks(db,typeId,count,incomplete,false,false);
     }
     private static JsonArray kitPicks(JsonObject db,String typeId,int count,boolean incomplete,boolean includeIncomplete,boolean all){
+        return kitPicks(db,typeId,count,incomplete,includeIncomplete,all,false);
+    }
+    private static JsonArray kitPicks(JsonObject db,String typeId,int count,boolean incomplete,boolean includeIncomplete,boolean all,boolean observedOnly){
         typeId=KitTypes.canonical(db,typeId);
         UUID.fromString(typeId);
         if(count<1||count>54||db==null||!db.has("kitTypes")||!db.getAsJsonObject("kitTypes").has(typeId))throw new IllegalArgumentException("Unknown kit type or invalid count");
@@ -604,10 +651,10 @@ public final class StashCatalog {
                 // Our own withdrawals invalidate quantities, not the known container's location.
                 if(all&&TaskWire.text(observed,"reason").equals("Contents changed by a confirmed stash withdrawal; rescan required")&&!TaskWire.flag(observed,"inferred")){
                     if(observed.has("withdrawnKitTypes")&&!observed.getAsJsonArray("withdrawnKitTypes").asList().contains(new JsonPrimitive(typeId)))continue;
-                    if(picks.size()==54)throw new IllegalStateException("Transfer all supports at most 54 matching source containers; split this stash selection");
+                    if(picks.size()==2048)throw new IllegalStateException("Transfer all supports at most 2048 matching source containers; split this stash selection");
                     picks.add(kitPick(observed,typeId,incomplete,TaskWire.text(db.getAsJsonObject("kitTypes").getAsJsonObject(typeId),"item")));continue;
                 }
-                if(all)throw new IllegalStateException("Transfer all needs a full, non-lazy source scan without unknown containers");
+                if(all&&!observedOnly)throw new IllegalStateException("Transfer all needs a full, non-lazy source scan without unknown containers");
                 continue;
             }
             for(JsonElement element:observed.getAsJsonArray("shulkers")){
@@ -616,7 +663,7 @@ public final class StashCatalog {
                 if(!includeIncomplete&&kitIncomplete(exemplar,box.getAsJsonObject("items"))!=incomplete)continue;
                 JsonObject pick=kitPick(observed,typeId,incomplete,TaskWire.text(box,"item"));
                 if(!picks.isEmpty()&&sameChest(picks.get(picks.size()-1).getAsJsonObject(),pick))continue;
-                if(picks.size()==54){if(all)throw new IllegalStateException("Transfer all supports at most 54 matching source chests; split this stash selection");continue;}
+                if(picks.size()==(all?2048:54)){if(all)throw new IllegalStateException("Transfer all supports at most 2048 matching source chests; split this stash selection");continue;}
                 picks.add(pick);
             }
         }
@@ -630,10 +677,25 @@ public final class StashCatalog {
         if(picks.isEmpty())throw new IllegalStateException("No observed or mapped source chest for this kit; scan or refresh the column before dispatch");
         return picks;
     }
+    private static int sourceScanGaps(JsonObject db){
+        return (int)db.getAsJsonObject("containers").asMap().values().stream().map(JsonElement::getAsJsonObject)
+            .filter(o->!TaskWire.text(o,"status").equals("removed")&&(!TaskWire.text(o,"status").equals("observed")||TaskWire.flag(o,"inferred")))
+            .filter(o->!TaskWire.text(o,"reason").equals("Contents changed by a confirmed stash withdrawal; rescan required")).count();
+    }
     private static JsonObject kitPick(JsonObject observed,String typeId,boolean incomplete,String item){
         JsonObject pick=new JsonObject();pick.addProperty("slot",0);pick.addProperty("dynamic",true);
         for(String axis:List.of("x","y","z"))pick.add(axis,observed.get(axis).deepCopy());
         pick.addProperty("kitTypeId",typeId);pick.addProperty("resource",item);pick.addProperty("incomplete",incomplete);return pick;
+    }
+    /** Numeric triples keep large manifests inside the existing byte budget; old position objects remain valid. */
+    public static JsonObject sourcePosition(JsonElement value){
+        JsonObject position;
+        if(value!=null&&value.isJsonArray()){
+            JsonArray xyz=value.getAsJsonArray();if(xyz.size()!=3)throw new IllegalArgumentException("Source position needs three coordinates");
+            position=new JsonObject();int i=0;for(String key:List.of("x","y","z"))position.add(key,xyz.get(i++).deepCopy());
+        }else if(value!=null&&value.isJsonObject())position=value.getAsJsonObject();
+        else throw new IllegalArgumentException("Invalid source position");
+        integer(position,"x",-29_900_000,29_900_000);integer(position,"y",-2048,2048);integer(position,"z",-29_900_000,29_900_000);return position;
     }
     private static boolean sameChest(JsonObject a,JsonObject b){return a.get("x").equals(b.get("x"))&&a.get("y").equals(b.get("y"))&&a.get("z").equals(b.get("z"));}
     /** Empty, one exact kit type, or mixed/unknown/loose items. Unknown stock is never free. */
@@ -663,14 +725,42 @@ public final class StashCatalog {
         int x=integer(input,"x",-29_900_000,29_900_000),y=integer(input,"y",-2048,2048),z=integer(input,"z",-29_900_000,29_900_000);
         if(!contains(plan,x,y,z)||!Set.of("X","Z","Vertical").contains(TaskWire.text(input,"axis")))throw new IllegalArgumentException("Invalid destination column");
         JsonObject column=new JsonObject();column.addProperty("x",x);column.addProperty("y",y);column.addProperty("z",z);column.addProperty("axis",TaskWire.text(input,"axis"));
+        for(String field:List.of("alternateX","alternateZ"))if(input.has(field)){
+            int offset=integer(input,field,-1,1);
+            if(offset==0||!TaskWire.text(column,"axis").equals("Vertical")||input.has(field.equals("alternateX")?"alternateZ":"alternateX")
+                ||!contains(plan,x+(field.equals("alternateX")?offset:0),y+1,z+(field.equals("alternateZ")?offset:0)))throw new IllegalArgumentException("Invalid alternating destination column");
+            column.addProperty(field,offset);
+        }
         return column;
     }
     public static boolean columnContains(JsonObject column,int x,int y,int z){
         int dx=x-column.get("x").getAsInt(),dy=y-column.get("y").getAsInt(),dz=z-column.get("z").getAsInt();
         if(dy<0)return false;
+        if(column.has("alternateX")||column.has("alternateZ"))return dx==(dy%2)*(column.has("alternateX")?column.get("alternateX").getAsInt():0)&&dz==(dy%2)*(column.has("alternateZ")?column.get("alternateZ").getAsInt():0);
         return switch(TaskWire.text(column,"axis")){case "X"->dx==0&&(dz==0||Math.abs(dz)==dy);case "Z"->dz==0&&(dx==0||Math.abs(dx)==dy);default->dx==0&&dz==0;};
     }
+    /** Alternating stacks need both adjacent levels witnessed; nearby banks alone prove no connection. */
+    public static JsonObject mappedColumn(JsonObject db,JsonObject anchor){
+        JsonObject column=new JsonObject();for(String key:List.of("x","y","z"))column.add(key,anchor.get(key).deepCopy());column.addProperty("axis",columnAxis(db));
+        int x=anchor.get("x").getAsInt(),y=anchor.get("y").getAsInt(),z=anchor.get("z").getAsInt();JsonObject rows=db.getAsJsonObject("containers");
+        JsonObject direct=rows.getAsJsonObject(x+","+(y+1)+","+z);if(direct!=null&&storageChest(direct))return column;
+        JsonObject above=rows.getAsJsonObject(x+","+(y+2)+","+z);
+        if(above==null||!storageChest(above))return column;
+        String field="";int offset=0,matches=0;
+        for(int[] d:List.of(new int[]{1,0},new int[]{-1,0},new int[]{0,1},new int[]{0,-1})){
+            JsonObject odd=rows.getAsJsonObject((x+d[0])+","+(y+1)+","+(z+d[1]));
+            if(odd!=null&&storageChest(odd)){matches++;field=d[0]==0?"alternateZ":"alternateX";offset=d[0]==0?d[1]:d[0];}
+        }
+        if(matches==1){column.addProperty("axis","Vertical");column.addProperty(field,offset);}
+        return column;
+    }
     private static String columnKey(JsonObject column){return column.get("x")+","+column.get("z");}
+    private static Set<String> allocatedColumns(JsonObject plan){
+        if(!plan.has("allocatedColumns"))return Set.of();
+        if(!TaskWire.flag(plan,"fillAllocatedColumns")||plan.has("targetColumn")||!plan.get("allocatedColumns").isJsonArray())throw new IllegalArgumentException("Column allocations require the allocation-fill policy");
+        JsonArray columns=plan.getAsJsonArray("allocatedColumns");if(columns.isEmpty()||columns.size()>128)throw new IllegalArgumentException("Allocate 1–128 destination columns");
+        Set<String> keys=new LinkedHashSet<>();for(JsonElement value:columns)if(!keys.add(columnKey(checkedColumn(plan,value.getAsJsonObject()))))throw new IllegalArgumentException("Duplicate allocated column");return keys;
+    }
     private static boolean storageChest(JsonObject o){return !TaskWire.text(o,"status").equals("removed")&&Set.of("minecraft:chest","minecraft:trapped_chest","").contains(TaskWire.text(o,"block"));}
     private static boolean assumedEmptyCandidate(JsonObject db,JsonObject o){
         return TaskWire.flag(db.getAsJsonObject("bounds"),"assumeEmpty")&&storageChest(o)&&!TaskWire.text(o,"block").isEmpty()
@@ -719,20 +809,23 @@ public final class StashCatalog {
             if(type==null)for(JsonElement value:list(root)){
                 JsonObject source=value.getAsJsonObject();
                 String candidate=KitTypes.canonical(source,kit);
-                if(TaskWire.text(source,"scope").equals(scope)&&(crew.equals(TaskWire.text(source,"crew"))||TaskWire.text(source,"crew").equals("Local"))&&source.getAsJsonObject("kitTypes").has(candidate)){
+                if(QueuePolicy.sameTeleportServer(TaskWire.text(source,"scope"),scope)&&(crew.equals(TaskWire.text(source,"crew"))||TaskWire.text(source,"crew").equals("Local"))&&source.getAsJsonObject("kitTypes").has(candidate)){
                     kit=candidate;type=source.getAsJsonObject("kitTypes").getAsJsonObject(kit);break;
                 }
             }
-            if(type==null)throw new IllegalArgumentException("Unknown kit type in this crew and world");
+            if(type==null)throw new IllegalArgumentException("Unknown kit type in this crew and Minecraft server");
             JsonObject criteria=new JsonObject(),identity=new JsonObject();criteria.addProperty("kitTypeId",kit);criteria.add("kitExemplar",type.get("items").deepCopy());identity.add(kit,type.deepCopy());criteria.add("kitIdentities",identity);KitTypes.bind(db,criteria);kit=KitTypes.canonical(db,kit);
             JsonObject prior=db.getAsJsonObject("kitTypes").getAsJsonObject(kit);if(prior!=null&&KitTypes.fullness(prior.getAsJsonObject("items"))>=KitTypes.fullness(type.getAsJsonObject("items")))type=prior;
         }
         JsonObject reservations=db.has("columnReservations")?db.getAsJsonObject("columnReservations"):new JsonObject();Set<String> keys=new HashSet<>();int bottom=columnBottom(db);
         for(JsonElement value:columns){
-            if(!value.isJsonObject()||value.getAsJsonObject().size()!=4)throw new IllegalArgumentException("Each column needs only x, y, z and axis");
+            if(!value.isJsonObject()||!Set.of("x","y","z","axis","alternateX","alternateZ").containsAll(value.getAsJsonObject().keySet()))throw new IllegalArgumentException("Invalid column fields");
             JsonObject column=checkedColumn(db.getAsJsonObject("bounds"),value.getAsJsonObject());String key=columnKey(column);
             JsonObject anchor=db.getAsJsonObject("containers").getAsJsonObject(column.get("x")+","+column.get("y")+","+column.get("z"));
             if(anchor==null||!storageChest(anchor)||column.get("y").getAsInt()!=bottom||!keys.add(key))throw new IllegalArgumentException("Select distinct recorded bottom-row chest columns");
+            JsonObject mapped=mappedColumn(db,anchor);
+            if(mapped.has("alternateX")||mapped.has("alternateZ"))column=mapped;
+            else if(column.has("alternateX")||column.has("alternateZ"))throw new IllegalArgumentException("Alternating column must match mapped chest geometry");
             if(kit.isEmpty()&&category==null){reservations.remove(key);continue;}
             for(var entry:db.getAsJsonObject("containers").entrySet()){
                 JsonObject o=entry.getValue().getAsJsonObject();
@@ -757,6 +850,8 @@ public final class StashCatalog {
         return saved.equals(allowed);
     }
     private static boolean columnObservedFull(JsonObject db,JsonObject column){
+        JsonObject fill=db.has("columnFill")?db.getAsJsonObject("columnFill").getAsJsonObject(columnKey(column)):null;
+        if(fill!=null&&!TaskWire.flag(fill,"uncertain")&&fill.get("capacity").getAsLong()>0&&fill.get("kits").getAsLong()>=fill.get("capacity").getAsLong())return true;
         Set<Integer> rows=new HashSet<>();
         for(JsonElement value:db.getAsJsonObject("containers").asMap().values()){
             JsonObject o=value.getAsJsonObject();if(!storageChest(o)||!columnContains(column,o.get("x").getAsInt(),o.get("y").getAsInt(),o.get("z").getAsInt()))continue;
@@ -776,9 +871,11 @@ public final class StashCatalog {
         if(requested!=null)requested=checkedColumn(db.getAsJsonObject("bounds"),requested);
         JsonObject reservations=db.has("columnReservations")?db.getAsJsonObject("columnReservations"):new JsonObject();
         JsonObject categories=categorySupport?KitCategories.get(root,crew,scope).getAsJsonObject("categories"):new JsonObject();
-        JsonObject selected=null;int best=8,bottom=columnBottom(db);String layoutAxis=columnAxis(db);
-        for(var entry:db.getAsJsonObject("containers").entrySet()){
-            JsonObject o=entry.getValue().getAsJsonObject();String key=columnKey(o);if(!storageChest(o)||o.get("y").getAsInt()!=bottom||excluded.contains(key))continue;
+        JsonObject selected=null;int best=8,bottom=columnBottom(db);
+        List<JsonObject> candidates=db.getAsJsonObject("containers").asMap().values().stream().map(JsonElement::getAsJsonObject).toList();
+        if(TaskWire.flag(db.getAsJsonObject("bounds"),"assumeEmpty"))candidates=candidates.stream().sorted(Comparator.comparingInt((JsonObject o)->o.get("z").getAsInt()).thenComparingInt(o->o.get("x").getAsInt())).toList();
+        for(JsonObject o:candidates){
+            String key=columnKey(o);if(!storageChest(o)||o.get("y").getAsInt()!=bottom||excluded.contains(key))continue;
             if(requested!=null&&(!key.equals(columnKey(requested))||o.get("y").getAsInt()!=requested.get("y").getAsInt()))continue;
             String occupant=columnOccupant(o);JsonObject reservation=reservations.has(key)?reservations.getAsJsonObject(key):null;
             JsonObject category=reservation==null?null:categories.getAsJsonObject(TaskWire.text(reservation,"categoryId"));
@@ -796,11 +893,12 @@ public final class StashCatalog {
             JsonObject candidate;
             if(requested!=null)candidate=requested.deepCopy();
             else if(reservation!=null&&reservation.has("column"))candidate=checkedColumn(db.getAsJsonObject("bounds"),reservation.getAsJsonObject("column"));
-            else {candidate=new JsonObject();for(String axis:List.of("x","y","z"))candidate.add(axis,o.get(axis).deepCopy());candidate.addProperty("axis",layoutAxis);}
+            else candidate=mappedColumn(db,o);
             if(columnObservedFull(db,candidate))continue;
             selected=candidate;best=rank;
         }
         if(selected==null)return null;
+        StashStock.startColumn(db,selected);
         if(!reservations.has(columnKey(selected))||!reservations.getAsJsonObject(columnKey(selected)).has("categoryId")&&(!TaskWire.flag(reservations.getAsJsonObject(columnKey(selected)),"manual")||!reservationMatches(reservations.getAsJsonObject(columnKey(selected)),allowed))){
             JsonObject reservation=reservations.has(columnKey(selected))?reservations.getAsJsonObject(columnKey(selected)).deepCopy():new JsonObject();if(!allowed.contains(TaskWire.text(reservation,"kitTypeId")))reservation.addProperty("kitTypeId",kit);reservation.addProperty("reservedAt",System.currentTimeMillis());
             if(allowed.size()>1){JsonArray ids=new JsonArray();allowed.forEach(ids::add);reservation.add("columnKitTypeIds",ids);reservation.add("column",selected.deepCopy());}
@@ -811,18 +909,30 @@ public final class StashCatalog {
     public static JsonObject kitAction(Path root,String crew,String scope,JsonObject request,String worker){
         String sourceCrew=get(root,crew,scope,TaskWire.text(request,"name")).isEmpty()?"Local":crew;
         JsonObject sourceRequest=request.deepCopy();sourceRequest.remove("targetColumn");sourceRequest.remove("columnKitTypeIds");
+        sourceRequest.remove("observedSourcesOnly");sourceRequest.remove("sourceScanGaps");
         JsonObject routed=route(root,sourceCrew,scope,sourceRequest,worker);String id=TaskWire.text(request,"kitTypeId");int count=integer(request,"count",1,36);
-        for(String key:List.of("transferAll","includeIncomplete","returnHome"))if(request.has(key)&&(!request.get(key).isJsonPrimitive()||!request.getAsJsonPrimitive(key).isBoolean()))throw new IllegalArgumentException("Expected boolean "+key);
+        for(String key:List.of("transferAll","includeIncomplete","returnHome","returnByDeath","enderTransport","fillAllocatedColumns","observedSourcesOnly"))if(request.has(key)&&(!request.get(key).isJsonPrimitive()||!request.getAsJsonPrimitive(key).isBoolean()))throw new IllegalArgumentException("Expected boolean "+key);
         boolean all=TaskWire.flag(request,"transferAll"),includeIncomplete=TaskWire.flag(request,"includeIncomplete");
         if(includeIncomplete&&TaskWire.flag(request,"incomplete"))throw new IllegalArgumentException("Incomplete removal cannot also include complete kits");
         String destination=TaskWire.text(request,"destination");if(!Set.of("Player","Ender Chest","Stash","Carry").contains(destination))throw new IllegalArgumentException("Choose Player, Ender Chest, Stash, or Carry for a kit withdrawal");
+        if(TaskWire.flag(request,"returnByDeath")&&(!destination.equals("Player")||!TaskWire.flag(request,"returnHome")))throw new IllegalArgumentException("Respawn return requires a player delivery with a return route");
         if(request.has("targetColumn")&&!destination.equals("Stash"))throw new IllegalArgumentException("A destination column requires a stash delivery");
         if(request.has("columnKitTypeIds"))columnKitTypes(request);
         // targetColumn belongs to the destination, never to the source bounds.
         routed.remove("targetColumn");
         routed.remove("columnKitTypeIds");
         if(all&&!destination.equals("Stash"))throw new IllegalArgumentException("Transfer all requires a destination stash");
-        JsonObject db=get(root,sourceCrew,scope,TaskWire.text(routed,"name"));id=KitTypes.canonical(db,id);JsonArray picks=kitPicks(db,id,count,TaskWire.flag(request,"incomplete"),includeIncomplete,all);
+        boolean fill=TaskWire.flag(request,"fillAllocatedColumns");
+        if(fill&&(!all||!destination.equals("Stash")||request.has("targetColumn")||TaskWire.flag(request,"oneBatch")||TaskWire.flag(request,"mixedLoad")))throw new IllegalArgumentException("Column filling requires a sequential until-empty stash transfer");
+        if(TaskWire.flag(request,"enderTransport")&&(!all||!destination.equals("Stash")||request.has("targetColumn")||TaskWire.flag(request,"oneBatch")||TaskWire.flag(request,"mixedLoad")))throw new IllegalArgumentException("Ender transport requires a sequential until-empty stash transfer");
+        if(TaskWire.flag(request,"enderTransport"))routed.addProperty("enderTransport",true);
+        JsonObject db=get(root,sourceCrew,scope,TaskWire.text(routed,"name"));id=KitTypes.canonical(db,id);JsonArray picks=kitPicks(db,id,count,TaskWire.flag(request,"incomplete"),includeIncomplete,all,TaskWire.flag(request,"observedSourcesOnly"));
+        if(all&&picks.size()>54){
+            boolean triples=picks.size()>512;JsonArray compact=new JsonArray();
+            for(JsonElement value:picks){JsonObject position=value.getAsJsonObject();if(triples){JsonArray xyz=new JsonArray();for(String key:List.of("x","y","z"))xyz.add(position.get(key).deepCopy());compact.add(xyz);}else{position.keySet().retainAll(Set.of("x","y","z"));compact.add(position);}}
+            picks=compact;
+            routed.addProperty("compactPicks",true);
+        }
         routed.add("picks",picks);routed.addProperty("type","StashResupply");routed.addProperty("kitTypeId",id);routed.addProperty("count",count);routed.addProperty("kitItem",TaskWire.text(db.getAsJsonObject("kitTypes").getAsJsonObject(id),"item"));
         routed.addProperty("destination",destination);routed.addProperty("depositMode",destination.equals("Ender Chest")?"Ender Chest":"Carry");routed.addProperty("catalogCrew",sourceCrew);
         routed.addProperty("incomplete",request.has("incomplete")&&request.get("incomplete").getAsBoolean());routed.add("kitExemplar",db.getAsJsonObject("kitTypes").getAsJsonObject(id).get("items").deepCopy());
@@ -833,23 +943,33 @@ public final class StashCatalog {
             routed.addProperty("dimension",scope.substring(scope.indexOf('\n')+1));
             if(TaskWire.flag(request,"returnHome")){
                 JsonObject back=route(root,sourceCrew,scope,db.getAsJsonObject("bounds"),worker);
-                back.addProperty("type","StashVisit");back.addProperty("dimension",TaskWire.text(routed,"dimension"));routed.add("returnStash",back);
+                back.addProperty("type","StashVisit");back.addProperty("destination","Player");back.addProperty("dimension",TaskWire.text(routed,"dimension"));routed.add("returnStash",back);
             }else routed.remove("returnStash");
         }
         if(destination.equals("Stash")){
-            String targetName=TaskWire.text(request,"targetStashName");if(targetName.equals(TaskWire.text(routed,"name")))throw new IllegalArgumentException("Choose a different destination stash");
-            String targetCrew=get(root,crew,scope,targetName).isEmpty()?"Local":crew;
-            JsonObject targetDb=get(root,targetCrew,scope,targetName);if(targetDb.isEmpty())throw new IllegalArgumentException("Define the destination stash in this world first");
+            String targetName=TaskWire.text(request,"targetStashName"),targetScope=scope;
+            if(request.has("targetDimension")){
+                String dimension=TaskWire.text(request,"targetDimension");if(dimension.length()>128||!dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+"))throw new IllegalArgumentException("Invalid destination dimension");
+                targetScope=scope.substring(0,scope.indexOf('\n')+1)+dimension;
+            }
+            if(targetScope.equals(scope)&&targetName.equals(TaskWire.text(routed,"name")))throw new IllegalArgumentException("Choose a different destination stash");
+            String targetCrew=get(root,crew,targetScope,targetName).isEmpty()?"Local":crew;
+            JsonObject targetDb=get(root,targetCrew,targetScope,targetName);if(targetDb.isEmpty())throw new IllegalArgumentException("Define the destination stash in its selected dimension first");
             KitTypes.bind(targetDb,routed);
             JsonObject catalogIdentities=KitTypes.identities(db.getAsJsonObject("kitTypes"));KitTypes.identities(targetDb.getAsJsonObject("kitTypes")).entrySet().forEach(e->catalogIdentities.add(e.getKey(),e.getValue().deepCopy()));
             Map<String,List<String>> families=new LinkedHashMap<>();catalogIdentities.entrySet().forEach(e->families.computeIfAbsent(TaskWire.text(e.getValue().getAsJsonObject(),"familyId"),k->new ArrayList<>()).add(e.getKey()));
             Set<String> known=new LinkedHashSet<>(catalogIdentities.keySet());for(var family:families.entrySet())if(family.getValue().size()==1)known.add(family.getKey());else for(String type:family.getValue())identities.add(type,catalogIdentities.get(type).deepCopy());
             if(known.size()>512)throw new IllegalArgumentException("Incidental kit recognition exceeds 512 catalog types");
             JsonArray knownIds=new JsonArray();known.forEach(knownIds::add);routed.add("knownKitTypeIds",knownIds);
-            JsonObject target=route(root,targetCrew,scope,targetDb.getAsJsonObject("bounds"),worker);
-            if(overlaps(routed,target))throw new IllegalArgumentException("Source and destination stash selections must not overlap");
+            JsonObject target=route(root,targetCrew,targetScope,targetDb.getAsJsonObject("bounds"),worker);
+            if(targetScope.equals(scope)&&overlaps(routed,target))throw new IllegalArgumentException("Source and destination stash selections must not overlap");
             target.addProperty("catalogCrew",targetCrew);target.addProperty("kitTypeId",id);target.addProperty("count",count);target.add("kitExemplar",routed.get("kitExemplar").deepCopy());target.add("incomplete",routed.get("incomplete").deepCopy());target.addProperty("includeIncomplete",includeIncomplete);routed.add("targetStash",target);
             target.add("kitIdentities",identities.deepCopy());
+            if(fill){
+                routed.addProperty("fillAllocatedColumns",true);target.addProperty("fillAllocatedColumns",true);
+                JsonObject back=route(root,sourceCrew,scope,db.getAsJsonObject("bounds"),worker);
+                back.addProperty("catalogCrew",sourceCrew);back.addProperty("dimension",scope.substring(scope.indexOf('\n')+1));routed.add("returnStash",back);
+            }
             if(request.has("targetColumn")){
                 JsonObject column=checkedColumn(target,request.getAsJsonObject("targetColumn"));
                 JsonObject anchor=targetDb.getAsJsonObject("containers").getAsJsonObject(column.get("x")+","+column.get("y")+","+column.get("z"));
@@ -859,36 +979,56 @@ public final class StashCatalog {
                 if(request.has("columnKitTypeIds")){JsonArray normalized=new JsonArray();for(String type:columnKitTypes(request)){String sourceId=KitTypes.canonical(db,type);normalized.add(sourceId.equals(id)?id:KitTypes.canonical(targetDb,sourceId));}target.add("columnKitTypeIds",normalized);}
             }
         }
-        int limit=all?24_000:7_500;
+        routed.remove("targetDimension");
+        int limit=all?60_000:7_500;
         while(!all&&routed.toString().length()>limit&&picks.size()>1)picks.remove(picks.size()-1);
         if(routed.toString().length()>limit)throw new IllegalStateException("Kit action exceeds the workflow data limit; split this stash selection or shorten its exemplar");
         return routed;
     }
     /** Freeze only type IDs; resolve one bounded, current delivery plan at a time. */
     public static JsonObject kitTransfer(Path root,String crew,String scope,JsonObject request,String worker){
-        if(request.has("routes")){if(TaskWire.flag(request,"mixedLoads"))throw new IllegalArgumentException("Mixed loads use one source and one destination");return kitRoutes(root,crew,scope,request,worker);}
+        if(request.has("columnAllocations")&&(request.has("routes")||TaskWire.flag(request,"mixedLoads")||TaskWire.flag(request,"enderTransport")||TaskWire.flag(request,"depositCarried")))throw new IllegalArgumentException("Column rotation uses sequential inventory loads with explicit destination allocations");
+        if(TaskWire.flag(request,"fillAllocatedColumns")&&(request.has("routes")||TaskWire.flag(request,"mixedLoads")||TaskWire.flag(request,"depositCarried")))throw new IllegalArgumentException("Column filling needs sequential kit types and an empty carried-kit inventory");
+        if(request.has("routes")){if(TaskWire.flag(request,"enderTransport"))throw new IllegalArgumentException("Ender transport uses sequential kit types");if(TaskWire.flag(request,"mixedLoads"))throw new IllegalArgumentException("Mixed loads use one source and one destination");return kitRoutes(root,crew,scope,request,worker);}
         if(request.has("targetColumn"))throw new IllegalArgumentException("Use Kit Delivery for a single-column transfer; multi-kit transfers allocate separate columns");
         String name=TaskWire.text(request,"name"),sourceCrew=get(root,crew,scope,name).isEmpty()?"Local":crew;
         JsonObject db=get(root,sourceCrew,scope,name);if(db.isEmpty())throw new IllegalArgumentException("Unknown source stash");
         int count=request.has("count")?integer(request,"count",1,36):36;
-        for(String key:List.of("includeIncomplete","depositCarried","depositOnly","mixedLoads"))if(request.has(key)&&(!request.get(key).isJsonPrimitive()||!request.getAsJsonPrimitive(key).isBoolean()))throw new IllegalArgumentException("Expected boolean "+key);
+        for(String key:List.of("includeIncomplete","depositCarried","depositOnly","mixedLoads","enderTransport","fillAllocatedColumns","observedSourcesOnly"))if(request.has(key)&&(!request.get(key).isJsonPrimitive()||!request.getAsJsonPrimitive(key).isBoolean()))throw new IllegalArgumentException("Expected boolean "+key);
+        if(TaskWire.flag(request,"observedSourcesOnly")&&(request.has("columnAllocations")||TaskWire.flag(request,"mixedLoads")))throw new IllegalArgumentException("Observed-only transfers use sequential kit types");
+        if(TaskWire.flag(request,"enderTransport")&&TaskWire.flag(request,"mixedLoads"))throw new IllegalArgumentException("Ender transport uses sequential kit types");
         if(TaskWire.flag(request,"depositOnly")&&!TaskWire.flag(request,"depositCarried"))throw new IllegalArgumentException("Deposit-only recovery requires depositCarried");
         boolean include=TaskWire.flag(request,"includeIncomplete");JsonArray ids=new JsonArray();Set<String> seen=new LinkedHashSet<>();
         JsonArray selected=request.has("kitTypeIds")?request.getAsJsonArray("kitTypeIds"):null;
         if(TaskWire.flag(request,"mixedLoads")&&(selected==null||selected.size()<2||selected.size()>16||TaskWire.flag(request,"depositCarried")))throw new IllegalArgumentException("Mixed loads require 2–16 selected kit types and an empty kit inventory; carried recovery uses a separate job");
         if(selected!=null&&(selected.isEmpty()||selected.size()>128))throw new IllegalArgumentException("Select 1–128 kit types, or omit kitTypeIds for all known types");
         Collection<String> candidates=selected==null?db.getAsJsonObject("kitTypes").keySet():selected.asList().stream().map(JsonElement::getAsString).toList();
+        String planningId="";
         for(String selectedId:candidates){String id=KitTypes.canonical(db,selectedId);
             UUID.fromString(id);if(!seen.add(id))throw new IllegalArgumentException("Duplicate kit type");
-            try{kitPicks(db,id,count,false,include,true);ids.add(id);}
-            catch(IllegalStateException e){if(selected!=null||!e.getMessage().startsWith("No observed or mapped source chest"))throw e;}
+            try{kitPicks(db,id,count,false,include,true,TaskWire.flag(request,"observedSourcesOnly"));ids.add(id);if(planningId.isEmpty())planningId=id;}
+            catch(IllegalStateException e){if(request.has("columnAllocations")&&e.getMessage().startsWith("No observed or mapped source chest"))ids.add(id);else if(selected!=null||!e.getMessage().startsWith("No observed or mapped source chest"))throw e;}
         }
-        if(ids.isEmpty()||ids.size()>128)throw new IllegalArgumentException("Source needs 1–128 transferable kit types");
+        if(ids.isEmpty()||ids.size()>128||planningId.isEmpty())throw new IllegalArgumentException("Source needs 1–128 transferable kit types");
         JsonObject args=db.getAsJsonObject("bounds").deepCopy();args.addProperty("count",count);args.addProperty("destination","Stash");args.addProperty("targetStashName",TaskWire.text(request,"targetStashName"));args.addProperty("transferAll",true);args.addProperty("includeIncomplete",include);args.add("kitTypeIds",ids);
+        if(TaskWire.flag(request,"observedSourcesOnly")){args.addProperty("observedSourcesOnly",true);args.addProperty("sourceScanGaps",sourceScanGaps(db));}
+        if(request.has("targetDimension"))args.add("targetDimension",request.get("targetDimension").deepCopy());
+        if(TaskWire.flag(request,"enderTransport"))args.addProperty("enderTransport",true);
+        if(TaskWire.flag(request,"fillAllocatedColumns"))args.addProperty("fillAllocatedColumns",true);
         args.addProperty("depositCarried",TaskWire.flag(request,"depositCarried"));
         if(TaskWire.flag(request,"mixedLoads"))args.addProperty("mixedLoads",true);
         if(TaskWire.flag(request,"depositOnly"))args.addProperty("depositOnly",true);
-        JsonObject first=args.deepCopy();first.remove("kitTypeIds");first.addProperty("kitTypeId",ids.get(0).getAsString());kitAction(root,crew,scope,first,worker);
+        if(request.has("columnAllocations"))args.addProperty("fillAllocatedColumns",true);
+        JsonObject first=args.deepCopy();first.remove("kitTypeIds");first.addProperty("kitTypeId",planningId);JsonObject planned=kitAction(root,crew,scope,first,worker);
+        if(request.has("columnAllocations")){
+            if(!request.get("columnAllocations").isJsonObject())throw new IllegalArgumentException("Specify column allocations by kit type");
+            JsonObject allocations=request.getAsJsonObject("columnAllocations"),checked=new JsonObject();Set<String> used=new HashSet<>();
+            if(allocations.size()!=ids.size())throw new IllegalArgumentException("Every selected kit needs a column allocation");
+            for(JsonElement id:ids){String key=id.getAsString();JsonObject target=planned.getAsJsonObject("targetStash").deepCopy();target.add("allocatedColumns",allocations.get(key));allocatedColumns(target);JsonArray columns=new JsonArray();
+                for(JsonElement value:target.getAsJsonArray("allocatedColumns")){JsonObject column=checkedColumn(target,value.getAsJsonObject());if(!used.add(columnKey(column)))throw new IllegalArgumentException("Kit allocations overlap");columns.add(column);}checked.add(key,columns);
+            }
+            args.add("columnAllocations",checked);
+        }
         return args;
     }
     /** Route descriptors stay small; each source manifest is resolved and frozen on its first turn. */
@@ -929,8 +1069,11 @@ public final class StashCatalog {
             plan.addProperty("oneBatch",true);JsonObject result=new JsonObject();result.add("args",plan);return result;
         }
         JsonObject args=task.getAsJsonObject("args").deepCopy();JsonArray ids=args.getAsJsonArray("kitTypeIds");
-        int index=integer(action,"index",1,ids.size());String id=ids.get(index-1).getAsString();args.remove("kitTypeIds");args.remove("depositOnly");args.remove("mixedLoads");args.addProperty("kitTypeId",id);
-        JsonObject result=new JsonObject();result.add("args",kitAction(root,TaskWire.text(task,"crew"),TaskWire.text(task,"server")+"\n"+TaskWire.text(task,"dimension"),args,worker));return result;
+        int index=integer(action,"index",1,ids.size());String id=ids.get(index-1).getAsString();args.remove("kitTypeIds");args.remove("depositOnly");args.remove("mixedLoads");args.remove("columnAllocations");args.addProperty("kitTypeId",id);
+        JsonObject result=new JsonObject();
+        try{result.add("args",kitAction(root,TaskWire.text(task,"crew"),TaskWire.text(task,"server")+"\n"+TaskWire.text(task,"dimension"),args,worker));}
+        catch(IllegalStateException e){if(!task.getAsJsonObject("args").has("columnAllocations")||!e.getMessage().startsWith("No observed or mapped source chest"))throw e;result.addProperty("sourceUnavailable",true);}
+        return result;
     }
     public static JsonObject cachedKitTransferPlan(Path root,JsonObject task,JsonObject run,String worker){
         JsonObject action=run.getAsJsonObject("action");
@@ -1011,9 +1154,16 @@ public final class StashCatalog {
         return touched;
     }
     /** Capture the stock baseline before an authenticated worker starts mutating storage. */
+    private static String actionScope(String scope,JsonObject action){
+        if(!action.has("dimension"))return scope;
+        String dimension=TaskWire.text(action,"dimension");
+        if(dimension.length()>128||!dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+"))throw new IllegalArgumentException("Invalid stash action dimension");
+        return scope.substring(0,scope.indexOf('\n')+1)+dimension;
+    }
     public static synchronized void beginTransfer(Path root,String crew,String scope,JsonObject run,JsonObject message){
         if(!message.has("action"))return;
         JsonObject action=message.getAsJsonObject("action");
+        scope=actionScope(scope,action);
         if(TaskWire.text(action,"type").equals("StashScan")&&message.has("stashScan")){
             JsonObject scan=message.getAsJsonObject("stashScan");
             if(TaskWire.text(scan,"phase").equals("Complete")&&TaskWire.text(action,"scanMode").equals("Full")&&!TaskWire.flag(action,"lazyMode")&&!action.has("scanCells")
@@ -1042,6 +1192,7 @@ public final class StashCatalog {
         String name=TaskWire.text(receipt,"stash"),catalogCrew=TaskWire.text(receipt,"catalogCrew");if(catalogCrew.isEmpty())catalogCrew=crew;
         if(action==null||!TaskWire.text(action,"type").equals("StashResupply")||!name.equals(TaskWire.text(action,"name"))
             ||!catalogCrew.equals(crew)&&!catalogCrew.equals("Local"))throw new IllegalArgumentException("Withdrawal receipt does not match its action");
+        scope=actionScope(scope,action);
         JsonArray picks=receipt.getAsJsonArray("withdrawn");if(picks==null||picks.isEmpty()||picks.size()>54)throw new IllegalArgumentException("Invalid stash withdrawal receipt");
         for(JsonElement value:picks){JsonObject p=value.getAsJsonObject();if(!contains(action,integer(p,"x",-29_900_000,29_900_000),integer(p,"y",-2048,2048),integer(p,"z",-29_900_000,29_900_000)))throw new IllegalArgumentException("Withdrawal is outside the assigned stash");if(p.has("items"))counts(p.getAsJsonObject("items"));}
         if(token.equals(TaskWire.text(run,"stashWithdrawalToken"))&&run.has("stashWithdrawalCount")&&picks.size()==run.get("stashWithdrawalCount").getAsInt()){
@@ -1090,6 +1241,7 @@ public final class StashCatalog {
     public static void depositReceipt(Path root,String crew,String scope,JsonObject run,JsonObject message){
         if(!message.has("stashDeposit"))return;
         JsonObject receipt=message.getAsJsonObject("stashDeposit"),action=message.getAsJsonObject("action");
+        if(action!=null)scope=actionScope(scope,action);
         if(action==null||!TaskWire.text(action,"type").equals("StashDeposit")||!TaskWire.text(receipt,"stash").equals(TaskWire.text(action,"name")))throw new IllegalArgumentException("Deposit receipt does not match its action");
         String catalogCrew=TaskWire.text(receipt,"catalogCrew");if(catalogCrew.isEmpty())catalogCrew=crew;if(!catalogCrew.equals(crew)&&!catalogCrew.equals("Local"))throw new IllegalArgumentException("Deposit belongs to another crew");
         JsonArray touched=receipt.getAsJsonArray("touched");if(touched==null||touched.isEmpty()||touched.size()>36)throw new IllegalArgumentException("Invalid stash deposit receipt");
@@ -1154,7 +1306,7 @@ public final class StashCatalog {
         int received=TaskWire.text(run,"stashToken").equals(TaskWire.text(message,"token"))&&run.has("stashDelivery")?integer(run,"stashDelivery",0,MAX_CONTAINERS):0;
         if(delivery>received){
             if(delivery!=received+1)throw new IllegalArgumentException("Stash observation delivery has a gap");
-            JsonObject saved=storeObservation(root,crew,TaskWire.text(task,"server")+"\n"+TaskWire.text(task,"dimension"),p,o);
+            JsonObject saved=storeObservation(root,crew,actionScope(TaskWire.text(task,"server")+"\n"+TaskWire.text(task,"dimension"),p),p,o);
             run.add("stashRecord",watchRecord(saved.getAsJsonObject("containers").getAsJsonObject(containerKey(o))));
             run.addProperty("stashToken",TaskWire.text(message,"token"));run.addProperty("stashDelivery",delivery);
         }
@@ -1163,14 +1315,15 @@ public final class StashCatalog {
         return ack;
     }
     private static synchronized JsonObject acceptDeposit(Path root,JsonObject task,JsonObject run,String crew,JsonObject message,JsonObject p,boolean categories){
-        String scope=TaskWire.text(task,"server")+"\n"+TaskWire.text(task,"dimension"),name=TaskWire.text(p,"name"),kit=TaskWire.text(p,"kitTypeId"),catalogCrew=TaskWire.text(p,"catalogCrew");
+        String scope=actionScope(TaskWire.text(task,"server")+"\n"+TaskWire.text(task,"dimension"),p),name=TaskWire.text(p,"name"),kit=TaskWire.text(p,"kitTypeId"),catalogCrew=TaskWire.text(p,"catalogCrew");
         UUID.fromString(kit);if(catalogCrew.isEmpty())catalogCrew=crew;if(!catalogCrew.equals(crew)&&!catalogCrew.equals("Local"))throw new IllegalArgumentException("Destination belongs to another crew");
         JsonObject db=get(root,catalogCrew,scope,name);if(db.isEmpty())throw new IllegalArgumentException("Unknown destination stash");
         for(String axis:List.of("X","Y","Z"))for(String edge:List.of("min","max"))if(!p.get(edge+axis).equals(db.getAsJsonObject("bounds").get(edge+axis)))throw new IllegalArgumentException("Destination bounds changed; restart this transfer");
-        String binding=catalogCrew+"\n"+scope+"\n"+name+"\n"+kit;
+        Set<String> allocation=allocatedColumns(p);
+        String binding=catalogCrew+"\n"+scope+"\n"+name+"\n"+kit+(allocation.isEmpty()?"":"\n"+TaskFiles.hash(p.get("allocatedColumns").toString()));
         if(!binding.equals(TaskWire.text(run,"depositBinding"))){run.addProperty("depositBinding",binding);run.remove("depositColumn");run.add("depositExcluded",new JsonArray());run.add("depositFullExcluded",new JsonArray());}
         int delivery=integer(message,"delivery",1,4096),received=TaskWire.text(run,"depositToken").equals(TaskWire.text(message,"token"))&&run.has("depositDelivery")?integer(run,"depositDelivery",0,4096):0;
-        JsonObject intent=new JsonObject();for(String key:List.of("observation","exhaustedColumn"))if(message.has(key))intent.add(key,message.get(key).deepCopy());String hash=TaskFiles.hash(intent.toString());
+        JsonObject intent=new JsonObject();for(String key:List.of("observation","exhaustedColumn","unavailableColumn"))if(message.has(key))intent.add(key,message.get(key).deepCopy());String hash=TaskFiles.hash(intent.toString());
         if(delivery<=received){if(delivery<received)return null;if(!hash.equals(TaskWire.text(run,"depositIntent")))throw new IllegalArgumentException("Deposit finding changed during retry");return run.getAsJsonObject("depositAck").deepCopy();}
         if(delivery!=received+1)throw new IllegalArgumentException("Deposit observation delivery has a gap");
         if(KitTypes.bind(db,p))StashStore.write(file(root,catalogCrew,scope,name),db);
@@ -1184,7 +1337,9 @@ public final class StashCatalog {
             // Keep an offline worker's lease until its action is reconciled, not until a wall-clock expiry.
             if(other!=run&&other.has("depositColumn")&&other.has("action")&&TaskWire.text(other.getAsJsonObject("action"),"type").equals("StashDeposit")&&TaskWire.text(other,"depositBinding").equals(binding))occupied.add(columnKey(other.getAsJsonObject("depositColumn")));
         }
-        if(message.has("exhaustedColumn")&&(!message.get("exhaustedColumn").isJsonPrimitive()||!message.getAsJsonPrimitive("exhaustedColumn").isBoolean()))throw new IllegalArgumentException("Expected boolean exhaustedColumn");
+        for(String key:List.of("exhaustedColumn","unavailableColumn"))if(message.has(key)&&(!message.get(key).isJsonPrimitive()||!message.getAsJsonPrimitive(key).isBoolean()))throw new IllegalArgumentException("Expected boolean "+key);
+        boolean unavailable=TaskWire.flag(message,"unavailableColumn");
+        if(unavailable&&(message.has("observation")||TaskWire.flag(message,"exhaustedColumn")))throw new IllegalArgumentException("Unreadable columns cannot also claim observed contents or fullness");
         JsonObject column=run.has("depositColumn")?checkedColumn(p,run.getAsJsonObject("depositColumn")):null;boolean permit=false;
         JsonObject limit=p.has("targetColumn")?checkedColumn(p,p.getAsJsonObject("targetColumn")):null;
         if(limit!=null&&column!=null&&!limit.equals(column))throw new IllegalArgumentException("Deposit reservation left the selected destination column");
@@ -1208,6 +1363,10 @@ public final class StashCatalog {
                 reservations.add(columnKey(column),changed);db.add("columnReservations",reservations);StashStore.write(file(root,catalogCrew,scope,name),db);excluded.add(columnKey(column));column=null;
             }
         }
+        if(unavailable){
+            if(column==null)throw new IllegalArgumentException("No destination column to defer");
+            if(limit==null){excluded.add(columnKey(column));column=null;permit=false;}
+        }
         if(TaskWire.flag(message,"exhaustedColumn")){
             if(column==null||message.has("observation"))throw new IllegalArgumentException("Invalid exhausted destination column");
             if(owned){
@@ -1222,14 +1381,17 @@ public final class StashCatalog {
             &&(db.has("fullColumns")&&db.getAsJsonObject("fullColumns").has(columnKey(column))||columnObservedFull(db,column))){
             excluded.add(columnKey(column));fullExcluded.add(columnKey(column));column=null;permit=false;
         }
-        boolean columnFull=limit!=null&&(owned&&TaskWire.flag(message,"exhaustedColumn")||!message.has("observation")
+        boolean columnFull=!unavailable&&limit!=null&&(owned&&TaskWire.flag(message,"exhaustedColumn")||!message.has("observation")
             &&(db.has("fullColumns")&&db.getAsJsonObject("fullColumns").has(columnKey(limit))||columnObservedFull(db,limit)));
         if(columnFull)column=limit;
-        else if(column==null){Set<String> unavailable=new HashSet<>(excluded);unavailable.addAll(occupied);column=reserveColumn(root,catalogCrew,scope,name,kit,unavailable,limit,allowed,categories);}
+        else if(column==null){Set<String> excludedColumns=new HashSet<>(excluded);excludedColumns.addAll(occupied);
+            if(!allocation.isEmpty())for(JsonElement value:db.getAsJsonObject("containers").asMap().values()){String key=columnKey(value.getAsJsonObject());if(!allocation.contains(key))excludedColumns.add(key);}
+            column=reserveColumn(root,catalogCrew,scope,name,kit,excludedColumns,limit,allowed,categories);}
         JsonObject ack=TaskWire.message("stash-ack");ack.addProperty("run",TaskWire.text(run,"id"));ack.addProperty("token",TaskWire.text(message,"token"));ack.addProperty("delivery",delivery);ack.addProperty("deposit",true);ack.addProperty("permit",permit);
-        if(column==null){run.remove("depositColumn");ack.addProperty("error",TaskWire.flag(db.getAsJsonObject("bounds"),"assumeEmpty")?"No mapped compatible column remains; load destination chunks with live storage updates or scan more columns":"No observed free or matching-kit column remains; scan more destination columns or free space");}else{run.add("depositColumn",column);ack.add("column",column.deepCopy());}
+        if(column==null){run.remove("depositColumn");ack.addProperty("error",TaskWire.flag(db.getAsJsonObject("bounds"),"assumeEmpty")?"No mapped compatible column remains; load destination chunks with live storage updates or scan more columns":"No observed free or matching-kit column remains; scan more destination columns or free space");if(limit==null)ack.addProperty("capacityUnavailable",true);}else{run.add("depositColumn",column);ack.add("column",column.deepCopy());}
         if(column!=null&&categories){JsonObject fresh=get(root,catalogCrew,scope,name),r=fresh.getAsJsonObject("columnReservations").getAsJsonObject(columnKey(column));if(r!=null&&r.has("categoryId"))ack.add("columnCategory",KitCategories.placementRule(KitCategories.category(root,catalogCrew,scope,TaskWire.text(r,"categoryId"))));}
         if(columnFull){ack.addProperty("columnFull",true);ack.addProperty("permit",false);}
+        if(unavailable&&limit!=null){ack.addProperty("error","Selected destination column has unreadable chests; remaining kits retained");ack.addProperty("permit",false);}
         JsonArray exhausted=new JsonArray();excluded.stream().sorted().forEach(exhausted::add);run.add("depositExcluded",exhausted);
         JsonArray full=new JsonArray();fullExcluded.stream().sorted().forEach(full::add);run.add("depositFullExcluded",full);
         run.addProperty("depositToken",TaskWire.text(message,"token"));run.addProperty("depositDelivery",delivery);run.addProperty("depositIntent",hash);run.add("depositAck",ack.deepCopy());return ack;

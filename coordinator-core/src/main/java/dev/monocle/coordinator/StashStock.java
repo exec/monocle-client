@@ -33,6 +33,15 @@ final class StashStock {
 
     static void change(JsonObject db, JsonArray boxes, int sign) {
         begin(db);
+        if(db.has("columnFill"))for(JsonElement value:boxes){
+            JsonObject box=value.getAsJsonObject();if(!box.has("x")||!box.has("y")||!box.has("z"))continue;
+            for(JsonElement entry:db.getAsJsonObject("columnFill").asMap().values()){
+                JsonObject row=entry.getAsJsonObject(),column=row.getAsJsonObject("column");
+                if(!StashCatalog.columnContains(column,box.get("x").getAsInt(),box.get("y").getAsInt(),box.get("z").getAsInt()))continue;
+                long next=row.get("kits").getAsLong()+sign*(box.has("quantity")?box.get("quantity").getAsLong():1);
+                if(next<0||next>row.get("capacity").getAsLong())row.addProperty("uncertain",true);row.addProperty("kits",Math.max(0,next));row.addProperty("updatedAt",System.currentTimeMillis());
+            }
+        }
         JsonObject stock = db.getAsJsonObject("transferStock"), counts = stock.getAsJsonObject("counts");
         for (JsonElement value : boxes) {
             JsonObject box = value.getAsJsonObject();
@@ -63,7 +72,31 @@ final class StashStock {
         return db.has("transferStock") ? db.getAsJsonObject("transferStock").getAsJsonObject("counts").deepCopy() : new JsonObject();
     }
 
+    /** Explicit empty storage starts at zero, never by erasing a known populated chest. */
+    static void startColumn(JsonObject db,JsonObject column){
+        if(!TaskWire.flag(db.getAsJsonObject("bounds"),"assumeEmpty"))return;
+        String key=column.get("x")+","+column.get("z");JsonObject fills=db.has("columnFill")?db.getAsJsonObject("columnFill"):new JsonObject();
+        long capacity=0;boolean empty=true;
+        for(JsonElement entry:db.getAsJsonObject("containers").asMap().values()){
+            JsonObject c=entry.getAsJsonObject();if(TaskWire.text(c,"status").equals("removed")||!Set.of("minecraft:chest","minecraft:trapped_chest").contains(TaskWire.text(c,"block"))
+                ||!StashCatalog.columnContains(column,c.get("x").getAsInt(),c.get("y").getAsInt(),c.get("z").getAsInt()))continue;
+            capacity+=c.has("slotCount")?c.get("slotCount").getAsLong():c.has("capacity")?c.get("capacity").getAsLong():0;
+            empty&=c.getAsJsonObject("items").isEmpty()&&c.getAsJsonArray("shulkers").isEmpty()&&!TaskWire.flag(c,"inferred")
+                &&(TaskWire.text(c,"status").equals("observed")||TaskWire.text(c,"reason").equals("Storage discovered; contents not yet observed"));
+        }
+        if(capacity==0||!fills.has(key)&&!empty)return;
+        JsonObject row=fills.has(key)?fills.getAsJsonObject(key):new JsonObject();
+        if(!row.has("kits")){row.addProperty("kits",0);row.addProperty("uncertain",false);row.addProperty("since",System.currentTimeMillis());row.add("column",column.deepCopy());}
+        if(!column.equals(row.get("column"))||row.has("capacity")&&capacity<row.get("capacity").getAsLong())row.addProperty("uncertain",true);
+        row.add("column",column.deepCopy());
+        row.addProperty("capacity",capacity);fills.add(key,row);db.add("columnFill",fills);
+    }
+
     static void observed(JsonObject db, JsonObject plan, JsonObject observation) {
+        if(db.has("columnFill")&&(TaskWire.text(observation,"status").equals("removed")||TaskWire.text(observation,"status").equals("observed")&&!Set.of("StashDeposit","StashResupply").contains(TaskWire.text(plan,"type"))))
+            for(JsonElement entry:db.getAsJsonObject("columnFill").asMap().values()){
+                JsonObject row=entry.getAsJsonObject();if(StashCatalog.columnContains(row.getAsJsonObject("column"),observation.get("x").getAsInt(),observation.get("y").getAsInt(),observation.get("z").getAsInt()))row.addProperty("uncertain",true);
+            }
         if (!db.has("transferStock")) return;
         JsonObject stock = db.getAsJsonObject("transferStock");
         stock.addProperty("uncertain", true);

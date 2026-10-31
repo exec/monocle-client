@@ -12,7 +12,7 @@ Telemetry records observations, not proof of a bug or permission to change gamep
 
 ## Files and limits
 
-Both host types use the same highway recorder. Each crew writes `<crew-journal-filename>.telemetry.jsonl` next to its recovery journal. The standalone host exposes its exact path in `status.highways.<crew>.telemetryPath`; it also writes `host-events.telemetry.jsonl` beside `host-tasks.json` for control requests, worker status changes, connection/world transitions and reported failures.
+Both host types use the same highway recorder. Each crew writes `<crew-journal-filename>.telemetry.jsonl` next to its recovery journal. The standalone host exposes its exact path in `status.highways.<crew>.telemetryPath`; it also writes `host-events.telemetry.jsonl` beside `host-tasks.sqlite` for control requests, worker status changes, connection/world transitions and reported failures.
 
 Each file rolls at 16 MiB, retaining the current file and three older generations (`.1` is newest). This is approximately 64 MiB per crew plus 64 MiB for host events, not permanent job history. A shared daemon writer has a 64-record queue: a full queue drops telemetry instead of blocking gameplay. Disk failures trigger a one-minute retry backoff. `telemetryError` and `telemetryDropped` in host status expose loss; crew records also carry dropped-record counts. A process crash can lose the queued tail. Recovery journals are completely separate and are never rotated by telemetry.
 
@@ -44,3 +44,31 @@ Start with `wait-observed`, correlate execution and worker IDs, and read its pre
 Logs include names, server/dimension, coordinates and inventory quantities: treat them as private. The recorder selects diagnostic fields and does not dump workflow scripts, profiles, credentials, raw packets or general chat. Status/reason text may originate in custom workflows, so review logs before sharing publicly. Root cause still requires interpreting the evidence; the logger does not guarantee automatic diagnosis.
 
 Update both host and workers for the full detail. Older hosts accept these bounded snapshots but do not persist the new host timeline. Schedule the standalone host restart between jobs or explicitly recover the interrupted job afterward.
+
+Player-delivery receipts may include the optional `failureReason: "tpa_timeout"`
+only with zero confirmed drops and no uncertain drop. Hosts validate this before
+mutating execution state and use it for requester notices after refund settlement.
+Host-managed chat dispatch reports may include `commandId` to acknowledge the exact
+host command, including an already-executed duplicate. A dispatch receipt confirms
+the client sent the message, not player receipt or reading.
+
+### Native server player lookups
+
+A worker advertising `playerLookupProtocol: 1` in its hello accepts authenticated
+host `manage-player-lookup` requests with `id`, `name` and `scope`. It reads only
+its current server player list and replies `worker-player-lookup` with the same
+request ID/name, actual scope and `status`: `Found`, `Missing`, `Ambiguous` or
+`Unavailable`. Only `Found` includes `player: {id, name}` with the server UUID and
+canonical name. There are no coordinates or full roster exports in this exchange.
+
+The host binds replies to the original connection, crew, server and requested
+name. At most 32 lookups may be outstanding, with a five-second response deadline;
+world changes, disconnects and shutdown invalidate pending lookups. Late replies
+are ignored. Gifts and credit tools wait asynchronously, without holding worker
+control. No external name service or offline UUID calculation is used.
+
+Operator `GET /v1/players/{name}` uses the configured kitbot courier by default,
+or a ready worker when no courier is configured and all candidate workers share
+one crew/server. Optional `?workerId=<uuid>` chooses the exact native worker;
+ambiguous server selection is rejected. Web UI kit delivery supplies its selected
+worker explicitly. The HTTP wait occurs outside the coordinator lock.

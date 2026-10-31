@@ -29,7 +29,7 @@ public final class BotLuaTest {
         invalid("return function(ctx) while true do pcall(function() error('x') end) end end", "budget");
         invalid("return function(ctx) local function f(n) return 1+f(n+1) end; f(0); return bot.done() end", "budget");
         invalid("return function(ctx) local s='x'; for i=1,30 do s=s..s end; ctx.state.s=s; return bot.done() end", "budget");
-        invalid("return function(ctx) local s='" + "x".repeat(20_000) + "'; for i=1,100 do ctx.state['v'..i]=s end; return bot.done() end", "32 KiB");
+        invalid("return function(ctx) local s='" + "x".repeat(20_000) + "'; for i=1,100 do ctx.state['v'..i]=s end; return bot.done() end", "64 KiB");
         invalid("return function(ctx) ctx.state.self=ctx.state; return bot.done() end", "acyclic");
         invalid("return function(ctx) ctx.state.f=function() end; return bot.done() end", "acyclic");
         invalid("return function(ctx) ctx.state[true]=1; return bot.done() end", "keys");
@@ -51,10 +51,10 @@ public final class BotLuaTest {
         invalid("return function(ctx) local t={}; for i=1,20000 do t[i]={} end; return bot.done() end", "budget");
         invalid("return function(ctx) local t=ctx.state; for i=1,18 do t.next={}; t=t.next end; return bot.done() end", "nesting");
         JsonObject oversized = new JsonObject();
-        for (int i = 0; i < 4097; i++) oversized.addProperty("v" + i, 0);
+        for (int i = 0; i < 16385; i++) oversized.addProperty("v" + i, 0);
         invalidData(oversized);
         JsonObject cycle = new JsonObject(); cycle.add("self", cycle); invalidData(cycle);
-        oversized = new JsonObject(); oversized.addProperty("first", "x".repeat(20_000)); oversized.addProperty("second", "y".repeat(20_000)); invalidData(oversized);
+        oversized = new JsonObject(); oversized.addProperty("first", "x".repeat(40_000)); oversized.addProperty("second", "y".repeat(40_000)); invalidData(oversized);
         try { BotLua.validate("return " + "function() return ".repeat(40) + "nil " + "end ".repeat(40)); throw new AssertionError("Nested prototypes must be bounded"); }
         catch (IllegalArgumentException expected) { }
         nativeMetatableIsolation();

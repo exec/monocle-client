@@ -45,6 +45,12 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public final BotStashObserver stashObserver=new BotStashObserver(this);
     public final BotStashExporter stashExporter=new BotStashExporter(this);
     public final WorkerCombatTracker combat=new WorkerCombatTracker();
+    private dev.monocle.coordinator.ServerAliases localServerAliases,hostServerAliases;
+    public String serverIdentity(String address){
+        if(hostServerAliases!=null)return hostServerAliases.server(address);
+        if(localServerAliases==null)localServerAliases=dev.monocle.coordinator.ServerAliases.load(MonocleClient.FOLDER.toPath());
+        return localServerAliases.server(address);
+    }
     private dev.monocle.coordinator.KnownHostiles hostiles;
     public final dev.monocle.coordinator.PlayerSightings sightings=new dev.monocle.coordinator.PlayerSightings();
     private dev.monocle.coordinator.IncidentTimeline incidents;
@@ -61,7 +67,10 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public dev.monocle.coordinator.IncidentTimeline incidents(){if(incidents==null){incidents=new dev.monocle.coordinator.IncidentTimeline(MonocleClient.FOLDER.toPath().resolve("incidents.telemetry.jsonl"));incidents.onEvent(e->{if(mode.get()==Mode.Host)notifications().incident(e);});}return incidents;}
     public void addSafetyTelemetry(JsonObject report){
         boolean lobby=Modules.get().get(dev.monocle.client.systems.modules.movement.LobbySkip.class).isInLobby();
+        report.addProperty("serverAliasesProtocol",1);report.addProperty("serverAddress",mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip);
+        report.addProperty("serverAliasesRevision",hostServerAliases==null?"":hostServerAliases.revision());
         report.addProperty("inLobby",lobby);report.addProperty("hostileWarningsProtocol",1);
+        report.addProperty("playerLookupProtocol",1);
         report.add("worldReadiness",dev.monocle.client.utils.network.WorldReadiness.INSTANCE.snapshot());
         report.add("playerSightings",lobby?new com.google.gson.JsonArray():sightings.snapshot());
         report.add("playerChecks",sightings.checks(System.currentTimeMillis()));
@@ -138,7 +147,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         if(operation.equals("guard"))hostiles().policy(Boolean.parseBoolean(value));
         else if(operation.equals("reconnect"))hostiles().policy(hostiles().enabled(),Boolean.parseBoolean(value),hostiles().reconnectSeconds());
         else if(operation.equals("cooldown"))hostiles().policy(hostiles().enabled(),hostiles().safeReconnect(),Integer.parseInt(value));
-        else if(operation.equals("add")){if(mc.getCurrentServer()==null)throw new IllegalStateException("Join a server first");String uuid="";if(mc.level!=null)for(var p:mc.level.players())if(p.getName().getString().equalsIgnoreCase(value)){uuid=p.getUUID().toString();break;}hostiles().add(mc.getCurrentServer().ip,value,uuid);}
+        else if(operation.equals("add")){if(mc.getCurrentServer()==null)throw new IllegalStateException("Join a server first");String uuid="";if(mc.level!=null)for(var p:mc.level.players())if(p.getName().getString().equalsIgnoreCase(value)){uuid=p.getUUID().toString();break;}hostiles().add(Utils.getServerIdentity(),value,uuid);}
         else if(operation.equals("remove"))hostiles().remove(value);
         syncHostiles();
     }
@@ -203,6 +212,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     private final Map<String, String> crewKeys = new LinkedHashMap<>();
     private final Map<String, SwarmCrew> coordinators = new LinkedHashMap<>();
     private final Map<String,Long> stashHomeUses = new LinkedHashMap<>();
+    private final Map<String,Long> killUses = new LinkedHashMap<>();
     private volatile Map<String, String> credentials = Map.of();
     private String selectedCrew = "Default";
     private String workerCrewName = "";
@@ -248,6 +258,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     public void disable() { close(); active = false; connectionDetail = "Offline"; }
     public void setEnabled(boolean enabled) { if (enabled) enable(); else disable(); save(); }
     public String connectionDetail() { return connectionDetail; }
+    long killReadyAt(String server){return killUses.getOrDefault(server,0L)+BotRespawnReturn.COOLDOWN_MS;}
+    void recordKillUse(String server,long now){killUses.put(server,now);killUses.entrySet().removeIf(e->now-e.getValue()>86_400_000);while(killUses.size()>128)killUses.remove(killUses.keySet().iterator().next());save();}
     public long stashHomeReadyAt(String route,long cooldownMillis){return stashHomeUses.getOrDefault(route,0L)+cooldownMillis;}
     public void recordStashHomeUse(String route,long now){stashHomeUses.put(route,now);stashHomeUses.entrySet().removeIf(e->now-e.getValue()>2_592_000_000L);save();}
 
@@ -410,6 +422,15 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
     /** Authenticated host-only management message; never forwarded to other workers. */
     public boolean handleManagement(SwarmConnection connection, com.google.gson.JsonObject message, boolean hostSide) {
         String type=dev.monocle.coordinator.TaskWire.text(message,"type");
+        if(type.equals("task-server-aliases")){
+            if(hostSide||connection!=worker||!connection.connected())throw new IllegalArgumentException("Server definitions must come from the connected host");
+            var definitions=dev.monocle.coordinator.ServerAliases.checked(message.getAsJsonObject("catalog"));
+            String address=mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip;
+            if(!serverIdentity(address).equals(definitions.server(address))&&(Modules.get().get(HighwayBuilder.class).hasJob()&&!crew.localAssigned()||Modules.get().get(dev.monocle.client.systems.modules.world.StashManager.class).isScanning())){
+                connectionDetail="Waiting for current work to finish before applying Minecraft server aliases";return true;
+            }
+            hostServerAliases=definitions;crew.announce();return true;
+        }
         if(type.equals("task-known-hostiles")){
             if(hostSide||connection!=worker||!connection.connected())throw new IllegalArgumentException("Hostile policy must come from the connected host");
             hostiles().accept(message.getAsJsonObject("catalog"));return true;
@@ -453,12 +474,27 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
                 if(member.isPresent()) {chat.append(member.get().id(),crewId,member.get().name(),"",dev.monocle.coordinator.TaskWire.text(message,"direction"),dev.monocle.coordinator.TaskWire.text(message,"text"),message.has("parts")?message.getAsJsonArray("parts"):null);return true;} }
             return true;
         }
+        if(type.equals("manage-player-lookup")){
+            if(hostSide||connection!=worker||!connection.connected())throw new IllegalArgumentException("Player lookups must come from the connected host");
+            UUID id=UUID.fromString(dev.monocle.coordinator.TaskWire.text(message,"id"));String name=dev.monocle.coordinator.TaskWire.text(message,"name"),scope=dev.monocle.coordinator.TaskWire.text(message,"scope");
+            if(!message.keySet().equals(Set.of("type","id","name","scope"))||!name.matches("[A-Za-z0-9_]{1,16}")||scope.length()>384||scope.indexOf('\n')<1||scope.indexOf('\n')!=scope.lastIndexOf('\n'))throw new IllegalArgumentException("Invalid server player lookup");
+            JsonObject reply=new JsonObject();reply.addProperty("type","worker-player-lookup");reply.addProperty("id",id.toString());reply.addProperty("name",name);reply.addProperty("scope",scope);reply.addProperty("status","Unavailable");
+            if(Utils.canUpdate()&&mc.getConnection()!=null&&!Modules.get().get(dev.monocle.client.systems.modules.movement.LobbySkip.class).isInLobby()){
+                String actual=worldScope();reply.addProperty("scope",actual);
+                if(actual.substring(0,actual.indexOf('\n')).equalsIgnoreCase(scope.substring(0,scope.indexOf('\n')))){
+                    var matches=mc.getConnection().getOnlinePlayers().stream().filter(p->p.getProfile().name().equalsIgnoreCase(name)).toList();
+                    reply.addProperty("status",matches.isEmpty()?"Missing":matches.size()>1?"Ambiguous":"Found");
+                    if(matches.size()==1){var profile=matches.getFirst().getProfile();JsonObject player=new JsonObject();player.addProperty("id",profile.id().toString());player.addProperty("name",profile.name());reply.add("player",player);}
+                }
+            }
+            connection.send(reply.toString());return true;
+        }
         if(type.equals("manage-chat")) {
             if(hostSide||connection!=worker||!connection.connected())throw new IllegalArgumentException("Chat commands must come from the connected host");
             UUID id=UUID.fromString(dev.monocle.coordinator.TaskWire.text(message,"id"));String text=dev.monocle.coordinator.BotChat.command(dev.monocle.coordinator.TaskWire.text(message,"text"));
-            if(!chat.first(id))return true;
-            if(!Utils.canUpdate()||!worldScope().equals(dev.monocle.coordinator.TaskWire.text(message,"scope"))) { reportChat("error","Chat not sent: worker world changed");return true; }
-            dev.monocle.client.utils.player.ChatUtils.sendPlayerMsg(text,false);reportChat("sent",text);return true;
+            if(!Utils.canUpdate()||!dev.monocle.coordinator.BotChat.commandScope(text,dev.monocle.coordinator.TaskWire.text(message,"scope"),worldScope())) { reportChat("error","Chat not sent: worker world changed");return true; }
+            if(chat.executed(id)){reportCommandChat("sent",text,id.toString());return true;}
+            dev.monocle.client.utils.player.ChatUtils.sendPlayerMsg(text,false);chat.first(id);reportCommandChat("sent",text,id.toString());return true;
         }
         if (tasks.handle(connection, message, hostSide)) return true;
         if (!message.has("type") || !message.get("type").getAsString().equals("assign-crew")) return false;
@@ -535,9 +571,10 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             SwarmConnection c=coordinator(crewId).connectionForWorker(member.id());if(c==null||!c.connected())continue;
             JsonObject m=new JsonObject();m.addProperty("type","manage-chat");m.addProperty("id",UUID.randomUUID().toString());m.addProperty("text",text);m.addProperty("scope",worldScope());c.send(m.toString()); }
     }
-    private void reportChat(String direction,String text) {
+    private void reportChat(String direction,String text) {reportCommandChat(direction,text,"");}
+    private void reportCommandChat(String direction,String text,String commandId) {
         if(!active||!isWorker())return;
-        JsonObject m=new JsonObject();m.addProperty("type","worker-chat");m.addProperty("direction",direction);m.addProperty("text",text.substring(0,Math.min(text.length(),2048)));worker.send(m.toString());
+        JsonObject m=new JsonObject();m.addProperty("type","worker-chat");m.addProperty("direction",direction);m.addProperty("text",text.substring(0,Math.min(text.length(),2048)));if(!commandId.isEmpty())m.addProperty("commandId",commandId);worker.send(m.toString());
     }
     @EventHandler
     private void onChat(dev.monocle.client.events.game.ReceiveMessageEvent event) {
@@ -555,6 +592,11 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             return java.util.Optional.empty();
         },net.minecraft.network.chat.Style.EMPTY);
         JsonObject m=new JsonObject();m.addProperty("type","worker-chat");m.addProperty("direction","received");m.addProperty("text",plain);
+        String[] whisper=dev.monocle.coordinator.BotChat.whisper(plain);
+        if(whisper!=null&&mc.getConnection()!=null){
+            var player=mc.getConnection().getOnlinePlayers().stream().filter(p->p.getProfile().name().equalsIgnoreCase(whisper[0])).findFirst().orElse(null);
+            if(player!=null){JsonObject sender=new JsonObject();sender.addProperty("name",player.getProfile().name());sender.addProperty("uuid",player.getProfile().id().toString());m.add("sender",sender);}
+        }
         if(parts.size()<=256)m.add("parts",parts);
         worker.send(m.toString());
     }
@@ -587,7 +629,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
 
     private String worldScope() {
         if (!Utils.canUpdate()) throw new IllegalStateException("Join the job's Minecraft server first.");
-        return (mc.getCurrentServer() == null ? "local" : mc.getCurrentServer().ip) + "\n" + mc.level.dimension().identifier();
+        return Utils.getServerIdentity() + "\n" + mc.level.dimension().identifier();
     }
     public List<JobView> jobs() {
         if (mode.get() != Mode.Host) return List.of();
@@ -915,7 +957,8 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
             value.put("workers", workers); crews.add(value);
         }
         tag.put("crews", crews);
-        ListTag homes=new ListTag();for(var entry:stashHomeUses.entrySet()){CompoundTag value=new CompoundTag();value.putString("route",entry.getKey());value.putLong("usedAt",entry.getValue());homes.add(value);}tag.put("stashHomeUses",homes);return tag;
+        ListTag homes=new ListTag();for(var entry:stashHomeUses.entrySet()){CompoundTag value=new CompoundTag();value.putString("route",entry.getKey());value.putLong("usedAt",entry.getValue());homes.add(value);}tag.put("stashHomeUses",homes);
+        ListTag kills=new ListTag();for(var entry:killUses.entrySet()){CompoundTag value=new CompoundTag();value.putString("server",entry.getKey());value.putLong("usedAt",entry.getValue());kills.add(value);}tag.put("killUses",kills);return tag;
     }
     @Override public Bots fromTag(CompoundTag tag) {
         if (settingsLoaded && (hasJobs() || hasPersistedCrewWork())) {
@@ -931,8 +974,9 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         pendingJoinCrew=tag.getStringOr("pendingJoinCrew","");pendingJoinJob=tag.getStringOr("pendingJoinJob","");
         try { if(!pendingJoinJob.isEmpty())UUID.fromString(pendingJoinJob); } catch(IllegalArgumentException e){pendingJoinCrew="";pendingJoinJob="";}
         presets.clear();
-        crewKeys.clear(); crewLabels.clear(); coordinators.clear();stashHomeUses.clear();
+        crewKeys.clear(); crewLabels.clear(); coordinators.clear();stashHomeUses.clear();killUses.clear();
         long now=System.currentTimeMillis();for(Tag item:tag.getListOrEmpty("stashHomeUses"))if(item instanceof CompoundTag value&&stashHomeUses.size()<128){String route=value.getStringOr("route","");long used=value.getLongOr("usedAt",0);if(!route.isBlank()&&route.length()<=256&&used>0&&used<=now+86_400_000L&&now-used<=2_592_000_000L)stashHomeUses.put(route,used);}
+        for(Tag item:tag.getListOrEmpty("killUses"))if(item instanceof CompoundTag value&&killUses.size()<128){String server=value.getStringOr("server","");long used=value.getLongOr("usedAt",0);if(!server.isBlank()&&server.length()<=256&&used>0&&used<=now+61_000&&now-used<=86_400_000)killUses.put(server,used);}
         Set<String> usedKeys = new HashSet<>();
         usedKeys.add(crewKey.get());
         for (Tag item : tag.getListOrEmpty("crews")) {
@@ -1208,7 +1252,7 @@ public final class Bots extends dev.monocle.client.systems.System<Bots> {
         }
         ConnectionConfig config = currentConfig();
         if (!config.equals(connectionConfig)) {
-            close(); connectionConfig = config;
+            close();hostServerAliases=null; connectionConfig = config;
             connectionDetail = config.mode() == Mode.Host ? "Press Start host to listen" : "Connecting";
         }
         if (mode.get() != Mode.Worker) return;

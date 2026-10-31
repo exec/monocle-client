@@ -71,7 +71,7 @@ public final class WorkerCombatTracker {
     private static Actor actor(Entity entity) {
         return entity==null?null:new Actor(entity.getUUID().toString(),bounded(entity.getName().getString(),64),entity instanceof Player);
     }
-    private static String scope(){return (mc.getCurrentServer()==null?"local":mc.getCurrentServer().ip)+"\n"+mc.level.dimension().identifier();}
+    private static String scope(){return (mc.getCurrentServer()==null?"local":dev.monocle.client.utils.Utils.getServerIdentity())+"\n"+mc.level.dimension().identifier();}
     void swing(Actor actor,Vec3 position,boolean holdingCrystal,long now) {
         swings.remove(actor.uuid);swings.put(actor.uuid,new Swing(actor,position,holdingCrystal,now));
         while(swings.size()>128)swings.remove(swings.keySet().iterator().next());

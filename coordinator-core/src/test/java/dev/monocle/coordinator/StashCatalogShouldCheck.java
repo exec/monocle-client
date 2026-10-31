@@ -6,6 +6,38 @@ import java.util.*;
 
 /** Cold restart checks: a warm cache must not hide an incomplete durable catalog. */
 final class StashCatalogShouldCheck {
+    private static void unavailableColumns()throws Exception{
+        Path root=Files.createTempDirectory("monocle-unreadable-overflow-");JsonObject p=plan("Overflow",0,6);p.addProperty("maxY",102);
+        StashCatalog.define(root,"A",SCOPE,p);JsonObject alpha=box("minecraft:obsidian",64),beta=box("minecraft:diamond",64);beta.addProperty("name","Other kit");
+        StashCatalog.save(root,"A",SCOPE,p,observation(0,alpha));StashCatalog.save(root,"A",SCOPE,p,observation(2));StashCatalog.save(root,"A",SCOPE,p,observation(4,beta));
+        String kit=KitTypes.id(alpha),other=KitTypes.id(beta);JsonArray reserved=new JsonArray();reserved.add(json("{x:4,y:100,z:0,axis:'Vertical'}"));
+        StashCatalog.setColumnReservations(root,"A",SCOPE,"Overflow",TaskWire.text(StashCatalog.summary(StashCatalog.get(root,"A",SCOPE,"Overflow")),"revision"),other,reserved);
+        JsonObject action=p.deepCopy();action.addProperty("type","StashDeposit");action.addProperty("kitTypeId",kit);action.addProperty("count",20);
+        JsonObject task=json("{id:'overflow-test',crew:'A',server:'server',dimension:'minecraft:the_end',runs:{}}"),run=json("{id:'00000000-0000-0000-0000-000000000002',token:'00000000-0000-0000-0000-000000000003'}");run.add("action",action);task.getAsJsonObject("runs").add(WORKER,run);
+        JsonObject m=TaskWire.message("stash-findings");m.addProperty("task","overflow-test");m.add("run",run.get("id"));m.add("token",run.get("token"));m.add("action",action);m.addProperty("delivery",1);
+        assert StashCatalog.accept(root,task,run,WORKER,"A",m).getAsJsonObject("column").get("x").getAsInt()==0;
+        m.addProperty("unavailableColumn",true);m.addProperty("delivery",2);JsonObject ack=StashCatalog.accept(root,task,run,WORKER,"A",m);
+        assert ack.getAsJsonObject("column").get("x").getAsInt()==2&&!ack.has("error") : "An unreadable partial column requests overflow space";
+        assert StashCatalog.accept(root,task,run,WORKER,"A",m).equals(ack) : "Lost overflow acknowledgements cannot reserve another column";
+        JsonObject db=StashCatalog.get(root,"A",SCOPE,"Overflow");assert !db.has("fullColumns") : "Unreadable is not full";
+        m.addProperty("delivery",3);m.addProperty("exhaustedColumn",true);rejects(()->StashCatalog.accept(root,task,run,WORKER,"A",m));m.remove("exhaustedColumn");
+        var unavailable=StashCatalog.accept(root,task,run,WORKER,"A",m);
+        assert unavailable.has("error")&&unavailable.get("capacityUnavailable").getAsBoolean() : "Overflow waits without taking another kit's reserved column";
+        assert StashCatalog.accept(root,task,run,WORKER,"A",m).equals(unavailable) : "A capacity retry remains idempotent";
+        StashCatalog.save(root,"A",SCOPE,p,observation(6));m.remove("unavailableColumn");m.addProperty("delivery",4);
+        var resumed=StashCatalog.accept(root,task,run,WORKER,"A",m);
+        assert resumed.getAsJsonObject("column").get("x").getAsInt()==6&&!resumed.has("error") : "A new request finds added space without replacing the job";
+        assert StashCatalog.reserveColumn(root,"A",SCOPE,"Overflow",kit,Set.of()).get("x").getAsInt()==0 : "Another job may retry an unreadable column later";
+        action.addProperty("fillAllocatedColumns",true);action.add("allocatedColumns",JsonParser.parseString("[{x:2,y:100,z:0,axis:'Vertical'}]"));
+        JsonObject allocatedRun=json("{id:'00000000-0000-0000-0000-000000000004',token:'00000000-0000-0000-0000-000000000005'}");allocatedRun.add("action",action);task.getAsJsonObject("runs").add(WORKER,allocatedRun);m.add("run",allocatedRun.get("id"));m.add("token",allocatedRun.get("token"));m.remove("unavailableColumn");m.addProperty("delivery",1);
+        assert StashCatalog.accept(root,task,allocatedRun,WORKER,"A",m).getAsJsonObject("column").get("x").getAsInt()==2;
+        m.addProperty("exhaustedColumn",true);m.addProperty("delivery",2);ack=StashCatalog.accept(root,task,allocatedRun,WORKER,"A",m);
+        assert ack.get("capacityUnavailable").getAsBoolean()&&!ack.has("column") : "One column cannot overflow into the rest of a kit's allocation";
+        action.add("allocatedColumns",JsonParser.parseString("[{x:6,y:100,z:0,axis:'Vertical'}]"));m.remove("exhaustedColumn");m.addProperty("delivery",1);m.addProperty("token","00000000-0000-0000-0000-000000000006");allocatedRun.add("token",m.get("token"));
+        assert StashCatalog.accept(root,task,allocatedRun,WORKER,"A",m).getAsJsonObject("column").get("x").getAsInt()==6 : "The next round switches to its next allocated column";
+        m.addProperty("unavailableColumn",true);m.addProperty("delivery",2);ack=StashCatalog.accept(root,task,allocatedRun,WORKER,"A",m);
+        assert ack.get("capacityUnavailable").getAsBoolean()&&!StashCatalog.get(root,"A",SCOPE,"Overflow").getAsJsonObject("fullColumns").has("6,0") : "Unreadable allocated columns retain cargo without falsely claiming fullness";
+    }
     private static final String SCOPE="server\nminecraft:the_end",WORKER="00000000-0000-0000-0000-000000000001";
     private static JsonObject json(String s){return JsonParser.parseString(s).getAsJsonObject();}
     private static void rejects(Runnable action){try{action.run();throw new AssertionError("Unsafe catalog operation accepted");}catch(IllegalArgumentException|IllegalStateException expected){}}
@@ -16,9 +48,206 @@ final class StashCatalogShouldCheck {
     private static JsonObject cold(Path file){StashStore.clearCache();return StashStore.read(file);}
 
     static void run()throws Exception{
-        scanFindingRetries();summaryCache();scannedFullColumns();kitReserves();assumedEmptyStorage();
+        observerReads();
+        observedSourceTransfer();
+        columnRequests();
+        occupancyWatches();
+        unavailableColumns();
+        scanFindingRetries();summaryCache();scannedFullColumns();kitReserves();assumedEmptyStorage();emptyColumnFill();alternatingColumns();crossDimensionTransfer();largeSourcePlan();
         kitVariants();legacyAliases();crossStashVariants();journal();largeDelta();sqliteCrashRecovery();sqliteScanRate();exportRetry();withdrawalPrefixes();depositEvidence();transferStock();freshReadAndEstimates();
         System.out.println("Stash checks passed: kit variants, SQLite cold reopen, targeted updates, rollback, atomic scan checkpoints and durable export receipts.");
+    }
+    private static void observerReads()throws Exception{
+        Path root=Files.createTempDirectory("monocle-observer-reads-");JsonObject p=plan("Watch",0,2);
+        StashCatalog.save(root,"A",SCOPE,p,observation(0));
+        try(var c=java.sql.DriverManager.getConnection("jdbc:sqlite:"+file(root,"Watch"));var s=c.createStatement()){
+            s.executeUpdate("UPDATE containers SET value='[]'");
+        }
+        assert StashCatalog.localWatches(root,false).isEmpty() : "Other crews are filtered using metadata before reading their inventory rows";
+        assert StashCatalog.localWatches(root,true,Set.of(SCOPE+"\nWatch")).isEmpty() : "Host-owned baselines are excluded before reading inventory rows";
+        rejects(()->StashCatalog.localWatches(root,true));
+
+        Path local=Files.createTempDirectory("monocle-local-watch-");StashCatalog.save(local,"Local",SCOPE,p,observation(0,box("minecraft:stone",64)));
+        Path localFile=local.resolve("stashes").resolve(TaskFiles.hash("Local\n"+SCOPE+"\nWatch")+".sqlite");
+        JsonObject first=StashCatalog.localWatches(local,false).get(0).getAsJsonObject();
+        String basis=TaskWire.text(first.getAsJsonObject("containers").getAsJsonObject("0,100,0"),"basis");
+        assert basis.equals(StashCatalog.observationBasis(StashStore.read(localFile).getAsJsonObject("containers").getAsJsonObject("0,100,0")));
+        first.getAsJsonObject("containers").remove("0,100,0");
+        assert StashCatalog.localWatches(local,false).get(0).getAsJsonObject().getAsJsonObject("containers").size()==1 : "Cached watches are detached from caller changes";
+        assert StashCatalog.localWatches(local,false,Set.of(SCOPE+"\nWatch")).isEmpty()&&StashCatalog.localWatches(local,false).size()==1;
+        try(var c=java.sql.DriverManager.getConnection("jdbc:sqlite:"+localFile);var s=c.createStatement()){
+            s.executeUpdate("UPDATE containers SET value=json_set(value,'$.observedAt',12345)");
+        }
+        JsonObject changed=StashCatalog.localWatches(local,false).get(0).getAsJsonObject().getAsJsonObject("containers").getAsJsonObject("0,100,0");
+        assert !basis.equals(TaskWire.text(changed,"basis"))&&changed.get("observedAt").getAsInt()==12345 : "External SQL commits invalidate compact watch caches";
+        StashCatalog.record(local,"Local",SCOPE,p,observation(1));
+        assert StashCatalog.localWatches(local,false).get(0).getAsJsonObject().getAsJsonObject("containers").size()==2 : "New storage is discovered after an in-process commit";
+
+        JsonObject message=json("{name:'Watch',crew:'A',owner:'synthetic-host',worker:'"+WORKER+"',eventId:'00000000-0000-0000-0000-000000000008',basis:''}");message.addProperty("scope",SCOPE);message.add("plan",p);message.add("observation",observation(1));
+        assert TaskWire.text(StashCatalog.acceptLocalLive(root,message),"outcome").equals("applied") : "A mirror observation reads its own row, not an unrelated malformed inventory";
+        assert TaskWire.text(StashCatalog.acceptLocalLive(root,message),"outcome").equals("unchanged") : "A durably queued retry remains idempotent";
+        message.addProperty("name","New mirror");message.addProperty("eventId","00000000-0000-0000-0000-000000000009");JsonObject newPlan=p.deepCopy();newPlan.addProperty("name","New mirror");message.add("plan",newPlan);
+        assert TaskWire.text(StashCatalog.acceptLocalLive(root,message),"outcome").equals("applied") : "First mirror use retains automatic local definition creation";
+        message.addProperty("name","Watch");message.addProperty("crew","Local");message.addProperty("owner","");message.addProperty("eventId","00000000-0000-0000-0000-000000000010");message.add("plan",p);message.add("observation",observation(0));
+        assert TaskWire.text(StashCatalog.acceptLocalLive(local,message),"outcome").equals("conflict") : "Local watches cannot bypass stale-basis checks";
+        StashStore.close(local);Files.delete(localFile);assert StashCatalog.localWatches(local,false).isEmpty() : "Deleted stashes never survive in the watch listing";
+        StashCatalog.save(local,"Local",SCOPE,p,observation(2));
+        assert StashCatalog.localWatches(local,false).get(0).getAsJsonObject().getAsJsonObject("containers").has("2,100,0") : "Recreated databases invalidate retained watch caches";
+    }
+    private static void observedSourceTransfer()throws Exception{
+        Path root=Files.createTempDirectory("monocle-observed-source-");JsonObject source=plan("Source",0,4),target=plan("Target",10,10),box=box("minecraft:obsidian",64);
+        source.addProperty("lazyMode",false);
+        StashCatalog.save(root,"A",SCOPE,source,observation(0,box));StashCatalog.save(root,"A",SCOPE,target,observation(10));
+        JsonObject unread=observation(2);unread.addProperty("status","unscanned");unread.addProperty("reason","Chest lid blocked");StashCatalog.save(root,"A",SCOPE,source,unread);
+        JsonObject request=source.deepCopy();request.addProperty("count",36);request.addProperty("targetStashName","Target");request.addProperty("enderTransport",true);request.add("kitTypeIds",new Gson().toJsonTree(List.of(KitTypes.id(box))));
+        rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));
+        request.addProperty("observedSourcesOnly",true);JsonObject args=StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER);
+        assert args.get("observedSourcesOnly").getAsBoolean()&&args.get("sourceScanGaps").getAsInt()==1&&args.get("enderTransport").getAsBoolean();
+        JsonObject task=json("{crew:'A',server:'server',dimension:'minecraft:the_end',package:{entry:'task-stash-transfer'}}");task.add("args",args);
+        JsonObject planned=StashCatalog.kitTransferPlan(root,task,WORKER,json("{type:'KitTransferPlan',index:1}")),action=planned.getAsJsonObject("args");
+        assert action.getAsJsonArray("picks").size()==1&&action.getAsJsonArray("picks").get(0).getAsJsonObject().get("x").getAsInt()==0;
+        assert !action.has("observedSourcesOnly")&&!action.has("sourceScanGaps") : "Host selection and coverage metadata must not consume native action fields";
+        assert cold(file(root,"Source")).getAsJsonObject("containers").getAsJsonObject("2,100,0").get("status").getAsString().equals("unscanned") : "Dispatch cannot rewrite an unread chest into empty stock";
+        String script=new dev.monocle.client.systems.bots.BotWorkflows(null).get("task-stash-transfer").script();
+        JsonObject state=json("{index:1,total:0,delivered:{},phase:'delivering'}"),receipt=json("{value:{delivered:1,missing:0,sourceExhausted:true}}");
+        JsonObject result=dev.monocle.client.systems.bots.BotLua.next(script,state,args,receipt,null).action().getAsJsonObject("result");
+        assert result.get("delivered").getAsInt()==1&&result.get("sourceScanGaps").getAsInt()==1&&!result.get("sourceExhausted").getAsBoolean() : "An observed-source pass cannot claim unread storage is exhausted";
+        request.addProperty("observedSourcesOnly","true");rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));request.addProperty("observedSourcesOnly",true);
+        source.addProperty("lazyMode",true);StashCatalog.define(root,"A",SCOPE,source);rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));
+    }
+    private static void columnRequests()throws Exception{
+        Path root=Files.createTempDirectory("monocle-column-rotation-");JsonObject source=plan("Source",0,2),target=plan("Target",4,6);source.addProperty("lazyMode",false);
+        JsonObject alpha=box("minecraft:obsidian",64),beta=box("minecraft:stone",64);String a=KitTypes.id(alpha),b=KitTypes.id(beta);
+        StashCatalog.save(root,"A",SCOPE,source,observation(0,alpha));StashCatalog.save(root,"A",SCOPE,source,observation(2,beta));StashCatalog.save(root,"A",SCOPE,source,observation(0));
+        StashCatalog.save(root,"A",SCOPE,target,observation(4));StashCatalog.save(root,"A",SCOPE,target,observation(6));
+        JsonObject request=source.deepCopy();request.addProperty("count",36);request.addProperty("targetStashName","Target");request.add("kitTypeIds",new Gson().toJsonTree(List.of(a,b)));JsonObject allocations=new JsonObject();allocations.add(a,JsonParser.parseString("[{x:4,y:100,z:0,axis:'Vertical'}]"));allocations.add(b,JsonParser.parseString("[{x:6,y:100,z:0,axis:'Vertical'}]"));request.add("columnAllocations",allocations);
+        JsonObject args=StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER);assert TaskWire.flag(args,"fillAllocatedColumns")&&args.getAsJsonObject("columnAllocations").equals(allocations);
+        JsonObject task=json("{crew:'A',server:'server',dimension:'minecraft:the_end',package:{entry:'task-stash-transfer'}}");task.add("args",args);
+        assert TaskWire.flag(StashCatalog.kitTransferPlan(root,task,WORKER,json("{type:'KitTransferPlan',index:1}")),"sourceUnavailable") : "A source removed since planning does not abort the other kit types";
+        JsonObject next=StashCatalog.kitTransferPlan(root,task,WORKER,json("{type:'KitTransferPlan',index:2}"));assert next.getAsJsonObject("args").get("kitTypeId").getAsString().equals(b)&&!next.getAsJsonObject("args").has("columnAllocations");
+        request.addProperty("enderTransport",true);rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));request.remove("enderTransport");
+        allocations.add(b,allocations.get(a).deepCopy());rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));allocations.add(b,new JsonArray());rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));
+    }
+    private static void occupancyWatches()throws Exception{
+        Path root=Files.createTempDirectory("monocle-occupancy-watch-");JsonObject p=plan("Occupancy",0,0);
+        for(int occupied:List.of(0,54)){
+            JsonObject o=observation(0);o.addProperty("slotCount",54);o.addProperty("occupiedSlots",occupied);StashCatalog.save(root,"A",SCOPE,p,o);
+            cold(file(root,"Occupancy"));JsonObject wire=StashCatalog.watchFrames(root,"A").getFirst().getAsJsonArray("records").get(0).getAsJsonObject();
+            assert wire.get("slotCount").getAsInt()==54&&wire.get("occupiedSlots").getAsInt()==occupied : "Worker catalog occupancy survives a host cold restart and reflects later contents";
+            assert !wire.has("items")&&!wire.has("shulkers") : "Availability must not broadcast complete kit contents";
+        }
+        JsonObject unknown=observation(0);unknown.addProperty("status","unscanned");StashCatalog.save(root,"A",SCOPE,p,unknown);cold(file(root,"Occupancy"));
+        JsonObject wire=StashCatalog.watchFrames(root,"A").getFirst().getAsJsonArray("records").get(0).getAsJsonObject();
+        assert !wire.has("occupiedSlots")&&!wire.has("slotCount") : "Invalidated storage cannot retain an old full or empty claim";
+    }
+    private static void largeSourcePlan()throws Exception{
+        Path root=Files.createTempDirectory("monocle-large-source-");JsonObject source=plan("Source",0,2048),target=plan("Target",3000,3000),box=box("minecraft:obsidian",1728);source.addProperty("lazyMode",false);
+        StashCatalog.save(root,"A",SCOPE,source,observation(0,box));StashCatalog.save(root,"A",SCOPE,target,observation(3000));JsonObject db=StashCatalog.get(root,"A",SCOPE,"Source");
+        for(int x=1;x<613;x++)db.getAsJsonObject("containers").add(x+",100,0",observation(x,box));StashStore.write(file(root,"Source"),db);
+        JsonObject request=source.deepCopy();request.addProperty("kitTypeId",KitTypes.id(box));request.addProperty("count",36);request.addProperty("destination","Stash");request.addProperty("targetStashName","Target");request.addProperty("transferAll",true);
+        JsonObject action=StashCatalog.kitAction(root,"A",SCOPE,request,WORKER);JsonArray picks=action.getAsJsonArray("picks");
+        Set<Integer> positions=new HashSet<>();for(JsonElement pick:picks){assert pick.isJsonArray();positions.add(StashCatalog.sourcePosition(pick).get("x").getAsInt());}
+        assert picks.size()==613&&positions.size()==613&&positions.contains(0)&&positions.contains(612)&&action.toString().length()<24_000 : "A large source retains every coordinate inside the existing workflow byte budget";
+        var decision=dev.monocle.client.systems.bots.BotLua.next(new dev.monocle.client.systems.bots.BotWorkflows(null).get("task-kit-delivery").script(),new JsonObject(),action,null,null);
+        assert decision.action().getAsJsonArray("picks").size()==613 : "The real Lua action boundary preserves numeric source triples";
+        rejects(()->StashCatalog.sourcePosition(JsonParser.parseString("[0,1]")));rejects(()->StashCatalog.sourcePosition(JsonParser.parseString("[0,1.5,2]")));
+        for(int x=613;x<2048;x++)db.getAsJsonObject("containers").add(x+",100,0",observation(x,box));StashStore.write(file(root,"Source"),db);
+        JsonObject large=StashCatalog.kitAction(root,"A",SCOPE,request,WORKER);
+        var expanded=dev.monocle.client.systems.bots.BotLua.next(new dev.monocle.client.systems.bots.BotWorkflows(null).get("task-kit-delivery").script(),new JsonObject(),large,null,null);
+        assert large.getAsJsonArray("picks").size()==2048&&expanded.action().getAsJsonArray("picks").size()==2048 : "The complete bounded manifest survives real Lua input and output conversion";
+        // Independently invented large synthetic coordinates exercise the status byte budget too.
+        JsonObject wire=large.deepCopy();wire.addProperty("minX",21_000_000);wire.addProperty("maxX",21_002_048);wire.addProperty("minZ",19_000_000);wire.addProperty("maxZ",19_000_000);
+        for(JsonElement v:wire.getAsJsonArray("picks")){JsonArray xyz=v.getAsJsonArray();xyz.set(0,new JsonPrimitive(21_000_000+xyz.get(0).getAsInt()));xyz.set(2,new JsonPrimitive(19_000_000));}
+        assert wire.toString().length()>32_768&&wire.toString().length()<dev.monocle.client.systems.bots.BotLua.MAX_STATE;
+        JsonObject report=json("{run:'"+WORKER+"',status:'Running',token:'"+WORKER+"'}"),run=json("{id:'"+WORKER+"',status:'Running'}");report.add("action",wire);
+        assert TaskWire.applyStatus(new JsonObject(),run,report,true) : "A worker reporting a valid large manifest must stay connected";
+        wire.addProperty("oversized","x".repeat(dev.monocle.client.systems.bots.BotLua.MAX_STATE));rejects(()->TaskWire.applyStatus(new JsonObject(),run,report,true));
+        db.getAsJsonObject("containers").add("2048,100,0",observation(2048,box));StashStore.write(file(root,"Source"),db);rejects(()->StashCatalog.kitAction(root,"A",SCOPE,request,WORKER));
+    }
+    private static void alternatingColumns()throws Exception{
+        Path root=Files.createTempDirectory("monocle-alternating-columns-");JsonObject p=plan("Aisles",0,4);p.addProperty("maxY",110);p.addProperty("maxZ",5);p.addProperty("assumeEmpty",true);
+        for(int x:List.of(4,0,2))for(int y=100;y<=110;y++){
+            JsonObject o=observation(x);o.addProperty("y",y);o.addProperty("z",(y-100)%2);o.addProperty("capacity",54);o.addProperty("status","unscanned");o.addProperty("reason","Storage discovered; contents not yet observed");StashCatalog.save(root,"A",SCOPE,p,o);
+        }
+        String kit=KitTypes.id(box("minecraft:obsidian",1728));JsonObject c=StashCatalog.reserveColumn(root,"A",SCOPE,"Aisles",kit,Set.of());
+        assert c.get("x").getAsInt()==0&&c.get("alternateZ").getAsInt()==1 : "An aisle fills by physical position, not discovery order";
+        assert StashCatalog.checkedColumn(p,c).equals(c);
+        for(int y=100;y<=110;y++)assert StashCatalog.columnContains(c,0,y,(y-100)%2)&&!StashCatalog.columnContains(c,0,y,1-(y-100)%2);
+        assert !StashCatalog.columnContains(c,2,101,1)&&!StashCatalog.columnContains(c,0,99,1);
+        JsonObject db=cold(file(root,"Aisles"));assert db.getAsJsonObject("columnFill").getAsJsonObject("0,0").get("capacity").getAsInt()==594 : "All eleven mapped double chests belong to the column";
+        JsonObject row=db.getAsJsonObject("columnFill").getAsJsonObject("0,0");row.getAsJsonObject("column").remove("alternateZ");row.addProperty("kits",10);StashStock.startColumn(db,c);
+        assert row.get("kits").getAsInt()==10&&row.get("uncertain").getAsBoolean()&&row.get("column").equals(c) : "Correcting an older column footprint keeps its count but invalidates an exact fill claim";
+        JsonObject invalid=c.deepCopy();invalid.addProperty("alternateZ",2);rejects(()->StashCatalog.checkedColumn(p,invalid));
+        JsonObject both=c.deepCopy();both.addProperty("alternateX",1);rejects(()->StashCatalog.checkedColumn(p,both));
+        JsonObject ambiguous=db.deepCopy(),other=observation(1);other.addProperty("y",101);ambiguous.getAsJsonObject("containers").add("1,101,0",other);
+        assert !StashCatalog.mappedColumn(ambiguous,observation(0)).has("alternateZ") : "Ambiguous neighboring stacks do not create a guessed chain";
+        assert !StashCatalog.wireSummary(StashCatalog.summary(db)).has("columnFill") : "Detailed fill ledgers stay off compact worker frames";
+        for(int[] offset:List.of(new int[]{1,0},new int[]{-1,0},new int[]{0,1},new int[]{0,-1})){
+            JsonObject mirror=json("{bounds:{minX:-5,maxX:5,minY:100,maxY:102,minZ:-5,maxZ:5},containers:{}}" );
+            for(int y=100;y<=102;y++){JsonObject o=observation((y%2)*offset[0]);o.addProperty("y",y);o.addProperty("z",(y%2)*offset[1]);mirror.getAsJsonObject("containers").add(StashCatalog.containerKey(o),o);}
+            JsonObject mapped=StashCatalog.checkedColumn(mirror.getAsJsonObject("bounds"),StashCatalog.mappedColumn(mirror,observation(0)));
+            assert StashCatalog.columnContains(mapped,offset[0],101,offset[1])&&!StashCatalog.columnContains(mapped,offset[0],102,offset[1]) : "All four alternating stack directions retain row parity";
+            JsonObject vertical=observation(0);vertical.addProperty("y",101);mirror.getAsJsonObject("containers").add("0,101,0",vertical);
+            JsonObject straight=StashCatalog.mappedColumn(mirror,observation(0));assert !straight.has("alternateX")&&!straight.has("alternateZ") : "Ordinary vertical neighbors never become a guessed alternating chain";
+        }
+    }
+    private static void crossDimensionTransfer()throws Exception{
+        Path root=Files.createTempDirectory("monocle-cross-world-transfer-");String overworld="server\nminecraft:overworld";JsonObject source=plan("Source",0,0),target=plan("Target",0,0),box=box("minecraft:obsidian",1728);source.addProperty("lazyMode",false);
+        StashCatalog.save(root,"A",SCOPE,source,observation(0,box));StashCatalog.save(root,"A",overworld,target,observation(0));
+        JsonObject request=source.deepCopy();request.addProperty("count",1);request.addProperty("kitTypeId",KitTypes.id(box));request.addProperty("destination","Stash");request.addProperty("targetStashName","Target");
+        rejects(()->StashCatalog.kitAction(root,"A",SCOPE,request,WORKER));request.addProperty("targetDimension","minecraft:overworld");
+        JsonObject planned=StashCatalog.kitAction(root,"A",SCOPE,request,WORKER),action=planned.getAsJsonObject("targetStash");action.addProperty("type","StashDeposit");
+        assert TaskWire.text(planned,"dimension").equals("minecraft:the_end")&&TaskWire.text(action,"dimension").equals("minecraft:overworld") : "Each /home leg owns its dimension even when bounds overlap";
+        JsonObject foreign=box("minecraft:diamond",64),otherCrew=box("minecraft:gold_block",64);StashCatalog.save(root,"A","other-server\nminecraft:the_end",source,observation(0,foreign));StashCatalog.save(root,"B",SCOPE,source,observation(0,otherCrew));
+        JsonArray columns=new JsonArray();columns.add(json("{x:0,y:100,z:0,axis:'Vertical'}"));String revision=TaskWire.text(StashCatalog.summary(StashCatalog.get(root,"A",overworld,"Target")),"revision");
+        rejects(()->StashCatalog.setColumnReservations(root,"A",overworld,"Target",revision,KitTypes.id(foreign),columns));
+        rejects(()->StashCatalog.setColumnReservations(root,"A",overworld,"Target",revision,KitTypes.id(otherCrew),columns));
+        JsonObject reserved=StashCatalog.setColumnReservations(root,"A",overworld,"Target",revision,KitTypes.id(box),columns);
+        assert reserved.getAsJsonObject("kitTypes").has(KitTypes.id(box)) : "Destination reservations can import same-crew kit types across dimensions, never other servers or crews";
+        JsonObject task=json("{id:'task',crew:'A',server:'server',dimension:'minecraft:the_end',runs:{}}"),run=json("{id:'run',token:'token'}");run.add("action",action);task.getAsJsonObject("runs").add(WORKER,run);
+        JsonObject message=TaskWire.message("stash-observation");message.addProperty("task","task");message.addProperty("run","run");message.addProperty("token","token");message.add("action",action);message.addProperty("delivery",1);
+        assert StashCatalog.accept(root,task,run,WORKER,"A",message).has("column");message.addProperty("delivery",2);message.add("observation",observation(0));
+        assert StashCatalog.accept(root,task,run,WORKER,"A",message).get("permit").getAsBoolean();
+        String execution=UUID.randomUUID().toString(),token=UUID.randomUUID().toString();run.addProperty("id",execution);run.addProperty("depositToken",token);message.addProperty("run",execution);message.addProperty("token",token);
+        JsonObject actual=box.deepCopy();actual.addProperty("x",0);actual.addProperty("y",100);actual.addProperty("z",0);JsonArray boxes=new JsonArray();boxes.add(actual);JsonObject receipt=json("{stash:'Target',deposited:1,receiptComplete:true,touched:[{x:0,y:100,z:0}]} ");receipt.add("depositedBoxes",boxes);message.add("stashDeposit",receipt);
+        StashCatalog.beginTransfer(root,"A",SCOPE,run,message);StashCatalog.depositReceipt(root,"A",SCOPE,run,message);StashCatalog.depositReceipt(root,"A",SCOPE,run,message);
+        assert StashCatalog.get(root,"A",SCOPE,"Target").isEmpty() : "No ghost catalog in the source dimension";
+        JsonObject totals=StashCatalog.summary(StashCatalog.get(root,"A",overworld,"Target")).getAsJsonObject("transferKitCounts");assert totals.getAsJsonObject(KitTypes.id(box)).get("complete").getAsInt()==1 : "Receipts count once in the destination world";
+        JsonArray ids=new JsonArray();ids.add(KitTypes.id(box));request.add("kitTypeIds",ids);JsonObject transfer=StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER);assert TaskWire.text(transfer,"targetDimension").equals("minecraft:overworld");
+        request.addProperty("enderTransport",true);transfer=StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER);assert TaskWire.flag(transfer,"enderTransport");
+        JsonObject enderRequest=transfer.deepCopy();enderRequest.remove("kitTypeIds");enderRequest.addProperty("kitTypeId",KitTypes.id(box));assert TaskWire.flag(StashCatalog.kitAction(root,"A",SCOPE,enderRequest,WORKER),"enderTransport") : "Late per-kit planning retains the ender buffer setting";
+        request.addProperty("mixedLoads",true);rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));request.remove("mixedLoads");
+        request.addProperty("fillAllocatedColumns",true);transfer=StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER);
+        assert TaskWire.flag(transfer,"fillAllocatedColumns");JsonObject filling=transfer.deepCopy();filling.remove("kitTypeIds");filling.addProperty("kitTypeId",KitTypes.id(box));filling=StashCatalog.kitAction(root,"A",SCOPE,filling,WORKER);
+        assert TaskWire.flag(filling.getAsJsonObject("targetStash"),"fillAllocatedColumns")
+            &&TaskWire.text(filling.getAsJsonObject("returnStash"),"name").equals("Source")&&TaskWire.text(filling.getAsJsonObject("returnStash"),"dimension").equals("minecraft:the_end")
+            : "Column overflow returns through the source worker home, not the destination dimension";
+        request.addProperty("depositCarried",true);rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));request.remove("depositCarried");
+        request.addProperty("fillAllocatedColumns","true");rejects(()->StashCatalog.kitTransfer(root,"A",SCOPE,request,WORKER));request.addProperty("fillAllocatedColumns",true);
+        request.addProperty("targetDimension","bad dimension");rejects(()->StashCatalog.kitAction(root,"A",SCOPE,request,WORKER));
+    }
+    private static void emptyColumnFill()throws Exception{
+        Path root=Files.createTempDirectory("monocle-empty-column-fill-");JsonObject p=plan("Aisles",0,0);p.addProperty("assumeEmpty",true);p.addProperty("maxY",102);
+        for(int y=100;y<=102;y++){
+            JsonObject o=observation(0);o.addProperty("y",y);o.addProperty("status","unscanned");o.addProperty("reason","Storage discovered; contents not yet observed");o.addProperty("capacity",54);StashCatalog.save(root,"A",SCOPE,p,o);
+        }
+        JsonObject box=box("minecraft:obsidian",1728);String kit=KitTypes.id(box);
+        JsonObject column=StashCatalog.reserveColumn(root,"A",SCOPE,"Aisles",kit,Set.of());
+        JsonObject db=cold(file(root,"Aisles")),row=db.getAsJsonObject("columnFill").getAsJsonObject("0,0");
+        assert row.get("kits").getAsInt()==0&&row.get("capacity").getAsInt()==162 : "Real mapped geometry supplies capacity without opening or fabricating empty contents";
+        box.addProperty("x",0);box.addProperty("y",102);box.addProperty("z",0);JsonArray boxes=new JsonArray();boxes.add(box);
+        StashStock.change(db,boxes,1);assert row.get("kits").getAsInt()==1;
+        StashStock.startColumn(db,column);assert row.get("kits").getAsInt()==1 : "Reusing a column never resets its fill ledger";
+        StashStore.record(file(root,"Aisles"),db,Set.of());db=cold(file(root,"Aisles"));row=db.getAsJsonObject("columnFill").getAsJsonObject("0,0");
+        assert StashCatalog.summary(db).getAsJsonObject("columnFill").getAsJsonObject("0,0").get("kits").getAsInt()==1 : "Counts survive SQLite cold restart and reach host summaries";
+        StashStock.observed(db,json("{type:'StashDeposit'}"),observation(0));assert !row.get("uncertain").getAsBoolean();
+        StashStock.change(db,boxes,-1);assert row.get("kits").getAsInt()==0 : "Confirmed withdrawals decrement the same column";
+        JsonObject removed=observation(0);removed.addProperty("status","removed");StashStock.observed(db,json("{type:'StashDeposit'}"),removed);assert row.get("uncertain").getAsBoolean() : "A removed chest invalidates exact fill even during a job";row.addProperty("uncertain",false);
+        row.addProperty("kits",162);StashStock.change(db,boxes,1);assert row.get("uncertain").getAsBoolean() : "More kits than mapped slots cannot silently become an exact full-column claim";row.addProperty("kits",0);row.addProperty("uncertain",false);
+        StashStock.observed(db,json("{type:'StashScan'}"),observation(0));assert row.get("uncertain").getAsBoolean() : "External reads cannot silently preserve an exact occupancy claim";
+        JsonObject occupied=observation(0,box);occupied.addProperty("slotCount",54);occupied.addProperty("occupiedSlots",1);
+        JsonObject unknown=json("{bounds:{assumeEmpty:true},containers:{}}" );unknown.getAsJsonObject("containers").add("0,100,0",occupied);
+        StashStock.startColumn(unknown,column);assert !unknown.has("columnFill") : "Known occupied storage is never reset to an empty baseline";
     }
     private static void assumedEmptyStorage()throws Exception{
         Path root=Files.createTempDirectory("monocle-assumed-empty-");JsonObject p=plan("Empty",0,2),box=box("minecraft:obsidian",1728);String kit=KitTypes.id(box);
