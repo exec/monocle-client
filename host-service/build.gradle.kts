@@ -42,7 +42,11 @@ val hostServiceCheck = tasks.register<JavaExec>("hostServiceCheck") {
     mainClass.set("dev.monocle.host.HostServiceTest")
     enableAssertions = true
 }
-tasks.test { exclude("**/HostServiceTest*.class", "**/KitStockCheck*.class", "**/TlsProxy*.class", "**/WebUiTest*.class") }
+tasks.test {
+    // Assertion mains run through hostServiceCheck, not test-framework discovery.
+    failOnNoDiscoveredTests = false
+    exclude("**/HostServiceTest*.class", "**/KitStockCheck*.class", "**/TlsProxy*.class", "**/WebUiTest*.class")
+}
 tasks.test { exclude("**/KitBotCheck*.class", "**/KitBotContentsCheck*.class", "**/MikeKitHandlerCheck*.class") }
 tasks.check { dependsOn(hostServiceCheck) }
 tasks.register<JavaExec>("faultReplayCheck") {
